@@ -15,6 +15,16 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
+// configureLogging points controller-runtime at klog.
+//
+// Until a logger is set, controller-runtime discards every line its manager and
+// reconcilers produce and says so once, after thirty seconds, with a stack
+// trace. Reconcilers whose errors reach nothing cannot be diagnosed, and every
+// defect found in this controller so far was found by reading a log.
+func configureLogging() {
+	ctrl.SetLogger(klog.Background())
+}
+
 // startRunControllers brings up the manager that reconciles BackupRun and
 // RestoreRun, and returns as soon as it is running.
 //
@@ -28,11 +38,7 @@ func startRunControllers(ctx context.Context, kubeconfig string) error {
 		return fmt.Errorf("build client configuration: %w", err)
 	}
 
-	// controller-runtime discards every log line until a logger is set, and
-	// says so once with a stack trace after thirty seconds. The rest of this
-	// binary logs through klog, so the manager does too, and the reconcilers'
-	// errors land beside the populator's in one stream.
-	ctrl.SetLogger(klog.Background())
+	configureLogging()
 
 	scheme := runtime.NewScheme()
 	for name, add := range map[string]func(*runtime.Scheme) error{
