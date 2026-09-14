@@ -11,10 +11,12 @@ snapshot back, either into the volume the app already has or into a second one
 beside it. [docs/restores.md](docs/restores.md) says which answers which
 question.
 
-Status, 2026-09-14: released at v0.2.3. VolumeRestore is proven on the walzen
-test cluster: a canary's claim was destroyed and refilled from restic, with the
-repository showing the file's four lines before and five after. BackupRun and
-RestoreRun have passing tests and have not yet run on a cluster.
+Status, 2026-09-14: released at v0.2.4. VolumeRestore and BackupRun are proven
+on the walzen test cluster. A canary's claim was destroyed and refilled from
+restic, with the repository showing the file's four lines before and five after,
+and a BackupRun took an off-schedule backup in 31 seconds and left the source's
+schedule exactly as it found it. RestoreRun's `into:` mode is fixed in v0.2.4
+and has not been rerun; its in-place mode has not run on a cluster at all.
 
 The Go module and its flake dev shell, the VolumeRestore API with its generated
 CRD, the internal/volsync and internal/populator packages with their fake-client
@@ -41,6 +43,15 @@ them, beside the populator's own loop. It also stops a write loop: the library
 has no early return for a claim it has already populated, so it calls the
 cleanup callback on every resync for the life of the claim, and the callback was
 writing VolumeRestore status each time without anything having changed.
+
+v0.2.4 carries the source claim's selected node onto the scratch claim a
+RestoreRun creates with `into:`. On a WaitForFirstConsumer class the populator
+library waits for `volume.kubernetes.io/selected-node` before it fills a claim,
+and the scheduler writes that annotation when a pod using the claim is
+scheduled. A scratch claim has no pod, so nothing ever wrote it and the claim
+stayed Pending: observed on the walzen test cluster, eight minutes with no prime
+claim and nothing in the controller's log. Every class on that cluster binds
+WaitForFirstConsumer.
 
 v0.2.3 gives controller-runtime a logger. Without one it discards every line the
 BackupRun and RestoreRun reconcilers produce, so a run that failed would have

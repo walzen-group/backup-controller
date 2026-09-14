@@ -13,6 +13,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// selectedNodeAnnotation is what a WaitForFirstConsumer class provisions
+// against, and what the populator library waits for before it fills a claim.
+const selectedNodeAnnotation = "volume.kubernetes.io/selected-node"
+
 // restoreSettings are the values a restore needs that the run itself does not
 // state, read off the claim's own VolumeRestore so none of them is retyped.
 type restoreSettings struct {
@@ -35,6 +39,11 @@ type restoreSettings struct {
 	// scratch claim an Into restore creates.
 	Capacity         *resource.Quantity
 	StorageClassName *string
+
+	// SelectedNode is the worker the source claim's volume is on, carried onto
+	// the scratch claim so a WaitForFirstConsumer class provisions it without a
+	// pod to schedule.
+	SelectedNode string
 }
 
 // repositoryFor resolves where a run reads from and how its mover should run.
@@ -66,6 +75,7 @@ func (r *RestoreRunReconciler) repositoryFor(ctx context.Context, run *backupv1a
 		return settings, fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
 	}
 	settings.StorageClassName = claim.Spec.StorageClassName
+	settings.SelectedNode = claim.Annotations[selectedNodeAnnotation]
 	if request, ok := claim.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
 		settings.Capacity = &request
 	}
@@ -168,16 +178,34 @@ func pointInTimeRestore(run *backupv1alpha1.RestoreRun, settings restoreSettings
 // It takes the source claim's size and class, so the copy is provisioned the
 // way the original was. It is an ordinary dynamic claim: deleting it takes its
 // dataset with it, which is what makes a scratch copy cheap to throw away.
+//
+// It also takes the source claim's selected node, and without that it is never
+// filled at all. On a WaitForFirstConsumer class the populator library waits
+// for volume.kubernetes.io/selected-node before it creates anything, and that
+// annotation is written by the scheduler when a pod using the claim is
+// scheduled. A scratch claim has no pod, so nothing would ever write it and the
+// claim would stay Pending for as long as it existed. Every class on the walzen
+// cluster binds WaitForFirstConsumer.
+//
+// Copying the source's node is also the right answer rather than a way around
+// the problem: the copy is made to be compared against the original, and both
+// datasets belong on the pool that already holds one of them.
 func scratchClaim(run *backupv1alpha1.RestoreRun, settings restoreSettings, restore string) *corev1.PersistentVolumeClaim {
 	size := settings.Capacity
 	if run.Spec.IntoSize != nil {
 		size = run.Spec.IntoSize
 	}
 
+	annotations := map[string]string{}
+	if settings.SelectedNode != "" {
+		annotations[selectedNodeAnnotation] = settings.SelectedNode
+	}
+
 	claim := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      run.Spec.Into,
-			Namespace: run.Namespace,
+			Name:        run.Spec.Into,
+			Namespace:   run.Namespace,
+			Annotations: annotations,
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(run, backupv1alpha1.GroupVersion.WithKind("RestoreRun")),
 			},

@@ -39,7 +39,10 @@ func populatedClaim() *corev1.PersistentVolumeClaim {
 	class := "zfs"
 	group := backupv1alpha1.GroupVersion.Group
 	return &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "canary-backup", Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "canary-backup", Namespace: namespace,
+			Annotations: map[string]string{selectedNodeAnnotation: "talos-unraid-ums-w-1"},
+		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			StorageClassName: &class,
@@ -280,6 +283,15 @@ func TestIntoCreatesASecondVolumeAndTouchesNothingElse(t *testing.T) {
 	}
 	if got := claim.Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "1Gi" {
 		t.Errorf("size = %s, want the source claim's 1Gi", got.String())
+	}
+	// Without this the claim is never filled at all. On a WaitForFirstConsumer
+	// class the populator library waits for selected-node before it creates
+	// anything, and that annotation is written by the scheduler when a pod
+	// using the claim is scheduled. A scratch claim has no pod, so it stayed
+	// Pending for as long as it existed: observed on the walzen test cluster,
+	// eight minutes with no prime claim and nothing in the controller's log.
+	if got := claim.Annotations[selectedNodeAnnotation]; got != "talos-unraid-ums-w-1" {
+		t.Errorf("selected node = %q, want the source claim's, or nothing ever provisions this", got)
 	}
 
 	// No ReplicationDestination at all: this mode never mounts the app's claim.
