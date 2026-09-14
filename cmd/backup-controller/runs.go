@@ -28,6 +28,12 @@ func startRunControllers(ctx context.Context, kubeconfig string) error {
 		return fmt.Errorf("build client configuration: %w", err)
 	}
 
+	// controller-runtime discards every log line until a logger is set, and
+	// says so once with a stack trace after thirty seconds. The rest of this
+	// binary logs through klog, so the manager does too, and the reconcilers'
+	// errors land beside the populator's in one stream.
+	ctrl.SetLogger(klog.Background())
+
 	scheme := runtime.NewScheme()
 	for name, add := range map[string]func(*runtime.Scheme) error{
 		"core":          corev1.AddToScheme,

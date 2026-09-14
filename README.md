@@ -11,7 +11,7 @@ snapshot back, either into the volume the app already has or into a second one
 beside it. [docs/restores.md](docs/restores.md) says which answers which
 question.
 
-Status, 2026-09-14: released at v0.2.2. VolumeRestore is proven on the walzen
+Status, 2026-09-14: released at v0.2.3. VolumeRestore is proven on the walzen
 test cluster: a canary's claim was destroyed and refilled from restic, with the
 repository showing the file's four lines before and five after. BackupRun and
 RestoreRun have passing tests and have not yet run on a cluster.
@@ -41,6 +41,11 @@ them, beside the populator's own loop. It also stops a write loop: the library
 has no early return for a claim it has already populated, so it calls the
 cleanup callback on every resync for the life of the claim, and the callback was
 writing VolumeRestore status each time without anything having changed.
+
+v0.2.3 gives controller-runtime a logger. Without one it discards every line the
+BackupRun and RestoreRun reconcilers produce, so a run that failed would have
+said nothing anywhere. The manager now logs through klog like the rest of the
+binary.
 
 v0.2.2 stops an error loop that had been there since v0.1.0. The library deletes
 the prime claim after calling the cleanup callback, so every pass after the one
