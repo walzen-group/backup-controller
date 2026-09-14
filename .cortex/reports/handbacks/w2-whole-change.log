@@ -1,0 +1,67 @@
+### git status --short
+AM .cortex/plans/2026-09-14-backup-controller/00-index.md
+A  .cortex/plans/2026-09-14-backup-controller/task-0-verify-library-contract.md
+AM .cortex/plans/2026-09-14-backup-controller/task-1-repo-scaffold.md
+AM .cortex/plans/2026-09-14-backup-controller/task-2-api-and-crd.md
+AM .cortex/plans/2026-09-14-backup-controller/task-3-populator.md
+AM .cortex/plans/2026-09-14-backup-controller/task-4-binary-and-envtest.md
+AM .cortex/plans/2026-09-14-backup-controller/task-5-install-assets.md
+A  .cortex/plans/2026-09-14-backup-controller/task-6-cluster-runbook.md
+A  .cortex/plans/2026-09-14-backup-controller/task-7-docs-status.md
+AM .cortex/plans/2026-09-14-backup-controller/task-8-final-review.md
+A  .envrc
+A  .github/workflows/ci.yaml
+A  .gitignore
+A  Makefile
+A  README.md
+A  config/crd/backup.wlz.li_volumerestores.yaml
+A  config/samples/backup.wlz.li_v1alpha1_volumerestore.yaml
+A  config/samples/claim.yaml
+A  docs/README.md
+A  docs/api.md
+A  docs/architecture.md
+A  docs/decisions.md
+A  docs/implementation-plan.md
+A  docs/integration.md
+A  docs/overview.md
+A  docs/packaging.md
+A  flake.lock
+A  flake.nix
+A  go.mod
+A  go.sum
+A  internal/api/v1alpha1/conditions.go
+A  internal/api/v1alpha1/crd_validation_test.go
+A  internal/api/v1alpha1/groupversion_info.go
+A  internal/api/v1alpha1/volumerestore_types.go
+A  internal/api/v1alpha1/zz_generated.deepcopy.go
+?? .cortex/plans/2026-09-14-backup-controller/library-contract-findings.md
+?? .cortex/reports/
+### nix develop -c go vet ./...
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+vet_exit=0
+### nix develop -c go build ./...
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+build_exit=0
+### nix develop -c go test ./... -race
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+?   	github.com/walzen-group/backup-controller/internal/api/v1alpha1	[no test files]
+race_exit=0
+### nix develop -c golangci-lint run
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+0 issues.
+lint_exit=0
+### nix develop -c make verify
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+rm -rf .tmp/crd
+mkdir -p .tmp/crd
+nix develop -c controller-gen crd paths=./internal/api/... output:crd:dir=.tmp/crd
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+diff -ru config/crd .tmp/crd
+verify_exit=0
+### nix develop -c actionlint
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+actionlint_exit=0
+### kubectl-validate config/crd/backup.wlz.li_volumerestores.yaml
+
+[1mconfig/crd/backup.wlz.li_volumerestores.yaml[0m...[32mOK[0m
+validate_exit=0

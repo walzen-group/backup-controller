@@ -1,0 +1,191 @@
+# CI for backup-controller. Every job runs the flake's toolchain through
+# `nix develop -c`, so CI and a developer's shell execute identical versions
+# of go, golangci-lint and actionlint. There is no per-tool setup action to
+# drift from the flake.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to the same ref supersedes an in-progress CI run. CI is
+# reproducible from the commit, so cancelling the older run loses nothing.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      - name: go vet
+        run: nix develop -c go vet ./...
+
+      - name: go test
+        run: nix develop -c go test ./... -race
+
+      - name: golangci-lint
+        run: nix develop -c golangci-lint run
+
+      - name: go build
+        run: nix develop -c go build ./...
+
+      # A workflow edit is linted here as well as locally. With no file
+      # argument actionlint finds the repository's .github/workflows itself,
+      # which keeps this step covering every workflow file the repo adds.
+      - name: actionlint
+        run: nix develop -c actionlint
+
+  generated:
+    name: Generated files match source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      # make verify regenerates the CRDs into .tmp/crd and exits non-zero on
+      # any diff against committed config/crd. This job must fail the build,
+      # not warn, so there is no continue-on-error on it and the step is kept
+      # plain: a green CI with drifted generated files is the exact state
+      # this job exists to prevent. The Makefile enters the flake itself
+      # (every recipe runs under `nix develop -c`), so make is called
+      # directly here rather than wrapped in another nix develop.
+      - name: make verify
+        run: make verify
+
+  envtest:
+    name: Envtest against a real API server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      # The suite carries the envtest build tag, so the plain check job never
+      # compiles it. It needs the control-plane binaries: without usable
+      # assets in KUBEBUILDER_ASSETS the suite fails in TestMain rather than
+      # skipping, which is why the asset path is resolved by a standalone
+      # assignment here. When setup-envtest cannot fetch the 1.37.0 binaries
+      # (a fresh runner downloads them on first use), set -e aborts the step
+      # there; the prefix form, KUBEBUILDER_ASSETS=$(setup-envtest use ...)
+      # go test, would pass an empty path to a suite that then fails for a
+      # reason that names the wrong cause.
+      - name: Run the tagged envtest suite
+        run: |
+          # shellcheck disable=SC2016  # the inner bash expands these
+          nix develop -c bash -c '
+            set -euo pipefail
+            assets=$(setup-envtest use 1.37.0 -p path)
+            KUBEBUILDER_ASSETS="$assets" go test -tags envtest ./internal/api/...
+          '
+
+  chart:
+    name: Chart and install manifests render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      # The render is what the infrastructure module fetches, so the objects it
+      # has to carry are checked here: the CRD and the Namespace are the two
+      # kinds the module applies in groups of their own, and the two
+      # securityContext lines are the hardening the pod has to keep.
+      - name: The install render carries the CRD, the namespace and the hardened pod
+        run: |
+          nix develop -c bash -c '
+            set -euo pipefail
+            mkdir -p .tmp
+            kustomize build deploy/ > .tmp/ci-deploy-render.yaml
+            grep -q "kind: CustomResourceDefinition" .tmp/ci-deploy-render.yaml
+            grep -q "kind: Namespace" .tmp/ci-deploy-render.yaml
+            grep -q "readOnlyRootFilesystem: true" .tmp/ci-deploy-render.yaml
+            grep -q "runAsNonRoot: true" .tmp/ci-deploy-render.yaml
+          '
+
+      - name: helm lint
+        run: nix develop -c helm lint chart/
+
+      - name: helm template
+        run: |
+          mkdir -p .tmp
+          nix develop -c helm template backup-controller chart/ > .tmp/ci-chart-render.yaml
+
+      # Schema validation of both renders with no cluster available.
+      # `kubectl apply --dry-run=client` cannot run here at all: kubectl v1.37
+      # performs API discovery even for a client dry-run, so it needs a
+      # reachable API server regardless of --validate (the failure CI run
+      # 34031346074 hit, reproduced offline on this host for apply and
+      # create). kubectl-validate embeds the API server's own structural
+      # schemas in its binary: it catches unknown fields, wrong types,
+      # unknown groups, and unparsable YAML with no server and no network.
+      # The tool is resolved from the nixpkgs revision already pinned in
+      # flake.lock, so its version and embedded schemas move with flake.lock
+      # and this adds no separate pin to maintain.
+      #
+      # Input is a file, not a pipe: kubectl-validate 0.0.4 validates only
+      # the first document of a /dev/stdin stream and silently passes every
+      # later document, so a piped render would verify nothing past the first
+      # object (measured on this host).
+      - name: Validate both renders against the API schemas, offline
+        run: |
+          # shellcheck disable=SC2016  # the inner bash expands these
+          nix develop -c bash -c '
+            set -euo pipefail
+            rev=$(nix eval --impure --raw --expr "(builtins.fromJSON (builtins.readFile ./flake.lock)).nodes.nixpkgs.locked.rev")
+            nix shell "github:NixOS/nixpkgs/${rev}#kubectl-validate" -c kubectl-validate .tmp/ci-deploy-render.yaml
+            nix shell "github:NixOS/nixpkgs/${rev}#kubectl-validate" -c kubectl-validate .tmp/ci-chart-render.yaml
+          '
+
+  image:
+    name: Image builds for linux/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # The image job is the exception to the nix rule: the build happens
+      # inside the Dockerfile's own Go stage, so the host toolchain is not
+      # involved and buildx can cache layers through the Actions cache.
+      - uses: docker/setup-buildx-action@v4.3.0
+
+      - name: Build the controller image without pushing
+        uses: docker/build-push-action@v7.3.0
+        with:
+          push: false
+          platforms: linux/amd64
+          file: Dockerfile
+          build-args: VERSION=ci-${{ github.sha }}
+          tags: backup-controller:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

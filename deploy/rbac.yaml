@@ -1,0 +1,72 @@
+# Every rule here traces to a caller in the controller.
+#
+# The library creates the prime claim for each restore, copies the app claim's
+# storage class, size and selected node onto it, and patches the volume's claim
+# reference to the app claim when the restore completes. Its watchers read
+# through the informer cache, so list and watch carry the reads and get is
+# granted for the objects it fetches by name. The recorder writes the events an
+# operator reads with kubectl describe.
+#
+# The secrets grant is the line worth arguing about: a restore copies the
+# repository Secret from the claim's namespace into the controller namespace
+# and deletes that copy when the restore ends, and RBAC cannot scope a rule to
+# Secrets whose names match a pattern, so the grant covers every Secret in the
+# cluster. docs/decisions.md records the alternative that avoids it.
+#
+# The status rules cover the controller's own writes to a VolumeRestore, which
+# the library performs as subresource updates and patches.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: backup-controller
+  labels:
+    app.kubernetes.io/name: backup-controller
+    app.kubernetes.io/instance: backup-controller
+rules:
+  # The app claim, the prime claim and the restored volume.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  # The data source the claim names.
+  - apiGroups: ["backup.wlz.li"]
+    resources: ["volumerestores"]
+    verbs: ["get", "list", "watch"]
+  # The conditions the controller reports on a VolumeRestore.
+  - apiGroups: ["backup.wlz.li"]
+    resources: ["volumerestores/status"]
+    verbs: ["patch", "update"]
+  # One destination per restore, created and removed by the callbacks.
+  - apiGroups: ["volsync.backube"]
+    resources: ["replicationdestinations"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # The repository Secret copy the populator writes for the length of a
+  # restore.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "delete"]
+  # The recorder the library hands to the callbacks.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: backup-controller
+  labels:
+    app.kubernetes.io/name: backup-controller
+    app.kubernetes.io/instance: backup-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: backup-controller
+subjects:
+  - kind: ServiceAccount
+    name: backup-controller
+    namespace: backup-system

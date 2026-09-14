@@ -1,0 +1,21 @@
+### meta-w2 own run on the frozen artifact
+assets=/home/nixos/.local/share/kubebuilder-envtest/k8s/1.37.0-linux-amd64
+=== RUN   TestCRDValidation
+=== RUN   TestCRDValidation/valid
+=== RUN   TestCRDValidation/repository_not_a_DNS-1123_subdomain
+=== RUN   TestCRDValidation/repository_missing
+=== RUN   TestCRDValidation/restoreAsOf_not_RFC3339
+=== RUN   TestCRDValidation/moverPodLabels_key_invalid
+=== RUN   TestCRDValidation/moverPodLabels_value_invalid
+--- PASS: TestCRDValidation (2.02s)
+    --- PASS: TestCRDValidation/valid (2.01s)
+    --- PASS: TestCRDValidation/repository_not_a_DNS-1123_subdomain (0.00s)
+    --- PASS: TestCRDValidation/repository_missing (0.00s)
+    --- PASS: TestCRDValidation/restoreAsOf_not_RFC3339 (0.00s)
+    --- PASS: TestCRDValidation/moverPodLabels_key_invalid (0.00s)
+    --- PASS: TestCRDValidation/moverPodLabels_value_invalid (0.00s)
+=== RUN   TestCRDRoundTrip
+--- PASS: TestCRDRoundTrip (0.00s)
+PASS
+ok  	github.com/walzen-group/backup-controller/internal/api/v1alpha1	6.435s
+envtest_exit=0

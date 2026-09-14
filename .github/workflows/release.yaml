@@ -1,0 +1,226 @@
+# Release pipeline for backup-controller. Triggered by a version tag (v1.2.3), it
+# publishes an immutable image, renders the deployment manifests pinned to
+# that image's digest, packages the chart and pushes it to ghcr.io as an OCI
+# artifact, and attaches everything to a GitHub Release. The tag itself is
+# created by hand; nothing here tags.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write    # create the GitHub Release
+  packages: write    # push the image to ghcr.io
+  id-token: write    # held back for signing work not in this release
+
+# Deliberately no cancel-in-progress here, unlike ci.yaml. A release run
+# cancelled mid-push can leave the tag pointing at a half-published image set.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      # These are the four Go commands of the check job in ci.yaml, word for
+      # word: a tag that does not pass CI does not become a release. If either
+      # side changes, change both.
+      - name: go vet
+        run: nix develop -c go vet ./...
+
+      - name: go test
+        run: nix develop -c go test ./... -race
+
+      - name: golangci-lint
+        run: nix develop -c golangci-lint run
+
+      - name: go build
+        run: nix develop -c go build ./...
+
+  release:
+    name: Publish image, manifests, chart
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - name: Reject a tag that is not a plain semver version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! printf '%s\n' "$TAG" \
+            | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::Refusing to release '$TAG'. Expected a plain semver" \
+              "tag like v1.2.3. Prerelease and build-metadata suffixes are" \
+              "rejected: they would silently overwrite the shared" \
+              "major.minor tag and cannot produce a valid chart version."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7.0.1
+
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      - name: Derive the release version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          # 1.2.3 -> 1.2, the rolling minor tag consumers may follow.
+          {
+            echo "version=${VERSION}"
+            echo "minor=${VERSION%.*}"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER}/backup-controller"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4.3.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the controller image
+        id: build
+        uses: docker/build-push-action@v7.3.0
+        with:
+          push: true
+          platforms: linux/amd64
+          file: Dockerfile
+          build-args: VERSION=${{ steps.version.outputs.version }}
+          tags: |
+            ${{ steps.version.outputs.image }}:v${{ steps.version.outputs.version }}
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.minor }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The digest goes in the job summary because that is the first place a
+      # person looks after a release run, and the digest is the half of the
+      # pin that actually decides which image a cluster runs.
+      - name: Report the pushed digest
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "## backup-controller v${VERSION}"
+            echo
+            echo "Pushed tags: ${IMAGE}:v${VERSION} and ${IMAGE}:${VERSION%.*}"
+            echo
+            echo "Pin by digest; the tags are for people:"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf 'IMAGE=%s\nVERSION=%s\nDIGEST=%s\n' \
+            "$IMAGE" "$VERSION" "$DIGEST" >> "$GITHUB_ENV"
+
+      # The workspace persists between steps, so the pushed digest is baked
+      # into the rendered manifest: kustomize edit set image records the
+      # override in deploy/kustomization.yaml (that command has no directory
+      # flag on kustomize v5, hence the cd), kubectl kustomize renders, and
+      # the grep proves the override was actually consumed: an image name in
+      # deploy/ that does not match the pushed image leaves the render
+      # floating on a tag, and this fails loudly instead.
+      - name: Render deploy/ with the image pinned by digest
+        run: |
+          # shellcheck disable=SC2016  # the inner bash expands these
+          nix develop -c bash -c '
+            set -euo pipefail
+            cd deploy
+            kustomize edit set image "$IMAGE=$IMAGE@$DIGEST"
+            cd ..
+            kubectl kustomize deploy/ > "backup-controller-$VERSION.yaml"
+            grep -q "@sha256:" "backup-controller-$VERSION.yaml" || {
+              echo "Rendered manifest does not pin the image by digest." \
+                "Check that deploy/ uses the image name $IMAGE." >&2
+              exit 1
+            }
+          '
+
+      # Helm package takes version and appVersion as flags, but image.digest
+      # is a value, so the values file of a throwaway copy of the chart is
+      # patched first. chart/ in the checkout is never modified.
+      - name: Package the Helm chart
+        run: |
+          rm -rf .tmp/release
+          mkdir -p .tmp/release
+          cp -r chart .tmp/release/chart
+          nix develop -c \
+            yq -i '.image.digest = strenv(DIGEST)' .tmp/release/chart/values.yaml
+          # shellcheck disable=SC2016  # the inner bash expands these
+          nix develop -c bash -c '
+            set -euo pipefail
+            helm package .tmp/release/chart \
+              --version "$VERSION" --app-version "$VERSION" \
+              --destination .tmp/release
+            mv .tmp/release/*.tgz "backup-controller-$VERSION.tgz"
+          '
+
+      # The packaged tarball is also pushed to ghcr.io as an OCI chart
+      # artifact, so a Flux-style consumer can pull
+      # oci://ghcr.io/walzen-group/backup-controller by version with the baked
+      # image.digest intact. The GitHub Release keeps the tarball attachment.
+      - name: Push the chart to ghcr.io as an OCI artifact
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # shellcheck disable=SC2016  # the inner bash expands these
+          nix develop -c bash -c '
+            set -euo pipefail
+            helm registry login ghcr.io -u "$GHCR_USER" -p "$GHCR_TOKEN"
+            helm push "backup-controller-$VERSION.tgz" oci://ghcr.io/walzen-group/backup-controller
+          '
+
+      # The CRDs move on their own schedule (schema changes only), so they
+      # ship as a separate bundle a cluster can apply before the workloads.
+      - name: Bundle the CRDs
+        run: |
+          : > "crds-$VERSION.yaml"
+          for f in config/crd/*.yaml; do
+            cat "$f" >> "crds-$VERSION.yaml"
+          done
+
+      - name: Create the GitHub Release
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: v${{ steps.version.outputs.version }}
+          body: |-
+            backup-controller ${{ steps.version.outputs.image }}:v${{ steps.version.outputs.version }}
+
+            Image digest: `${{ steps.build.outputs.digest }}`
+
+            Pin by digest; the tag is for people:
+            `${{ steps.version.outputs.image }}@${{ steps.build.outputs.digest }}`
+
+            backup-controller-${{ steps.version.outputs.version }}.yaml is the rendered
+            deploy/ tree with the image already pinned to that digest.
+            crds-${{ steps.version.outputs.version }}.yaml holds the CRDs,
+            which version separately from the controller.
+          files: |
+            backup-controller-${{ steps.version.outputs.version }}.yaml
+            backup-controller-${{ steps.version.outputs.version }}.tgz
+            crds-${{ steps.version.outputs.version }}.yaml

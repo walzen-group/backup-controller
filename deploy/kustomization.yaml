@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - rbac.yaml
+  - deployment.yaml
+  # kubectl kustomize refuses to load files outside the deploy/ tree, and
+  # controller-gen writes config/crd/ without a kustomization.yaml of its own,
+  # so the CRDs are verbatim copies under deploy/crds/ instead of a ../
+  # reference. Refresh with: cp config/crd/*.yaml deploy/crds/
+  - crds
+
+# The release workflow pins this image by digest with
+# `kustomize edit set image ghcr.io/walzen-group/backup-controller=<image>@sha256:<digest>`,
+# and then fails the run when the render carries no @sha256:. The name here has
+# to match the image in deployment.yaml, or the override matches nothing and
+# the release stops at that grep.
+images:
+  - name: ghcr.io/walzen-group/backup-controller
+    newTag: v0.1.0

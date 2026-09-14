@@ -1,0 +1,13 @@
+# Keep the image build context to what go build reads. In particular .git is
+# never in the context, so the build cannot depend on repository metadata, and
+# nothing in deploy/, chart/, or docs/ can leak into the final image.
+.git
+.github
+.tmp
+.cortex
+.direnv
+result
+result-*
+docs
+chart
+deploy

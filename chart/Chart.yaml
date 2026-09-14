@@ -1,0 +1,16 @@
+apiVersion: v2
+name: backup-controller
+description: Restore a claim from a VolSync restic repository by creating a VolumeRestore
+type: application
+# The release workflow passes the tag to helm package as --version and
+# --app-version. Keep each on its own line.
+version: 0.1.0
+appVersion: 0.1.0
+keywords:
+  - storage
+  - backup
+  - restore
+  - volsync
+home: https://github.com/walzen-group/backup-controller
+sources:
+  - https://github.com/walzen-group/backup-controller

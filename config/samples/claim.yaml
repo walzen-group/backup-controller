@@ -1,0 +1,18 @@
+# Claim "notes-data": the app's volume, restored from the VolumeRestore beside
+# it. The dataSourceRef is what starts the restore; deleting the claim and this
+# object is what deletes the volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: notes-data
+  namespace: notes
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: zfs
+  resources:
+    requests:
+      storage: 1Gi
+  dataSourceRef:
+    apiGroup: backup.wlz.li
+    kind: VolumeRestore
+    name: notes-data

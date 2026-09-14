@@ -1,0 +1,17 @@
+{
+  "files_changed": [
+    "flake.nix",
+    "flake.lock",
+    ".envrc",
+    ".gitignore",
+    "go.mod",
+    "Makefile",
+    ".github/workflows/ci.yaml"
+  ],
+  "diffs_per_worker": {
+    "impl-t1-scaffold": "7 files, 164 insertions, 0 deletions (git diff --cached --stat restricted to the Target paths). Per file: flake.nix 35, flake.lock 27, .envrc 1, .gitignore 4, go.mod 3, Makefile 42, .github/workflows/ci.yaml 52. No Go package, no internal/, cmd/ or go.sum. git add -A also staged the pre-existing README.md, docs/* and the orchestrator's .cortex/plans/*, which the worker did not author; no commits exist, and nothing outside the Target list was written."
+  },
+  "gate_evidence": "/home/nixos/repos/backup-controller/.cortex/reports/handbacks/w1-gate-evidence.txt",
+  "whole_change_output": "Wave 1 (task-1 repo scaffold), dispatch 2026-09-14-bc-w1b, worker impl-t1-scaffold, meta meta-w1. VERDICT: task-1 meets its Target and Change sections; the milestone's stated gap is the designed one and was not papered over. All four wave-1 whole-change checks ran. nix develop -c go version -> go1.26.7 linux/amd64, exit 0. nix develop -c go build ./... -> matched no packages, exit 0. nix develop -c actionlint .github/workflows/ci.yaml -> silent, exit 0. nix flake lock --no-update -> exit 1 'unrecognised flag --no-update': that flag does not exist in nix 2.34.8 (nix flake lock --help lists no such option), so the literal acceptance line is unsatisfiable on this host; the criterion behind it holds and is verified by nix flake lock (exit 0, flake.lock md5 7bcde4baf18fd68adec731bb9fbbaf0f unchanged before and after) and by nix flake metadata resolving lock version 7 at nixpkgs rev ef34387ddd751e1ab8857adf4676492d32eb24ec. EMPTY-MODULE GAP: re-measured first-hand and matching the spec's table exactly (vet exit 1 'no packages to vet', test exit 1 'no packages to test', lint exit 5 'no go files to analyze'); no package was added anywhere (a glob for **/*.go matched nothing, internal/, cmd/ and go.sum absent), so the gap is real and task 2 is where it closes. DEVIATIONS REPRODUCED: controller-gen reports v0.22.0 against the spec table's 0.21.0 (locked nixpkgs drift; nothing in the tree pins it); actionlint given the directory argument exits 3 'is a directory', so the landed CI step uses the bare form, whose coverage in this repo is proven ('Detected project', 'Collected 1 YAML files', 'Linting .github/workflows/ci.yaml', exit 0) and which will lint every workflow file task 5 adds; nix develop -c make check exits 2 failing at vet, not at lint, since vet is the first prerequisite. OPEN ITEMS FOR THE ORCHESTRATOR, all spec-text repairs needing no product code: task-1 line 112's 'actionlint .github/workflows/' cannot work; line 138's '--no-update' does not exist; line 50's controller-tools 0.21.0 is stale; and the line 'make check therefore fails at the lint step here' contradicts the recipe order. Task-2 line 212 and task-5 line 148 both use working actionlint forms and need no change. x86_64-darwin cannot instantiate because nixpkgs 26.11 dropped that platform (recorded in .tmp/eval-x86_64-darwin.err; reproduced on kuport's own flake, so upstream policy); the four-system list stands as specified and no gate depends on it. REPAIRS NEEDED IN THE TREE: none. HOLDS: none. No worker was in flight at delivery (roster: impl-t1-scaffold done).",
+  "deliverable_paths": []
+}

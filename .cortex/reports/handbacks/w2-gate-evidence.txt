@@ -1,0 +1,306 @@
+backup-controller epic, wave 2 (dispatch 2026-09-14-bc-w2): gate evidence
+meta-agent meta-w2; workers impl-t0-contract (task 0), impl-t2-api (task 2)
+recorded 2026-09-14; task 0 is verified and closed below, task 2 is still running
+
+SECTION 1 - task 0 worker hand-back, verbatim as received by meta-w2
+
+A2A: Findings written to .cortex/plans/2026-09-14-backup-controller/library-contract-findings.md.
+Pinned module is github.com/kubernetes-csi/lib-volume-populator/v3@v3.3.0, exact go.mod use
+github.com/kubernetes-csi/lib-volume-populator/v3 v3.3.0. Verdicts: a CONFIRMED, b CONFIRMED,
+c CONFIRMED, d CONFIRMED, e CONFIRMED, f CONFIRMED, g CONFIRMED, h DIFFERENT, i DIFFERENT,
+j CONFIRMED, k CONFIRMED. DIFFERENT h: metrics.go registers only the configured metricsPath and
+exposes no health route, so task 4 cannot claim a library health endpoint and task 5 needs a
+separate health handler or a probe against an endpoint the binary actually exposes. DIFFERENT i:
+ImageName belongs only to PodConfig; provider-function mode invokes callbacks without a pod or
+image, so task 3 must not add an image dependency, task 4 should not require --image for library
+provider mode unless retaining an external packaging flag, and task 5 must not require an image
+for callbacks. VolSync v0.16.0: empty repository restore prints no eligible snapshots and exits
+success; status.lastManualSync is updated. Failed restic jobs set status.latestMoverStatus.result
+=Failed and logs; reconcile errors set Synchronizing/Error conditions. Acceptance:
+.tmp/contract/go.mod contains both pins; findings file is 15787 bytes. git status showed
+surrounding wave changes (staged 26, unstaged 5, untracked 5) plus this findings file; no
+internal/, flake.nix, Makefile, or root go.mod edits by me. git diff --cached --stat was the
+pre-existing 26-file staged diff.
+
+SECTION 2 - meta-w2 verification of task 0
+
+2.1 Deliverable exists, pinned version stated
+$ stat -c '%s %y %n' .cortex/plans/2026-09-14-backup-controller/library-contract-findings.md
+15787 2026-09-14 10:34:16 .cortex/plans/2026-09-14-backup-controller/library-contract-findings.md
+
+$ cat .tmp/contract/go.mod
+module contract / go 1.26.7 / require ( github.com/backube/volsync v0.16.0 // indirect ;
+github.com/kubernetes-csi/lib-volume-populator/v3 v3.3.0 // indirect )
+Both pins present, as the acceptance line requires.
+
+The document states the version string task 3 must use: "github.com/kubernetes-csi/lib-volume-populator/v3
+v3.3.0", and explains why the un-suffixed query lists only through v1.2.0 (the v3 module carries
+the major-version suffix). Confirmed against the proxy listing in the worker transcript.
+
+2.2 All eleven questions carry a verdict line
+Step 3 rows a to i and step 4 rows j and k are all present in the document's verdict table: nine
+CONFIRMED (a, b, c, d, e, f, g, j, k) and two DIFFERENT (h, i), eleven rows in all. No row is
+missing and no row is left without a verdict.
+
+2.3 Citations resolved first-hand against the module cache
+Every citation below was read by meta-w2 at the cited path and the quoted content was present.
+
+a  VolumePopulatorConfig fields and RunControllerWithConfig signature
+   controller.go:125-173 -> MasterURL, Kubeconfig, HttpEndpoint, MetricsPath, Namespace, Prefix,
+   Gk, Gvr, PodConfig, ProviderFunctionConfig, MutatorConfig, ProviderMetricManager,
+   CrossNamespace, SharedInformerOptions, StopCh, Workqueue, Recorder. All present.
+   controller.go:246-247 -> func RunControllerWithConfig(vpcfg VolumePopulatorConfig), no return.
+   controller.go:296-298 -> PodConfig and ProviderFunctionConfig together is a Fatalf.
+b  PopulatorParams fields: KubeClient, Pvc, PvcPrime, StorageClass, Unstructured, Recorder.
+   Exact names and types match controller.go:195-207.
+c  Callback signatures at controller.go:186-193 match. Error semantics read at
+   controller.go:809-829: PopulateFn error returns it after a warning event; PopulateCompleteFn
+   error likewise; complete=false returns fmt.Errorf(reasonWaitForDataPopulationFinished).
+   controller.go:559-601: that reason string is requeued rate-limited and is documented in the
+   source as "not an actual error", which is the requeue-without-error path the document claims.
+d  controller.go:720 pvcPrimeName := fmt.Sprintf("%s-%s", populatorPvcPrefix, pvc.UID);
+   controller.go:67 populatorPvcPrefix = "prime"; controller.go:749-762 the created claim copies
+   AccessModes, Resources, StorageClassName and VolumeMode, and sets
+   annotation volume.kubernetes.io/selected-node (constant at controller.go:70) when the storage
+   class is WaitForFirstConsumer, which controller.go:696-697 selects. Matches docs/architecture.md
+   and docs/decisions.md.
+e  controller.go:657 c.unstLister.Namespace(dataSourceRefNamespace).Get(dataSourceRef.Name), and
+   the fetched object is handed to callbacks as params.Unstructured. The library reads it; the
+   callback receives the object, not a reference.
+f  controller.go:938-968 patches PersistentVolume.Spec.ClaimRef to the app claim's namespace, name
+   and UID and sets the populated-from annotation to namespace/dataSourceName; the cleanup stage
+   then calls PopulateCleanupFn and deletes the prime claim.
+g  v3@v3.3.0/go.mod:1-14 -> module github.com/kubernetes-csi/lib-volume-populator/v3, go 1.26.0,
+   k8s.io/api, k8s.io/apimachinery, k8s.io/client-go, k8s.io/component-base,
+   k8s.io/component-helpers all at v0.36.0.
+h  DIFFERENT confirmed. metrics.go:96-122 startListener(httpEndpoint, metricsPath) returns early
+   when either is empty, registers only metricsPath on a new ServeMux, and exposes no health route.
+i  DIFFERENT confirmed. PodConfig owns ImageName; ProviderFunctionConfig holds only PopulateFn,
+   PopulateCompleteFn and PopulateCleanupFn; the provider branch at controller.go:800-833 invokes
+   the callbacks and never reads an image or creates a pod.
+j  VolSync entry.sh:337-341 prints "No eligible snapshots found" and "No data will be restored",
+   skips the restore, and the script continues to a zero exit; mover.go:152-168 reports completion;
+   machine.go transitionToCleaningUp calls r.SetLastManualTag(r.ManualTag()) and
+   replicationdestination_types.go declares LastManualSync string with the comment that it is set
+   to the last spec.trigger.manual when the manual sync is done. The design's empty-repository
+   claim holds.
+k  mover.go:614-627 calls utils.UpdateMoverStatusForFailedJob at the backoff limit and then deletes
+   the job; podlogs.go:188-190 sets moverStatus.Result = MoverResultFailed. common_types.go:127-137
+   declares MoverStatus{Result, Logs}, and replicationdestination_types.go exposes
+   LatestMoverStatus at status.latestMoverStatus. The field PopulateCompleteFn can read exists.
+
+2.4 Style and format
+$ grep -n -E 'em dash|en dash|delve|leverage|robust|seamless|comprehensive|It.s worth noting|In conclusion' <findings>
+No match. The document keeps the writing convention the spec asks for.
+
+The document also carries every required section: the pinned version with its reason, the verdict
+table, the per-DIFFERENT consequence notes naming tasks 2, 3 and 4, a "what task 3 must know"
+section, a "what task 4 must know" section, and a "what the design got right" section. Inferred
+statements are marked [INFERENCE], as the spec requires.
+
+2.5 Scope: no repository file outside the document was modified
+$ git status --short
+staged 26, unstaged 5, untracked 5.
+flake.nix, flake.lock, .envrc, .gitignore, Makefile, README.md, docs/* and .cortex/plans/* carry no
+task-0 modification. go.mod, go.sum, internal/ and config/ are the concurrent task-2 worker's
+output: their mtimes fall in 10:31:16 to 10:33:32, while the findings file is 10:34:16, and the
+files are exactly task 2's targets (internal/api/v1alpha1/*, config/crd/*). The root go.mod holds
+no lib-volume-populator dependency, so task 0 did not add one, as its constraints require.
+.tmp/contract/ holds the scratch module the spec allows.
+
+2.6 Judgement on the two DIFFERENT findings
+Both are real and both are already absorbed by the wave-3 and wave-4 specs: task-4's flag table
+says task 0's finding (i) settles whether --image is still required, and task-5's install-assets
+step says when no health endpoint exists, omit the probes and record that in the report. Neither
+finding contradicts a hard statement in docs/, so nothing needs escalating for them. One wording
+nit for the orchestrator: finding i's preamble says "the design says task 4 should require an
+image flag", while the task-4 text defers the question to this finding rather than asserting it.
+The verdict and the consequence are right; the preamble overstates what the spec said.
+
+SECTION 3 - task 2 in flight, and the CRD cost gap escalated
+
+3.1 Where task 2 stands at the time of this write-up
+Written so far, all inside its Target list: internal/api/v1alpha1/groupversion_info.go,
+volumerestore_types.go, conditions.go, zz_generated.deepcopy.go, crd_validation_test.go,
+config/crd/backup.wlz.li_volumerestores.yaml, go.sum, and the go.mod dependency block
+(k8s.io/api, k8s.io/apimachinery, k8s.io/client-go v0.36.0, sigs.k8s.io/controller-runtime
+v0.24.1). config/samples/ and the ci.yaml jobs were not yet written when this section was recorded.
+
+3.2 The gap: the spec's CEL rules make the CRD invalid at install
+The worker measured this, and meta-w2 read the measurement from its transcript rather than
+re-running it. Without a bound on the MoverPodLabels map:
+
+  start envtest control plane: unable to install CRDs onto control plane: unable to create CRD
+  instances: unable to create CRD "volumerestores.backup.wlz.li": CustomResourceDefinition.apiextensions.k8s.io
+  "volumerestores.backup.wlz.li" is invalid:
+  spec.validation.openAPIV3Schema.properties[spec].properties[moverPodLabels].x-kubernetes-validations[1].rule:
+  Forbidden: estimated rule cost exceeds budget by factor of more than 100x (try simplifying the rule,
+  or adding maxItems, maxProperties, and maxLength where arrays, maps, and strings are declared)
+
+With +kubebuilder:validation:MaxProperties=16 added to the field, the same install still fails:
+
+  spec.validation.openAPIV3Schema.properties[spec].properties[moverPodLabels].x-kubernetes-validations[1].rule:
+  Forbidden: estimated rule cost exceeds budget by factor of 6.0x
+
+So the two label rules the task-2 spec mandates cannot be installed on an unbounded map, and the
+envtest suite cannot start until a bound controller-gen can emit is in place. The API server's own
+message names the remedy (maxItems, maxProperties, maxLength). docs/api.md's validation table and
+the task-2 spec's marker table state no bound for moverPodLabels.
+
+3.3 Escalation, delivered after the hold cleared
+meta-w2 sent the gap to the orchestrator with c2d steer --agent orchestrator, and the tool refused
+the delivery: the orchestrator's session was sitting on an Ask dialog addressed to the user
+("nix flake lock --no-update in task 1's acceptance cannot run on this host. Accept the substitute
+check?", three options plus Other). That is a user decision on a wave-1 gate exception, so meta-w2
+did not answer it through send-keys and did not push the text through any other channel.
+
+The user answered the dialog and the orchestrator took the finding as a defect in its own spec. The
+task-2 spec now carries `+kubebuilder:validation:MaxProperties=8` on the MoverPodLabels row, plus a
+binding paragraph recording the measurements (over 100x unbounded, 6.0x at 16), the reason the API
+server refuses the object, and the fallback order: shorten the expressions, then lower the bound to
+4 or 2, then keep only the key rule and record the deviation. meta-w2 relayed that text verbatim to
+impl-t2-api, which consumed it (c2d steer, delivery status delivered, consumed true). The gate is
+unchanged: the CRD installs against the envtest API server, kubectl-validate accepts it, and the six
+CRD-validation cases hold. The bound that lands and any fallback step used are named in that
+worker's hand-back as a deviation and are carried in section 4 below.
+
+SECTION 4 - task 2 worker hand-back, verbatim as received by meta-w2
+
+A2A: task-2 done, no commits, all gates green.
+
+Files written under /home/nixos/repos/backup-controller: internal/api/v1alpha1/groupversion_info.go,
+volumerestore_types.go, conditions.go, crd_validation_test.go (build tag envtest),
+zz_generated.deepcopy.go (generated); config/crd/backup.wlz.li_volumerestores.yaml (generated);
+config/samples/backup.wlz.li_v1alpha1_volumerestore.yaml and config/samples/claim.yaml; the
+generated and envtest jobs appended to .github/workflows/ci.yaml; go.mod and go.sum. Those paths
+only were staged with git add -A style adds; nothing committed. Makefile, flake.nix and the check
+job untouched.
+
+git status --short: staged 35 (task 1 scaffolding plus my files), unstaged 7 (the plan docs,
+including the task-2 spec the orchestrator edited), untracked 2 (library-contract-findings.md from
+task 0, and .cortex/reports/). My staged diff stat, 11 files, 1329 insertions:
+.github/workflows/ci.yaml 106, config/crd/backup.wlz.li_volumerestores.yaml 431,
+config/samples/backup.wlz.li_v1alpha1_volumerestore.yaml 11, config/samples/claim.yaml 18,
+go.mod 58, go.sum 161, internal/api/v1alpha1/conditions.go 38, crd_validation_test.go 195,
+groupversion_info.go 28, volumerestore_types.go 133, zz_generated.deepcopy.go 150.
+
+Pinned versions and where they come from: k8s.io/api v0.36.0, k8s.io/apimachinery v0.36.0,
+k8s.io/client-go v0.36.0, sigs.k8s.io/controller-runtime v0.24.1. The k8s.io train is what the
+library requires: lib-volume-populator/v3@v3.3.0/go.mod declares go 1.26.0 and k8s.io/* v0.36.0,
+and task 0 findings pin the same import path and version. controller-runtime v0.24.1 is the release
+whose go.mod requires k8s.io v0.36.0; v0.25.x moves to v0.37.0. go mod tidy normalized task 1's go
+directive to go 1.26.0. Envtest assets came from setup-envtest use 1.37.0 -p path resolving to
+/home/nixos/.local/share/kubebuilder-envtest/k8s/1.37.0-linux-amd64, no download.
+
+Six envtest cases, go test -tags envtest ./internal/api/... -v, exit 0: valid object, rejected
+Not_A_Name, rejected missing repository, rejected restoreAsOf yesterday, rejected key UPPER KEY,
+rejected value bad value!, plus a seventh case reading the stored object back.
+
+make verify: controller-gen regenerates into .tmp/crd and diff -ru config/crd .tmp/crd prints no
+diff lines, exit 0. Other gates: make generate and make manifests exit 0; go build, go vet,
+golangci-lint (0 issues), go test ./... -race exit 0; actionlint exit 0; kubectl-validate on the
+generated CRD prints OK, exit 0.
+
+Deviations, two, both measured on the 1.37.0 API server. One: MoverPodLabels is
+map[string]MoverPodLabelValue, a named string type carrying MaxLength=63, not map[string]string.
+controller-gen applies field markers only to the field's own schema, so a map value type is the
+only route to additionalProperties.maxLength (controller-tools v0.22.0 pkg/crd/schema.go:421-480,
+where the value schema is built from an empty TypeInfo), and that declared length is what the CEL
+cost estimator needs: unbounded rules refused at over 100x budget, 16 entries 6.0x, 8 entries 3.0x,
+and with the 63-character value bound the CRD installs and every rejection row holds. The
+orchestrator ladder was not needed: step 1 cheaper expressions stayed unused and step 3 dropping
+the value rule stayed unused, so both rules keep their exact text and meaning. JSON is unchanged,
+the field is still an object of strings, and task 3 assigns through the helper
+VolumeRestoreSpec.MoverLabels() map[string]string instead of the raw field. Two: MaxProperties=8 per
+the orchestrator spec fix, replacing the 16 first measured.
+
+Task 3 identifiers: v1alpha1.SetReady(conditions *[]metav1.Condition, generation int64, status
+metav1.ConditionStatus, reason, message string), ConditionReady, ReasonRestoring, ReasonRestoreFailed,
+ReasonRestored, RestorePhaseRestoring, RestorePhaseFailed.
+
+Test-first record: the envtest suite was written before the API package existed;
+.tmp/envtest-red-cost.log holds the red run where the API server refused the CRD for CEL cost, and
+the run before the validation markers failed all five rejection rows because the API server stored
+the malformed object. Cluster substitution recorded: no cluster is reachable here, so the envtest
+suite covers both the apply and the read-back halves of the milestone acceptance criterion, and
+task 6 carries the cluster commands.
+
+SECTION 5 - meta-w2 verification of task 2
+
+5.1 Deliverable set and staged diff
+$ git diff --cached --stat -- config internal go.mod go.sum .github/workflows/ci.yaml
+11 files changed, 1329 insertions(+), the per-file split matching the hand-back exactly.
+35 files are staged in all: the 26 of wave 1 plus task 2's nine new files. Makefile, flake.nix and
+.envrc carry no modification entry. ci.yaml's check job still holds exactly the five steps wave 1
+landed (go vet, go test -race, golangci-lint, go build, actionlint) with the generated and envtest
+jobs appended after it; there is no commit to diff that job against, so the check is the step list
+read against the wave-1 record rather than a byte comparison.
+
+5.2 The API types match the spec's field table and markers
+groupversion_info.go: GroupVersion backup.wlz.li/v1alpha1, SchemeBuilder, AddToScheme and the
+object-generate and groupName markers.
+volumerestore_types.go: VolumeRestore, VolumeRestoreList, the object root, status subresource,
+resource scope and shortName and printcolumn markers; Repository with Required, MinLength=1,
+MaxLength=253 and the DNS-1123 pattern; RestoreAsOf as *string with Format="date-time";
+MoverSecurityContext as *corev1.PodSecurityContext; VolumeRestoreStatus with Conditions and
+Claims; ClaimRestoreStatus with Name, UID, Phase, StartedAt; RestorePhase with
+RestorePhaseRestoring and RestorePhaseFailed.
+conditions.go: ConditionReady, ReasonRestoring, ReasonRestoreFailed, ReasonRestored, and SetReady
+writing through meta.SetStatusCondition with ObservedGeneration.
+The generated CRD carries group backup.wlz.li, kind VolumeRestore, listKind VolumeRestoreList,
+plural volumerestores, shortNames [vrestore], singular volumerestore, scope Namespaced, the Ready
+print column with JSONPath .status.conditions[?(@.type=="Ready")].status, required [repository],
+pattern and 253-length bounds, moverPodLabels with maxProperties 8 and additionalProperties
+maxLength 63, both label rules with their exact wording, and a status subresource.
+config/samples: the VolumeRestore notes-data with repository notes-restic and a moverPodLabels
+entry, and the claim notes-data naming apiGroup backup.wlz.li, kind VolumeRestore, name notes-data.
+
+5.3 The six CRD cases and the API server's verdicts
+The suite's table holds the six rows the spec names, the five malformed ones asserted through
+apierrors.IsInvalid and the valid one asserted to be accepted, plus a round trip. meta-w2 ran the
+tagged suite itself on the frozen artifact, with -count=1 so the Go test cache could not answer for
+the regenerated YAML, and read the full verbose output (section 6). All six rows and the round trip
+pass, exit 0.
+
+5.4 The defect meta-w2 found and sent back
+The MoverPodLabels doc comment and the CRD description it generates both said "the object carries
+at most 16 of them" while the marker was MaxProperties=8, and that description ships to
+deploy/ and chart/ through task 5. meta-w2 steered the owning worker, which changed the sentence
+to name 8, regenerated, re-ran make verify (no diff, exit 0) and re-ran the tagged suite with
+-count=1 (all six rows and the round trip pass). Verified after the fix:
+internal/api/v1alpha1/volumerestore_types.go:32 and
+config/crd/backup.wlz.li_volumerestores.yaml:68 both read "at most 8 of them".
+
+5.5 The deviation meta-w2 carries to the orchestrator
+MoverPodLabels is map[string]MoverPodLabelValue with MaxLength=63, not map[string]string, and the
+spec's field table says the type mirrors the ReplicationDestination field. The change is what makes
+the mandated CEL rules installable: at 8 entries and no value bound the rule is still 3.0x over the
+API server's budget, so neither the bound reduction nor the rule shortening the orchestrator's
+ladder prescribes can rescue the unbounded-string form. JSON shape and both rule texts are
+unchanged, and VolumeRestoreSpec.MoverLabels() returns map[string]string so the assignment task 3
+makes needs no conversion loop. Task 3's spec text should name that helper, since its current
+wording tells the worker to assign the field directly.
+
+SECTION 6 - meta-w2 whole-change checks, run on the frozen artifact
+
+$ nix develop -c go vet ./...        -> vet_exit=0
+$ nix develop -c go build ./...      -> build_exit=0
+$ nix develop -c go test ./... -race -> race_exit=0 (internal/api/v1alpha1 reports no test files:
+                                        the suite is build-tagged, which is the spec's design)
+$ nix develop -c golangci-lint run   -> 0 issues, lint_exit=0
+$ nix develop -c make verify         -> diff -ru config/crd .tmp/crd prints nothing, verify_exit=0
+$ nix develop -c actionlint          -> actionlint_exit=0
+$ kubectl-validate config/crd/backup.wlz.li_volumerestores.yaml -> OK, validate_exit=0
+
+The raw logs are .cortex/reports/handbacks/w2-whole-change.log and
+.cortex/reports/handbacks/w2-envtest-meta.log.
+
+SECTION 7 - open items and holds
+
+1. Task 3's spec text needs the MoverLabels() helper named (section 5.5). Nothing is blocked by it;
+   the type and the helper both exist and the JSON contract is unchanged.
+2. Task 5 copies the generated CRD description into deploy/ and chart/, so the corrected "at most 8"
+   text travels with it; nothing further to carry.
+3. No hold is outstanding. The escalation that the orchestrator's user-facing Ask dialog interrupted
+   was delivered and accepted once the user answered, and the spec fix it produced was relayed to
+   the worker verbatim and consumed. The wave closes with both workers settled and no wait owed.

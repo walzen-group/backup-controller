@@ -1,0 +1,43 @@
+# Container image settings.
+image:
+  # Repository the controller image is pulled from.
+  repository: ghcr.io/walzen-group/backup-controller
+  # Image tag. Empty means v<appVersion>, the form the release pipeline
+  # publishes, like v0.1.0.
+  tag: ""
+  # Image digest, like sha256:... . When set it wins over tag, and this is
+  # what a release pins.
+  digest: ""
+  # Pull policy for the controller container.
+  pullPolicy: IfNotPresent
+
+# Overrides for the chart name used in object names.
+nameOverride: ""
+# Overrides the generated release-qualified name entirely.
+fullnameOverride: ""
+
+# Namespace the controller creates its prime claim and ReplicationDestination
+# in, passed to the container as --namespace. It has to be the namespace the
+# release is installed into, which is backup-system for the install command in
+# the README.
+namespace: backup-system
+
+rbac:
+  # Create the ClusterRole and ClusterRoleBinding for the controller.
+  create: true
+serviceAccount:
+  # Create the ServiceAccount the Deployment runs with.
+  create: true
+  # Name to use instead of the generated one. Also works with create false,
+  # to point the Deployment at a ServiceAccount you manage elsewhere.
+  name: ""
+
+# Compute resources for the controller container. There is deliberately no CPU
+# limit: throttling a controller during a restore delays the copy without
+# protecting the node it runs on.
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 128Mi

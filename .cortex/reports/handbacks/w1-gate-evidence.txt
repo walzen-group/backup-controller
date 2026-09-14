@@ -1,0 +1,252 @@
+backup-controller epic, wave 1, task-1 repo scaffold: gate evidence
+meta-agent meta-w1, dispatch 2026-09-14-bc-w1b, worker impl-t1-scaffold
+recorded 2026-09-14; sections 1-3 below, then the raw transcript excerpt in section 4
+
+SECTION 1 - worker's hand-back, verbatim as received by meta-w1
+
+A2A: task-1 repo scaffold complete, /home/nixos/repos/backup-controller. No commit made; nothing outside the Target list touched.
+
+FILES WRITTEN (all staged with git add -A only): flake.nix, flake.lock (nix flake lock), .envrc, .gitignore, go.mod, Makefile, .github/workflows/ci.yaml. git diff --cached --stat for those 7: 164 insertions, 0 deletions. No Go package added.
+
+GIT STATUS --short: 26 entries, every one 'A ' staged; the 7 scaffold files plus the pre-existing README.md, docs/* and .cortex/plans/*. .tmp/ is gitignored (gate logs only) and absent from status. No commits exist yet, so every nix command emits 'warning: Git tree ... is dirty'; cosmetic.
+
+ACCEPTANCE COMMANDS (from the repo root):
+1. nix develop -c go version -> 'go version go1.26.7 linux/amd64', exit 0.
+2. nix develop -c go build ./... -> 'go: warning: "./..." matched no packages', exit 0.
+3. nix develop -c actionlint .github/workflows/ci.yaml -> no output, exit 0.
+4. nix develop -c go vet ./... -> exit 1, 'go: warning: "./..." matched no packages' / 'no packages to vet'.
+5. nix develop -c go test ./... -race -> exit 1, 'go: warning: "./..." matched no packages' / 'no packages to test'.
+6. nix develop -c golangci-lint run -> exit 5, 'level=error msg="Running error: context loading failed: no go files to analyze: running `go mod tidy` may solve the problem"' (that is the full message).
+7. nix flake lock --no-update -> exit 1, 'error: unrecognised flag --no-update'. nix here is 2.34.8 and has no such flag. Substituted the documented equivalent: nix flake lock (already up-to-date entries are not modified) run twice, exit 0 both, flake.lock md5 7bcde4baf18fd68adec731bb9fbbaf0f before and after (unchanged); nix flake metadata resolves lock version 7 at nixpkgs rev ef34387ddd751e1ab8857adf4676492d32eb24ec. The unchanged property the gate asks for is observed; only the flag name does not exist in this nix.
+
+KNOWN GAP, recorded as the milestone's gap, not closed and not worked around: items 4, 5 and 6 above are red because the module holds no package by design. Task 2 adds the first package and they go green there. No package was added to close them. make check therefore cannot pass here; the milestone-1 local gate is items 1, 2, 3 and 7 plus the flake entering cleanly.
+
+DEVIATIONS:
+1. CI actionlint step. The step text the spec names, 'actionlint .github/workflows/', fails on actionlint 1.7.12: exit 3, 'could not read ".github/workflows/": read .github/workflows/: is a directory'. The step now runs the bare form 'nix develop -c actionlint', which the tool documents as project detection. Verified: actionlint -debug prints 'Detected project: /home/nixos/repos/backup-controller', 'Collected 1 YAML files', 'Linting .github/workflows/ci.yaml', exit 0; a deliberately broken workflow placed in a scratch git project is caught by the same bare form (exit 1, 'property "eventt" is not defined'). It lints every workflow file task 5 adds with no further edit.
+2. make check fails at the vet step, not the lint step. Observed: 'nix develop -c make check' -> 'no packages to vet' then 'make: *** [Makefile:20: vet] Error 1', exit 2; make stops at the first failing prerequisite, and vet is first in the specified vet, test, lint, build order. Separately, make is not on the host PATH; it is in the devShell (gnumake 4.4.1), so 'nix develop -c make check' is the working form. The Makefile itself matches the spec table.
+3. controller-gen reports 'Version: v0.22.0'; the spec's table says controller-tools 0.21.0. Every other pin matches: go 1.26.7, golangci-lint 2.13.2, kubectl 1.37.0, kustomize 5.8.1, helm 4.2.4, yq-go 4.53.3, actionlint 1.7.12, hadolint 2.14.0.
+4. devShells.x86_64-darwin cannot be instantiated on the pinned nixpkgs: 'error: Nixpkgs 26.11 has dropped support for x86_64-darwin'. Reproduced identically against kuport's own flake (path:/home/nixos/repos/kuport#devShells.x86_64-darwin.default.drvPath throws the same error), so it is upstream nixpkgs policy, not this flake's package list. x86_64-linux, aarch64-linux and aarch64-darwin all evaluate to a drvPath. The four-system list is kept as the spec requires and no acceptance gate depends on x86_64-darwin.
+5. Style: the flake description uses a colon where kuport's uses an em dash, per global constraint 8.
+6. nix flake check was not run, per the spec.
+
+SECTION 2 - meta-w1 whole-change checks and first-hand re-measurements
+
+$ cd /home/nixos/repos/backup-controller
+$ nix develop -c go version
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+go version go1.26.7 linux/amd64
+exit=0
+
+$ nix develop -c go build ./...
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+go: warning: "./..." matched no packages
+exit=0
+
+$ nix develop -c actionlint .github/workflows/ci.yaml
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+exit=0
+
+$ md5sum flake.lock                       # before
+7bcde4baf18fd68adec731bb9fbbaf0f  flake.lock
+$ nix flake lock --no-update
+error: unrecognised flag '--no-update'
+Try 'nix --help' for more information.
+exit=1
+$ md5sum flake.lock                       # after
+7bcde4baf18fd68adec731bb9fbbaf0f  flake.lock
+$ git status --short -- flake.lock
+A  flake.lock
+
+$ md5sum flake.lock                       # before bare lock
+7bcde4baf18fd68adec731bb9fbbaf0f  flake.lock
+$ nix flake lock
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+exit=0
+$ md5sum flake.lock                       # after bare lock: unchanged
+7bcde4baf18fd68adec731bb9fbbaf0f  flake.lock
+
+$ nix flake lock --help
+nix flake lock - create missing lock file entries
+Synopsis: nix flake lock [option...] flake-url        # no --no-update option exists
+
+$ nix flake metadata --json | jq -r '.locks.nodes.nixpkgs.locked.rev'
+ef34387ddd751e1ab8857adf4676492d32eb24ec
+exit=0
+
+$ jq -r '.version, .nodes.nixpkgs.locked.rev, .nodes.nixpkgs.locked.lastModified' flake.lock
+7
+ef34387ddd751e1ab8857adf4676492d32eb24ec
+1789286504
+
+# Empty-module reds, re-measured first-hand against the spec's recorded-gap table
+$ nix develop -c go vet ./...
+go: warning: "./..." matched no packages
+no packages to vet
+VET_EXIT=1
+$ nix develop -c go test ./... -race
+go: warning: "./..." matched no packages
+no packages to test
+TEST_EXIT=1
+$ nix develop -c golangci-lint run
+level=error msg="Running error: context loading failed: no go files to analyze: running `go mod tidy` may solve the problem"
+LINT_EXIT=5
+
+# Deviation claims reproduced first-hand
+$ nix develop -c controller-gen --version
+Version: v0.22.0
+exit=0
+$ nix develop -c actionlint .github/workflows/
+could not read ".github/workflows/": read .github/workflows/: is a directory
+exit=3
+$ nix develop -c make check
+nix develop -c go vet ./...
+go: warning: "./..." matched no packages
+no packages to vet
+make: *** [Makefile:20: vet] Error 1
+exit=2
+$ nix develop -c actionlint -debug        # the landed CI step's bare form, in this repo
+verbose: Linting all workflow files in repository: /home/nixos/repos/backup-controller
+verbose: Detected project: /home/nixos/repos/backup-controller
+verbose: Collected 1 YAML files
+verbose: Linting .github/workflows/ci.yaml
+exit=0
+
+SECTION 3 - meta-w1 conformance read of the diff and the tree
+
+Target list, all seven present and staged (git diff --cached --stat restricted to those paths:
+164 insertions, 0 deletions): flake.nix 35, flake.lock 27, .envrc 1, .gitignore 4, go.mod 3,
+Makefile 42, .github/workflows/ci.yaml 52.
+
+Non-goals respected. No Go package anywhere: a glob for **/*.go matched nothing, and internal/,
+cmd/ and go.sum do not exist. No package was added to close the empty-module reds.
+
+Nothing outside the Target list touched. mtimes: README.md 09:25:24; docs/README.md 09:29:10;
+docs/api.md 09:26:50; docs/architecture.md 09:26:23; docs/decisions.md 09:28:26;
+docs/implementation-plan.md 09:28:59; docs/integration.md 09:27:58; docs/overview.md 09:25:47;
+docs/packaging.md 09:27:22, all before the worker's session start at 10:20:53. The only post-start
+writes are the seven Target files (flake.nix 10:21:26) and the orchestrator's own plan docs
+(10:16 - 10:21:59).
+
+flake.nix: one nixpkgs input on github:NixOS/nixpkgs/nixos-unstable; devShells.default for
+x86_64-linux, aarch64-linux, x86_64-darwin and aarch64-darwin; kuport's forAllSystems shape verbatim.
+Packages: kuport's nine (go_1_26, gopls, golangci-lint, kubernetes-controller-tools, kubectl,
+kustomize, kubernetes-helm, setup-envtest, git) plus the spec's three additions (yq-go, actionlint,
+hadolint), which is the spec table's twelve. Kuport's package-list comment carried over. The
+description names this project and its mechanism as the spec requires.
+
+Makefile: NIX := nix develop -c; CONTROLLER_GEN := $(NIX) controller-gen; all eight targets .PHONY
+(build test vet lint check generate manifests verify); each recipe matching the spec table row for
+row; check := vet test lint build in that order; kuport's rationale comment carried over.
+
+.github/workflows/ci.yaml: exactly one job, check; on push branches ["**"] and pull_request;
+permissions contents: read; concurrency group ci-${{ github.ref }} with cancel-in-progress true;
+actions/checkout@v7.0.1; cachix/install-nix-action@v31.11.1 with experimental-features =
+nix-command flakes; DeterminateSystems/magic-nix-cache-action@v14; the four gate steps in order,
+then the actionlint step; kuport's header comment carried over. No job beyond check.
+
+go.mod: module github.com/walzen-group/backup-controller, go 1.26, no requirements.
+.envrc: use flake.  .gitignore: .direnv/, .tmp/, result, result-*.
+.tmp/ holds the worker's gate logs, is gitignored, and is absent from git status.
+
+Spec-text defects for the orchestrator (deviations 1, 2, 3 and the second half of 7 are corrections
+to the spec doc, not defects in the landed work):
+  task-1 line 112  'nix develop -c actionlint .github/workflows/' cannot work (a directory argument;
+                   exit 3). The landed CI step uses the bare form, whose coverage in this repo is
+                   proven above.
+  task-1 line 138  'nix flake lock --no-update' is not a flag in nix 2.34.8 (exit 1). The criterion
+                   behind it holds and is verified by the bare lock run plus nix flake metadata.
+  task-1 line 50   the table pins controller-tools 0.21.0; the locked nixpkgs ships controller-gen
+                   v0.22.0. Nothing in the tree pins it, so this is the flake's input.
+  task-1           'make check therefore fails at the lint step here' contradicts the recipe order
+                   (vet is first). The observed failure is at vet, exit 2.
+
+SECTION 4 - raw excerpt of the worker terminal transcript around the gate runs
+(read via herdr agent read impl-t1-scaffold --source recent --lines 1500, from the
+go-version gate through the actionlint directory run; the pane elides some scrolled
+output and marks it inline as "… N earlier lines …")
+
+$ mkdir -p .tmp && { nix develop -c go version; echo "EXIT=$?"; } 2>&1 | tee .tmp/gate-go-version.log
+├─── Output ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+… (130 earlier lines, showing 10 of 140) (ctrl+o to expand)
+copying path '/nix/store/8rjcl6imbqzzpfyfpznrw1qs8dpdhm00-python3.14-pyflakes-3.4.0' from 'https://cache.nixos.org'...
+copying path '/nix/store/l1mk756h2hqw22g5ba6ppipar40ivij7-actionlint-1.7.12' from 'https://cache.nixos.org'...
+copying path '/nix/store/z4c6k0mrlkwl3s4w9ysxc8vq1wylm3ms-gcc-wrapper-15.3.0' from 'https://cache.nixos.org'...
+copying path '/nix/store/dp0zdsysxsli2xncj4prvhsik08qn697-stdenv-linux' from 'https://cache.nixos.org'...
+building '/nix/store/vx0r7h7jnrc4cg33vlk6bg2qf30r58zk-nix-shell-env.drv'...
+this path will be fetched (107.5 KiB download, 107.4 KiB unpacked):
+/nix/store/2qdkkyyrf2hxwmykimcnnb1ksd6cff4a-bash-interactive-5.3p15-man
+copying path '/nix/store/2qdkkyyrf2hxwmykimcnnb1ksd6cff4a-bash-interactive-5.3p15-man' from 'https://cache.nixos.org'...
+go version go1.26.7 linux/amd64
+EXIT=0
+⟦Wall: 21.04s | Timeout: 2700s⟧
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+$ set -x
+nix develop -c go build ./... ; echo "BUILD_EXIT=$?"
+nix develop -c actionlint .github/workflows/ci.yaml ; echo "ACTIONLINT_EXIT=$?"
+nix develop -c go vet ./... ; echo "VET_EXIT=$?"
+nix develop -c go test ./... -race ; echo "TEST_EXIT=$?"
+nix develop -c golangci-lint run ; echo "LINT_EXIT=$?"
+nix develop -c controller-gen --version ; echo "CGEN_EXIT=$?"
+
+├─── Output ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+… (21 earlier lines, showing 10 of 31) (ctrl+o to expand)
++ nix develop -c golangci-lint run
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+level=error msg="Running error: context loading failed: no go files to analyze: running `go mod tidy` may solve the problem"
++ echo LINT_EXIT=5
+LINT_EXIT=5
++ nix develop -c controller-gen --version
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+Version: v0.22.0
++ echo CGEN_EXIT=0
+CGEN_EXIT=0
+⟦Wall: 7.16s | Timeout: 900s⟧
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+$ which make; make check ; echo "MAKE_CHECK_EXIT=$?"
+├─── Output ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+error: command not found: make
+MAKE_CHECK_EXIT=127
+⟦Wall: 0.60s | Timeout: 600s⟧
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+$ nix develop -c bash -c 'command -v make || echo NO_MAKE_IN_DEVSHELL'; echo "---"
+git add -A
+b=$(md5sum flake.lock | cut -d' ' -f1); nix flake lock 2>&1; echo "LOCK_EXIT=$?"; a=$(md5sum flake.lock | cut -d' ' -f1)
+echo "flake.lock md5 before=$b after=$a"; [ "$b" = "$a" ] && echo "LOCK UNCHANGED" || echo "LOCK CHANGED"
+nix flake metadata --json 2>/dev/null | jq -r '"locked nixpkgs rev: " + .locks.nodes.nixpkgs.locked.rev + "  version: " + (.locks.version|tostring)'
+echo "--- status"; git status --short; echo "--- cached stat"; git diff --cached --stat
+├─── Output ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+… (53 earlier lines, showing 10 of 63) (ctrl+o to expand)
+docs/architecture.md                               | 141 ++++++++++++
+docs/decisions.md                                  |  99 +++++++++
+docs/implementation-plan.md                        | 121 +++++++++++
+docs/integration.md                                | 129 +++++++++++
+docs/overview.md                                   | 106 +++++++++
+docs/packaging.md                                  | 130 +++++++++++
+flake.lock                                         |  27 +++
+flake.nix                                          |  35 +++
+go.mod                                             |   3 +
+26 files changed, 2795 insertions(+)
+⟦Wall: 0.67s | Timeout: 600s⟧
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+$ nix develop -c make check; echo "MAKE_CHECK_EXIT=$?"
+├─── Output ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+nix develop -c go vet ./...
+warning: Git tree '/home/nixos/repos/backup-controller' is dirty
+go: warning: "./..." matched no packages
+no packages to vet
+make: *** [Makefile:20: vet] Error 1
+MAKE_CHECK_EXIT=2
+⟦Wall: 1.00s | Timeout: 600s⟧
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+$ nix develop -c actionlint .github/workflows/ ; echo "ACTIONLINT_DIR_EXIT=$?"

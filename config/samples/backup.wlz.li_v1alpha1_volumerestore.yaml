@@ -1,0 +1,11 @@
+# VolumeRestore "notes-data": the notes app's volume claims this object in its
+# dataSourceRef, and the data comes out of repository Secret notes-restic.
+apiVersion: backup.wlz.li/v1alpha1
+kind: VolumeRestore
+metadata:
+  name: notes-data
+  namespace: notes
+spec:
+  repository: notes-restic
+  moverPodLabels:
+    kueue.x-k8s.io/queue-name: backup

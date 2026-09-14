@@ -1,0 +1,21 @@
+# golangci-lint configuration. This repo's flake provides golangci-lint
+# 2.13.2, which reads the v2 file schema: version: "2" at the top, formatters
+# split out of linters. A v1 config on a v2 binary is rejected, not silently
+# half-applied, so if this file ever fails to load the fix is here, not in the
+# tool version.
+version: "2"
+
+linters:
+  # default: standard is errcheck, govet, ineffassign, staticcheck, unused.
+  # The entries below add the rest of the set this project requires.
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - misspell
+
+formatters:
+  # gofmt and goimports moved from linters to formatters in the v2 schema.
+  enable:
+    - gofmt
+    - goimports
