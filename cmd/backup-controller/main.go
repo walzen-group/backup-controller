@@ -34,7 +34,7 @@ const prefix = "backup.wlz.li"
 
 func main() {
 	var (
-		kubeconfig  = flag.String("kubeconfig", "", "path to a kubeconfig; empty means the ambient configuration")
+		kubeconfig  = kubeconfigFlag(flag.CommandLine)
 		namespace   = flag.String("namespace", "backup-system", "namespace the prime claim and the ReplicationDestination live in")
 		metricsAddr = flag.String("metrics-addr", ":8080", "address the metrics listener binds")
 		metricsPath = flag.String("metrics-path", "/metrics", "path the metrics listener serves")
@@ -48,7 +48,7 @@ func main() {
 		return
 	}
 
-	operations, err := newClientOperations(*kubeconfig)
+	operations, err := newClientOperations(kubeconfig())
 	if err != nil {
 		klog.Errorf("failed to build the Kubernetes client: %v", err)
 		os.Exit(1)
@@ -61,7 +61,7 @@ func main() {
 	// returns, which is the only shutdown signal this process gets.
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
-	if err := startRunControllers(runs, *kubeconfig); err != nil {
+	if err := startRunControllers(runs, kubeconfig()); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)
 	}
@@ -72,7 +72,7 @@ func main() {
 	// returns once the controller has stopped, and returning from main here is
 	// the clean exit.
 	populatormachinery.RunControllerWithConfig(populatormachinery.VolumePopulatorConfig{
-		Kubeconfig:   *kubeconfig,
+		Kubeconfig:   kubeconfig(),
 		HttpEndpoint: *metricsAddr,
 		MetricsPath:  *metricsPath,
 		Namespace:    *namespace,

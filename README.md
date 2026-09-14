@@ -11,9 +11,11 @@ snapshot back, either into the volume the app already has or into a second one
 beside it. [docs/restores.md](docs/restores.md) says which answers which
 question.
 
-Status, 2026-09-14: released at v0.2.0. v0.1.2 is installed on the walzen test
-cluster and has restored a volume there end to end; the two run kinds in v0.2.0
-have passing tests and have not yet been exercised on a cluster.
+Status, 2026-09-14: released at v0.2.1. VolumeRestore is proven on the walzen
+test cluster: a canary's claim was destroyed and refilled from restic, with the
+repository showing the file's four lines before and five after. BackupRun and
+RestoreRun have passing tests and have not yet run on a cluster.
+
 The Go module and its flake dev shell, the VolumeRestore API with its generated
 CRD, the internal/volsync and internal/populator packages with their fake-client
 tests, the binary in cmd/backup-controller bound to the populator library's
@@ -40,12 +42,19 @@ has no early return for a claim it has already populated, so it calls the
 cleanup callback on every resync for the life of the claim, and the callback was
 writing VolumeRestore status each time without anything having changed.
 
+v0.2.1 fixes a startup panic in v0.2.0. Importing controller-runtime brings in
+pkg/client/config, whose init registers a `--kubeconfig` flag, and main declared
+a second one, so the binary died with `flag redefined: kubeconfig` before it did
+anything. Every gate passed: nothing in the test path calls main. The binary now
+reuses whichever flag is registered, and cmd has tests that exercise the default
+FlagSet where the collision happened.
+
 The walzen infrastructure repository installs the release through a terragrunt
 unit and consumes it from its backup module, described in
-[docs/integration.md](docs/integration.md). Nothing has restored a volume on a
-cluster yet, and
+[docs/integration.md](docs/integration.md).
 [.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md](.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md)
-is the run that settles it.
+is the cluster run, whose install and terragrunt canary steps have now been
+performed.
 
 ## The problem it exists for
 
@@ -83,7 +92,8 @@ on any volume where the clone is acceptable.
 | --- | --- |
 | [docs/overview.md](docs/overview.md) | the problem, the mechanism, and what changes for an app |
 | [docs/architecture.md](docs/architecture.md) | the object flow, the library it builds on, and what runs where |
-| [docs/api.md](docs/api.md) | the custom resource: every field, its status, and a worked example |
+| [docs/api.md](docs/api.md) | the custom resources: every field, their status, and a worked example |
+| [docs/restores.md](docs/restores.md) | what fills a claim, what overwrites one, and which to reach for |
 | [docs/packaging.md](docs/packaging.md) | the release: image, rendered manifests, Helm chart, and what each asset has to contain |
 | [docs/integration.md](docs/integration.md) | how the infrastructure repository installs and consumes it |
 | [docs/decisions.md](docs/decisions.md) | why this shape rather than the alternatives that were rejected |
