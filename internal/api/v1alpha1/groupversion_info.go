@@ -1,4 +1,9 @@
-// Package v1alpha1 contains the backup.wlz.li API types: VolumeRestore.
+// Package v1alpha1 contains the backup.wlz.li API types.
+//
+// VolumeRestore is a standing declaration that fills a claim as the claim is
+// created. BackupRun and RestoreRun are one-shot operations against a volume
+// that already exists: one takes a backup now, the other writes a chosen
+// snapshot back. docs/restores.md says which answers which question.
 // +kubebuilder:object:generate=true
 // +groupName=backup.wlz.li
 package v1alpha1
@@ -22,6 +27,8 @@ var AddToScheme = SchemeBuilder.AddToScheme
 func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(GroupVersion,
 		&VolumeRestore{}, &VolumeRestoreList{},
+		&BackupRun{}, &BackupRunList{},
+		&RestoreRun{}, &RestoreRunList{},
 	)
 	metav1.AddToGroupVersion(scheme, GroupVersion)
 	return nil

@@ -157,9 +157,10 @@ wrong choice discards data.
 | write an older snapshot into the claim the app already has | add a ReplicationDestination in Direct mode pointed at that claim, with the workload scaled to zero |
 
 The first discards what the volume holds at that moment, so back the current
-state up before reaching for it: setting `volsync.backube/use-copy-trigger` on
-the ReplicationSource takes a backup on demand, and the state you are about to
-discard becomes a snapshot you can restore later.
+state up before reaching for it. A ReplicationSource accepts one trigger, so an
+on-demand run means swapping its schedule for a manual one and restoring the
+schedule afterwards; the infrastructure repository's
+docs/cluster/backups-flux.md has the steps under "Take a snapshot now".
 
 The third is unchanged by this project. A Direct-mode restore mounts an existing
 claim and overwrites it, and it does not care whether that claim was provisioned

@@ -4,7 +4,16 @@ A Kubernetes volume populator that fills a new PersistentVolumeClaim from a
 restic repository by asking VolSync to restore into it, so the resulting volume
 is an ordinary dataset with nothing behind it.
 
-Status, 2026-09-14: released at v0.1.2 and installed on the walzen test cluster.
+It carries three kinds. A VolumeRestore is a standing declaration that fills a
+claim as the claim is created, always from the newest backup, with no operator
+involved. A BackupRun takes one backup now. A RestoreRun writes a chosen
+snapshot back, either into the volume the app already has or into a second one
+beside it. [docs/restores.md](docs/restores.md) says which answers which
+question.
+
+Status, 2026-09-14: released at v0.2.0. v0.1.2 is installed on the walzen test
+cluster and has restored a volume there end to end; the two run kinds in v0.2.0
+have passing tests and have not yet been exercised on a cluster.
 The Go module and its flake dev shell, the VolumeRestore API with its generated
 CRD, the internal/volsync and internal/populator packages with their fake-client
 tests, the binary in cmd/backup-controller bound to the populator library's
@@ -24,6 +33,12 @@ cache to sync before the controller runs at all, so under v0.1.1 the reflector
 failed every few seconds and every claim stayed Pending. Only a cluster showed
 this: the offline check compared deploy/rbac.yaml against the table in
 [docs/packaging.md](docs/packaging.md), and the two agreed with each other.
+
+v0.2.0 adds the BackupRun and RestoreRun kinds and the manager that reconciles
+them, beside the populator's own loop. It also stops a write loop: the library
+has no early return for a claim it has already populated, so it calls the
+cleanup callback on every resync for the life of the claim, and the callback was
+writing VolumeRestore status each time without anything having changed.
 
 The walzen infrastructure repository installs the release through a terragrunt
 unit and consumes it from its backup module, described in

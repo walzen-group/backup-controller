@@ -11,6 +11,7 @@ require (
 
 require (
 	github.com/blang/semver/v4 v4.0.0 // indirect
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-openapi/swag/cmdutils v0.25.4 // indirect
 	github.com/go-openapi/swag/conv v0.25.4 // indirect
 	github.com/go-openapi/swag/fileutils v0.25.4 // indirect
@@ -24,6 +25,8 @@ require (
 	github.com/go-openapi/swag/yamlutils v0.25.4 // indirect
 	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
+	golang.org/x/sync v0.19.0 // indirect
+	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
 	k8s.io/component-base v0.36.0 // indirect
 	k8s.io/component-helpers v0.36.0 // indirect
 	sigs.k8s.io/gateway-api v1.5.1 // indirect

@@ -24,6 +24,40 @@ const (
 	ReasonRestored = "Restored"
 )
 
+// Reasons a BackupRun or a RestoreRun carries on its Ready condition. A run is
+// Ready False while it works and True once it has finished, either way, so a
+// Flux Kustomization with wait: true gates on it the way it gates on a Job.
+const (
+	// ReasonRunning reports work under way.
+	ReasonRunning = "Running"
+
+	// ReasonSucceeded reports work that finished.
+	ReasonSucceeded = "Succeeded"
+
+	// ReasonFailed reports a run that gave up. Whatever it created is removed
+	// before it says so.
+	ReasonFailed = "Failed"
+
+	// ReasonTriggerHeld reports a source whose manual trigger belongs to
+	// something else, another run or a hand-written patch. A run declines
+	// rather than writing over a trigger it did not set.
+	ReasonTriggerHeld = "TriggerHeld"
+
+	// ReasonClaimInUse reports an in-place restore waiting for a pod to let go
+	// of the claim it has to write into. Two writers on one filesystem is how
+	// the volume being restored is corrupted, so the run waits.
+	ReasonClaimInUse = "ClaimInUse"
+
+	// ReasonTimedOut reports a mover still running at the run's timeout. The
+	// trigger is cleared and the destination removed before this is reported,
+	// so a stuck mover never leaves a source holding a spent tag.
+	ReasonTimedOut = "TimedOut"
+
+	// ReasonInvalid reports a spec the controller will not act on, with the
+	// field named in the message.
+	ReasonInvalid = "Invalid"
+)
+
 // SetReady sets or replaces the Ready condition on conditions, stamped with the
 // generation the caller observed. It is the only way this package writes the
 // condition, so the type and the transition time are never retyped by callers.

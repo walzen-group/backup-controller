@@ -41,15 +41,32 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  # The data source the claim names.
+  # The data source the claim names. create is for a RestoreRun writing the
+  # point-in-time VolumeRestore its scratch claim is filled from.
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create"]
   # The conditions the controller reports on a VolumeRestore.
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores/status"]
     verbs: ["patch", "update"]
-  # One destination per restore, created and removed by the callbacks.
+  # The one-shot runs, and the finalizer each carries. Without update on the
+  # objects themselves the finalizer cannot be added or removed, and a run that
+  # cannot drop its finalizer can never be deleted.
+  - apiGroups: ["backup.wlz.li"]
+    resources: ["backupruns", "restoreruns"]
+    verbs: ["get", "list", "watch", "update", "delete"]
+  - apiGroups: ["backup.wlz.li"]
+    resources: ["backupruns/status", "restoreruns/status"]
+    verbs: ["patch", "update"]
+  # A BackupRun writes the manual trigger onto a source and takes it away
+  # again. Nothing here changes a schedule: a manual tag wins wherever both are
+  # set, so the field Flux and tofu declare is never in the payload.
+  - apiGroups: ["volsync.backube"]
+    resources: ["replicationsources"]
+    verbs: ["get", "list", "watch", "patch"]
+  # One destination per restore, created and removed by the callbacks and by a
+  # RestoreRun.
   - apiGroups: ["volsync.backube"]
     resources: ["replicationdestinations"]
     verbs: ["get", "list", "watch", "create", "delete"]

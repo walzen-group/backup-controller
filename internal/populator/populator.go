@@ -9,6 +9,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -129,11 +130,22 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 	if err != nil {
 		return err
 	}
+	before := vr.Status.DeepCopy()
+
 	retireClaimStatus(vr, claim)
 	if len(vr.Status.Claims) == 0 {
 		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionTrue, backupv1alpha1.ReasonRestored, "no claim is being restored")
 	} else {
 		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoring, fmt.Sprintf("%d claim(s) still restoring", len(vr.Status.Claims)))
+	}
+
+	// The library has no early return for a claim it has already populated: it
+	// walks the whole path on every resync, reaches the completion branch and
+	// calls this function again, for the life of the claim. Writing
+	// unconditionally would be one status update per volume every resync
+	// interval, forever, none of them changing anything.
+	if equality.Semantic.DeepEqual(before, &vr.Status) {
+		return nil
 	}
 	if err := c.operations.SetStatus(ctx, vr); err != nil {
 		return fmt.Errorf("set VolumeRestore status: %w", err)

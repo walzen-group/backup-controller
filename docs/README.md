@@ -5,6 +5,7 @@
 | [overview.md](overview.md) | the problem, the mechanism, and what an app keeps |
 | [architecture.md](architecture.md) | the object flow, the library, the node the volume lands on, and every failure case |
 | [api.md](api.md) | the VolumeRestore resource, field by field, with a worked example |
+| [restores.md](restores.md) | what fills a claim, what overwrites one, and which to reach for |
 | [packaging.md](packaging.md) | the release assets, the repository layout, the RBAC, and the workflow to copy |
 | [integration.md](integration.md) | the terragrunt module and unit, the Flux component change, and how to prove it on the test cluster |
 | [decisions.md](decisions.md) | what was chosen, what was rejected, and what would have gone wrong |

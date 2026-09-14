@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -53,6 +54,17 @@ func main() {
 		os.Exit(1)
 	}
 	callbacks := populator.New(operations, *namespace)
+
+	// BackupRun and RestoreRun are reconciled by a controller-runtime manager
+	// of this binary's own, because the populator library drives only the one
+	// kind it is given. It is started here and cancelled after the library
+	// returns, which is the only shutdown signal this process gets.
+	runs, stopRuns := context.WithCancel(context.Background())
+	defer stopRuns()
+	if err := startRunControllers(runs, *kubeconfig); err != nil {
+		klog.Errorf("failed to start the run controllers: %v", err)
+		os.Exit(1)
+	}
 
 	// The library registers its own SIGTERM and interrupt handler and closes
 	// the stop channel itself, so this binary installs no second handler: two

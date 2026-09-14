@@ -296,6 +296,43 @@ var _ Operations = (*fakeOperations)(nil)
 // filled from the object, and that claims[] holds only the claims being
 // populated now. Cleanup is the only callback that runs when a restore ends, so
 // it is the one place that can retire the entry and report the object Ready.
+// The library has no early return for a claim it has already populated: every
+// resync walks the whole path, reaches the completion branch and calls Cleanup
+// again, for the life of the claim. Writing status each time would be one
+// update per volume every resync interval, forever, none of them changing
+// anything. Observed as a PopulatorFinished event repeating on a long-bound
+// claim, which is the library's own and harmless; the writes behind it were not.
+func TestCleanupWritesNothingWhenThereIsNothingToChange(t *testing.T) {
+	ops := restoringOperations()
+	callbacks := New(ops, "backup-system")
+	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
+		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
+	})
+
+	if err := callbacks.Cleanup(context.Background(), params); err != nil {
+		t.Fatalf("first Cleanup() error = %v", err)
+	}
+	if len(ops.statuses) != 1 {
+		t.Fatalf("status writes after the first call = %d, want 1", len(ops.statuses))
+	}
+
+	// Feed back what the first call wrote, which is what the next resync reads
+	// off the cluster: the claim already retired and the condition already
+	// saying so, leaving the second call nothing to write.
+	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ops.statuses[0])
+	if err != nil {
+		t.Fatalf("convert the written status back: %v", err)
+	}
+	retired := params
+	retired.Unstructured = &unstructured.Unstructured{Object: object}
+	if err := callbacks.Cleanup(context.Background(), retired); err != nil {
+		t.Fatalf("second Cleanup() error = %v", err)
+	}
+	if len(ops.statuses) != 1 {
+		t.Errorf("status writes after the second call = %d, want the second to write nothing", len(ops.statuses))
+	}
+}
+
 func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
 	ops := restoringOperations()
 	callbacks := New(ops, "backup-system")

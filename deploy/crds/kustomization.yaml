@@ -1,12 +1,15 @@
 # Verbatim copies of the CRDs generated under config/crd/. controller-gen owns
-# the originals; refresh these with
-#   cp config/crd/*.yaml deploy/crds/
-# after `make manifests`, in the same commit that changes the API. One file is
-# enough for the release asset: the render has to carry the CRD beside the
-# workload so the infrastructure module applies the whole install from a single
+# the originals and `make manifests` copies them here, so a new kind needs an
+# entry below and nothing else. `make verify` diffs this directory against
+# config/crd and fails on any drift.
+#
+# Every CRD belongs in the release asset: the render carries them beside the
+# workload, so the infrastructure module applies the whole install from a single
 # fetch.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
   - backup.wlz.li_volumerestores.yaml
+  - backup.wlz.li_backupruns.yaml
+  - backup.wlz.li_restoreruns.yaml

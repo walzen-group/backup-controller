@@ -297,11 +297,23 @@ operations differ in what they discard.
 | write an older snapshot into the claim the app already has | set `restore:` in the unit's inputs.yaml and apply, which scales the workload to zero and has VolSync's mover overwrite the claim in place |
 
 The first discards whatever the volume holds at that moment. Before reaching for
-it to test a theory, back the current state up so the theory can be walked back:
-setting `volsync.backube/use-copy-trigger` on the ReplicationSource runs a
-backup on demand, and the state you are about to discard becomes a snapshot you
-can restore later. A manual ZFS snapshot on the node preserves it too, and only
-on that node's pool.
+it to test a theory, back the current state up so the theory can be walked back.
+A ReplicationSource accepts one trigger, so an on-demand run means swapping the
+schedule for a manual one and putting the schedule back afterwards:
+
+```sh
+kubectl -n canary-backup patch replicationsource canary-backup --type=merge -p '{"spec":{"trigger":{"manual":"manual-2026-09-14","schedule":null}}}'
+kubectl -n canary-backup get replicationsource canary-backup -o jsonpath='{.status.lastManualSync}{"\n"}'
+terragrunt apply
+```
+
+Expected result: the trigger string from the second command once the mover has
+finished, and the schedule restored by the apply, which reads the patch as
+drift. A manual trigger left in place makes the source report healthy while
+taking no further backups.
+
+A manual ZFS snapshot on the node preserves the state too, and only on that
+node's pool.
 
 The third is unchanged by this project. A Direct-mode restore mounts an existing
 claim and overwrites it, and it works the same whether that claim was

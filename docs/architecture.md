@@ -66,43 +66,40 @@ has to mount. One decision, made once.
 
 ## Object flow for one restore
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant sched as scheduler
+    participant lib as populator library
+    participant ctl as backup-controller
+    participant vs as VolSync
+
+    Note over sched: claim notes-data is Pending,<br/>its dataSourceRef names a VolumeRestore
+    sched->>sched: tries to place the app's pod,<br/>annotates the claim with selected-node
+
+    lib->>lib: creates prime-<uid> in backup-system<br/>same class, size and selected-node, no data source
+    lib->>ctl: PopulateFn
+
+    ctl->>ctl: copies the repository Secret into backup-system
+    ctl->>vs: creates ReplicationDestination restore-<uid><br/>copyMethod Direct, destinationPVC prime-<uid>
+    vs->>vs: the mover runs, queued like every other mover
+    vs-->>ctl: status.lastManualSync == <uid>
+
+    lib->>ctl: PopulateCompleteFn
+    ctl-->>lib: true
+
+    lib->>lib: patches the PersistentVolume's claimRef<br/>from prime-<uid> to notes-data
+    lib->>ctl: PopulateCleanupFn
+    ctl->>vs: deletes the ReplicationDestination
+    ctl->>ctl: deletes the copied Secret
+    lib->>lib: deletes the prime claim
+
+    Note over sched: claim notes-data is Bound,<br/>holding the restored data
 ```
-app namespace                          controller namespace
-─────────────                          ────────────────────
-PersistentVolumeClaim notes-data
-  dataSourceRef -> VolumeRestore
-  (Pending)
-      │
-      │  the scheduler tries to place the pod and
-      │  annotates the claim with selected-node
-      ▼
-VolumeRestore notes-data               PersistentVolumeClaim prime-<uid>
-  repository: notes-restic-data          same class, size, selected-node
-      │                                  no data source
-      │  PopulateFn                            │
-      ▼                                        │
-                                       Secret <copied repository Secret>
-                                       ReplicationDestination restore-<uid>
-                                         copyMethod: Direct
-                                         destinationPVC: prime-<uid>
-                                         trigger.manual: <uid>
-                                         cacheStorageClassName: <from the VR>
-                                              │
-                                              │  VolSync's mover runs,
-                                              │  queued like every other mover
-                                              ▼
-                                       prime-<uid> Bound, holding the data
-      │  PopulateCompleteFn -> true
-      ▼
-  the library patches the PV's claimRef to notes-data
-      │  PopulateCleanupFn
-      ▼
-                                       ReplicationDestination deleted
-                                       Secret copy deleted
-                                       prime claim deleted
-PersistentVolumeClaim notes-data
-  (Bound, holding the restored data)
-```
+
+Every object the restore created is gone by the end. What survives is the
+PersistentVolume, now bound to the app's claim, and it is an ordinary dataset
+with no origin.
 
 ## Why the repository Secret is copied
 

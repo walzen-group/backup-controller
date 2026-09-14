@@ -35,8 +35,22 @@ pvc-a565bb72-…   (the app's claim)         pvc-dc2523e6-…@snapshot-db99d945-
 pvc-dc2523e6-…   (the destination's copy)  <none>
 ```
 
-The app's dataset is a clone of a snapshot of the destination's dataset. Three
-consequences follow, and all three last for the life of the claim:
+The app's dataset is a clone of a snapshot of the destination's dataset, and
+those are the real names from that cluster:
+
+```mermaid
+flowchart LR
+    repo[("restic repository")]
+    dest["the destination's copy<br/>pvc-dc2523e6"]
+    snap["VolumeSnapshot<br/>snapshot-db99d945"]
+    app["the app's volume<br/>pvc-a565bb72"]
+
+    repo -- "the mover restores" --> dest
+    dest -- "snapshotted" --> snap
+    snap -- "cloned" --> app
+```
+
+Three consequences follow, and all three last for the life of the claim:
 
 | | |
 | --- | --- |
@@ -70,6 +84,18 @@ For a claim naming a VolumeRestore, the controller:
 3. waits for the mover to report the restore complete
 4. deletes the ReplicationDestination
 5. hands the filled volume to the app's claim, which binds
+
+```mermaid
+flowchart LR
+    repo[("restic repository")]
+    app["the app's volume<br/>no origin, no snapshot"]
+
+    repo -- "the mover restores straight in" --> app
+```
+
+Two objects exist while that runs, the empty volume and the destination, and
+both are gone when it ends. What stays on the pool is the one dataset the app
+asked for.
 
 The app's dataset is then a plain dataset with no origin. Nothing is pinned,
 nothing drifts, and the destination keeps no permanent copy.
