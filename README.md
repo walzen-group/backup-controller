@@ -11,7 +11,7 @@ snapshot back, either into the volume the app already has or into a second one
 beside it. [docs/restores.md](docs/restores.md) says which answers which
 question.
 
-Status, 2026-09-14: released at v0.2.1. VolumeRestore is proven on the walzen
+Status, 2026-09-14: released at v0.2.2. VolumeRestore is proven on the walzen
 test cluster: a canary's claim was destroyed and refilled from restic, with the
 repository showing the file's four lines before and five after. BackupRun and
 RestoreRun have passing tests and have not yet run on a cluster.
@@ -41,6 +41,14 @@ them, beside the populator's own loop. It also stops a write loop: the library
 has no early return for a claim it has already populated, so it calls the
 cleanup callback on every resync for the life of the claim, and the callback was
 writing VolumeRestore status each time without anything having changed.
+
+v0.2.2 stops an error loop that had been there since v0.1.0. The library deletes
+the prime claim after calling the cleanup callback, so every pass after the one
+that finishes a restore arrives without it, and the callback rejected that. The
+library requeues on error, so one restored claim erred several times a second
+for as long as it existed, re-emitting PopulatorFinished as it went. Cleanup
+exists to remove things, and the prime claim being gone is the state it works
+towards.
 
 v0.2.1 fixes a startup panic in v0.2.0. Importing controller-runtime brings in
 pkg/client/config, whose init registers a `--kubeconfig` flag, and main declared

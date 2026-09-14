@@ -296,6 +296,32 @@ var _ Operations = (*fakeOperations)(nil)
 // filled from the object, and that claims[] holds only the claims being
 // populated now. Cleanup is the only callback that runs when a restore ends, so
 // it is the one place that can retire the entry and report the object Ready.
+// The library deletes the prime claim after calling PopulateCleanupFn, so every
+// pass after the one that finished the restore arrives without it. Rejecting
+// that failed the sync, and the library requeues on error, so one restored
+// claim erred several times a second for as long as it existed:
+//
+//	error syncing 'pvc/canary-backup/canary-backup': populator parameters
+//	have no prime PVC, requeuing
+//
+// Cleanup exists to remove things, and the prime claim being gone is the state
+// it works towards.
+func TestCleanupToleratesTheAlreadyDeletedPrimeClaim(t *testing.T) {
+	ops := restoringOperations()
+	callbacks := New(ops, "backup-system")
+	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
+		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
+	})
+	params.PvcPrime = nil
+
+	if err := callbacks.Cleanup(context.Background(), params); err != nil {
+		t.Fatalf("Cleanup() without a prime claim = %v, want it tolerated", err)
+	}
+	if len(ops.statuses) != 1 {
+		t.Errorf("status writes = %d, want the restore still reported as ended", len(ops.statuses))
+	}
+}
+
 // The library has no early return for a claim it has already populated: every
 // resync walks the whole path, reaches the completion branch and calls Cleanup
 // again, for the life of the claim. Writing status each time would be one

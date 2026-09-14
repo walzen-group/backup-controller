@@ -112,7 +112,7 @@ func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.Popu
 
 // Cleanup removes the destination and copied repository Secret.
 func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.PopulatorParams) error {
-	if err := validateParams(params); err != nil {
+	if err := validateCleanupParams(params); err != nil {
 		return err
 	}
 	claim := params.Pvc
@@ -153,12 +153,34 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 	return nil
 }
 
+// validateParams checks what Populate and Complete need. Cleanup calls
+// validateCleanupParams instead, which asks for less.
 func validateParams(params populatormachinery.PopulatorParams) error {
-	if params.Pvc == nil {
-		return fmt.Errorf("populator parameters have no application PVC")
+	if err := validateCleanupParams(params); err != nil {
+		return err
 	}
 	if params.PvcPrime == nil {
 		return fmt.Errorf("populator parameters have no prime PVC")
+	}
+	return nil
+}
+
+// validateCleanupParams checks what Cleanup needs, which excludes the prime
+// claim.
+//
+// The library deletes the prime claim after calling PopulateCleanupFn, so it is
+// present on the pass that finishes a restore and absent on every pass after
+// it. It also has no early return for a claim it has already populated, so it
+// walks the completion path on every resync for the life of the claim.
+// Requiring the prime claim here therefore failed every one of those passes,
+// and the library requeues on error: one restore left the claim erroring and
+// re-emitting PopulatorFinished for as long as it existed.
+//
+// Cleanup exists to remove things. The prime claim being gone is the state it
+// works towards, so its absence is nothing to reject.
+func validateCleanupParams(params populatormachinery.PopulatorParams) error {
+	if params.Pvc == nil {
+		return fmt.Errorf("populator parameters have no application PVC")
 	}
 	if params.Unstructured == nil {
 		return fmt.Errorf("populator parameters have no VolumeRestore")
