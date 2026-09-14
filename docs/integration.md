@@ -13,7 +13,7 @@ kuport is the pattern to copy, and it exists in that repository today:
 | --- | --- | --- |
 | module | `modules/networking/kuport/opentofu` | `modules/cluster/backup-controller/opentofu` |
 | unit | `environments/*/networking/kuport` | `environments/*/cluster/backup-controller` |
-| version input | `kuport_version: "v0.4.0"` | `backup_controller_version: "v0.1.1"` |
+| version input | `kuport_version: "v0.4.0"` | `backup_controller_version: "v0.1.2"` |
 
 The module belongs under `cluster/` rather than `networking/`, beside volsync
 and zfs-localpv, because it is a storage-path component and it has to be applied
@@ -80,7 +80,7 @@ input naming the ClusterQueue the kueue unit owns.
 # rendered manifests, which hold the CRD, the RBAC and the image pinned by
 # digest, so this one string moves the schema and the controller together.
 # renovate: datasource=github-releases depName=walzen-group/backup-controller
-backup_controller_version: "v0.1.1"
+backup_controller_version: "v0.1.2"
 
 # queue_name: the ClusterQueue the kueue unit owns. The unit labels
 # backup-system kueue-managed and writes a LocalQueue of this name there, so a

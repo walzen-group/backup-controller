@@ -3,10 +3,8 @@
 Date: 2026-09-14. Audience: the admin who runs the walzen test cluster.
 
 Milestones 1 through 5 of [docs/implementation-plan.md](../../docs/implementation-plan.md)
-are implemented, their gates pass, and v0.1.1 is released. This page is the
-cluster run: every step, what it should print, and what a wrong answer means. No
-command in the offline work touched a cluster, so nothing below has been
-performed yet.
+are implemented, their gates pass, and v0.1.2 is released. This page is the
+cluster run: every step, what it should print, and what a wrong answer means.
 
 ## What this runbook proves
 
@@ -169,6 +167,24 @@ terragrunt destroy
 Expected result: the namespace, the claim, the Deployment and the VolSync
 objects are gone. A dynamic claim takes its dataset with it, because the zfs
 class reclaims the volume with the claim.
+
+The destroy returns before the namespace has finished terminating, and Step 9
+fails while that is still going:
+
+```
+Error: canary-backup/canary-backup-restic failed to run apply: error when creating
+"/tmp/1763270912kubectl_manifest.yaml": secrets "canary-backup-restic" is forbidden:
+unable to create new content in namespace canary-backup because it is being terminated
+```
+
+Wait for it to go before Step 9:
+
+```sh
+kubectl get ns canary-backup
+```
+
+Expected result: `Error from server (NotFound): namespaces "canary-backup" not found`.
+It took about two minutes on the test cluster.
 
 ### Step 9: apply it again and read the file
 
