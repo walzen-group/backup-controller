@@ -114,6 +114,7 @@ library and the callbacks actually use:
 | --- | --- | --- |
 | `persistentvolumeclaims` | get, list, watch, create, patch, delete | the app's claim and the prime claim |
 | `persistentvolumes` | get, list, watch, patch | rebinding the volume to the app's claim |
+| `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used |
 | `volumerestores` (our group) | get, list, watch | reading the data source |
 | `volumerestores/status` | patch, update | reporting conditions |
 | `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per restore |

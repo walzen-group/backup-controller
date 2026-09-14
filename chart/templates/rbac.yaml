@@ -30,6 +30,14 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
+  # The library builds a pod informer whether or not a populator pod is used,
+  # and waits for its cache to sync before the controller runs at all
+  # (populator-machinery/controller.go:289 and :542). Without this rule the
+  # reflector fails every few seconds, the cache never syncs, and every claim
+  # stays Pending with nothing on it saying why.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
   # The data source the claim names.
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores"]

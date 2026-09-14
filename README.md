@@ -4,12 +4,12 @@ A Kubernetes volume populator that fills a new PersistentVolumeClaim from a
 restic repository by asking VolSync to restore into it, so the resulting volume
 is an ordinary dataset with nothing behind it.
 
-Status, 2026-09-14: released at v0.1.1, with no restore yet performed on a
-cluster. The Go module and its flake dev shell, the VolumeRestore API with its
-generated CRD, the internal/volsync and internal/populator packages with their
-fake-client tests, the binary in cmd/backup-controller bound to the populator
-library's provider callbacks, the deploy/ tree, the Helm chart under chart/ and
-the release workflow all exist, and their gates pass.
+Status, 2026-09-14: released at v0.1.2 and installed on the walzen test cluster.
+The Go module and its flake dev shell, the VolumeRestore API with its generated
+CRD, the internal/volsync and internal/populator packages with their fake-client
+tests, the binary in cmd/backup-controller bound to the populator library's
+provider callbacks, the deploy/ tree, the Helm chart under chart/ and the
+release workflow all exist, and their gates pass.
 
 v0.1.0 was the first release. v0.1.1 adds the cacheStorageClassName and
 cacheCapacity passthroughs: VolSync's mover provisions a metadata cache claim
@@ -17,6 +17,13 @@ for every restore, and without a class named for it that claim comes from the
 cluster's default storage class. Where that default reclaims Retain, each
 restore leaves a cache dataset on the pool, which is the shape this project
 exists to remove.
+
+v0.1.2 adds `pods: get, list, watch` to the ClusterRole. The populator library
+builds a pod informer whether or not a populator pod is used, and waits for its
+cache to sync before the controller runs at all, so under v0.1.1 the reflector
+failed every few seconds and every claim stayed Pending. Only a cluster showed
+this: the offline check compared deploy/rbac.yaml against the table in
+[docs/packaging.md](docs/packaging.md), and the two agreed with each other.
 
 The walzen infrastructure repository installs the release through a terragrunt
 unit and consumes it from its backup module, described in
