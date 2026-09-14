@@ -38,6 +38,12 @@ func New(vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim, 
 				// namespace.
 				Repository:  SecretCopyName(types.UID(trigger)),
 				RestoreAsOf: vr.Spec.RestoreAsOf,
+				// The mover provisions a metadata cache claim for every
+				// restore. Left unset the class is the cluster's default, and
+				// that class's reclaim policy decides whether the cache
+				// dataset outlives the restore that made it.
+				CacheStorageClassName: vr.Spec.CacheStorageClassName,
+				CacheCapacity:         vr.Spec.CacheCapacity,
 				MoverConfig: volsyncv1alpha1.MoverConfig{
 					MoverPodLabels:       vr.Spec.MoverLabels(),
 					MoverSecurityContext: vr.Spec.MoverSecurityContext,

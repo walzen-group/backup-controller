@@ -96,6 +96,16 @@ func (in *VolumeRestoreSpec) DeepCopyInto(out *VolumeRestoreSpec) {
 		*out = new(string)
 		**out = **in
 	}
+	if in.CacheStorageClassName != nil {
+		in, out := &in.CacheStorageClassName, &out.CacheStorageClassName
+		*out = new(string)
+		**out = **in
+	}
+	if in.CacheCapacity != nil {
+		in, out := &in.CacheCapacity, &out.CacheCapacity
+		x := (*in).DeepCopy()
+		*out = &x
+	}
 	if in.MoverPodLabels != nil {
 		in, out := &in.MoverPodLabels, &out.MoverPodLabels
 		*out = make(map[string]MoverPodLabelValue, len(*in))

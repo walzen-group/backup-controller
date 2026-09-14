@@ -20,6 +20,6 @@ should exist reads overview and decisions.
 
 | Settled | Open |
 | --- | --- |
-| the populator mechanism and the three callbacks | the API group and kind name, which need Sam's word before a CRD ships |
-| VolSync does the data movement | whether the repository Secret is copied or lives in the controller's namespace, if the ClusterRole's reach becomes an objection |
-| a release carries the rendered manifests, the CRDs and a chart | whether the Flux component keeps both paths after the new one is proven |
+| the populator mechanism and the three callbacks | whether the repository Secret is copied or lives in the controller's namespace, if the ClusterRole's reach becomes an objection |
+| the API group and kind, shipped as backup.wlz.li/VolumeRestore in v0.1.0 | whether the Flux component keeps both paths once the new one is proven |
+| VolSync does the data movement, and a release carries the rendered manifests, the CRDs and a chart | how long a large volume's restore runs against the library's requeue behaviour, which only a cluster answers |

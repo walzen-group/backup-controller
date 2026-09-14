@@ -160,8 +160,10 @@ func TestPopulateReportsRestoring(t *testing.T) {
 	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != backupv1alpha1.ReasonRestoring {
 		t.Fatalf("Ready condition = %#v, want False/Restoring", condition)
 	}
-	if condition.Message != "restore-claim-123" {
-		t.Errorf("Ready message = %q, want destination name", condition.Message)
+	// The destination lives in the controller's namespace, so the message says
+	// which namespace to look in as well as what to look for.
+	if condition.Message != "waiting for ReplicationDestination restore-claim-123 in backup-system" {
+		t.Errorf("Ready message = %q, want the destination and its namespace", condition.Message)
 	}
 	if len(status.Status.Claims) != 1 || status.Status.Claims[0].Name != "notes" || status.Status.Claims[0].UID != types.UID("claim-123") || status.Status.Claims[0].Phase != backupv1alpha1.RestorePhaseRestoring || status.Status.Claims[0].StartedAt == nil {
 		t.Fatalf("claim status = %#v, want restoring claim with start time", status.Status.Claims)

@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -26,6 +27,21 @@ type VolumeRestoreSpec struct {
 	// +optional
 	// +kubebuilder:validation:Format="date-time"
 	RestoreAsOf *string `json:"restoreAsOf,omitempty"`
+
+	// CacheStorageClassName is the class the restic mover's metadata cache
+	// claim is provisioned from. Omitted, the cluster's default class
+	// provisions it, and on a cluster whose default class reclaims Retain that
+	// leaves a dataset behind after every restore. Name a class that reclaims
+	// Delete.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	CacheStorageClassName *string `json:"cacheStorageClassName,omitempty"`
+
+	// CacheCapacity is the size of that cache claim. Omitted, VolSync picks
+	// its own default.
+	// +optional
+	CacheCapacity *resource.Quantity `json:"cacheCapacity,omitempty"`
 
 	// MoverPodLabels are put on the mover pod, so the restore is admitted by
 	// the cluster's backup queue the way every other mover is. Keys and values

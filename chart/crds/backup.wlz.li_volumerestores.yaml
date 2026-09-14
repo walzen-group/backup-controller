@@ -51,6 +51,25 @@ spec:
               to a field of the ReplicationDestination the controller creates, and carries
               that field's name.
             properties:
+              cacheCapacity:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  CacheCapacity is the size of that cache claim. Omitted, VolSync picks
+                  its own default.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+              cacheStorageClassName:
+                description: |-
+                  CacheStorageClassName is the class the restic mover's metadata cache
+                  claim is provisioned from. Omitted, the cluster's default class
+                  provisions it, and on a cluster whose default class reclaims Retain that
+                  leaves a dataset behind after every restore. Name a class that reclaims
+                  Delete.
+                maxLength: 253
+                minLength: 1
+                type: string
               moverPodLabels:
                 additionalProperties:
                   description: |-

@@ -1,10 +1,13 @@
 # Implementation plan
 
-Status, 2026-09-14: milestones 1 through 5 are implemented in this repository
-and their gates pass. Milestone 6 is the admin's to run on the walzen test
-cluster, and its steps are written out in
+Status, 2026-09-14: milestones 1 through 5 are implemented in this repository,
+their gates pass, and v0.1.1 is released.
+
+Milestones 6 and 7 have swapped order since this page was written. A cluster run
+needs a claim to run against, and the walzen infrastructure repository's own
+canary is that claim, so milestone 7's module, unit and backup path come first
+and milestone 6 is the canary standing on them. The steps are in
 [.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md](../.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md).
-Milestone 7, the infrastructure repository, is untouched.
 
 Written for an agent starting from an empty repository with no memory of the
 design conversation. Read [overview.md](overview.md) and
@@ -62,8 +65,9 @@ Proof: `go test ./... -race` green, and the tests name the cases above.
 
 ## Milestone 4: the binary
 
-1. `cmd/backup-controller`: flags for kubeconfig, namespace, metrics endpoint,
-   and the image name the library wants even in provider-function mode.
+1. `cmd/backup-controller`: flags for kubeconfig, namespace and metrics
+   endpoint. The library's image name belongs to `PodConfig` alone, so a
+   provider-function controller declares no image flag and passes none.
 2. Wire `RunControllerWithConfig` to the callbacks.
 3. A `Dockerfile` on a distroless base, non-root, read-only root filesystem.
 
@@ -79,8 +83,8 @@ is watching the kind, and exits cleanly on SIGTERM.
 3. `.github/workflows/release.yaml` copied from kuport's and renamed, with the
    digest grep and the semver guard intact.
 
-Proof: a `v0.0.1` tag produces four assets, and the rendered manifest contains
-`@sha256:`.
+Proof: a tag attaches three assets to the release and pushes the chart to the
+registry, and the rendered manifest contains `@sha256:`. v0.1.0 did all four.
 
 ## Milestone 6: it works on the test cluster
 
@@ -103,11 +107,18 @@ The third row is the project. Record the numbers beside the same measurement
 taken on a volume still using the snapshot path, so the infrastructure
 repository's documentation can state a magnitude rather than a mechanism.
 
+The mover pod in the last row runs in the controller's namespace now, so Kueue
+sees it only when that namespace carries the label Kueue's
+managedJobsNamespaceSelector matches and holds a LocalQueue of the name the
+mover's label gives. [integration.md](integration.md) says which unit writes
+both.
+
 ## Milestone 7: the infrastructure repository
 
-Follow [integration.md](integration.md): the module, the unit, the component
-change, and the documentation search. Leave both paths working until a canary
-has survived a delete-and-refill and a cluster reboot.
+Follow [integration.md](integration.md): the module, the unit, the terragrunt
+backup path, the Flux component change, and the documentation search. Leave both
+paths working until a canary has survived a delete-and-refill and a cluster
+reboot.
 
 ## What would make this project wrong
 
@@ -123,5 +134,11 @@ Say so rather than working around it:
 - the restore of a large volume takes long enough that the library's own
   timeouts fire before a mover finishes
 
-The fourth is the most likely of the four and the first to test, because a
-fifty gigabyte restore is the case this project exists for.
+The fourth is the most likely of the four, and it shows up on its own the first
+time a large volume is restored in the normal course of running the cluster.
+Watch for it then. Do not stage a fifty gigabyte restore to find out: the
+library requeues the claim for as long as `PopulateCompleteFn` reports false,
+so the wall time a restore takes is only a problem if a timeout inside the
+library interrupts it, and the symptom of that is a claim that returns to
+Pending or a ReplicationDestination deleted and recreated mid-restore. Either
+one is visible in a restore of any size.

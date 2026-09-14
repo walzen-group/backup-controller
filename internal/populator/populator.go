@@ -74,7 +74,10 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 	}
 
 	setClaimStatus(vr, claim, backupv1alpha1.RestorePhaseRestoring)
-	backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoring, destinationName)
+	// The name alone leaves a reader hunting for the namespace it is in, which
+	// is the controller's rather than the app's.
+	waiting := fmt.Sprintf("waiting for ReplicationDestination %s in %s", destinationName, c.namespace)
+	backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoring, waiting)
 	if err := c.operations.SetStatus(ctx, vr); err != nil {
 		return fmt.Errorf("set VolumeRestore status: %w", err)
 	}

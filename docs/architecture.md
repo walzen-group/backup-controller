@@ -86,6 +86,7 @@ VolumeRestore notes-data               PersistentVolumeClaim prime-<uid>
                                          copyMethod: Direct
                                          destinationPVC: prime-<uid>
                                          trigger.manual: <uid>
+                                         cacheStorageClassName: <from the VR>
                                               │
                                               │  VolSync's mover runs,
                                               │  queued like every other mover
@@ -138,4 +139,5 @@ a repository Secret that lives in the controller's namespace from the start.
 | the prime claim | the controller's namespace | one restore |
 | the ReplicationDestination | the controller's namespace | one restore |
 | the copied repository Secret | the controller's namespace | one restore |
+| the mover's restic metadata cache claim | the controller's namespace | one restore, and VolSync deletes it with the destination |
 | the restored PersistentVolume | cluster-scoped | the life of the app's claim |

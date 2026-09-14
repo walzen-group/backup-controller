@@ -4,16 +4,26 @@ A Kubernetes volume populator that fills a new PersistentVolumeClaim from a
 restic repository by asking VolSync to restore into it, so the resulting volume
 is an ordinary dataset with nothing behind it.
 
-Status, 2026-09-14: implemented and unreleased. The Go module and its flake dev
-shell, the `VolumeRestore` API with its generated CRD, the `internal/volsync`
-and `internal/populator` packages with their fake-client tests, the binary in
-`cmd/backup-controller` bound to the populator library's provider callbacks, the
-`deploy/` tree, the Helm chart under `chart/` and the release workflow all exist
-and their gates pass. No tag has been cut, so ghcr.io holds no image and no
-release asset exists yet, and the infrastructure repository work in
-[docs/integration.md](docs/integration.md) is still nobody's done work. The
-cluster proof is a runbook rather than a run:
-[.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md](.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md).
+Status, 2026-09-14: released at v0.1.1, with no restore yet performed on a
+cluster. The Go module and its flake dev shell, the VolumeRestore API with its
+generated CRD, the internal/volsync and internal/populator packages with their
+fake-client tests, the binary in cmd/backup-controller bound to the populator
+library's provider callbacks, the deploy/ tree, the Helm chart under chart/ and
+the release workflow all exist, and their gates pass.
+
+v0.1.0 was the first release. v0.1.1 adds the cacheStorageClassName and
+cacheCapacity passthroughs: VolSync's mover provisions a metadata cache claim
+for every restore, and without a class named for it that claim comes from the
+cluster's default storage class. Where that default reclaims Retain, each
+restore leaves a cache dataset on the pool, which is the shape this project
+exists to remove.
+
+The walzen infrastructure repository installs the release through a terragrunt
+unit and consumes it from its backup module, described in
+[docs/integration.md](docs/integration.md). Nothing has restored a volume on a
+cluster yet, and
+[.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md](.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md)
+is the run that settles it.
 
 ## The problem it exists for
 

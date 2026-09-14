@@ -129,7 +129,7 @@ NotFound.
 
 ### 5. The Ready message is a bare object name
 
-Rank: note.
+Rank: note. Repaired in v0.1.1, after this review closed.
 
 internal/populator/populator.go:77 sets the Ready condition's message to the
 destination's name alone, such as `restore-c4c02f23`. The example in

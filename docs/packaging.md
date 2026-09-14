@@ -9,7 +9,8 @@ already consumes, so copy that shape rather than inventing one.
 ## What a release has to attach
 
 A tag `vX.Y.Z` produces four things, and the infrastructure repository reads the
-first of them:
+first of them. The release page lists the first three; the fourth is a registry
+push rather than an attached file:
 
 | Asset | Contents | Consumed by |
 | --- | --- | --- |
@@ -77,7 +78,9 @@ Copy kuport's and change the names. What each step is for:
    chart is never modified.
 7. **Push the chart to ghcr.io** as an OCI artifact.
 8. **Bundle the CRDs** by concatenating `config/crd/*.yaml`.
-9. **Create the GitHub Release** with all four assets and the digest in the body.
+9. **Create the GitHub Release** with the three file assets attached and the
+   digest in the body. Step 7 already pushed the chart to the registry, so the
+   release page itself lists three files.
 
 ## What the rendered manifest must contain
 

@@ -7,20 +7,25 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
 func TestNewPassesThroughSpecFields(t *testing.T) {
 	restoreAsOf := "2026-09-14T12:00:00Z"
+	cacheClass := "zfs-ephemeral"
+	cacheCapacity := resource.MustParse("2Gi")
 	securityContext := &corev1.PodSecurityContext{RunAsNonRoot: new(true)}
 	vr := &backupv1alpha1.VolumeRestore{
 		ObjectMeta: metav1.ObjectMeta{Generation: 7},
 		Spec: backupv1alpha1.VolumeRestoreSpec{
-			Repository:           "repo-secret",
-			RestoreAsOf:          &restoreAsOf,
-			MoverPodLabels:       map[string]backupv1alpha1.MoverPodLabelValue{"queue": "backup"},
-			MoverSecurityContext: securityContext,
+			Repository:            "repo-secret",
+			RestoreAsOf:           &restoreAsOf,
+			CacheStorageClassName: &cacheClass,
+			CacheCapacity:         &cacheCapacity,
+			MoverPodLabels:        map[string]backupv1alpha1.MoverPodLabelValue{"queue": "backup"},
+			MoverSecurityContext:  securityContext,
 		},
 	}
 	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{UID: types.UID("claim-123"), Name: "notes"}}
@@ -53,6 +58,15 @@ func TestNewPassesThroughSpecFields(t *testing.T) {
 	if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != restoreAsOf {
 		t.Errorf("restore as of = %#v, want %q", rd.Spec.Restic.RestoreAsOf, restoreAsOf)
 	}
+	// Without a class the mover's cache claim comes from the cluster default,
+	// and a default that reclaims Retain leaves its dataset on the pool after
+	// every restore.
+	if rd.Spec.Restic.CacheStorageClassName == nil || *rd.Spec.Restic.CacheStorageClassName != cacheClass {
+		t.Errorf("cache storage class = %#v, want %q", rd.Spec.Restic.CacheStorageClassName, cacheClass)
+	}
+	if rd.Spec.Restic.CacheCapacity == nil || rd.Spec.Restic.CacheCapacity.Cmp(cacheCapacity) != 0 {
+		t.Errorf("cache capacity = %#v, want %s", rd.Spec.Restic.CacheCapacity, cacheCapacity.String())
+	}
 	if !reflect.DeepEqual(rd.Spec.Restic.MoverPodLabels, map[string]string{"queue": "backup"}) {
 		t.Errorf("mover labels = %#v, want queue label", rd.Spec.Restic.MoverPodLabels)
 	}
@@ -61,7 +75,8 @@ func TestNewPassesThroughSpecFields(t *testing.T) {
 	}
 
 	empty := New(&backupv1alpha1.VolumeRestore{Spec: backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"}}, claim, "prime-claim-123", "backup-system")
-	if empty.Spec.Restic.RestoreAsOf != nil || empty.Spec.Restic.MoverPodLabels != nil || empty.Spec.Restic.MoverSecurityContext != nil {
+	if empty.Spec.Restic.RestoreAsOf != nil || empty.Spec.Restic.MoverPodLabels != nil || empty.Spec.Restic.MoverSecurityContext != nil ||
+		empty.Spec.Restic.CacheStorageClassName != nil || empty.Spec.Restic.CacheCapacity != nil {
 		t.Fatalf("empty optional fields = %#v, want nil", empty.Spec.Restic)
 	}
 }
