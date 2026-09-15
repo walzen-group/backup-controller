@@ -68,6 +68,22 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Allowed("not a creation")
 	}
 
+	// A dry-run decision is thrown away: the API server never persists a
+	// mutating patch from a dry-run request, so choosing a bootstrap here
+	// changes nothing.
+	//
+	// Enforcing here does do something, and it is a deadlock. Flux dry-runs
+	// every object in a Kustomization before it applies any of them, so on an
+	// app's first deploy this handler is asked about a Cluster whose
+	// ObjectStore sits in the same set and does not exist yet. Refusing fails
+	// the dry-run, Flux applies nothing, the ObjectStore is never created, and
+	// the next reconcile asks the same question and gets the same answer.
+	//
+	// The real request arrives with DryRun unset and is decided in full.
+	if req.DryRun != nil && *req.DryRun {
+		return admission.Allowed("dry run")
+	}
+
 	cluster := &unstructured.Unstructured{}
 	if err := json.Unmarshal(req.Object.Raw, cluster); err != nil {
 		return admission.Errored(http.StatusBadRequest, err)

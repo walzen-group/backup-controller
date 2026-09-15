@@ -376,6 +376,49 @@ func TestAnUnreadableStoreRefusesTheCluster(t *testing.T) {
 	}
 }
 
+// A dry-run request is allowed without reading anything, even where a real
+// request on the same Cluster would be refused.
+//
+// Flux dry-runs every object in a Kustomization before it applies any of them,
+// so on an app's first deploy this handler sees a Cluster whose ObjectStore is
+// in the same set and does not exist yet. Refusing there fails the dry-run,
+// Flux applies nothing, the ObjectStore is never created, and every later
+// reconcile repeats it. Measured on 2026-09-15 as:
+//
+//	dry-run failed: admission webhook "bootstrap.backup.wlz.li" denied the
+//	request: read ObjectStore app/app-pg-store:
+//	objectstores.barmancloud.cnpg.io "app-pg-store" not found
+func TestADryRunIsAllowedWithoutReadingTheStore(t *testing.T) {
+	raw, err := json.Marshal(cluster(t, nil))
+	if err != nil {
+		t.Fatalf("marshal the cluster: %v", err)
+	}
+
+	dryRun := true
+	decider := &Decider{
+		// No objects, so a read fails the way a missing ObjectStore does.
+		Client: fake.NewClientBuilder().WithScheme(scheme(t)).Build(),
+		Prober: stubProber{err: errors.New("the prober must not run on a dry run")},
+	}
+
+	response := decider.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: admissionv1.Create,
+			Namespace: "app",
+			Name:      "app-pg",
+			Object:    runtime.RawExtension{Raw: raw},
+			DryRun:    &dryRun,
+		},
+	})
+
+	if !response.Allowed {
+		t.Fatalf("a dry run was refused: %s", response.Result.Message)
+	}
+	if len(response.Patches) != 0 {
+		t.Fatalf("a dry run returned %d patches, want none", len(response.Patches))
+	}
+}
+
 func TestTheServerNameParameterWinsOverTheClusterName(t *testing.T) {
 	original := cluster(t, func(object map[string]any) {
 		spec, _ := object["spec"].(map[string]any)
