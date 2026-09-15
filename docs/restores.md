@@ -230,6 +230,22 @@ CloudNativePG refuses to archive into a prefix that already holds WAL, which is
 true of every restore: the prefix a database recovers from is the prefix it
 archives to.
 
+### Reaching an object store over TLS
+
+The webhook talks to the object store directly, so it has to verify whatever
+certificate that endpoint presents. Neither case is configured on this
+controller and neither is hardcoded:
+
+| The endpoint's certificate | What verifies it |
+| --- | --- |
+| signed by a public authority | the public roots in the image |
+| signed by a private authority | the store's own `endpointCA` |
+
+`endpointCA` is a field on the ObjectStore, a Secret name and key holding a PEM
+bundle, and the Barman Cloud plugin already reads it for exactly this reason.
+So an endpoint that needs a CA is described once, on the store, and the plugin
+and this controller both pick it up. A store that needs none declares none.
+
 ### Refusing rather than guessing
 
 The webhook is registered with `failurePolicy: Fail`. When it cannot run, or

@@ -31,12 +31,18 @@ var ObjectStoreGVK = schema.GroupVersionKind{
 
 // Location is everything needed to ask the object store whether one database
 // has a base backup in it.
+//
+// CABundle is empty for an endpoint signed by a public authority and holds a
+// PEM bundle for one that is not. It comes from the store's own endpointCA,
+// the field the Barman Cloud plugin already reads for the same reason, so an
+// endpoint is described once and both the plugin and this controller trust it.
 type Location struct {
 	Endpoint  string
 	Bucket    string
 	Prefix    string
 	AccessKey string
 	SecretKey string
+	CABundle  []byte
 }
 
 // BasePrefix is the key prefix barman writes base backups under. A listing
@@ -91,13 +97,48 @@ func ResolveLocation(
 		return Location{}, err
 	}
 
+	bundle, err := endpointCA(ctx, c, namespace, store)
+	if err != nil {
+		return Location{}, err
+	}
+
 	return Location{
 		Endpoint:  endpoint,
 		Bucket:    bucket,
 		Prefix:    strings.Trim(prefix+"/"+serverName, "/"),
 		AccessKey: accessKey,
 		SecretKey: secretKey,
+		CABundle:  bundle,
 	}, nil
+}
+
+// endpointCA reads the store's endpointCA bundle, and returns nothing when the
+// store declares none. An endpoint signed by a public authority needs no
+// bundle, and the image ships the public roots for that case.
+func endpointCA(
+	ctx context.Context,
+	c client.Reader,
+	namespace string,
+	store *unstructured.Unstructured,
+) ([]byte, error) {
+	name, found, err := unstructured.NestedString(store.Object, "spec", "configuration", "endpointCA", "name")
+	if err != nil || !found || name == "" {
+		return nil, nil
+	}
+	key, found, err := unstructured.NestedString(store.Object, "spec", "configuration", "endpointCA", "key")
+	if err != nil || !found || key == "" {
+		return nil, fmt.Errorf("ObjectStore %s/%s names an endpointCA Secret with no key", namespace, store.GetName())
+	}
+
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, secret); err != nil {
+		return nil, fmt.Errorf("read endpointCA Secret %s/%s: %w", namespace, name, err)
+	}
+	bundle, ok := secret.Data[key]
+	if !ok {
+		return nil, fmt.Errorf("endpointCA Secret %s/%s has no key %q", namespace, name, key)
+	}
+	return bundle, nil
 }
 
 // splitDestination turns s3://bucket/some/prefix/ into its bucket and its

@@ -2,9 +2,17 @@ package bootstrap
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"testing"
+	"time"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -304,6 +312,61 @@ func TestSplitDestinationSeparatesBucketFromPrefix(t *testing.T) {
 		if bucket != tc.bucket || prefix != tc.prefix {
 			t.Errorf("splitDestination(%q) = %q, %q; want %q, %q", tc.in, bucket, prefix, tc.bucket, tc.prefix)
 		}
+	}
+}
+
+// A store fronted by a public authority declares no endpointCA, and the client
+// verifies against the roots the image ships.
+func TestNoEndpointCAMeansThePublicRoots(t *testing.T) {
+	transport, err := tlsTransport(nil)
+	if err != nil {
+		t.Fatalf("tlsTransport(nil): %v", err)
+	}
+	if transport.TLSClientConfig.RootCAs == nil {
+		t.Error("no root pool was built")
+	}
+	if transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Error("the transport accepts TLS below 1.2")
+	}
+}
+
+// A store fronted by a private authority carries the bundle that signs it, and
+// nothing about that authority is configured on this controller.
+func TestAnEndpointCAIsAddedToTheRoots(t *testing.T) {
+	// A throwaway self-signed certificate, generated in this test so the
+	// repository carries no certificate material of its own.
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate a key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "store.example"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create a certificate: %v", err)
+	}
+	bundle := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+
+	transport, err := tlsTransport(bundle)
+	if err != nil {
+		t.Fatalf("tlsTransport(bundle): %v", err)
+	}
+
+	subjects := transport.TLSClientConfig.RootCAs.Subjects() //nolint:staticcheck // reading the pool is the assertion
+	if len(subjects) == 0 {
+		t.Fatal("the bundle was not added to the pool")
+	}
+}
+
+func TestAnUnparsableEndpointCAIsRejected(t *testing.T) {
+	if _, err := tlsTransport([]byte("this is not a certificate")); err == nil {
+		t.Fatal("a bundle holding no PEM certificate was accepted")
 	}
 }
 
