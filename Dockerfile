@@ -5,10 +5,17 @@
 # ReplicationDestination objects and lets VolSync's mover do the data work, so
 # nothing in the image is executed except the binary itself.
 #
-# No CA bundle is copied in. The controller talks to the in-cluster API server
+# A CA bundle is copied in. The controller reaches the in-cluster API server
 # with the ServiceAccount token and the cluster CA, both mounted by the
-# kubelet. If it ever needs outbound TLS to something else, this is the line to
-# revisit.
+# kubelet, and that needs no bundle. The bootstrap webhook also reaches the
+# object store over HTTPS, which does: on scratch with no roots, every S3
+# listing fails with
+#
+#   tls: failed to verify certificate: x509: certificate signed by unknown authority
+#
+# and the webhook then refuses every Cluster, because it fails closed. An
+# object store behind a private CA needs that CA mounted into the pod as well;
+# these are the public roots only.
 #
 # The binary writes no files, so the Deployment's readOnlyRootFilesystem costs
 # the image nothing.
@@ -18,6 +25,11 @@
 FROM golang:1.26.8-alpine3.24@sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628 AS build
 
 WORKDIR /src
+
+# The public roots the scratch stage copies. Installed explicitly rather than
+# relied on from the base image, so a base image that stops shipping them fails
+# this line instead of producing an image whose every S3 call fails at TLS.
+RUN apk add --no-cache ca-certificates
 
 # Resolve module downloads before copying sources so edits to Go code do not
 # invalidate the dependency layer.
@@ -41,6 +53,7 @@ FROM scratch
 # runAsNonRoot, so the image states a non-root uid and gid of its own.
 USER 65532:65532
 
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/backup-controller /backup-controller
 
 ENTRYPOINT ["/backup-controller"]
