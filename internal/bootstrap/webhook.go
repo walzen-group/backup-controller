@@ -101,6 +101,23 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
+	// Two databases archiving to one prefix interleave their WAL and leave the
+	// archive unrestorable, which is silent and permanent. Nothing else on the
+	// cluster can see this coming: each Cluster is valid on its own, and the
+	// pair is the problem.
+	holder, err := archiveHolder(ctx, d.Client, req.Namespace, req.Name, at)
+	if err != nil {
+		logger.Error(err, "cannot check which databases archive here")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	if holder != "" {
+		logger.Info("refusing the Cluster", "reason", "another database archives here", "holder", holder, "prefix", at.Prefix)
+		return admission.Denied(fmt.Sprintf(
+			"%s already archives to %s/%s. Two databases writing one archive interleave their WAL and leave it unrestorable. Give this Cluster an archive of its own, or a serverName that is not %q.",
+			holder, at.Bucket, at.Prefix, serverName,
+		))
+	}
+
 	has, err := d.Prober.HasBaseBackup(ctx, at)
 	if err != nil {
 		logger.Error(err, "cannot list the object store")
@@ -121,6 +138,49 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	}
 	logger.Info("recovering the Cluster from its object store", "prefix", at.BasePrefix())
 	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
+}
+
+// archiveHolder returns the name of an existing Cluster that already archives
+// to the same bucket and prefix, or an empty string when none does.
+//
+// It compares resolved destinations rather than names, because two Clusters
+// can reach one prefix through differently named ObjectStores. The Cluster
+// being admitted is skipped by namespace and name, so a recreate of the same
+// database does not collide with the record of itself.
+//
+// A Cluster whose own store cannot be read is skipped rather than treated as a
+// collision. Refusing a new database because an unrelated one is misconfigured
+// would put this check in the way of work it has no business blocking.
+func archiveHolder(
+	ctx context.Context,
+	c client.Reader,
+	namespace, name string,
+	at Location,
+) (string, error) {
+	clusters := &unstructured.UnstructuredList{}
+	clusters.SetGroupVersionKind(ClusterListGVK)
+	if err := c.List(ctx, clusters); err != nil {
+		return "", fmt.Errorf("list the Clusters: %w", err)
+	}
+
+	for i := range clusters.Items {
+		other := &clusters.Items[i]
+		if other.GetNamespace() == namespace && other.GetName() == name {
+			continue
+		}
+		store, serverName, found := archiver(other)
+		if !found {
+			continue
+		}
+		theirs, err := ResolveLocation(ctx, c, other.GetNamespace(), store, serverName)
+		if err != nil {
+			continue
+		}
+		if theirs.Bucket == at.Bucket && theirs.Prefix == at.Prefix {
+			return fmt.Sprintf("%s/%s", other.GetNamespace(), other.GetName()), nil
+		}
+	}
+	return "", nil
 }
 
 // archiver finds the Cluster's WAL archiving plugin and the server name it

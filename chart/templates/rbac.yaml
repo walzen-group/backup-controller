@@ -83,6 +83,13 @@ rules:
   - apiGroups: ["barmancloud.cnpg.io"]
     resources: ["objectstores"]
     verbs: ["get"]
+  # Before admitting a Cluster the webhook checks that no other database
+  # already archives to the same bucket and prefix, which would interleave
+  # their WAL and leave the archive unrestorable. That question is only
+  # answerable by looking at every Cluster on the cluster.
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

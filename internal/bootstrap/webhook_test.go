@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +41,11 @@ func scheme(t *testing.T) *runtime.Scheme {
 	if err := corev1.AddToScheme(s); err != nil {
 		t.Fatalf("register the core types: %v", err)
 	}
+	// The handler reads both kinds as unstructured, so the fake client needs
+	// them by GVK rather than by Go type.
+	s.AddKnownTypeWithName(ObjectStoreGVK, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(ClusterListGVK, &unstructured.UnstructuredList{})
+	s.AddKnownTypeWithName(ClusterListGVK.GroupVersion().WithKind("Cluster"), &unstructured.Unstructured{})
 	return s
 }
 
@@ -101,7 +107,7 @@ func secret() *corev1.Secret {
 	}
 }
 
-func decide(t *testing.T, c *unstructured.Unstructured, prober Prober) admission.Response {
+func decide(t *testing.T, c *unstructured.Unstructured, prober Prober, existing ...*unstructured.Unstructured) admission.Response {
 	t.Helper()
 	raw, err := json.Marshal(c)
 	if err != nil {
@@ -109,7 +115,11 @@ func decide(t *testing.T, c *unstructured.Unstructured, prober Prober) admission
 	}
 
 	builder := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(secret())
-	builder = builder.WithRuntimeObjects(store())
+	objects := []runtime.Object{store()}
+	for _, object := range existing {
+		objects = append(objects, object)
+	}
+	builder = builder.WithRuntimeObjects(objects...)
 
 	decider := &Decider{Client: builder.Build(), Prober: prober}
 	return decider.Handle(context.Background(), admission.Request{
@@ -153,6 +163,70 @@ func jsonpatchApply(original, patch []byte) ([]byte, error) {
 		return nil, err
 	}
 	return decoded.Apply(original)
+}
+
+// Two databases archiving to one prefix interleave their WAL and leave the
+// archive unrestorable, silently and permanently. Neither Cluster is invalid
+// on its own, so only something that can see both can catch it. Measured on
+// the test cluster on 2026-09-15, when a new canary and an existing Flux
+// canary both wanted canary-postgres-pg.
+func TestAClusterIsRefusedWhenAnotherArchivesThere(t *testing.T) {
+	// Same object store and the same server name, in another namespace.
+	other := cluster(t, func(object map[string]any) {
+		metadata, _ := object["metadata"].(map[string]any)
+		metadata["name"] = "app-pg"
+		metadata["namespace"] = "other"
+	})
+	other.SetAPIVersion("postgresql.cnpg.io/v1")
+	other.SetKind("Cluster")
+
+	// The other namespace needs its own store and secret for the holder's
+	// destination to resolve.
+	otherStore := store()
+	otherStore.SetNamespace("other")
+	otherSecret := secret()
+	otherSecret.Namespace = "other"
+
+	raw, err := json.Marshal(cluster(t, nil))
+	if err != nil {
+		t.Fatalf("marshal the cluster: %v", err)
+	}
+	builder := fake.NewClientBuilder().WithScheme(scheme(t)).
+		WithObjects(secret(), otherSecret).
+		WithRuntimeObjects(store(), otherStore, other)
+
+	decider := &Decider{Client: builder.Build(), Prober: stubProber{has: false}}
+	response := decider.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: admissionv1.Create,
+			Namespace: "app",
+			Name:      "app-pg",
+			Object:    runtime.RawExtension{Raw: raw},
+		},
+	})
+
+	if response.Allowed {
+		t.Fatal("a Cluster was admitted while another database archives to its prefix")
+	}
+	if !strings.Contains(response.Result.Message, "other/app-pg") {
+		t.Errorf("the refusal does not name the holder: %q", response.Result.Message)
+	}
+}
+
+// Recreating the same database is not a collision with the record of itself.
+func TestARecreateOfTheSameClusterIsNotACollision(t *testing.T) {
+	existing := cluster(t, nil)
+	existing.SetAPIVersion("postgresql.cnpg.io/v1")
+	existing.SetKind("Cluster")
+
+	response := decide(t, cluster(t, nil), stubProber{has: true}, existing)
+
+	if !response.Allowed {
+		t.Fatalf("recreating a database was refused: %v", response.Result)
+	}
+	if len(response.Patches) == 0 {
+		t.Error("the recreate was not restored from its own archive")
+	}
 }
 
 func TestAnEmptyStoreLeavesTheClusterOnInitdb(t *testing.T) {

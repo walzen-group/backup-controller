@@ -230,6 +230,32 @@ CloudNativePG refuses to archive into a prefix that already holds WAL, which is
 true of every restore: the prefix a database recovers from is the prefix it
 archives to.
 
+### Refusing a shared archive
+
+Before admitting a Cluster, the webhook checks that no other database already
+archives to the same bucket and prefix, and refuses it if one does:
+
+```text
+other/app-pg already archives to backups/app/app-pg. Two databases writing one
+archive interleave their WAL and leave it unrestorable. Give this Cluster an
+archive of its own, or a serverName that is not "app-pg".
+```
+
+This is the one failure nothing else on the cluster can see. Each Cluster is
+valid on its own; the pair is the problem. The damage is silent and permanent:
+WAL filenames are timeline plus position and nothing else, so the second
+database overwrites the first's segments, and a base backup whose WAL range is
+gone can never reach consistency again.
+
+It compares resolved destinations rather than names, because two Clusters can
+reach one prefix through differently named ObjectStores. The Cluster being
+admitted is skipped by namespace and name, so recreating a database is not a
+collision with the record of itself, which is what makes restores work.
+
+A Cluster whose own store cannot be read is skipped rather than counted as a
+holder. Refusing a new database because an unrelated one is misconfigured would
+block work this check has no business blocking.
+
 ### Reaching an object store over TLS
 
 The webhook talks to the object store directly, so it has to verify whatever

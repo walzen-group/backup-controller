@@ -21,6 +21,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// ClusterListGVK is CloudNativePG's Cluster list, read to find whether a
+// database already archives where a new one is about to.
+var ClusterListGVK = schema.GroupVersionKind{
+	Group:   "postgresql.cnpg.io",
+	Version: "v1",
+	Kind:    "ClusterList",
+}
+
 // ObjectStoreGVK is the Barman Cloud plugin's store, which holds the bucket,
 // the endpoint and the credential references a Cluster archives through.
 var ObjectStoreGVK = schema.GroupVersionKind{
