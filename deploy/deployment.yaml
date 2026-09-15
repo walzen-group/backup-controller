@@ -31,10 +31,21 @@ spec:
         # listen address and path keep their defaults, :8080 and /metrics.
         args:
         - --namespace=backup-system
+        - --webhook-cert-dir=/etc/webhook/tls
         ports:
         - name: metrics
           containerPort: 8080
           protocol: TCP
+        - name: webhook
+          containerPort: 9443
+          protocol: TCP
+        # cert-manager writes tls.crt and tls.key here and rewrites them on
+        # renewal. controller-runtime watches the directory and reloads the
+        # certificate without a restart, so a renewal is not an outage.
+        volumeMounts:
+        - name: webhook-tls
+          mountPath: /etc/webhook/tls
+          readOnly: true
         # The library registers only the configured metrics path and serves no
         # health route, so this container declares no liveness or readiness
         # probe: a probe against the metrics port would prove the process
@@ -56,3 +67,7 @@ spec:
             memory: 64Mi
           limits:
             memory: 128Mi
+      volumes:
+      - name: webhook-tls
+        secret:
+          secretName: backup-controller-webhook-tls

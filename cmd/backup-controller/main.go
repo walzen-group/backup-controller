@@ -38,6 +38,8 @@ func main() {
 		namespace   = flag.String("namespace", "backup-system", "namespace the prime claim and the ReplicationDestination live in")
 		metricsAddr = flag.String("metrics-addr", ":8080", "address the metrics listener binds")
 		metricsPath = flag.String("metrics-path", "/metrics", "path the metrics listener serves")
+		webhookCert = flag.String("webhook-cert-dir", "", "directory holding tls.crt and tls.key; empty serves no webhook")
+		webhookPort = flag.Int("webhook-port", 9443, "port the admission webhook listens on")
 		printVer    = flag.Bool("version", false, "print the version and exit")
 	)
 	klog.InitFlags(nil)
@@ -61,7 +63,8 @@ func main() {
 	// returns, which is the only shutdown signal this process gets.
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
-	if err := startRunControllers(runs, kubeconfig()); err != nil {
+	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
+	if err := startRunControllers(runs, kubeconfig(), hook); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)
 	}

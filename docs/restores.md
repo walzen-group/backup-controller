@@ -197,3 +197,60 @@ spec:
   repository: other-app-restic
   into: scratch
 ```
+
+## Databases restore themselves
+
+Everything above is about volumes. A CloudNativePG database has the same gap
+that a volume used to have, and the controller closes it the same way: by
+deciding at creation time rather than asking anyone.
+
+`spec.bootstrap` is read once, when CloudNativePG creates a Cluster, and never
+again. So a Cluster created after a cluster rebuild bootstraps with `initdb`,
+comes up empty, and reports healthy while its archive sits untouched in the
+object store. Nobody is told.
+
+The bootstrap webhook watches Clusters being created and looks in the object
+store the Cluster archives through:
+
+| What it finds | What it does |
+| --- | --- |
+| no base backup | nothing; the Cluster bootstraps as written |
+| a base backup | rewrites the Cluster to recover from it |
+| the Cluster already declares a recovery | nothing; a point in time was asked for on purpose |
+| `backup.wlz.li/bootstrap: initdb` | nothing; an empty database was asked for on purpose |
+
+Neither kustomize nor OpenTofu can make that choice, because both render their
+manifests before anything has spoken to the object store. Admission is the one
+moment when the Cluster is known and the store is reachable.
+
+A rewritten Cluster gets three things: `bootstrap.recovery` naming an
+`externalClusters` entry the webhook adds, and the annotation
+`cnpg.io/skipEmptyWalArchiveCheck`. The annotation is needed because
+CloudNativePG refuses to archive into a prefix that already holds WAL, which is
+true of every restore: the prefix a database recovers from is the prefix it
+archives to.
+
+### Refusing rather than guessing
+
+The webhook is registered with `failurePolicy: Fail`. When it cannot run, or
+cannot read the object store, the Cluster is refused.
+
+The alternative is worse than it sounds. Allowing the Cluster through would
+create it exactly as written, which is `initdb`, which is an empty database
+beside a full archive, reported as success. That failure arrives during a
+cluster rebuild, when this controller is most likely to be starting up and an
+operator is least likely to be reading Cluster events.
+
+### Starting a database empty
+
+With the webhook installed, deleting a Cluster brings its data back, which
+leaves no way to discard a database. The opt-out is an annotation the webhook
+honours and leaves alone:
+
+```yaml
+metadata:
+  annotations:
+    backup.wlz.li/bootstrap: initdb
+```
+
+Any other value is ignored, so a typo does not silently wipe a database.

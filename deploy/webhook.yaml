@@ -1,0 +1,89 @@
+# The Cluster bootstrap webhook, its serving certificate, and the Service the
+# API server reaches it through.
+#
+# cert-manager issues and renews the certificate and injects the CA into the
+# webhook configuration, so nothing here expires on a date somebody has to
+# remember. The issuer is self-signed because the only party that has to trust
+# this certificate is the API server, and the caBundle annotation is how it is
+# told to.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: backup-controller-webhook
+  namespace: backup-system
+  labels:
+    app.kubernetes.io/name: backup-controller
+    app.kubernetes.io/instance: backup-controller
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: backup-controller-webhook
+  namespace: backup-system
+  labels:
+    app.kubernetes.io/name: backup-controller
+    app.kubernetes.io/instance: backup-controller
+spec:
+  secretName: backup-controller-webhook-tls
+  dnsNames:
+    - backup-controller-webhook.backup-system.svc
+    - backup-controller-webhook.backup-system.svc.cluster.local
+  issuerRef:
+    name: backup-controller-webhook
+    kind: Issuer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backup-controller-webhook
+  namespace: backup-system
+  labels:
+    app.kubernetes.io/name: backup-controller
+    app.kubernetes.io/instance: backup-controller
+spec:
+  selector:
+    app.kubernetes.io/name: backup-controller
+    app.kubernetes.io/instance: backup-controller
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+      protocol: TCP
+---
+# failurePolicy is Fail on purpose. A webhook that is unavailable would
+# otherwise let a Cluster be created exactly as written, which is initdb, which
+# is a silently empty database beside a full archive. Refusing the creation is
+# the loud failure, and it is the one worth having during a cluster rebuild.
+#
+# The scope is Clusters being created. CloudNativePG reads spec.bootstrap only
+# when it creates a Cluster, so an update carries nothing this handler could
+# act on.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: backup-controller-bootstrap
+  labels:
+    app.kubernetes.io/name: backup-controller
+    app.kubernetes.io/instance: backup-controller
+  annotations:
+    cert-manager.io/inject-ca-from: backup-system/backup-controller-webhook
+webhooks:
+  - name: bootstrap.backup.wlz.li
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 15
+    rules:
+      - apiGroups: ["postgresql.cnpg.io"]
+        apiVersions: ["v1"]
+        resources: ["clusters"]
+        operations: ["CREATE"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: backup-controller-webhook
+        namespace: backup-system
+        path: /mutate-postgresql-cnpg-io-v1-cluster
+        port: 443

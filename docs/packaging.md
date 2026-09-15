@@ -121,10 +121,26 @@ library and the callbacks actually use:
 | `secrets` | get, create, delete | copying the repository Secret for the length of a restore |
 | `storageclasses` | get, list, watch | reading the binding mode |
 | `events` | create, patch | the recorder the library uses |
+| `objectstores.barmancloud.cnpg.io` | get | the bootstrap webhook, reading where a Cluster archives |
 
 Narrow `secrets` if it can be narrowed. A ClusterRole that can read every Secret
 in the cluster is the one line in this install worth arguing about, and
 [decisions.md](decisions.md) records the alternative that avoids it.
+
+## What the install needs on the cluster
+
+| Component | For |
+| --- | --- |
+| VolSync | the movers every volume backup and restore runs through |
+| CloudNativePG and the Barman Cloud plugin | the databases the bootstrap webhook acts on |
+| cert-manager | the webhook's serving certificate, issued and renewed with no operator step |
+
+cert-manager is a hard requirement when the webhook is enabled. It issues the
+certificate and injects the CA into the MutatingWebhookConfiguration through the
+`cert-manager.io/inject-ca-from` annotation, so neither has an expiry date
+anyone has to diary. A cluster without cert-manager installs with
+`webhook.enabled: false` in the chart, and then a rebuilt cluster brings its
+databases back empty; [restores.md](restores.md) says what that costs.
 
 ## Versioning
 

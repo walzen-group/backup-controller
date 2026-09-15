@@ -76,6 +76,13 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # The bootstrap webhook reads the object store a Cluster archives through, to
+  # find the bucket, the endpoint and the Secret holding its keys. get alone,
+  # because the handler fetches one store by the name the Cluster gave it and
+  # goes through the uncached reader.
+  - apiGroups: ["barmancloud.cnpg.io"]
+    resources: ["objectstores"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

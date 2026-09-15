@@ -22,6 +22,22 @@ fullnameOverride: ""
 # the README.
 namespace: backup-system
 
+# The admission webhook that chooses how a CloudNativePG Cluster starts. A
+# Cluster whose object store already holds a base backup is recovered from it;
+# one whose store is empty bootstraps an empty database.
+webhook:
+  # Serve the webhook and install its Service and MutatingWebhookConfiguration.
+  # Turning it off leaves every Cluster to bootstrap as written, so a rebuilt
+  # cluster comes back with empty databases.
+  enabled: true
+  # Port the controller listens on inside the pod.
+  port: 9443
+  # cert-manager issues and renews the serving certificate and injects the CA
+  # into the webhook configuration. With create false, supply a Secret of this
+  # name holding tls.crt and tls.key, and inject the caBundle yourself.
+  certManager:
+    create: true
+
 rbac:
   # Create the ClusterRole and ClusterRoleBinding for the controller.
   create: true

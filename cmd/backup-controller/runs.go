@@ -6,6 +6,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/runs"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -13,6 +14,8 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 // configureLogging points controller-runtime at klog.
@@ -25,14 +28,23 @@ func configureLogging() {
 	ctrl.SetLogger(klog.Background())
 }
 
+// BootstrapWebhook is where the Cluster admission webhook listens and finds
+// its serving certificate. An empty CertDir leaves the webhook unregistered,
+// which is how the binary runs in a cluster that has not installed it.
+type BootstrapWebhook struct {
+	CertDir string
+	Port    int
+}
+
 // startRunControllers brings up the manager that reconciles BackupRun and
-// RestoreRun, and returns as soon as it is running.
+// RestoreRun, serves the bootstrap webhook when one is configured, and returns
+// as soon as it is running.
 //
 // The manager is given a context of the caller's rather than
 // ctrl.SetupSignalHandler, because the populator library installs the process's
 // only signal handler and a second one on the same channel panics. Cancelling
 // that context after the library returns is what stops this manager.
-func startRunControllers(ctx context.Context, kubeconfig string) error {
+func startRunControllers(ctx context.Context, kubeconfig string, hook BootstrapWebhook) error {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client configuration: %w", err)
@@ -51,15 +63,40 @@ func startRunControllers(ctx context.Context, kubeconfig string) error {
 		}
 	}
 
-	// The library already serves this process's metrics endpoint, so the
-	// manager serves none: two listeners on one address and the second fails.
-	manager, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:         scheme,
+	options := ctrl.Options{
+		Scheme: scheme,
+		// The library already serves this process's metrics endpoint, so the
+		// manager serves none: two listeners on one address and the second
+		// fails.
 		Metrics:        metricsserver.Options{BindAddress: "0"},
 		LeaderElection: false,
-	})
+	}
+	if hook.CertDir != "" {
+		options.WebhookServer = webhook.NewServer(webhook.Options{
+			CertDir: hook.CertDir,
+			Port:    hook.Port,
+		})
+	}
+
+	manager, err := ctrl.NewManager(restConfig, options)
 	if err != nil {
 		return fmt.Errorf("create the manager: %w", err)
+	}
+
+	if hook.CertDir != "" {
+		// The uncached reader, so the webhook's Secret and ObjectStore reads
+		// need get alone. The manager's cached client would require list and
+		// watch on every Secret in the cluster and would hold them in memory
+		// for the life of the process.
+		decider := &bootstrap.Decider{
+			Client: manager.GetAPIReader(),
+			Prober: bootstrap.S3Prober{},
+		}
+		manager.GetWebhookServer().Register(
+			bootstrap.WebhookPath,
+			&admission.Webhook{Handler: decider},
+		)
+		klog.Infof("serving the bootstrap webhook on :%d%s", hook.Port, bootstrap.WebhookPath)
 	}
 
 	if err := (&runs.BackupRunReconciler{Client: manager.GetClient()}).SetupWithManager(manager); err != nil {

@@ -27,10 +27,26 @@ spec:
         # listen address and path keep their defaults, :8080 and /metrics.
         args:
         - --namespace={{ .Values.namespace }}
+        {{- if .Values.webhook.enabled }}
+        - --webhook-cert-dir=/etc/webhook/tls
+        - --webhook-port={{ .Values.webhook.port }}
+        {{- end }}
         ports:
         - name: metrics
           containerPort: 8080
           protocol: TCP
+        {{- if .Values.webhook.enabled }}
+        - name: webhook
+          containerPort: {{ .Values.webhook.port }}
+          protocol: TCP
+        # cert-manager writes tls.crt and tls.key here and rewrites them on
+        # renewal. controller-runtime watches the directory and reloads the
+        # certificate without a restart, so a renewal is not an outage.
+        volumeMounts:
+        - name: webhook-tls
+          mountPath: /etc/webhook/tls
+          readOnly: true
+        {{- end }}
         # The library registers only the configured metrics path and serves no
         # health route, so this container declares no liveness or readiness
         # probe: a probe against the metrics port would prove the process
@@ -46,3 +62,9 @@ spec:
             - ALL
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
+      {{- if .Values.webhook.enabled }}
+      volumes:
+      - name: webhook-tls
+        secret:
+          secretName: {{ include "backup-controller.fullname" . }}-webhook-tls
+      {{- end }}
