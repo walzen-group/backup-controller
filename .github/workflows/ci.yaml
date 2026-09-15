@@ -163,9 +163,24 @@ jobs:
           # shellcheck disable=SC2016  # the inner bash expands these
           nix develop -c bash -c '
             set -euo pipefail
+            # kubectl-validate embeds the API server schemas and knows no CRD
+            # from another project, so the webhook certificate objects are
+            # split out before validation: cert-manager.io/v1 has no schema it
+            # can load, and one such document fails the whole file. Only that
+            # group is split, so any other unknown group still fails here.
+            #
+            # The split is asserted rather than trusted. A render that stopped
+            # emitting the Certificate would otherwise validate clean and
+            # install a webhook with no serving certificate.
+            for render in ci-deploy-render ci-chart-render; do
+              yq "select(.apiVersion == \"cert-manager.io/v1\")" ".tmp/${render}.yaml" > ".tmp/${render}-certs.yaml"
+              yq "select(.apiVersion != \"cert-manager.io/v1\")" ".tmp/${render}.yaml" > ".tmp/${render}-core.yaml"
+              grep -q "kind: Certificate" ".tmp/${render}-certs.yaml"
+              grep -q "kind: Issuer" ".tmp/${render}-certs.yaml"
+            done
             rev=$(nix eval --impure --raw --expr "(builtins.fromJSON (builtins.readFile ./flake.lock)).nodes.nixpkgs.locked.rev")
-            nix shell "github:NixOS/nixpkgs/${rev}#kubectl-validate" -c kubectl-validate .tmp/ci-deploy-render.yaml
-            nix shell "github:NixOS/nixpkgs/${rev}#kubectl-validate" -c kubectl-validate .tmp/ci-chart-render.yaml
+            nix shell "github:NixOS/nixpkgs/${rev}#kubectl-validate" -c kubectl-validate .tmp/ci-deploy-render-core.yaml
+            nix shell "github:NixOS/nixpkgs/${rev}#kubectl-validate" -c kubectl-validate .tmp/ci-chart-render-core.yaml
           '
 
   image:
