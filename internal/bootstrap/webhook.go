@@ -162,9 +162,28 @@ func archiver(cluster *unstructured.Unstructured) (store, serverName string, fou
 // bootstrap, the external cluster it reads through, and the annotation that
 // lets it archive into the prefix it restored from.
 func setRecovery(cluster *unstructured.Unstructured, store, serverName string) error {
+	recovery := map[string]any{"source": RecoverySource}
+
+	// The application database, its owning role and the Secret holding that
+	// role's password carry over from initdb.
+	//
+	// Dropping them is not harmless. CloudNativePG defaults a recovery's
+	// database and owner to "app", so a Cluster that was created with
+	// database "canary" comes back with its data in "canary" and an empty
+	// "app" beside it, and the <cluster>-app Secret the workload reads points
+	// at the empty one. The restore looks like data loss and is not.
+	for _, field := range []string{"database", "owner"} {
+		value, found, err := unstructured.NestedString(cluster.Object, "spec", "bootstrap", "initdb", field)
+		if err == nil && found && value != "" {
+			recovery[field] = value
+		}
+	}
+	if secret, found, err := unstructured.NestedMap(cluster.Object, "spec", "bootstrap", "initdb", "secret"); err == nil && found {
+		recovery["secret"] = secret
+	}
+
 	unstructured.RemoveNestedField(cluster.Object, "spec", "bootstrap", "initdb")
 
-	recovery := map[string]any{"source": RecoverySource}
 	if err := unstructured.SetNestedMap(cluster.Object, recovery, "spec", "bootstrap", "recovery"); err != nil {
 		return fmt.Errorf("set the recovery bootstrap: %w", err)
 	}

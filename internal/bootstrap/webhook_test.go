@@ -204,6 +204,40 @@ func TestAStoreWithABackupRecoversTheCluster(t *testing.T) {
 	}
 }
 
+// CloudNativePG defaults a recovery's database and owner to "app". A Cluster
+// created with another database name would then come back with its data in
+// that database and an empty "app" beside it, and the <cluster>-app Secret the
+// workload reads would point at the empty one. Measured on the test cluster
+// with v0.3.2, which dropped these fields.
+func TestTheDatabaseAndOwnerSurviveTheRewrite(t *testing.T) {
+	original := cluster(t, func(object map[string]any) {
+		spec, _ := object["spec"].(map[string]any)
+		spec["bootstrap"] = map[string]any{
+			"initdb": map[string]any{
+				"database": "canary",
+				"owner":    "canary",
+				"secret":   map[string]any{"name": "canary-credentials"},
+			},
+		}
+	})
+
+	response := decide(t, original, stubProber{has: true})
+	patched := applied(t, original, response)
+
+	database, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "database")
+	if database != "canary" {
+		t.Errorf("recovery database = %q, want canary", database)
+	}
+	owner, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "owner")
+	if owner != "canary" {
+		t.Errorf("recovery owner = %q, want canary", owner)
+	}
+	secretName, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "secret", "name")
+	if secretName != "canary-credentials" {
+		t.Errorf("recovery secret = %q, want canary-credentials", secretName)
+	}
+}
+
 func TestTheOptOutAnnotationKeepsTheDatabaseEmpty(t *testing.T) {
 	c := cluster(t, func(object map[string]any) {
 		metadata, _ := object["metadata"].(map[string]any)
