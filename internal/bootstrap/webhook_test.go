@@ -419,6 +419,104 @@ func TestADryRunIsAllowedWithoutReadingTheStore(t *testing.T) {
 	}
 }
 
+// update sends an update of old to new, as a dry run when dryRun is set, with
+// a client that holds nothing, so a handler that reads anything fails.
+func update(t *testing.T, old, new *unstructured.Unstructured, dryRun bool) admission.Response {
+	t.Helper()
+	oldRaw, err := json.Marshal(old)
+	if err != nil {
+		t.Fatalf("marshal the old cluster: %v", err)
+	}
+	newRaw, err := json.Marshal(new)
+	if err != nil {
+		t.Fatalf("marshal the new cluster: %v", err)
+	}
+	decider := &Decider{
+		Client: fake.NewClientBuilder().WithScheme(scheme(t)).Build(),
+		Prober: stubProber{err: errors.New("the prober must not run on an update")},
+	}
+	return decider.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: admissionv1.Update,
+			Namespace: "app",
+			Name:      "app-pg",
+			Object:    runtime.RawExtension{Raw: newRaw},
+			OldObject: runtime.RawExtension{Raw: oldRaw},
+			DryRun:    &dryRun,
+		},
+	})
+}
+
+// recovered is a Cluster as this webhook left it after a restore.
+func recovered(t *testing.T) *unstructured.Unstructured {
+	t.Helper()
+	return cluster(t, func(object map[string]any) {
+		spec, _ := object["spec"].(map[string]any)
+		spec["bootstrap"] = map[string]any{
+			"recovery": map[string]any{"source": RecoverySource, "database": "app", "owner": "app"},
+		}
+	})
+}
+
+// Flux applies the Cluster from git on every reconcile, and git still holds
+// initdb. Server-side apply keeps the recovery the webhook wrote and adds initdb
+// back, and CloudNativePG refuses the result. Measured on 2026-09-17 as:
+//
+//	dry-run failed (Invalid): admission webhook "vcluster.cnpg.io" denied the
+//	request: Cluster.cluster.cnpg.io "canary-backup-aio-flux-pg" is invalid:
+//	spec.bootstrap: Forbidden: Only one bootstrap method can be specified at a time
+func TestAnUpdateDropsInitdbFromARecoveredCluster(t *testing.T) {
+	for _, dryRun := range []bool{true, false} {
+		merged := recovered(t)
+		_ = unstructured.SetNestedMap(merged.Object, map[string]any{"database": "app", "owner": "app"}, "spec", "bootstrap", "initdb")
+
+		response := update(t, recovered(t), merged, dryRun)
+
+		if !response.Allowed {
+			t.Fatalf("dry run %v: the update was refused: %v", dryRun, response.Result)
+		}
+		patched := applied(t, merged, response)
+		if _, found, _ := unstructured.NestedMap(patched, "spec", "bootstrap", "initdb"); found {
+			t.Errorf("dry run %v: initdb survived the update", dryRun)
+		}
+		source, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "source")
+		if source != RecoverySource {
+			t.Errorf("dry run %v: recovery source = %q, want %q", dryRun, source, RecoverySource)
+		}
+	}
+}
+
+// A Cluster this webhook did not recover keeps whatever its update says.
+func TestAnUpdateOfAnInitdbClusterIsLeftAlone(t *testing.T) {
+	response := update(t, cluster(t, nil), cluster(t, nil), true)
+
+	if !response.Allowed {
+		t.Fatalf("the update was refused: %v", response.Result)
+	}
+	if len(response.Patches) != 0 {
+		t.Fatalf("an initdb cluster was rewritten: %v", response.Patches)
+	}
+}
+
+// A point-in-time restore someone wrote by hand is theirs to get right.
+func TestAnUpdateOfADeclaredRecoveryIsLeftAlone(t *testing.T) {
+	declared := func() *unstructured.Unstructured {
+		return cluster(t, func(object map[string]any) {
+			spec, _ := object["spec"].(map[string]any)
+			spec["bootstrap"] = map[string]any{
+				"initdb":   map[string]any{"database": "app"},
+				"recovery": map[string]any{"source": "objectstore"},
+			}
+		})
+	}
+
+	response := update(t, declared(), declared(), true)
+
+	if len(response.Patches) != 0 {
+		t.Fatalf("a declared recovery was rewritten: %v", response.Patches)
+	}
+}
+
 func TestTheServerNameParameterWinsOverTheClusterName(t *testing.T) {
 	original := cluster(t, func(object map[string]any) {
 		spec, _ := object["spec"].(map[string]any)

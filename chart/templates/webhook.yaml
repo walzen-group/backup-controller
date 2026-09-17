@@ -54,9 +54,9 @@ spec:
 # is a silently empty database beside a full archive. Refusing the creation is
 # the loud failure, and it is the one worth having during a cluster rebuild.
 #
-# The scope is Clusters being created. CloudNativePG reads spec.bootstrap only
-# when it creates a Cluster, so an update carries nothing this handler could
-# act on.
+# The second entry takes updates, where the handler drops the initdb that Flux
+# re-applies from git over a recovered Cluster. It ignores failures so an
+# unavailable controller blocks no update to any other Cluster.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
@@ -78,6 +78,23 @@ webhooks:
         apiVersions: ["v1"]
         resources: ["clusters"]
         operations: ["CREATE"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: {{ $webhookName }}
+        namespace: {{ .Release.Namespace }}
+        path: /mutate-postgresql-cnpg-io-v1-cluster
+        port: 443
+  - name: bootstrap-update.backup.wlz.li
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    rules:
+      - apiGroups: ["postgresql.cnpg.io"]
+        apiVersions: ["v1"]
+        resources: ["clusters"]
+        operations: ["UPDATE"]
         scope: Namespaced
     clientConfig:
       service:

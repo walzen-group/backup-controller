@@ -230,6 +230,28 @@ CloudNativePG refuses to archive into a prefix that already holds WAL, which is
 true of every restore: the prefix a database recovers from is the prefix it
 archives to.
 
+### Updates to a recovered Cluster
+
+A GitOps tool applies the Cluster from its source on every reconcile, and the
+source still holds `initdb`. Server-side apply keeps the `recovery` the webhook
+wrote and adds `initdb` back, and CloudNativePG refuses the result:
+
+```text
+admission webhook "vcluster.cnpg.io" denied the request: Cluster.cluster.cnpg.io
+"canary-backup-aio-flux-pg" is invalid: spec.bootstrap: Forbidden: Only one
+bootstrap method can be specified at a time
+```
+
+A second webhook entry takes updates. When the stored Cluster has a `recovery`
+whose source is `backup-controller`, the handler drops `initdb` from the
+incoming object. It reads nothing, so it also acts on dry-runs, which is where
+Flux first hits the refusal. A Cluster without that recovery source is left as
+the update wrote it.
+
+The update entry is registered with `failurePolicy: Ignore`. An unavailable
+controller then fails only a recovered Cluster's update, with the error above,
+and blocks no update to any other Cluster.
+
 ### Refusing a shared archive
 
 Before admitting a Cluster, the webhook checks that no other database already
@@ -274,8 +296,8 @@ and this controller both pick it up. A store that needs none declares none.
 
 ### Refusing rather than guessing
 
-The webhook is registered with `failurePolicy: Fail`. When it cannot run, or
-cannot read the object store, the Cluster is refused.
+The creation entry is registered with `failurePolicy: Fail`. When it cannot
+run, or cannot read the object store, the Cluster is refused.
 
 The alternative is worse than it sounds. Allowing the Cluster through would
 create it exactly as written, which is `initdb`, which is an empty database

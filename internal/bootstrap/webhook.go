@@ -64,8 +64,11 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		"cluster", fmt.Sprintf("%s/%s", req.Namespace, req.Name),
 	)
 
+	if req.Operation == admissionv1.Update {
+		return keepRecovery(req)
+	}
 	if req.Operation != admissionv1.Create {
-		return admission.Allowed("not a creation")
+		return admission.Allowed("not a creation or an update")
 	}
 
 	// A dry-run decision is thrown away: the API server never persists a
@@ -153,6 +156,40 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	logger.Info("recovering the Cluster from its object store", "prefix", at.BasePrefix())
+	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
+}
+
+// keepRecovery drops initdb from an update of a Cluster this webhook recovered.
+//
+// Flux applies the Cluster from git on every reconcile, and git holds initdb.
+// Server-side apply keeps the recovery written at creation and adds initdb back,
+// and CloudNativePG refuses a Cluster with two bootstrap methods. That refusal
+// fails the dry-run Flux runs first, so this runs on dry-runs too. It reads
+// nothing, and CloudNativePG ignores spec.bootstrap once a Cluster exists, so
+// dropping initdb changes nothing about the database.
+func keepRecovery(req admission.Request) admission.Response {
+	old := &unstructured.Unstructured{}
+	if err := json.Unmarshal(req.OldObject.Raw, old); err != nil {
+		return admission.Errored(http.StatusBadRequest, err)
+	}
+	source, _, _ := unstructured.NestedString(old.Object, "spec", "bootstrap", "recovery", "source")
+	if source != RecoverySource {
+		return admission.Allowed("not recovered by this webhook")
+	}
+
+	cluster := &unstructured.Unstructured{}
+	if err := json.Unmarshal(req.Object.Raw, cluster); err != nil {
+		return admission.Errored(http.StatusBadRequest, err)
+	}
+	if _, found, _ := unstructured.NestedMap(cluster.Object, "spec", "bootstrap", "initdb"); !found {
+		return admission.Allowed("no initdb to drop")
+	}
+	unstructured.RemoveNestedField(cluster.Object, "spec", "bootstrap", "initdb")
+
+	patched, err := json.Marshal(cluster)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
 	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
 }
 
