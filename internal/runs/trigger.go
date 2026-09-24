@@ -12,6 +12,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -25,6 +26,15 @@ const Finalizer = "backup.wlz.li/run-cleanup"
 // pollInterval is how often a waiting run looks again. The movers' progress is
 // not watched, so this is the resolution of every wait in this package.
 const pollInterval = 10 * time.Second
+
+// after requeues after d, or returns err alone. controller-runtime ignores a
+// requeue that comes with an error, and warns about the pair.
+func after(d time.Duration, err error) (ctrl.Result, error) {
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: d}, nil
+}
 
 // TriggerFor returns the manual tag a run writes onto a source.
 //

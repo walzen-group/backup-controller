@@ -5,11 +5,19 @@ restic repository by asking VolSync to restore into it, so the resulting volume
 is an ordinary dataset with nothing behind it.
 
 It carries three kinds. A VolumeRestore is a standing declaration that fills a
-claim as the claim is created, always from the newest backup, with no operator
-involved. A BackupRun takes one backup now. A RestoreRun writes a chosen
-snapshot back, either into the volume the app already has or into a second one
-beside it. [docs/restores.md](docs/restores.md) says which answers which
-question.
+claim as the claim is created, from the newest backup, with no admin involved.
+A BackupRun takes one backup now, of one volume, one database, or a whole
+namespace. A RestoreRun writes a chosen moment back, of one volume, one
+database, or a whole namespace. [docs/restores.md](docs/restores.md) says which
+answers which question.
+
+From v0.5.0 the controller also schedules a namespace's backups. A namespace
+names its schedule in `backup.wlz.li/schedule`, each claim and CloudNativePG
+Cluster opts in with `backup.wlz.li/enabled`, and every tick becomes a BackupRun
+that Kueue admits as one unit and that stops the workloads marked
+`backup.wlz.li/quiesce` while the volumes' clones are cut.
+[docs/namespace-backups.md](docs/namespace-backups.md) has the mechanism, with
+every mode measured on the walzen prod cluster on 2026-09-24.
 
 Status, 2026-09-14: released at v0.2.4. VolumeRestore and BackupRun are proven
 on the walzen test cluster. A canary's claim was destroyed and refilled from
@@ -118,6 +126,7 @@ on any volume where the clone is acceptable.
 | [docs/architecture.md](docs/architecture.md) | the object flow, the library it builds on, and what runs where |
 | [docs/api.md](docs/api.md) | the custom resources: every field, their status, and a worked example |
 | [docs/restores.md](docs/restores.md) | what fills a claim, what overwrites one, and which to reach for |
+| [docs/namespace-backups.md](docs/namespace-backups.md) | the annotations, the scheduler, the runs, quiesce and the metrics, measured on the prod canary |
 | [docs/packaging.md](docs/packaging.md) | the release: image, rendered manifests, Helm chart, and what each asset has to contain |
 | [docs/integration.md](docs/integration.md) | how the infrastructure repository installs and consumes it |
 | [docs/decisions.md](docs/decisions.md) | why this shape rather than the alternatives that were rejected |

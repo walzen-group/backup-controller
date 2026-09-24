@@ -147,7 +147,7 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	run.Status.StartedAt = &now
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "restoring")
-	return ctrl.Result{RequeueAfter: time.Second}, r.writeStatus(ctx, run)
+	return after(time.Second, r.writeStatus(ctx, run))
 }
 
 // items lists what the run's spec names.
@@ -332,14 +332,14 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 
 	switch {
 	case len(recreate) > 0:
-		return ctrl.Result{RequeueAfter: pollInterval}, r.waitFor(ctx, run, backupv1alpha1.ReasonRecreate,
-			fmt.Sprintf("recreate %s to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it", strings.Join(recreate, ", ")))
+		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonRecreate,
+			fmt.Sprintf("recreate %s to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it", strings.Join(recreate, ", "))))
 	case waitReason != "":
-		return ctrl.Result{RequeueAfter: pollInterval}, r.waitFor(ctx, run, waitReason, waitMessage)
+		return after(pollInterval, r.waitFor(ctx, run, waitReason, waitMessage))
 	}
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "restoring")
-	return ctrl.Result{RequeueAfter: pollInterval}, r.writeStatus(ctx, run)
+	return after(pollInterval, r.writeStatus(ctx, run))
 }
 
 // restoreVolume advances one in-place volume restore, and returns a waiting

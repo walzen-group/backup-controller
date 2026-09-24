@@ -31,6 +31,20 @@ func TestParseBackupInfoReadsTheEndToTheMicrosecond(t *testing.T) {
 	}
 }
 
+// barman-cloud writes no backup_id into backup.info; the ID is the directory.
+func TestABaseBackupIsNamedByItsDirectory(t *testing.T) {
+	// The ID format is barman's, as CloudNativePG reported it for the prod
+	// canary's Backup canary-namespace-backup-pg-a9158795: 20260924T224544.
+	info := "status=DONE\nend_time=2026-09-24 22:45:54.061271+00:00\n"
+	backup, done, err := baseBackupAt("canary-namespace-backup/canary-namespace-backup-pg/base/20260924T224544/backup.info", []byte(info))
+	if err != nil || !done {
+		t.Fatalf("backup = %+v, done = %v, err = %v", backup, done, err)
+	}
+	if backup.ID != "20260924T224544" {
+		t.Errorf("id = %q, want the directory name", backup.ID)
+	}
+}
+
 func TestParseBackupInfoSkipsABackupThatDidNotFinish(t *testing.T) {
 	_, done, err := ParseBackupInfo([]byte("backup_id=x\nstatus=FAILED\n"))
 	if err != nil {

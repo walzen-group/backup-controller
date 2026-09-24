@@ -1,7 +1,9 @@
 # API
 
-One custom resource. A claim names it in `dataSourceRef`, and it says which
-restic repository to restore from.
+This page covers the VolumeRestore, which a claim names in `dataSourceRef` to
+say which restic repository to restore from. BackupRun and RestoreRun, and the
+annotations a namespace declares its backups with, are in
+[namespace-backups.md](namespace-backups.md).
 
 ## VolumeRestore
 

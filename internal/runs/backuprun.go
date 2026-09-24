@@ -93,7 +93,7 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 	run.Status.Phase = backupv1alpha1.RunPhaseQueued
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonQueued,
 		"waiting for the backup queue to admit the run")
-	return ctrl.Result{RequeueAfter: time.Second}, r.writeStatus(ctx, run)
+	return after(time.Second, r.writeStatus(ctx, run))
 }
 
 // items lists what the run's spec names. Everything it backs up has to be
@@ -182,7 +182,7 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	run.Status.StartedAt = newTime(metav1.NewTime(r.Now()))
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "backing up")
-	return ctrl.Result{RequeueAfter: time.Second}, r.writeStatus(ctx, run)
+	return after(time.Second, r.writeStatus(ctx, run))
 }
 
 // work stops the quiesced workloads, starts every item, restarts the
@@ -207,8 +207,8 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 			return ctrl.Result{}, err
 		}
 		if !gone {
-			return ctrl.Result{RequeueAfter: time.Second * 2}, r.waitFor(ctx, run, backupv1alpha1.ReasonRunning,
-				fmt.Sprintf("waiting for pod %s to stop before the clones are cut", pod))
+			return after(2*time.Second, r.waitFor(ctx, run, backupv1alpha1.ReasonRunning,
+				fmt.Sprintf("waiting for pod %s to stop before the clones are cut", pod)))
 		}
 	}
 
@@ -246,7 +246,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	}
 
 	if waiting != "" {
-		return ctrl.Result{RequeueAfter: pollInterval}, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, waiting)
+		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, waiting))
 	}
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "backing up")
@@ -256,7 +256,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		// looks more often than the others.
 		interval = 2 * time.Second
 	}
-	return ctrl.Result{RequeueAfter: interval}, r.writeStatus(ctx, run)
+	return after(interval, r.writeStatus(ctx, run))
 }
 
 // quiesce stops the marked workloads and records what it changed before
@@ -273,8 +273,8 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		source := &volsyncv1alpha1.ReplicationSource{}
 		err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
 		if err == nil && busy(source) && manualTag(source) != TriggerFor(run.UID) {
-			return ctrl.Result{RequeueAfter: pollInterval}, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy,
-				fmt.Sprintf("ReplicationSource %s is still completing another run's backup", item.Name))
+			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy,
+				fmt.Sprintf("ReplicationSource %s is still completing another run's backup", item.Name)))
 		}
 	}
 

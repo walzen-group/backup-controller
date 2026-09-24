@@ -4,7 +4,7 @@ Three operations bring data back, and they differ in what they discard. This
 page owns that distinction; [api.md](api.md) describes the VolumeRestore field
 by field and [architecture.md](architecture.md) has the object flow.
 
-## The one thing to know first
+## Know this first
 
 A volume populator acts once, at the moment a claim is created. A VolumeRestore
 is a standing declaration that says where a new volume's contents come from, and
@@ -47,13 +47,13 @@ flowchart TD
 | To do this | Create | Stop the workload | What is discarded |
 | --- | --- | --- | --- |
 | rebuild from the newest backup | nothing, delete the claim | yes, to release the claim | the volume's current contents |
-| read an older snapshot beside the live volume | a second VolumeRestore with `restoreAsOf`, and a claim naming it | no | nothing |
-| write an older snapshot into the existing volume | a ReplicationDestination in Direct mode | yes, the mover mounts the claim | the volume's current contents |
+| read an older snapshot beside the live volume | a RestoreRun with `into:` | no | nothing |
+| write an older snapshot into the existing volume | a RestoreRun naming the claim | yes, the mover mounts the claim | the volume's current contents |
 
 The middle row is the one to reach for when the question is whether an older
 backup is any better, because it answers that without betting the current data on
-the answer. A VolumeRestore is a standing declaration rather than a one-shot job,
-so any number of them can exist at once, each naming its own point in time.
+the answer. A VolumeRestore is a standing declaration, so any number of them can
+exist at once, each naming its own point in time.
 
 ## Which claim shapes each one works on
 
@@ -87,8 +87,8 @@ two ways back for a dynamic one.
 
 The Direct-mode restore itself is indifferent to the shape. It names
 `destinationPVC` and writes into whatever claim that is, without knowing how the
-claim was provisioned, so nothing about moving a volume onto a VolumeRestore
-takes the in-place restore away from it.
+claim was provisioned, so a volume moved onto a VolumeRestore keeps its in-place
+restore.
 
 ## Why an in-place restore needs the workload stopped
 
@@ -107,48 +107,29 @@ destination after it; a Flux app is suspended and scaled down by hand.
 
 Two of the three operations discard what the volume holds. Whatever has not
 reached the repository is gone with it, so take a backup on demand first
-whenever the newest writes might matter. Submit a BackupRun and watch it the way
-you would a Job:
+whenever the newest writes might matter. Submit a BackupRun naming the claim, or
+`all: true` for everything the namespace marks backup.wlz.li/enabled, and watch
+it the way you would a Job:
 
 ```yaml
 apiVersion: backup.wlz.li/v1alpha1
 kind: BackupRun
 metadata:
   name: before-the-rebuild
-  namespace: canary-backup
+  namespace: canary-namespace-backup
 spec:
-  source: canary-backup
+  source: canary-namespace-backup-data
 ```
 
-`kubectl -n canary-backup get brun` prints the source, the phase and the age,
-which are the columns the CRD declares. The phase runs Running to Succeeded, or
-to Failed with the reason on the Ready condition.
+The phase runs Queued, Running and Succeeded, or Failed with the reason on the
+Ready condition. `status.items[].snapshotTime` holds the time restic stamped on
+the snapshot the mover saved, and the object stays as the record. Set
+`ttlSecondsAfterFinished` to have it clean itself up.
 
-`status.snapshotTime` then holds the moment the repository captured, and the
-object stays as the record. Set `ttlSecondsAfterFinished` to have it clean
-itself up.
-
-### Why this is an object rather than a procedure
-
-A ReplicationSource accepts one trigger and a manual tag wins wherever both are
-set, so running one backup by hand means writing a tag and taking it away again.
-Leaving the tag behind is silent and permanent: the source reports healthy,
-keeps its `lastSyncTime`, and takes no further backups, because the state
-machine syncs only while `spec.trigger.manual` differs from
-`status.lastManualSync`.
-
-Nothing else clears it for you. Server-side apply prunes only the fields its own
-manager set, and client-side apply leaves alone any live field absent from both
-its last-applied annotation and its desired state, so the tag survives a
-reconcile while the schedule comes back beside it. Measured on the walzen test
-cluster on 2026-09-14: after `terragrunt apply`, the trigger read
-`{"manual":"manual-test-1","schedule":"*/15 * * * *"}` with `nextSyncTime` empty.
-
-The controller closes that. It clears the tag on success, on failure and on
-timeout, and a finalizer means deleting the run mid-flight clears it too. The
-schedule is never in the payload at all: the controller writes and removes
-`spec.trigger.manual` and nothing else, so the field Flux and tofu declare stays
-entirely theirs.
+The controller writes the claim's ReplicationSource itself and keeps the spent
+manual tag on it between runs, because VolSync syncs a source with no trigger in
+a tight loop. [namespace-backups.md](namespace-backups.md) has the whole
+mechanism, the scheduler and the measured runs.
 
 ## Submitting a restore
 
@@ -167,7 +148,7 @@ spec:
   restoreAsOf: "2026-09-13T00:00:00Z"
 ```
 
-That is the in-place restore, and it waits rather than stopping anything. While
+That is the in-place restore, and it stops nothing itself. While
 a pod still mounts the claim the run sits in phase Waiting, with the reason
 ClaimInUse and a message naming the pod that holds it. Stop the workload however
 that app is deployed and the restore begins on its own.
@@ -184,7 +165,16 @@ spec:
 
 The controller writes a VolumeRestore carrying that point in time and a claim
 naming it, so the ordinary populator path fills it. Mount `canary-backup-friday`
-from a throwaway pod and compare. Deleting it takes its dataset with it.
+from a throwaway pod and compare. Deleting the claim deletes its dataset too.
+
+Before it creates anything, a run lists the repository's snapshots and fails
+with reason NoBackupInReach when none is at or before `restoreAsOf`. VolSync's
+mover would otherwise print `No eligible snapshots found`, exit 0, and report
+success having written nothing.
+
+`database: <cluster>` restores one database and `all: true` every enabled volume
+and database in the namespace; [namespace-backups.md](namespace-backups.md)
+shows both on the prod canary.
 
 To restore a repository no claim in the namespace owns, name the Secret instead
 of a claim. It has to be a Secret in the run's own namespace: a run that could
@@ -202,7 +192,7 @@ spec:
 
 Everything above is about volumes. A CloudNativePG database has the same gap
 that a volume used to have, and the controller closes it the same way: by
-deciding at creation time rather than asking anyone.
+deciding at creation time.
 
 `spec.bootstrap` is read once, when CloudNativePG creates a Cluster, and never
 again. So a Cluster created after a cluster rebuild bootstraps with `initdb`,
@@ -215,17 +205,19 @@ store the Cluster archives through:
 | What it finds | What it does |
 | --- | --- |
 | no base backup | nothing; the Cluster bootstraps as written |
-| a base backup | rewrites the Cluster to recover from it |
-| the Cluster already declares a recovery | nothing; a point in time was asked for on purpose |
+| a base backup | rewrites the Cluster to recover from it, to the end of the archive |
+| a base backup, and a RestoreRun that deleted this Cluster | rewrites it to recover to the run's `restoreAsOf`, and names the run in `backup.wlz.li/restore-run` |
+| a base backup, and `backup.wlz.li/restore-as-of` on the Cluster | rewrites it to recover to that moment |
+| no base backup at or before the moment a run or the annotation asks for | refuses the Cluster, naming the oldest base backup |
+| the Cluster already declares a recovery | nothing, unless a RestoreRun waits for this Cluster; then it refuses it, so two targets cannot race |
 | `backup.wlz.li/bootstrap: initdb` | nothing; an empty database was asked for on purpose |
 
 Neither kustomize nor OpenTofu can make that choice, because both render their
 manifests before anything has spoken to the object store. Admission is the one
 moment when the Cluster is known and the store is reachable.
 
-A rewritten Cluster gets three things: `bootstrap.recovery` naming an
-`externalClusters` entry the webhook adds, and the annotation
-`cnpg.io/skipEmptyWalArchiveCheck`. The annotation is needed because
+A rewritten Cluster gets `bootstrap.recovery`, the `externalClusters` entry that
+recovery names, and the annotation `cnpg.io/skipEmptyWalArchiveCheck`. The annotation is needed because
 CloudNativePG refuses to archive into a prefix that already holds WAL, which is
 true of every restore: the prefix a database recovers from is the prefix it
 archives to.
@@ -242,7 +234,7 @@ admission webhook "vcluster.cnpg.io" denied the request: Cluster.cluster.cnpg.io
 bootstrap method can be specified at a time
 ```
 
-A second webhook entry takes updates. When the stored Cluster has a `recovery`
+A second webhook entry receives updates. When the stored Cluster has a `recovery`
 whose source is `backup-controller`, the handler drops `initdb` from the
 incoming object. It reads nothing, so it also acts on dry-runs, which is where
 Flux first hits the refusal. A Cluster without that recovery source is left as
@@ -269,6 +261,9 @@ WAL filenames are timeline plus position and nothing else, so the second
 database overwrites the first's segments, and a base backup whose WAL range is
 gone can never reach consistency again.
 
+A Cluster that declares its own recovery is checked like any other: where a
+Cluster archives does not depend on how it bootstraps.
+
 It compares resolved destinations rather than names, because two Clusters can
 reach one prefix through differently named ObjectStores. The Cluster being
 admitted is skipped by namespace and name, so recreating a database is not a
@@ -294,7 +289,7 @@ bundle, and the Barman Cloud plugin already reads it for exactly this reason.
 So an endpoint that needs a CA is described once, on the store, and the plugin
 and this controller both pick it up. A store that needs none declares none.
 
-### Refusing rather than guessing
+### Refuse a Cluster the webhook cannot decide
 
 The creation entry is registered with `failurePolicy: Fail`. When it cannot
 run, or cannot read the object store, the Cluster is refused.

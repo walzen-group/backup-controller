@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -53,7 +54,7 @@ func (p S3Prober) BaseBackups(ctx context.Context, at Location) ([]BaseBackup, e
 		if err != nil {
 			return nil, fmt.Errorf("read %s/%s: %w", at.Bucket, object.Key, err)
 		}
-		backup, done, err := ParseBackupInfo(raw)
+		backup, done, err := baseBackupAt(object.Key, raw)
 		if err != nil {
 			return nil, fmt.Errorf("%s/%s: %w", at.Bucket, object.Key, err)
 		}
@@ -63,6 +64,22 @@ func (p S3Prober) BaseBackups(ctx context.Context, at Location) ([]BaseBackup, e
 	}
 	sort.Slice(backups, func(i, j int) bool { return backups[i].End.Before(backups[j].End) })
 	return backups, nil
+}
+
+// baseBackupAt reads the backup.info stored at key, base/<id>/backup.info.
+//
+// barman-cloud's backup.info carries no backup_id, so the directory holding it
+// names the backup. Measured on the prod canary: a refusal named an empty ID
+// until the ID came from the key.
+func baseBackupAt(key string, raw []byte) (BaseBackup, bool, error) {
+	backup, done, err := ParseBackupInfo(raw)
+	if err != nil {
+		return BaseBackup{}, false, err
+	}
+	if backup.ID == "" {
+		backup.ID = path.Base(path.Dir(key))
+	}
+	return backup, done, nil
 }
 
 // ParseBackupInfo reads the fields of a barman backup.info this controller
