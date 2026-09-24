@@ -214,6 +214,10 @@ Cluster deleted:
 PersistentVolumeClaim canary-namespace-backup-data: no snapshot at or before 2026-09-24T21:00:00Z; the oldest, defb7a4d, is from 2026-09-24T22:09:58Z
 ```
 
+```text
+Cluster canary-namespace-backup-pg: no base backup finished by 2026-09-24T22:12:00Z; the oldest, 20260924T221544, finished at 2026-09-24T22:15:45Z
+```
+
 Without the first check, VolSync's mover prints `No eligible snapshots found`,
 exits 0, and the restore reports success having written nothing.
 
@@ -291,9 +295,19 @@ Cluster, the same destroy and apply came back to that moment on both sides:
 start db=[10 2026-09-24T22:14:38Z,2026-09-24T22:15:38Z,2026-09-24T22:15:47Z] file=[9 2026-09-24T22:13:38Z,2026-09-24T22:14:38Z,2026-09-24T22:15:38Z]
 ```
 
-A claim pinned before every snapshot stays Pending with reason NoBackupInReach on
-its VolumeRestore, and the webhook refuses a Cluster pinned before every base
-backup. The annotation pins every later creation too, so it raises the
+The webhook refuses a Cluster pinned before every base backup. The canary
+applied with `backup.wlz.li/restore-as-of: "2026-09-24T21:00:00Z"` failed on:
+
+```text
+admission webhook "bootstrap.backup.wlz.li" denied the request: annotation backup.wlz.li/restore-as-of asks for 2026-09-24T21:00:00Z, and no base backup in prod-cluster-backup-cnpg/canary-namespace-backup/canary-namespace-backup-pg/base/ finished by then; the oldest, 20260924T221544, finished at 2026-09-24T22:15:45Z.
+```
+
+A claim pinned before every snapshot stays Pending, with reason NoBackupInReach
+on its VolumeRestore, once a pod is scheduled for it. The populator's test
+covers that; on the canary the writer depends on the refused Cluster, so no pod
+was scheduled and the populator never ran.
+
+The annotation pins every later creation too, so it raises the
 `backup_controller_restore_pinned` series while it is set.
 
 ## Metrics
