@@ -3,10 +3,12 @@ package populator
 import (
 	"context"
 	"fmt"
+	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/restic"
 	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -30,11 +32,40 @@ type Operations interface {
 type Callbacks struct {
 	operations Operations
 	namespace  string
+	snapshots  restic.Lister
 }
 
-// New returns provider callbacks backed by the supplied operations.
-func New(operations Operations, namespace string) *Callbacks {
-	return &Callbacks{operations: operations, namespace: namespace}
+// New returns provider callbacks backed by the supplied operations. snapshots
+// lists a repository's snapshots, for a claim that pins its restore to a
+// moment with backup.wlz.li/restore-as-of.
+func New(operations Operations, namespace string, snapshots restic.Lister) *Callbacks {
+	return &Callbacks{operations: operations, namespace: namespace, snapshots: snapshots}
+}
+
+// pinnedOutOfReach returns a reason when the claim pins its restore to a moment
+// no snapshot reaches. VolSync would restore nothing and report success, and
+// the claim would bind an empty volume.
+func (c *Callbacks) pinnedOutOfReach(ctx context.Context, claim *corev1.PersistentVolumeClaim, repo *corev1.Secret) (string, error) {
+	value, ok := claim.Annotations[backupv1alpha1.AnnotationRestoreAsOf]
+	if !ok || c.snapshots == nil {
+		return "", nil
+	}
+	at, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return fmt.Sprintf("%s is %q, which is not an RFC 3339 time", backupv1alpha1.AnnotationRestoreAsOf, value), nil
+	}
+	snapshots, err := c.snapshots.Snapshots(ctx, repo)
+	if err != nil {
+		return "", fmt.Errorf("list the snapshots in %s: %w", repo.Name, err)
+	}
+	if _, ok := restic.AtOrBefore(snapshots, at); ok {
+		return "", nil
+	}
+	if len(snapshots) == 0 {
+		return fmt.Sprintf("%s asks for %s and the repository holds no snapshot", backupv1alpha1.AnnotationRestoreAsOf, value), nil
+	}
+	return fmt.Sprintf("%s asks for %s; the oldest snapshot, %s, is from %s",
+		backupv1alpha1.AnnotationRestoreAsOf, value, snapshots[0].ShortID(), snapshots[0].Time.UTC().Format(time.RFC3339)), nil
 }
 
 // Populate creates the repository Secret copy and ReplicationDestination.
@@ -67,6 +98,20 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 	if _, err := c.operations.GetReplicationDestination(ctx, c.namespace, destinationName); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return fmt.Errorf("get ReplicationDestination %s/%s: %w", c.namespace, destinationName, err)
+		}
+		reason, err := c.pinnedOutOfReach(ctx, claim, repo)
+		if err != nil {
+			return err
+		}
+		if reason != "" {
+			// The claim stays Pending and the library retries, so fixing the
+			// annotation or recreating the claim without it lets it fill.
+			setClaimStatus(vr, claim, backupv1alpha1.RestorePhaseFailed)
+			backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonNoBackupInReach, reason)
+			if err := c.operations.SetStatus(ctx, vr); err != nil {
+				return fmt.Errorf("set VolumeRestore status: %w", err)
+			}
+			return fmt.Errorf("claim %s/%s: %s", claim.Namespace, claim.Name, reason)
 		}
 		destination := internalvolsync.New(vr, claim, prime.Name, c.namespace)
 		if err := c.operations.CreateReplicationDestination(ctx, destination); err != nil && !apierrors.IsAlreadyExists(err) {

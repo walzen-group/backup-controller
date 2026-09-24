@@ -16,6 +16,7 @@ import (
 	"time"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
+	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,12 +28,17 @@ import (
 
 // stubProber answers the base backup question without an object store.
 type stubProber struct {
-	has bool
-	err error
+	has     bool
+	err     error
+	backups []BaseBackup
 }
 
 func (s stubProber) HasBaseBackup(context.Context, Location) (bool, error) {
 	return s.has, s.err
+}
+
+func (s stubProber) BaseBackups(context.Context, Location) ([]BaseBackup, error) {
+	return s.backups, s.err
 }
 
 func scheme(t *testing.T) *runtime.Scheme {
@@ -40,6 +46,9 @@ func scheme(t *testing.T) *runtime.Scheme {
 	s := runtime.NewScheme()
 	if err := corev1.AddToScheme(s); err != nil {
 		t.Fatalf("register the core types: %v", err)
+	}
+	if err := backupv1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("register the backup types: %v", err)
 	}
 	// The handler reads both kinds as unstructured, so the fake client needs
 	// them by GVK rather than by Go type.
@@ -107,7 +116,7 @@ func secret() *corev1.Secret {
 	}
 }
 
-func decide(t *testing.T, c *unstructured.Unstructured, prober Prober, existing ...*unstructured.Unstructured) admission.Response {
+func decide(t *testing.T, c *unstructured.Unstructured, prober Prober, existing ...runtime.Object) admission.Response {
 	t.Helper()
 	raw, err := json.Marshal(c)
 	if err != nil {
@@ -115,10 +124,7 @@ func decide(t *testing.T, c *unstructured.Unstructured, prober Prober, existing 
 	}
 
 	builder := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(secret())
-	objects := []runtime.Object{store()}
-	for _, object := range existing {
-		objects = append(objects, object)
-	}
+	objects := append([]runtime.Object{store()}, existing...)
 	builder = builder.WithRuntimeObjects(objects...)
 
 	decider := &Decider{Client: builder.Build(), Prober: prober}
@@ -325,6 +331,147 @@ func TestTheOptOutAnnotationKeepsTheDatabaseEmpty(t *testing.T) {
 	}
 	if len(response.Patches) != 0 {
 		t.Fatalf("an opted-out cluster was rewritten: %v", response.Patches)
+	}
+}
+
+// declaredRecovery is a Cluster written the way the terragrunt restore input
+// and the Flux postgres-recovery component write one.
+func declaredRecovery(t *testing.T) *unstructured.Unstructured {
+	return cluster(t, func(object map[string]any) {
+		spec, _ := object["spec"].(map[string]any)
+		spec["bootstrap"] = map[string]any{
+			"recovery": map[string]any{
+				"source":         "objectstore",
+				"recoveryTarget": map[string]any{"targetTime": "2026-09-15T07:33:00Z"},
+			},
+		}
+	})
+}
+
+// waiting is a RestoreRun that deleted app-pg and waits for it to come back.
+func waiting(asOf *string) *backupv1alpha1.RestoreRun {
+	return &backupv1alpha1.RestoreRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "back-to-monday", Namespace: "app"},
+		Spec:       backupv1alpha1.RestoreRunSpec{Database: "app-pg", RestoreAsOf: asOf},
+		Status: backupv1alpha1.RestoreRunStatus{
+			Phase: backupv1alpha1.RunPhaseWaiting,
+			Items: []backupv1alpha1.RestoreItem{{Kind: "Cluster", Name: "app-pg", Phase: backupv1alpha1.ItemDeleted}},
+		},
+	}
+}
+
+var monday = time.Date(2026, 9, 21, 0, 0, 0, 0, time.UTC)
+
+// A declared recovery archives like any other Cluster, so it collides like
+// one: two databases writing one prefix interleave their WAL whatever either
+// bootstrapped from.
+func TestADeclaredRecoveryIsRefusedWhenAnotherArchivesThere(t *testing.T) {
+	other := cluster(t, func(object map[string]any) {
+		metadata, _ := object["metadata"].(map[string]any)
+		metadata["name"] = "second-pg"
+	})
+	other.SetAPIVersion("postgresql.cnpg.io/v1")
+	other.SetKind("Cluster")
+	// second-pg archives to app-pg's prefix by naming it as its server.
+	plugins, _, _ := unstructured.NestedSlice(other.Object, "spec", "plugins")
+	plugin, _ := plugins[0].(map[string]any)
+	plugin["parameters"] = map[string]any{"barmanObjectName": "app-pg-store", "serverName": "app-pg"}
+	_ = unstructured.SetNestedSlice(other.Object, plugins, "spec", "plugins")
+
+	response := decide(t, declaredRecovery(t), stubProber{has: true}, other)
+
+	if response.Allowed {
+		t.Fatal("a declared recovery was admitted onto a prefix another database archives to")
+	}
+	if !strings.Contains(response.Result.Message, "app/second-pg") {
+		t.Errorf("the refusal does not name the holder: %q", response.Result.Message)
+	}
+}
+
+func TestARunWaitingForTheClusterSetsItsTarget(t *testing.T) {
+	asOf := "2026-09-22T00:00:00Z"
+	original := cluster(t, nil)
+	prober := stubProber{has: true, backups: []BaseBackup{{ID: "20260920T030000", End: monday.Add(-24 * time.Hour)}}}
+
+	response := decide(t, original, prober, waiting(&asOf))
+	if !response.Allowed {
+		t.Fatalf("the cluster was refused: %v", response.Result)
+	}
+	patched := applied(t, original, response)
+
+	target, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "recoveryTarget", "targetTime")
+	if target != asOf {
+		t.Errorf("targetTime = %q, want the run's restoreAsOf %q", target, asOf)
+	}
+	annotations, _, _ := unstructured.NestedStringMap(patched, "metadata", "annotations")
+	if annotations[backupv1alpha1.AnnotationRestoreRun] != "back-to-monday" {
+		t.Errorf("%s = %q, want the run's name", backupv1alpha1.AnnotationRestoreRun, annotations[backupv1alpha1.AnnotationRestoreRun])
+	}
+}
+
+func TestARunWithoutAMomentRecoversToTheEndOfTheArchive(t *testing.T) {
+	original := cluster(t, nil)
+	response := decide(t, original, stubProber{has: true}, waiting(nil))
+	patched := applied(t, original, response)
+
+	if _, found, _ := unstructured.NestedMap(patched, "spec", "bootstrap", "recovery", "recoveryTarget"); found {
+		t.Error("a run without restoreAsOf set a recovery target")
+	}
+	annotations, _, _ := unstructured.NestedStringMap(patched, "metadata", "annotations")
+	if annotations[backupv1alpha1.AnnotationRestoreRun] != "back-to-monday" {
+		t.Error("the recovered Cluster does not name the run")
+	}
+}
+
+func TestADeclaredRecoveryIsRefusedWhileARunWaits(t *testing.T) {
+	response := decide(t, declaredRecovery(t), stubProber{has: true}, waiting(nil))
+
+	if response.Allowed {
+		t.Fatal("a declared recovery was admitted while a RestoreRun waits for the same Cluster")
+	}
+	if !strings.Contains(response.Result.Message, "back-to-monday") {
+		t.Errorf("the refusal does not name the run: %q", response.Result.Message)
+	}
+}
+
+func TestTheRestoreAsOfAnnotationSetsTheTarget(t *testing.T) {
+	original := cluster(t, func(object map[string]any) {
+		metadata, _ := object["metadata"].(map[string]any)
+		metadata["annotations"] = map[string]any{backupv1alpha1.AnnotationRestoreAsOf: "2026-09-22T00:00:00Z"}
+	})
+	prober := stubProber{has: true, backups: []BaseBackup{{ID: "a", End: monday}}}
+
+	response := decide(t, original, prober)
+	patched := applied(t, original, response)
+
+	target, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "recoveryTarget", "targetTime")
+	if target != "2026-09-22T00:00:00Z" {
+		t.Errorf("targetTime = %q, want the annotation's time", target)
+	}
+}
+
+// A target before the oldest base backup finished is one Postgres can never
+// reach, so the Cluster is refused with the oldest backup named.
+func TestATargetBeforeEveryBaseBackupIsRefused(t *testing.T) {
+	asOf := "2026-09-01T00:00:00Z"
+	prober := stubProber{has: true, backups: []BaseBackup{{ID: "20260920T030000", End: monday}}}
+
+	response := decide(t, cluster(t, nil), prober, waiting(&asOf))
+
+	if response.Allowed {
+		t.Fatal("a target before every base backup was admitted")
+	}
+	if !strings.Contains(response.Result.Message, "20260920T030000") {
+		t.Errorf("the refusal does not name the oldest backup: %q", response.Result.Message)
+	}
+}
+
+// A run that asks for a recovery must not come back as an empty database.
+func TestARunIsRefusedWhenTheStoreHoldsNoBaseBackup(t *testing.T) {
+	response := decide(t, cluster(t, nil), stubProber{has: false}, waiting(nil))
+
+	if response.Allowed {
+		t.Fatal("a Cluster a RestoreRun waits for was admitted to initdb")
 	}
 }
 

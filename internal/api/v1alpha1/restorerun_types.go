@@ -6,13 +6,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// RestoreRunSpec asks for one restore from a repository, at a point in time of
-// your choosing.
+// RestoreRunSpec asks for one restore: of one volume, of one database, or of
+// everything the namespace marks backup.wlz.li/enabled, to the newest backup
+// or to a chosen moment.
 //
-// A VolumeRestore fills a claim at the moment the claim is created, and always
-// from the newest backup. This object is the other operation: it acts on a
-// claim that already exists and holds data, and it can reach any snapshot in
-// the repository. docs/restores.md has the three shapes and what each discards.
+// A volume restores in place, or into a new claim with Into. A database
+// restores by being created again: the run deletes its Cluster, and when Flux
+// or tofu creates it again the bootstrap webhook recovers it to RestoreAsOf.
+// +kubebuilder:validation:XValidation:rule="((has(self.claim) || has(self.repository)) ? 1 : 0) + (has(self.database) ? 1 : 0) + ((has(self.all) && self.all) ? 1 : 0) == 1",message="set exactly one of claim (or repository), database and all"
+// +kubebuilder:validation:XValidation:rule="!has(self.previous) || has(self.claim) || has(self.repository)",message="previous applies to one volume only"
+// +kubebuilder:validation:XValidation:rule="!has(self.into) || has(self.claim) || has(self.repository)",message="into needs claim or repository"
 type RestoreRunSpec struct {
 	// Claim is the claim in this namespace whose repository to restore from,
 	// and, unless Into names another, the claim the restore writes into.
@@ -25,8 +28,7 @@ type RestoreRunSpec struct {
 	Claim string `json:"claim,omitempty"`
 
 	// Repository is the restic Secret in this namespace to restore from, for a
-	// restore whose source is not a claim in this namespace. Exactly one of
-	// Claim and Repository is required.
+	// restore whose source is not a claim in this namespace. It needs Into.
 	//
 	// The Secret has to be in this namespace. A RestoreRun that could name a
 	// Secret anywhere would let whoever may create one here read any backup in
@@ -39,22 +41,30 @@ type RestoreRunSpec struct {
 	// Into is a claim to create and fill, leaving the source claim untouched.
 	// Omitted, the restore overwrites Claim in place and the workload holding
 	// it has to be stopped first.
-	//
-	// This is the shape to reach for when the question is whether an older
-	// backup is any better, because it answers that without betting the current
-	// data on the answer.
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
 	Into string `json:"into,omitempty"`
 
 	// IntoSize is the size of the claim named by Into. Omitted, the source
-	// claim's request is used, which is what you want unless the repository
-	// holds more than the live volume now does.
+	// claim's request is used.
 	// +optional
 	IntoSize *resource.Quantity `json:"intoSize,omitempty"`
 
-	// RestoreAsOf selects the newest snapshot taken at or before this time.
-	// Omitted, and with Previous unset, the newest snapshot is used.
+	// Database is the CloudNativePG Cluster in this namespace to restore. The
+	// run deletes it, and it is recovered when it is created again.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	Database string `json:"database,omitempty"`
+
+	// All restores every claim and every Cluster in this namespace marked
+	// backup.wlz.li/enabled: the volumes in place, then the databases.
+	// +optional
+	All bool `json:"all,omitempty"`
+
+	// RestoreAsOf is the moment to restore to. A volume restores the newest
+	// snapshot taken at or before it; a database replays WAL to it exactly.
+	// Omitted, and with Previous unset, a volume restores its newest snapshot
+	// and a database the end of its WAL archive.
 	// +optional
 	// +kubebuilder:validation:Format="date-time"
 	RestoreAsOf *string `json:"restoreAsOf,omitempty"`
@@ -64,8 +74,8 @@ type RestoreRunSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	Previous *int32 `json:"previous,omitempty"`
 
-	// Timeout is how long to wait for the mover before giving up. On expiry the
-	// run fails and its ReplicationDestination is removed.
+	// Timeout is how long to wait for the movers and the recovered databases
+	// before giving up.
 	// +optional
 	// +kubebuilder:default="4h"
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
@@ -85,22 +95,15 @@ type RestoreRunSpec struct {
 
 // RestoreRunStatus reports how far the restore got.
 type RestoreRunStatus struct {
-	// Phase is the run's state, and the column `kubectl get` prints. A restore
-	// in place sits in Waiting until nothing mounts the claim.
+	// Phase is the run's state, and the column `kubectl get` prints.
 	// +optional
 	Phase RunPhase `json:"phase,omitempty"`
 
-	// Destination is the ReplicationDestination doing the work, in this
-	// namespace, for as long as the run lasts.
-	// +optional
-	Destination string `json:"destination,omitempty"`
-
-	// Target is the claim being written, which is Into when it is set and Claim
-	// otherwise.
+	// Target is the claim an Into restore creates and fills.
 	// +optional
 	Target string `json:"target,omitempty"`
 
-	// StartedAt is when the destination was created.
+	// StartedAt is when the run passed its checks and began restoring.
 	// +optional
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
 
@@ -108,21 +111,49 @@ type RestoreRunStatus struct {
 	// +optional
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 
+	// Items has one entry per volume restored in place and per database.
+	// +optional
+	Items []RestoreItem `json:"items,omitempty"`
+
 	// Conditions carry the kstatus-compatible state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// RestoreItem is one volume or database a RestoreRun restores.
+type RestoreItem struct {
+	// Kind is PersistentVolumeClaim for a volume and Cluster for a database.
+	Kind string `json:"kind"`
+	// Name is the claim's or the Cluster's name.
+	Name string `json:"name"`
+	// Phase is how far this item got.
+	Phase ItemPhase `json:"phase"`
+	// Message says why an item failed or was skipped.
+	// +optional
+	Message string `json:"message,omitempty"`
+	// Destination is the ReplicationDestination restoring a volume, while it
+	// exists.
+	// +optional
+	Destination string `json:"destination,omitempty"`
+	// Snapshot is the restic snapshot a volume restores, as its short ID.
+	// +optional
+	Snapshot string `json:"snapshot,omitempty"`
+	// BaseBackup is the barman base backup a database's recovery starts from.
+	// +optional
+	BaseBackup string `json:"baseBackup,omitempty"`
+}
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=rrun
-// +kubebuilder:printcolumn:name="Target",type=string,JSONPath=`.status.target`
+// +kubebuilder:printcolumn:name="Claim",type=string,JSONPath=`.spec.claim`
+// +kubebuilder:printcolumn:name="Database",type=string,JSONPath=`.spec.database`
+// +kubebuilder:printcolumn:name="All",type=boolean,JSONPath=`.spec.all`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// RestoreRun restores a repository into a volume, at a chosen point in time.
-// Submit it and watch it the way you would a Job; the controller creates the
-// ReplicationDestination, waits for the mover, and removes it again.
+// RestoreRun restores volumes and databases to a chosen point in time. Submit
+// it and watch it the way you would a Job.
 type RestoreRun struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

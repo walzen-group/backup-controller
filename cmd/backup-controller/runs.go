@@ -7,7 +7,9 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/runs"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
@@ -37,14 +39,17 @@ type BootstrapWebhook struct {
 }
 
 // startRunControllers brings up the manager that reconciles BackupRun and
-// RestoreRun, serves the bootstrap webhook when one is configured, and returns
-// as soon as it is running.
+// RestoreRun, runs the scheduler, serves the bootstrap webhook when one is
+// configured, and returns as soon as it is running.
 //
 // The manager is given a context of the caller's rather than
 // ctrl.SetupSignalHandler, because the populator library installs the process's
 // only signal handler and a second one on the same channel panics. Cancelling
 // that context after the library returns is what stops this manager.
-func startRunControllers(ctx context.Context, kubeconfig string, hook BootstrapWebhook) error {
+//
+// metricsAddr is where the manager serves the scheduler's series. The library
+// serves its own registry on another port, and nothing can register into it.
+func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook) error {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client configuration: %w", err)
@@ -55,6 +60,7 @@ func startRunControllers(ctx context.Context, kubeconfig string, hook BootstrapW
 	scheme := runtime.NewScheme()
 	for name, add := range map[string]func(*runtime.Scheme) error{
 		"core":          corev1.AddToScheme,
+		"apps":          appsv1.AddToScheme,
 		"volsync":       volsyncv1alpha1.AddToScheme,
 		"backup.wlz.li": backupv1alpha1.AddToScheme,
 	} {
@@ -64,11 +70,8 @@ func startRunControllers(ctx context.Context, kubeconfig string, hook BootstrapW
 	}
 
 	options := ctrl.Options{
-		Scheme: scheme,
-		// The library already serves this process's metrics endpoint, so the
-		// manager serves none: two listeners on one address and the second
-		// fails.
-		Metrics:        metricsserver.Options{BindAddress: "0"},
+		Scheme:         scheme,
+		Metrics:        metricsserver.Options{BindAddress: metricsAddr},
 		LeaderElection: false,
 	}
 	if hook.CertDir != "" {
@@ -99,11 +102,17 @@ func startRunControllers(ctx context.Context, kubeconfig string, hook BootstrapW
 		klog.Infof("serving the bootstrap webhook on :%d%s", hook.Port, bootstrap.WebhookPath)
 	}
 
-	if err := (&runs.BackupRunReconciler{Client: manager.GetClient()}).SetupWithManager(manager); err != nil {
+	reader := manager.GetAPIReader()
+	backups := &runs.BackupRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}}
+	if err := backups.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the BackupRun controller: %w", err)
 	}
-	if err := (&runs.RestoreRunReconciler{Client: manager.GetClient()}).SetupWithManager(manager); err != nil {
+	restores := &runs.RestoreRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Prober: bootstrap.S3Prober{}}
+	if err := restores.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the RestoreRun controller: %w", err)
+	}
+	if err := (&runs.Scheduler{Client: manager.GetClient(), Reader: reader}).SetupWithManager(manager); err != nil {
+		return fmt.Errorf("register the scheduler: %w", err)
 	}
 
 	go func() {
@@ -112,6 +121,6 @@ func startRunControllers(ctx context.Context, kubeconfig string, hook BootstrapW
 		}
 	}()
 
-	klog.Infof("starting backup-controller: reconciling %s BackupRun and RestoreRun", backupv1alpha1.GroupVersion.String())
+	klog.Infof("starting backup-controller: reconciling %s BackupRun and RestoreRun, scheduling namespaces", backupv1alpha1.GroupVersion.String())
 	return nil
 }

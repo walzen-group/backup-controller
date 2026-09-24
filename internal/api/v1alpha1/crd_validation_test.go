@@ -162,6 +162,65 @@ func TestCRDValidation(t *testing.T) {
 	}
 }
 
+// TestRunsNameExactlyOneScope is the API server's answer for the rules that a
+// run names one volume, one database, or the whole namespace, and never two.
+func TestRunsNameExactlyOneScope(t *testing.T) {
+	previous := int32(1)
+	backups := []struct {
+		name    string
+		spec    BackupRunSpec
+		wantErr bool
+	}{
+		{"source", BackupRunSpec{Source: "notes-data"}, false},
+		{"database", BackupRunSpec{Database: "notes-pg"}, false},
+		{"all", BackupRunSpec{All: true}, false},
+		{"nothing", BackupRunSpec{}, true},
+		{"source and all", BackupRunSpec{Source: "notes-data", All: true}, true},
+		{"source and database", BackupRunSpec{Source: "notes-data", Database: "notes-pg"}, true},
+	}
+	for i, tc := range backups {
+		t.Run("BackupRun "+tc.name, func(t *testing.T) {
+			run := &BackupRun{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("brun-%d", i), Namespace: "default"}, Spec: tc.spec}
+			check(t, k8sClient.Create(context.Background(), run), tc.wantErr)
+		})
+	}
+
+	restores := []struct {
+		name    string
+		spec    RestoreRunSpec
+		wantErr bool
+	}{
+		{"claim", RestoreRunSpec{Claim: "notes-data"}, false},
+		{"claim into", RestoreRunSpec{Claim: "notes-data", Into: "notes-data-monday"}, false},
+		{"repository into", RestoreRunSpec{Repository: "notes-restic", Into: "copy"}, false},
+		{"database", RestoreRunSpec{Database: "notes-pg"}, false},
+		{"all", RestoreRunSpec{All: true}, false},
+		{"nothing", RestoreRunSpec{}, true},
+		{"claim and database", RestoreRunSpec{Claim: "notes-data", Database: "notes-pg"}, true},
+		{"database and all", RestoreRunSpec{Database: "notes-pg", All: true}, true},
+		{"previous with all", RestoreRunSpec{All: true, Previous: &previous}, true},
+		{"into with database", RestoreRunSpec{Database: "notes-pg", Into: "copy"}, true},
+	}
+	for i, tc := range restores {
+		t.Run("RestoreRun "+tc.name, func(t *testing.T) {
+			run := &RestoreRun{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("rrun-%d", i), Namespace: "default"}, Spec: tc.spec}
+			check(t, k8sClient.Create(context.Background(), run), tc.wantErr)
+		})
+	}
+}
+
+func check(t *testing.T, err error, wantErr bool) {
+	t.Helper()
+	switch {
+	case wantErr && err == nil:
+		t.Fatal("the API server stored the run, want an Invalid rejection")
+	case wantErr && !apierrors.IsInvalid(err):
+		t.Fatalf("the API server rejected the run with %v, want apierrors.IsInvalid", err)
+	case !wantErr && err != nil:
+		t.Fatalf("the API server rejected a valid run: %v", err)
+	}
+}
+
 // TestCRDRoundTrip reads a stored object back. A schema that accepted the
 // object while dropping a field would leave a claim with nothing to restore
 // from, so the field the API server hands back is part of the contract.

@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // selectedNodeAnnotation is what a WaitForFirstConsumer class provisions
@@ -46,31 +47,26 @@ type restoreSettings struct {
 	SelectedNode string
 }
 
-// repositoryFor resolves where a run reads from and how its mover should run.
+// repositoryFor resolves where a restore reads from and how its mover runs.
 //
 // Naming a claim is the ordinary case and states nothing twice: the claim's
 // dataSourceRef names its VolumeRestore, and that object already carries the
 // repository Secret, the cache class and the queue label. Naming a repository
-// directly covers a claim that is not populated, which is every fixed-name
-// claim, and a restore from a repository no claim here owns.
-func (r *RestoreRunReconciler) repositoryFor(ctx context.Context, run *backupv1alpha1.RestoreRun) (restoreSettings, error) {
-	switch {
-	case run.Spec.Claim == "" && run.Spec.Repository == "":
-		return restoreSettings{}, fmt.Errorf("one of spec.claim and spec.repository is required")
-	case run.Spec.Claim == "" && run.Spec.Into == "":
-		return restoreSettings{}, fmt.Errorf("spec.into is required when spec.repository names the source, because there is no claim to restore in place")
-	}
-
-	settings := restoreSettings{Secret: run.Spec.Repository, MoverSecurityContext: run.Spec.MoverSecurityContext}
-	if run.Spec.Claim == "" {
+// directly covers a restore from a repository no claim here owns.
+func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, repository string, moverContext *corev1.PodSecurityContext) (restoreSettings, error) {
+	settings := restoreSettings{Secret: repository, MoverSecurityContext: moverContext}
+	if claimName == "" {
+		if repository == "" {
+			return settings, fmt.Errorf("one of spec.claim and spec.repository is required")
+		}
 		return settings, nil
 	}
 
 	claim := &corev1.PersistentVolumeClaim{}
-	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Claim}
-	if err := r.Get(ctx, key, claim); err != nil {
+	key := types.NamespacedName{Namespace: namespace, Name: claimName}
+	if err := c.Get(ctx, key, claim); err != nil {
 		if apierrors.IsNotFound(err) {
-			return settings, fmt.Errorf("no PersistentVolumeClaim %s in this namespace", run.Spec.Claim)
+			return settings, fmt.Errorf("no PersistentVolumeClaim %s in this namespace", claimName)
 		}
 		return settings, fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
 	}
@@ -80,24 +76,16 @@ func (r *RestoreRunReconciler) repositoryFor(ctx context.Context, run *backupv1a
 		settings.Capacity = &request
 	}
 
-	// A fixed-name claim names no VolumeRestore, because it binds its volume
-	// before anything could fill it. Such a claim restores in place like any
-	// other, and its run has to say which repository.
-	source := claim.Spec.DataSourceRef
-	if source == nil || source.Kind != "VolumeRestore" {
-		if settings.Secret == "" {
-			return settings, fmt.Errorf("claim %s names no VolumeRestore, so spec.repository has to say which repository to restore from", run.Spec.Claim)
+	// A fixed-name claim names no VolumeRestore in its dataSourceRef, because it
+	// binds its volume before anything could fill it; the VolumeRestore of the
+	// same name describes its repository. A run that names the repository
+	// itself needs neither.
+	vr, err := volumeRestoreFor(ctx, c, claim)
+	if err != nil {
+		if settings.Secret != "" {
+			return settings, nil
 		}
-		return settings, nil
-	}
-
-	vr := &backupv1alpha1.VolumeRestore{}
-	vrKey := types.NamespacedName{Namespace: run.Namespace, Name: source.Name}
-	if err := r.Get(ctx, vrKey, vr); err != nil {
-		if apierrors.IsNotFound(err) {
-			return settings, fmt.Errorf("claim %s names VolumeRestore %s, which does not exist", run.Spec.Claim, source.Name)
-		}
-		return settings, fmt.Errorf("get VolumeRestore %s: %w", vrKey, err)
+		return settings, err
 	}
 
 	if settings.Secret == "" {
@@ -118,7 +106,7 @@ func (r *RestoreRunReconciler) repositoryFor(ctx context.Context, run *backupv1a
 // holding the snapshot rather than a merge of the two. cleanupCachePVC drops
 // the mover's cache claim when the run ends. The trigger is the run's UID, so a
 // controller that restarts mid-restore recognises its own work.
-func directDestination(run *backupv1alpha1.RestoreRun, settings restoreSettings, name string) *volsyncv1alpha1.ReplicationDestination {
+func directDestination(run *backupv1alpha1.RestoreRun, claim string, settings restoreSettings, name string) *volsyncv1alpha1.ReplicationDestination {
 	return &volsyncv1alpha1.ReplicationDestination{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: run.Namespace},
 		Spec: volsyncv1alpha1.ReplicationDestinationSpec{
@@ -126,7 +114,7 @@ func directDestination(run *backupv1alpha1.RestoreRun, settings restoreSettings,
 			Restic: &volsyncv1alpha1.ReplicationDestinationResticSpec{
 				ReplicationDestinationVolumeOptions: volsyncv1alpha1.ReplicationDestinationVolumeOptions{
 					CopyMethod:     volsyncv1alpha1.CopyMethodDirect,
-					DestinationPVC: &run.Spec.Claim,
+					DestinationPVC: &claim,
 				},
 				Repository:            settings.Secret,
 				RestoreAsOf:           run.Spec.RestoreAsOf,

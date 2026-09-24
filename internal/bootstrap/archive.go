@@ -60,10 +60,11 @@ func (l Location) BasePrefix() string {
 	return strings.TrimPrefix(l.Prefix+"/base/", "/")
 }
 
-// Prober answers whether a base backup exists at a location. The interface
-// exists so the decision logic is testable without an object store.
+// Prober answers what base backups exist at a location. The interface exists
+// so the decision logic is testable without an object store.
 type Prober interface {
 	HasBaseBackup(ctx context.Context, at Location) (bool, error)
+	BaseBackups(ctx context.Context, at Location) ([]BaseBackup, error)
 }
 
 // ResolveLocation reads the named ObjectStore and the Secret it points at, and

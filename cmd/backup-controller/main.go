@@ -15,6 +15,7 @@ import (
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/populator"
+	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -36,8 +37,9 @@ func main() {
 	var (
 		kubeconfig  = kubeconfigFlag(flag.CommandLine)
 		namespace   = flag.String("namespace", "backup-system", "namespace the prime claim and the ReplicationDestination live in")
-		metricsAddr = flag.String("metrics-addr", ":8080", "address the metrics listener binds")
+		metricsAddr = flag.String("metrics-addr", ":8080", "address the populator library's metrics listener binds")
 		metricsPath = flag.String("metrics-path", "/metrics", "path the metrics listener serves")
+		runsMetrics = flag.String("runs-metrics-addr", ":8081", "address the scheduler's metrics listener binds, at /metrics")
 		webhookCert = flag.String("webhook-cert-dir", "", "directory holding tls.crt and tls.key; empty serves no webhook")
 		webhookPort = flag.Int("webhook-port", 9443, "port the admission webhook listens on")
 		printVer    = flag.Bool("version", false, "print the version and exit")
@@ -55,7 +57,7 @@ func main() {
 		klog.Errorf("failed to build the Kubernetes client: %v", err)
 		os.Exit(1)
 	}
-	callbacks := populator.New(operations, *namespace)
+	callbacks := populator.New(operations, *namespace, restic.S3Lister{})
 
 	// BackupRun and RestoreRun are reconciled by a controller-runtime manager
 	// of this binary's own, because the populator library drives only the one
@@ -64,7 +66,7 @@ func main() {
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
-	if err := startRunControllers(runs, kubeconfig(), hook); err != nil {
+	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)
 	}

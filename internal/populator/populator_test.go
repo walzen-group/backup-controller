@@ -3,11 +3,14 @@ package populator
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -100,7 +103,7 @@ func TestPopulateCopiesRepositorySecret(t *testing.T) {
 		Type:       corev1.SecretTypeOpaque,
 		Data:       map[string][]byte{"repository": []byte("s3://bucket"), "password": []byte("secret")},
 	}
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 
 	if err := callbacks.Populate(context.Background(), params()); err != nil {
 		t.Fatalf("Populate() error = %v", err)
@@ -114,7 +117,7 @@ func TestPopulateCopiesRepositorySecret(t *testing.T) {
 
 func TestPopulateNamesFromClaimUID(t *testing.T) {
 	ops := populatedOperations()
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 	if err := callbacks.Populate(context.Background(), params()); err != nil {
 		t.Fatalf("Populate() error = %v", err)
 	}
@@ -133,7 +136,7 @@ func TestPopulateReusesExistingDestination(t *testing.T) {
 		Spec:       volsyncv1alpha1.ReplicationDestinationSpec{Paused: true},
 	}
 	ops.destinations[namespacedName(existing.Namespace, existing.Name)] = existing.DeepCopy()
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 
 	if err := callbacks.Populate(context.Background(), params()); err != nil {
 		t.Fatalf("Populate() error = %v", err)
@@ -148,7 +151,7 @@ func TestPopulateReusesExistingDestination(t *testing.T) {
 
 func TestPopulateReportsRestoring(t *testing.T) {
 	ops := populatedOperations()
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 	if err := callbacks.Populate(context.Background(), params()); err != nil {
 		t.Fatalf("Populate() error = %v", err)
 	}
@@ -182,7 +185,7 @@ func TestCompleteTriggerMatching(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ops := restoringOperations()
 			ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: test.last}
-			callbacks := New(ops, "backup-system")
+			callbacks := New(ops, "backup-system", nil)
 			got, err := callbacks.Complete(context.Background(), params())
 			if err != nil || got != test.want {
 				t.Fatalf("Complete() = %t, %v, want %t, nil", got, err, test.want)
@@ -196,7 +199,7 @@ func TestCompleteReportsFailedMover(t *testing.T) {
 	ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{
 		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "mover logs"},
 	}
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 	complete, err := callbacks.Complete(context.Background(), params())
 	if err != nil || complete {
 		t.Fatalf("Complete() = %t, %v, want false, nil", complete, err)
@@ -216,7 +219,7 @@ func TestCompleteReportsFailedMover(t *testing.T) {
 
 func TestCleanupDeletesDestinationAndSecret(t *testing.T) {
 	ops := restoringOperations()
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 	if err := callbacks.Cleanup(context.Background(), params()); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
@@ -226,9 +229,58 @@ func TestCleanupDeletesDestinationAndSecret(t *testing.T) {
 }
 
 func TestCleanupToleratesMissingObjects(t *testing.T) {
-	callbacks := New(newFakeOperations(), "backup-system")
+	callbacks := New(newFakeOperations(), "backup-system", nil)
 	if err := callbacks.Cleanup(context.Background(), params()); err != nil {
 		t.Fatalf("Cleanup() error = %v, want nil for missing objects", err)
+	}
+}
+
+// fixedSnapshots is a lister holding one snapshot.
+type fixedSnapshots []restic.Snapshot
+
+func (f fixedSnapshots) Snapshots(context.Context, *corev1.Secret) ([]restic.Snapshot, error) {
+	return f, nil
+}
+
+var monday = restic.Snapshot{ID: "6e473100aaaa", Time: time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)}
+
+func pinned(at string) populatormachinery.PopulatorParams {
+	p := params()
+	p.Pvc.Annotations = map[string]string{backupv1alpha1.AnnotationRestoreAsOf: at}
+	return p
+}
+
+// A claim pinned to a moment restores that moment, where the VolumeRestore
+// alone would restore the newest snapshot.
+func TestAPinnedClaimRestoresItsMoment(t *testing.T) {
+	ops := populatedOperations()
+	callbacks := New(ops, "backup-system", fixedSnapshots{monday})
+
+	if err := callbacks.Populate(context.Background(), pinned("2026-09-22T00:00:00Z")); err != nil {
+		t.Fatalf("Populate() error = %v", err)
+	}
+	rd := ops.destinations[namespacedName("backup-system", "restore-claim-123")]
+	if rd == nil || rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-22T00:00:00Z" {
+		t.Fatalf("restoreAsOf = %v, want the claim's annotation", rd)
+	}
+}
+
+// VolSync restores nothing and reports success when no snapshot reaches the
+// moment, and the claim would bind an empty volume. The populator stops first.
+func TestAPinnedClaimNoSnapshotReachesStaysPending(t *testing.T) {
+	ops := populatedOperations()
+	callbacks := New(ops, "backup-system", fixedSnapshots{monday})
+
+	err := callbacks.Populate(context.Background(), pinned("2026-09-01T00:00:00Z"))
+	if err == nil {
+		t.Fatal("Populate() filled a claim pinned before every snapshot")
+	}
+	if len(ops.createdRD) != 0 {
+		t.Fatalf("a destination was created: %v", ops.createdRD)
+	}
+	last := ops.statuses[len(ops.statuses)-1]
+	if cond := last.Status.Conditions[0]; cond.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(cond.Message, "6e473100") {
+		t.Fatalf("condition = %+v, want NoBackupInReach naming the oldest snapshot", cond)
 	}
 }
 
@@ -308,7 +360,7 @@ var _ Operations = (*fakeOperations)(nil)
 // it works towards.
 func TestCleanupToleratesTheAlreadyDeletedPrimeClaim(t *testing.T) {
 	ops := restoringOperations()
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
 		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
 	})
@@ -330,7 +382,7 @@ func TestCleanupToleratesTheAlreadyDeletedPrimeClaim(t *testing.T) {
 // claim, which is the library's own and harmless; the writes behind it were not.
 func TestCleanupWritesNothingWhenThereIsNothingToChange(t *testing.T) {
 	ops := restoringOperations()
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
 		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
 	})
@@ -361,7 +413,7 @@ func TestCleanupWritesNothingWhenThereIsNothingToChange(t *testing.T) {
 
 func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
 	ops := restoringOperations()
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
 		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
 	})
@@ -386,7 +438,7 @@ func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
 // claim must leave the others reported and the object not Ready.
 func TestCleanupLeavesOtherClaimsRestoring(t *testing.T) {
 	ops := restoringOperations()
-	callbacks := New(ops, "backup-system")
+	callbacks := New(ops, "backup-system", nil)
 	params := paramsWithClaims(
 		backupv1alpha1.ClaimRestoreStatus{Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring},
 		backupv1alpha1.ClaimRestoreStatus{Name: "photos", UID: types.UID("claim-456"), Phase: backupv1alpha1.RestorePhaseRestoring},

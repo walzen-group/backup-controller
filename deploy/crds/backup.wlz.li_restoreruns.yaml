@@ -17,9 +17,15 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.target
-      name: Target
+    - jsonPath: .spec.claim
+      name: Claim
       type: string
+    - jsonPath: .spec.database
+      name: Database
+      type: string
+    - jsonPath: .spec.all
+      name: All
+      type: boolean
     - jsonPath: .status.phase
       name: Phase
       type: string
@@ -30,9 +36,8 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          RestoreRun restores a repository into a volume, at a chosen point in time.
-          Submit it and watch it the way you would a Job; the controller creates the
-          ReplicationDestination, waits for the mover, and removes it again.
+          RestoreRun restores volumes and databases to a chosen point in time. Submit
+          it and watch it the way you would a Job.
         properties:
           apiVersion:
             description: |-
@@ -53,14 +58,19 @@ spec:
             type: object
           spec:
             description: |-
-              RestoreRunSpec asks for one restore from a repository, at a point in time of
-              your choosing.
+              RestoreRunSpec asks for one restore: of one volume, of one database, or of
+              everything the namespace marks backup.wlz.li/enabled, to the newest backup
+              or to a chosen moment.
 
-              A VolumeRestore fills a claim at the moment the claim is created, and always
-              from the newest backup. This object is the other operation: it acts on a
-              claim that already exists and holds data, and it can reach any snapshot in
-              the repository. docs/restores.md has the three shapes and what each discards.
+              A volume restores in place, or into a new claim with Into. A database
+              restores by being created again: the run deletes its Cluster, and when Flux
+              or tofu creates it again the bootstrap webhook recovers it to RestoreAsOf.
             properties:
+              all:
+                description: |-
+                  All restores every claim and every Cluster in this namespace marked
+                  backup.wlz.li/enabled: the volumes in place, then the databases.
+                type: boolean
               claim:
                 description: |-
                   Claim is the claim in this namespace whose repository to restore from,
@@ -71,15 +81,17 @@ spec:
                   instead to restore from a repository no claim here owns.
                 maxLength: 253
                 type: string
+              database:
+                description: |-
+                  Database is the CloudNativePG Cluster in this namespace to restore. The
+                  run deletes it, and it is recovered when it is created again.
+                maxLength: 253
+                type: string
               into:
                 description: |-
                   Into is a claim to create and fill, leaving the source claim untouched.
                   Omitted, the restore overwrites Claim in place and the workload holding
                   it has to be stopped first.
-
-                  This is the shape to reach for when the question is whether an older
-                  backup is any better, because it answers that without betting the current
-                  data on the answer.
                 maxLength: 253
                 type: string
               intoSize:
@@ -88,8 +100,7 @@ spec:
                 - type: string
                 description: |-
                   IntoSize is the size of the claim named by Into. Omitted, the source
-                  claim's request is used, which is what you want unless the repository
-                  holds more than the live volume now does.
+                  claim's request is used.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
               moverSecurityContext:
@@ -336,8 +347,7 @@ spec:
               repository:
                 description: |-
                   Repository is the restic Secret in this namespace to restore from, for a
-                  restore whose source is not a claim in this namespace. Exactly one of
-                  Claim and Repository is required.
+                  restore whose source is not a claim in this namespace. It needs Into.
 
                   The Secret has to be in this namespace. A RestoreRun that could name a
                   Secret anywhere would let whoever may create one here read any backup in
@@ -347,15 +357,17 @@ spec:
                 type: string
               restoreAsOf:
                 description: |-
-                  RestoreAsOf selects the newest snapshot taken at or before this time.
-                  Omitted, and with Previous unset, the newest snapshot is used.
+                  RestoreAsOf is the moment to restore to. A volume restores the newest
+                  snapshot taken at or before it; a database replays WAL to it exactly.
+                  Omitted, and with Previous unset, a volume restores its newest snapshot
+                  and a database the end of its WAL archive.
                 format: date-time
                 type: string
               timeout:
                 default: 4h
                 description: |-
-                  Timeout is how long to wait for the mover before giving up. On expiry the
-                  run fails and its ReplicationDestination is removed.
+                  Timeout is how long to wait for the movers and the recovered databases
+                  before giving up.
                 type: string
               ttlSecondsAfterFinished:
                 description: |-
@@ -365,6 +377,14 @@ spec:
                 minimum: 0
                 type: integer
             type: object
+            x-kubernetes-validations:
+            - message: set exactly one of claim (or repository), database and all
+              rule: '((has(self.claim) || has(self.repository)) ? 1 : 0) + (has(self.database)
+                ? 1 : 0) + ((has(self.all) && self.all) ? 1 : 0) == 1'
+            - message: previous applies to one volume only
+              rule: '!has(self.previous) || has(self.claim) || has(self.repository)'
+            - message: into needs claim or repository
+              rule: '!has(self.into) || has(self.claim) || has(self.repository)'
           status:
             description: RestoreRunStatus reports how far the restore got.
             properties:
@@ -429,24 +449,56 @@ spec:
                   - type
                   type: object
                 type: array
-              destination:
-                description: |-
-                  Destination is the ReplicationDestination doing the work, in this
-                  namespace, for as long as the run lasts.
-                type: string
+              items:
+                description: Items has one entry per volume restored in place and
+                  per database.
+                items:
+                  description: RestoreItem is one volume or database a RestoreRun
+                    restores.
+                  properties:
+                    baseBackup:
+                      description: BaseBackup is the barman base backup a database's
+                        recovery starts from.
+                      type: string
+                    destination:
+                      description: |-
+                        Destination is the ReplicationDestination restoring a volume, while it
+                        exists.
+                      type: string
+                    kind:
+                      description: Kind is PersistentVolumeClaim for a volume and
+                        Cluster for a database.
+                      type: string
+                    message:
+                      description: Message says why an item failed or was skipped.
+                      type: string
+                    name:
+                      description: Name is the claim's or the Cluster's name.
+                      type: string
+                    phase:
+                      description: Phase is how far this item got.
+                      type: string
+                    snapshot:
+                      description: Snapshot is the restic snapshot a volume restores,
+                        as its short ID.
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  - phase
+                  type: object
+                type: array
               phase:
-                description: |-
-                  Phase is the run's state, and the column `kubectl get` prints. A restore
-                  in place sits in Waiting until nothing mounts the claim.
+                description: Phase is the run's state, and the column `kubectl get`
+                  prints.
                 type: string
               startedAt:
-                description: StartedAt is when the destination was created.
+                description: StartedAt is when the run passed its checks and began
+                  restoring.
                 format: date-time
                 type: string
               target:
-                description: |-
-                  Target is the claim being written, which is Into when it is set and Claim
-                  otherwise.
+                description: Target is the claim an Into restore creates and fills.
                 type: string
             type: object
         type: object

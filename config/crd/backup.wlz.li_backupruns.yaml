@@ -20,6 +20,12 @@ spec:
     - jsonPath: .spec.source
       name: Source
       type: string
+    - jsonPath: .spec.database
+      name: Database
+      type: string
+    - jsonPath: .spec.all
+      name: All
+      type: boolean
     - jsonPath: .status.phase
       name: Phase
       type: string
@@ -30,9 +36,9 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          BackupRun takes one backup of a volume on demand. Submit it and watch it the
-          way you would a Job; the controller writes the source's manual trigger, waits
-          for the mover, and takes the trigger away again.
+          BackupRun takes one backup on demand, and is also the record the scheduler
+          leaves for every scheduled backup. Submit it and watch it the way you would
+          a Job.
         properties:
           apiVersion:
             description: |-
@@ -53,41 +59,51 @@ spec:
             type: object
           spec:
             description: |-
-              BackupRunSpec asks for one backup of a volume, now, outside its schedule.
+              BackupRunSpec asks for one backup now: of one volume, of one database, or of
+              everything the namespace marks backup.wlz.li/enabled.
 
-              A ReplicationSource takes its backups on a cronspec. Running one on demand
-              means giving it a manual trigger and taking that trigger away again when the
-              run is over, because a manual tag wins wherever both are set and a source
-              left holding a spent tag reports healthy while taking no further backups.
-              This object exists so that sequence belongs to a controller rather than to
-              whoever remembered to finish it.
+              The controller writes and triggers each volume's ReplicationSource itself,
+              named after the claim, and asks CloudNativePG for a base backup of each
+              database. A run with all set is admitted by the namespace's Kueue queue as
+              one unit and stops the workloads marked backup.wlz.li/quiesce until every
+              volume's clone is cut.
             properties:
-              source:
-                description: Source is the ReplicationSource in this namespace to
-                  run.
+              all:
+                description: |-
+                  All backs up every claim and every Cluster in this namespace marked
+                  backup.wlz.li/enabled, and stops the workloads marked
+                  backup.wlz.li/quiesce while the clones are cut.
+                type: boolean
+              database:
+                description: |-
+                  Database is the CloudNativePG Cluster in this namespace to take a base
+                  backup of.
                 maxLength: 253
-                minLength: 1
-                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                type: string
+              source:
+                description: |-
+                  Source is the claim to back up. Its ReplicationSource carries the same
+                  name, and the claim has to be marked backup.wlz.li/enabled.
+                maxLength: 253
                 type: string
               timeout:
                 default: 1h
                 description: |-
-                  Timeout is how long to wait for the mover before giving up. On expiry the
-                  run fails and the trigger is cleared, so a mover that never finishes
-                  leaves the source back on its schedule rather than silently stopped.
+                  Timeout is how long the run waits for its movers and base backups
+                  before it gives up. Admission by the queue does not count toward it.
                 type: string
               ttlSecondsAfterFinished:
                 description: |-
                   TTLSecondsAfterFinished deletes this object that long after it reaches a
-                  terminal phase. Omitted, it is kept, which is usually what you want: the
-                  question "did my backup before that restore actually finish" is worth
-                  being able to answer later.
+                  terminal phase. Omitted, it is kept as the record of what was backed up.
                 format: int32
                 minimum: 0
                 type: integer
-            required:
-            - source
             type: object
+            x-kubernetes-validations:
+            - message: set exactly one of source, database and all
+              rule: '(has(self.source) ? 1 : 0) + (has(self.database) ? 1 : 0) + ((has(self.all)
+                && self.all) ? 1 : 0) == 1'
           status:
             description: BackupRunStatus reports how far the run got.
             properties:
@@ -154,25 +170,110 @@ spec:
                   - type
                   type: object
                 type: array
+              items:
+                description: Items has one entry per volume and database the run backs
+                  up.
+                items:
+                  description: BackupItem is one volume or database a BackupRun backs
+                    up.
+                  properties:
+                    backup:
+                      description: Backup is the CloudNativePG Backup the run created
+                        for a database.
+                      type: string
+                    empty:
+                      description: |-
+                        Empty reports a volume VolSync did not back up because it held no
+                        files. The repository gains no snapshot for such a run.
+                      type: boolean
+                    kind:
+                      description: Kind is ReplicationSource for a volume and Cluster
+                        for a database.
+                      type: string
+                    message:
+                      description: Message says why an item failed or was skipped.
+                      type: string
+                    name:
+                      description: Name is the object's name, which for a volume is
+                        also the claim's.
+                      type: string
+                    phase:
+                      description: Phase is how far this item got.
+                      type: string
+                    snapshot:
+                      description: Snapshot is the restic snapshot the mover wrote,
+                        as its short ID.
+                      type: string
+                    snapshotTime:
+                      description: |-
+                        SnapshotTime is the time restic stamped on that snapshot, which is when
+                        the backup of the volume's clone started.
+                      format: date-time
+                      type: string
+                    trigger:
+                      description: Trigger is the manual tag the run wrote onto a
+                        ReplicationSource.
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  - phase
+                  type: object
+                type: array
               phase:
                 description: Phase is the run's state, and the column `kubectl get`
                   prints.
                 type: string
-              snapshotTime:
+              quiesced:
                 description: |-
-                  SnapshotTime is the source's lastSyncTime for this run, which is the
-                  moment the repository holds.
+                  Quiesced lists the workloads this run scaled to zero, with the replicas
+                  it gives each back.
+                items:
+                  description: QuiescedWorkload is one workload a run stopped.
+                  properties:
+                    kind:
+                      description: Kind is Deployment or StatefulSet.
+                      type: string
+                    name:
+                      description: Name is the workload's name in the run's namespace.
+                      type: string
+                    replicas:
+                      description: Replicas is what the workload ran with before the
+                        run stopped it.
+                      format: int32
+                      type: integer
+                  required:
+                  - kind
+                  - name
+                  - replicas
+                  type: object
+                type: array
+              quiescedAt:
+                description: |-
+                  QuiescedAt is when the run stopped the workloads marked
+                  backup.wlz.li/quiesce, or found none to stop.
+                format: date-time
+                type: string
+              restartedAt:
+                description: RestartedAt is when the run gave those workloads their
+                  replicas back.
                 format: date-time
                 type: string
               startedAt:
-                description: StartedAt is when the trigger was written.
+                description: StartedAt is when the run was admitted and began backing
+                  up.
                 format: date-time
                 type: string
-              trigger:
+              suspendedKustomizations:
                 description: |-
-                  Trigger is the manual tag this run wrote onto the source. It is derived
-                  from the run's UID, so a controller that restarts mid-run recomputes the
-                  same value and continues rather than starting a second backup.
+                  SuspendedKustomizations lists the Flux Kustomizations this run
+                  suspended, as namespace/name. The run resumes exactly these.
+                items:
+                  type: string
+                type: array
+              workload:
+                description: Workload is the Kueue Workload that admits the run, while
+                  it exists.
                 type: string
             type: object
         type: object

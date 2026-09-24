@@ -38,10 +38,21 @@ const (
 	// before it says so.
 	ReasonFailed = "Failed"
 
-	// ReasonTriggerHeld reports a source whose manual trigger belongs to
-	// something else, another run or a hand-written patch. A run declines
-	// rather than writing over a trigger it did not set.
-	ReasonTriggerHeld = "TriggerHeld"
+	// ReasonQueued reports a run waiting for Kueue to admit it.
+	ReasonQueued = "Queued"
+
+	// ReasonSourceBusy reports a run waiting for another run's backup of the
+	// same volume to finish.
+	ReasonSourceBusy = "SourceBusy"
+
+	// ReasonNoBackupInReach reports a restore whose moment predates every
+	// backup of an item. The run fails before it deletes or overwrites
+	// anything.
+	ReasonNoBackupInReach = "NoBackupInReach"
+
+	// ReasonRecreate reports a restore waiting for the Clusters it deleted to
+	// be created again, by Flux or by a terragrunt apply.
+	ReasonRecreate = "WaitingForRecreate"
 
 	// ReasonClaimInUse reports an in-place restore waiting for a pod to let go
 	// of the claim it has to write into. Two writers on one filesystem is how

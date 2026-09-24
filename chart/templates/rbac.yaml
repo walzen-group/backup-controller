@@ -49,19 +49,49 @@ rules:
     verbs: ["patch", "update"]
   # The one-shot runs, and the finalizer each carries. Without update on the
   # objects themselves the finalizer cannot be added or removed, and a run that
-  # cannot drop its finalizer can never be deleted.
+  # cannot drop its finalizer can never be deleted. create is the scheduler
+  # writing a BackupRun at each tick of a namespace's schedule.
   - apiGroups: ["backup.wlz.li"]
-    resources: ["backupruns", "restoreruns"]
+    resources: ["backupruns"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: ["backup.wlz.li"]
+    resources: ["restoreruns"]
     verbs: ["get", "list", "watch", "update", "delete"]
   - apiGroups: ["backup.wlz.li"]
     resources: ["backupruns/status", "restoreruns/status"]
     verbs: ["patch", "update"]
-  # A BackupRun writes the manual trigger onto a source and takes it away
-  # again. Nothing here changes a schedule: a manual tag wins wherever both are
-  # set, so the field Flux and tofu declare is never in the payload.
+  # The controller writes each enabled claim's source and triggers it with a
+  # manual tag.
   - apiGroups: ["volsync.backube"]
     resources: ["replicationsources"]
-    verbs: ["get", "list", "watch", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # The scheduler reads each namespace's backup.wlz.li/schedule annotation.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  # A base backup on demand, through the barman-cloud plugin.
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["backups"]
+    verbs: ["get", "create"]
+  # Quiesce scales a marked workload to zero and back, and suspends the Flux
+  # Kustomization that would otherwise put the replicas back mid-run.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "patch"]
+  # A run is admitted as one Kueue Workload. The run sets its PodsReady
+  # condition itself, because the Workload has no pods to report it.
+  - apiGroups: ["kueue.x-k8s.io"]
+    resources: ["workloads"]
+    verbs: ["get", "create", "delete"]
+  - apiGroups: ["kueue.x-k8s.io"]
+    resources: ["workloads/status"]
+    verbs: ["update"]
+  - apiGroups: ["kueue.x-k8s.io"]
+    resources: ["localqueues"]
+    verbs: ["list"]
   # One destination per restore, created and removed by the callbacks and by a
   # RestoreRun.
   - apiGroups: ["volsync.backube"]
@@ -86,10 +116,11 @@ rules:
   # Before admitting a Cluster the webhook checks that no other database
   # already archives to the same bucket and prefix, which would interleave
   # their WAL and leave the archive unrestorable. That question is only
-  # answerable by looking at every Cluster on the cluster.
+  # answerable by looking at every Cluster on the cluster. A database run
+  # reads its Cluster, and a restore deletes it so it is created again.
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters"]
-    verbs: ["list"]
+    verbs: ["get", "list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

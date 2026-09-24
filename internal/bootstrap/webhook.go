@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
+	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -97,17 +99,11 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Allowed("opted out")
 	}
 
-	// A Cluster that already asks for a recovery was written that way on
-	// purpose, by the Flux component or a unit's restore input, and it carries
-	// a point in time this webhook has no opinion about.
-	if _, found, _ := unstructured.NestedMap(cluster.Object, "spec", "bootstrap", "recovery"); found {
-		logger.Info("leaving the Cluster alone", "reason", "it already declares a recovery")
-		return admission.Allowed("already recovering")
-	}
+	_, declared, _ := unstructured.NestedMap(cluster.Object, "spec", "bootstrap", "recovery")
 
-	store, serverName, found := archiver(cluster)
+	store, serverName, found := Archiver(cluster)
 	if !found {
-		logger.Info("leaving the Cluster to initdb", "reason", "it archives nowhere")
+		logger.Info("leaving the Cluster alone", "reason", "it archives nowhere")
 		return admission.Allowed("no archiving plugin")
 	}
 
@@ -123,7 +119,8 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	// Two databases archiving to one prefix interleave their WAL and leave the
 	// archive unrestorable, which is silent and permanent. Nothing else on the
 	// cluster can see this coming: each Cluster is valid on its own, and the
-	// pair is the problem.
+	// pair is the problem. Where a Cluster archives does not depend on how it
+	// bootstraps, so a Cluster declaring its own recovery is checked too.
 	holder, err := archiveHolder(ctx, d.Client, req.Namespace, req.Name, at)
 	if err != nil {
 		logger.Error(err, "cannot check which databases archive here")
@@ -137,26 +134,137 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		))
 	}
 
+	run, err := waitingRun(ctx, d.Client, req.Namespace, req.Name)
+	if err != nil {
+		logger.Error(err, "cannot read the namespace's RestoreRuns")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	// A Cluster that already asks for a recovery was written that way on
+	// purpose, by the Flux component or a unit's restore input. It keeps its
+	// own target, unless a RestoreRun is waiting to recover it: then two
+	// targets name one database, and neither may win by accident.
+	if declared {
+		if run != nil {
+			return admission.Denied(fmt.Sprintf(
+				"RestoreRun %s is waiting to recover %s/%s, and the Cluster declares its own spec.bootstrap.recovery. Remove the declared recovery (the terragrunt restore input or the postgres-recovery component), or delete the RestoreRun.",
+				run.Name, req.Namespace, req.Name,
+			))
+		}
+		logger.Info("leaving the Cluster alone", "reason", "it already declares a recovery")
+		return admission.Allowed("already recovering")
+	}
+
+	target, source, err := restoreTarget(cluster, run)
+	if err != nil {
+		return admission.Denied(err.Error())
+	}
+
 	has, err := d.Prober.HasBaseBackup(ctx, at)
 	if err != nil {
 		logger.Error(err, "cannot list the object store")
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	if !has {
+		if run != nil || target != nil {
+			return admission.Denied(fmt.Sprintf(
+				"%s asks for a recovery, and %s/%s holds no base backup to recover from.",
+				source, at.Bucket, at.BasePrefix(),
+			))
+		}
 		logger.Info("leaving the Cluster to initdb", "reason", "no base backup in the store", "prefix", at.BasePrefix())
 		return admission.Allowed("no base backup")
 	}
 
-	if err := setRecovery(cluster, store, serverName); err != nil {
+	// A target before the oldest base backup's end is one Postgres can never
+	// reach. CloudNativePG would keep the Cluster in recovery reporting that
+	// no backup matched, so the webhook refuses it here with the reason.
+	if target != nil {
+		backups, err := d.Prober.BaseBackups(ctx, at)
+		if err != nil {
+			logger.Error(err, "cannot list the base backups")
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+		if _, ok := AtOrBefore(backups, *target); !ok {
+			return admission.Denied(fmt.Sprintf(
+				"%s asks for %s, and no base backup in %s/%s finished by then%s.",
+				source, target.Format(time.RFC3339), at.Bucket, at.BasePrefix(), oldest(backups),
+			))
+		}
+	}
+
+	if err := setRecovery(cluster, store, serverName, target); err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	if run != nil {
+		annotations := cluster.GetAnnotations()
+		annotations[backupv1alpha1.AnnotationRestoreRun] = run.Name
+		cluster.SetAnnotations(annotations)
 	}
 
 	patched, err := json.Marshal(cluster)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	logger.Info("recovering the Cluster from its object store", "prefix", at.BasePrefix())
+	logger.Info("recovering the Cluster from its object store", "prefix", at.BasePrefix(), "target", target, "for", source)
 	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
+}
+
+// waitingRun returns the RestoreRun that deleted this Cluster and waits for it
+// to come back, or nil when none does.
+func waitingRun(ctx context.Context, c client.Reader, namespace, name string) (*backupv1alpha1.RestoreRun, error) {
+	runs := &backupv1alpha1.RestoreRunList{}
+	if err := c.List(ctx, runs, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list RestoreRuns in %s: %w", namespace, err)
+	}
+	for i := range runs.Items {
+		run := &runs.Items[i]
+		if run.Status.Phase.Finished() || !run.DeletionTimestamp.IsZero() {
+			continue
+		}
+		for _, item := range run.Status.Items {
+			if item.Kind == "Cluster" && item.Name == name && item.Phase == backupv1alpha1.ItemDeleted {
+				return run, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+// restoreTarget returns the moment to recover to and what asked for it: the
+// waiting RestoreRun's restoreAsOf, else the Cluster's restore-as-of
+// annotation, else no target, which replays to the end of the archive.
+func restoreTarget(cluster *unstructured.Unstructured, run *backupv1alpha1.RestoreRun) (*time.Time, string, error) {
+	if run != nil {
+		source := "RestoreRun " + run.Name
+		if run.Spec.RestoreAsOf == nil {
+			return nil, source, nil
+		}
+		t, err := time.Parse(time.RFC3339, *run.Spec.RestoreAsOf)
+		if err != nil {
+			return nil, source, fmt.Errorf("%s has an unparsable restoreAsOf %q: %w", source, *run.Spec.RestoreAsOf, err)
+		}
+		return &t, source, nil
+	}
+
+	value, ok := cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreAsOf]
+	if !ok {
+		return nil, "the webhook", nil
+	}
+	source := "annotation " + backupv1alpha1.AnnotationRestoreAsOf
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return nil, source, fmt.Errorf("%s is %q, which is not an RFC 3339 time", source, value)
+	}
+	return &t, source, nil
+}
+
+// oldest names the oldest base backup for a refusal message.
+func oldest(backups []BaseBackup) string {
+	if len(backups) == 0 {
+		return "; it holds no completed base backup"
+	}
+	return fmt.Sprintf("; the oldest, %s, finished at %s", backups[0].ID, backups[0].End.UTC().Format(time.RFC3339))
 }
 
 // keepRecovery drops initdb from an update of a Cluster this webhook recovered.
@@ -221,7 +329,7 @@ func archiveHolder(
 		if other.GetNamespace() == namespace && other.GetName() == name {
 			continue
 		}
-		store, serverName, found := archiver(other)
+		store, serverName, found := Archiver(other)
 		if !found {
 			continue
 		}
@@ -236,10 +344,10 @@ func archiveHolder(
 	return "", nil
 }
 
-// archiver finds the Cluster's WAL archiving plugin and the server name it
+// Archiver finds the Cluster's WAL archiving plugin and the server name it
 // writes under. A Cluster with no such plugin backs nothing up and has nothing
 // to recover from.
-func archiver(cluster *unstructured.Unstructured) (store, serverName string, found bool) {
+func Archiver(cluster *unstructured.Unstructured) (store, serverName string, found bool) {
 	plugins, ok, err := unstructured.NestedSlice(cluster.Object, "spec", "plugins")
 	if err != nil || !ok {
 		return "", "", false
@@ -273,9 +381,13 @@ func archiver(cluster *unstructured.Unstructured) (store, serverName string, fou
 
 // setRecovery rewrites the Cluster to restore from its own archive: the
 // bootstrap, the external cluster it reads through, and the annotation that
-// lets it archive into the prefix it restored from.
-func setRecovery(cluster *unstructured.Unstructured, store, serverName string) error {
+// lets it archive into the prefix it restored from. A nil target replays to
+// the end of the archive.
+func setRecovery(cluster *unstructured.Unstructured, store, serverName string, target *time.Time) error {
 	recovery := map[string]any{"source": RecoverySource}
+	if target != nil {
+		recovery["recoveryTarget"] = map[string]any{"targetTime": target.UTC().Format(time.RFC3339)}
+	}
 
 	// The application database, its owning role and the Secret holding that
 	// role's password carry over from initdb.

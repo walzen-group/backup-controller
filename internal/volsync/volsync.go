@@ -16,6 +16,18 @@ func Trigger(claim *corev1.PersistentVolumeClaim) string {
 	return string(claim.UID)
 }
 
+// RestoreAsOf is the moment a claim's restore goes back to: the claim's own
+// backup.wlz.li/restore-as-of annotation, else the VolumeRestore's
+// restoreAsOf, else nil for the newest snapshot.
+func RestoreAsOf(vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim) *string {
+	if claim != nil {
+		if value, ok := claim.Annotations[backupv1alpha1.AnnotationRestoreAsOf]; ok {
+			return &value
+		}
+	}
+	return vr.Spec.RestoreAsOf
+}
+
 // New builds a ReplicationDestination that restores into the prime claim.
 func New(vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim, primeClaim, namespace string) *volsyncv1alpha1.ReplicationDestination {
 	trigger := Trigger(claim)
@@ -37,7 +49,7 @@ func New(vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim, 
 				// vr.Spec.Repository, which names the original in the app's
 				// namespace.
 				Repository:  SecretCopyName(types.UID(trigger)),
-				RestoreAsOf: vr.Spec.RestoreAsOf,
+				RestoreAsOf: RestoreAsOf(vr, claim),
 				// The mover provisions a metadata cache claim for every
 				// restore. Left unset the class is the cluster's default, and
 				// that class's reclaim policy decides whether the cache

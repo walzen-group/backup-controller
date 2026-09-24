@@ -22,27 +22,10 @@ type S3Prober struct{}
 // the presence of anything below <server>/base/ is the whole answer, and a
 // store holding years of backups is listed no more expensively than an empty
 // one.
-func (S3Prober) HasBaseBackup(ctx context.Context, at Location) (bool, error) {
-	endpoint, secure, err := splitEndpoint(at.Endpoint)
+func (p S3Prober) HasBaseBackup(ctx context.Context, at Location) (bool, error) {
+	client, err := p.client(at)
 	if err != nil {
 		return false, err
-	}
-
-	options := &minio.Options{
-		Creds:  credentials.NewStaticV4(at.AccessKey, at.SecretKey, ""),
-		Secure: secure,
-	}
-	if secure {
-		transport, err := tlsTransport(at.CABundle)
-		if err != nil {
-			return false, err
-		}
-		options.Transport = transport
-	}
-
-	client, err := minio.New(endpoint, options)
-	if err != nil {
-		return false, fmt.Errorf("build the object store client: %w", err)
 	}
 
 	// MaxKeys stops the server after one object rather than trusting the
@@ -60,6 +43,32 @@ func (S3Prober) HasBaseBackup(ctx context.Context, at Location) (bool, error) {
 		return false, fmt.Errorf("list %s/%s: %w", at.Bucket, at.BasePrefix(), object.Err)
 	}
 	return true, nil
+}
+
+// client connects to the location's endpoint, trusting its endpointCA.
+func (S3Prober) client(at Location) (*minio.Client, error) {
+	endpoint, secure, err := splitEndpoint(at.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	options := &minio.Options{
+		Creds:  credentials.NewStaticV4(at.AccessKey, at.SecretKey, ""),
+		Secure: secure,
+	}
+	if secure {
+		transport, err := tlsTransport(at.CABundle)
+		if err != nil {
+			return nil, err
+		}
+		options.Transport = transport
+	}
+
+	client, err := minio.New(endpoint, options)
+	if err != nil {
+		return nil, fmt.Errorf("build the object store client: %w", err)
+	}
+	return client, nil
 }
 
 // tlsTransport builds the client's TLS settings: the public roots the image

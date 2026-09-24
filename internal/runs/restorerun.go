@@ -3,10 +3,13 @@ package runs
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,15 +19,27 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// RestoreRunReconciler writes a chosen snapshot back into a volume.
+// RestoreRunReconciler restores volumes and databases to a chosen moment.
 //
-// It has two modes and they share almost nothing. With Into set it creates a
-// second claim and lets the populator fill it, which touches the app's volume
-// not at all. Without it the restore is in place, which means a Direct-mode
-// ReplicationDestination mounting the claim the app uses, and that one waits
-// until nothing else has the claim mounted.
+// A volume restores in place through a Direct-mode ReplicationDestination
+// mounting the claim, once nothing else mounts it. A database restores by
+// being created again: the run deletes its Cluster, and the bootstrap webhook
+// recovers the Cluster Flux or tofu creates next to the run's moment. With
+// Into set, a volume restores into a new claim instead, through the ordinary
+// populator path, and nothing of the app's is touched.
 type RestoreRunReconciler struct {
 	client.Client
+
+	// Reader reads without the informer cache: Secrets, ObjectStores and
+	// Clusters.
+	Reader client.Reader
+
+	// Snapshots lists a repository's snapshots, for the check that a volume
+	// has one the run's moment reaches.
+	Snapshots restic.Lister
+
+	// Prober lists a database's base backups, for the same check.
+	Prober bootstrap.Prober
 
 	// Now is the clock, injected so tests can move time without sleeping.
 	Now func() time.Time
@@ -47,12 +62,11 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-
 	if !run.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, r.finalize(ctx, run)
 	}
 	if run.Status.Phase.Finished() {
-		return r.expire(ctx, run)
+		return expire(ctx, r.Client, run, run.Spec.TTLSecondsAfterFinished, run.Status.CompletedAt, r.Now())
 	}
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		controllerutil.AddFinalizer(run, Finalizer)
@@ -61,112 +75,529 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	repository, err := r.repositoryFor(ctx, run)
-	if err != nil {
-		return ctrl.Result{}, r.fail(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
-	}
-
 	if run.Spec.Into != "" {
-		return r.reconcileIntoNewClaim(ctx, run, repository)
+		return r.reconcileIntoNewClaim(ctx, run)
 	}
-	return r.reconcileInPlace(ctx, run, repository)
+	if run.Status.Phase == "" {
+		return r.plan(ctx, run)
+	}
+	return r.work(ctx, run)
 }
 
-// reconcileInPlace overwrites the claim the app already has.
-//
-// The mover mounts that claim and writes into it, and ReadWriteOnce restricts a
-// claim to one node rather than to one pod, so Kubernetes would let the app
-// mount it at the same time. Two writers on one filesystem is how the volume
-// being restored is corrupted, so this waits rather than scaling anything: who
-// stops the workload depends on what deployed it, and a controller that scaled
-// a Flux-owned Deployment would be reverted on its next reconcile, mid-restore.
-func (r *RestoreRunReconciler) reconcileInPlace(ctx context.Context, run *backupv1alpha1.RestoreRun, repository restoreSettings) (ctrl.Result, error) {
-	run.Status.Target = run.Spec.Claim
+// target parses the run's moment, nil for the newest backup.
+func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
+	if run.Spec.RestoreAsOf == nil {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, *run.Spec.RestoreAsOf)
+	if err != nil {
+		return nil, fmt.Errorf("restoreAsOf %q is not an RFC 3339 time", *run.Spec.RestoreAsOf)
+	}
+	return &t, nil
+}
 
-	name := "restore-" + string(run.UID)
-	destination := &volsyncv1alpha1.ReplicationDestination{}
-	key := types.NamespacedName{Namespace: run.Namespace, Name: name}
-	err := r.Get(ctx, key, destination)
+// plan lists the run's items and checks, before it touches anything, that a
+// backup reaches the run's moment for every one of them.
+func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
+	items, err := r.items(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
+	at, err := target(run)
+	if err != nil {
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
+
+	var unreachable []string
+	for i := range items {
+		item := &items[i]
+		if item.Phase != backupv1alpha1.ItemPending {
+			continue
+		}
+		var reason string
+		switch item.Kind {
+		case "PersistentVolumeClaim":
+			item.Snapshot, reason, err = r.checkVolume(ctx, run, item.Name, at)
+		case "Cluster":
+			item.BaseBackup, reason, err = r.checkDatabase(ctx, run.Namespace, item.Name, at)
+		}
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if reason != "" {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, reason
+			unreachable = append(unreachable, fmt.Sprintf("%s %s: %s", item.Kind, item.Name, reason))
+		}
+	}
+
+	run.Status.Items = items
+	if len(unreachable) > 0 {
+		// Nothing has been deleted or overwritten yet, so the other items stay
+		// as they were and the run reports every item it cannot reach.
+		for i := range run.Status.Items {
+			if run.Status.Items[i].Phase == backupv1alpha1.ItemPending {
+				run.Status.Items[i].Phase = backupv1alpha1.ItemSkipped
+				run.Status.Items[i].Message = "left alone because another item has no backup the run's moment reaches"
+			}
+		}
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, strings.Join(unreachable, "; "))
+	}
+
+	now := metav1.NewTime(r.Now())
+	run.Status.Phase = backupv1alpha1.RunPhaseRunning
+	run.Status.StartedAt = &now
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "restoring")
+	return ctrl.Result{RequeueAfter: time.Second}, r.writeStatus(ctx, run)
+}
+
+// items lists what the run's spec names.
+func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
+	pending := func(kind, name string) backupv1alpha1.RestoreItem {
+		return backupv1alpha1.RestoreItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
+	}
+	switch {
+	case run.Spec.Claim != "":
+		return []backupv1alpha1.RestoreItem{pending("PersistentVolumeClaim", run.Spec.Claim)}, nil
+	case run.Spec.Repository != "":
+		return nil, fmt.Errorf("spec.into is required when spec.repository names the source, because there is no claim to restore in place")
+	case run.Spec.Database != "":
+		return []backupv1alpha1.RestoreItem{pending("Cluster", run.Spec.Database)}, nil
+	}
+
+	claims, err := enabledClaims(ctx, r.Reader, run.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	clusters, err := enabledClusters(ctx, r.Reader, run.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	var items []backupv1alpha1.RestoreItem
+	for _, claim := range claims {
+		items = append(items, pending("PersistentVolumeClaim", claim.Name))
+	}
+	for i := range clusters {
+		item := pending("Cluster", clusters[i].GetName())
+		if _, _, archives := bootstrap.Archiver(&clusters[i]); !archives {
+			item.Phase, item.Message = backupv1alpha1.ItemSkipped, "the Cluster archives nowhere, so it has no backup to restore"
+		}
+		items = append(items, item)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
+	}
+	return items, nil
+}
+
+// checkVolume finds the snapshot a restore of the claim would select, and
+// returns a reason when there is none. VolSync itself restores nothing and
+// reports success when no snapshot matches, so this is the only place the
+// missing snapshot is caught.
+func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string, at *time.Time) (string, string, error) {
+	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
+	if err != nil {
+		return "", err.Error(), nil
+	}
+	return r.selectSnapshot(ctx, run, settings.Secret, at)
+}
+
+// selectSnapshot returns the short ID of the snapshot the run would restore
+// from the repository Secret, or a reason when there is none.
+func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time) (string, string, error) {
+	secret := &corev1.Secret{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: secretName}, secret); err != nil {
+		return "", fmt.Sprintf("read repository Secret %s: %v", secretName, err), nil
+	}
+	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
+	if err != nil {
+		return "", "", fmt.Errorf("list the snapshots in %s: %w", secretName, err)
+	}
+	if len(snapshots) == 0 {
+		return "", "the repository holds no snapshot", nil
+	}
+
+	index := len(snapshots) - 1
+	if at != nil {
+		found, ok := restic.AtOrBefore(snapshots, *at)
+		if !ok {
+			return "", fmt.Sprintf("no snapshot at or before %s; the oldest, %s, is from %s",
+				at.UTC().Format(time.RFC3339), snapshots[0].ShortID(), snapshots[0].Time.UTC().Format(time.RFC3339)), nil
+		}
+		for i, s := range snapshots {
+			if s.ID == found.ID {
+				index = i
+			}
+		}
+	}
+	if run.Spec.Previous != nil {
+		index -= int(*run.Spec.Previous)
+		if index < 0 {
+			return "", fmt.Sprintf("previous %d reaches past the oldest snapshot", *run.Spec.Previous), nil
+		}
+	}
+	return snapshots[index].ShortID(), "", nil
+}
+
+// checkDatabase finds the base backup a recovery of the Cluster would start
+// from, and returns a reason when there is none.
+func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, name string, at *time.Time) (string, string, error) {
+	cluster, found, err := getCluster(ctx, r.Reader, namespace, name)
+	if err != nil {
+		return "", "", err
+	}
+	if !found {
+		return "", fmt.Sprintf("no Cluster %s in this namespace", name), nil
+	}
+	store, serverName, archives := bootstrap.Archiver(cluster)
+	if !archives {
+		return "", "the Cluster archives nowhere, so it has no backup to restore", nil
+	}
+	location, err := bootstrap.ResolveLocation(ctx, r.Reader, namespace, store, serverName)
+	if err != nil {
+		return "", err.Error(), nil
+	}
+	backups, err := r.Prober.BaseBackups(ctx, location)
+	if err != nil {
+		return "", "", fmt.Errorf("list the base backups of %s: %w", name, err)
+	}
+	if len(backups) == 0 {
+		return "", fmt.Sprintf("%s/%s holds no completed base backup; deleting the Cluster would bring it back empty", location.Bucket, location.BasePrefix()), nil
+	}
+	if at == nil {
+		return backups[len(backups)-1].ID, "", nil
+	}
+	backup, ok := bootstrap.AtOrBefore(backups, *at)
+	if !ok {
+		return "", fmt.Sprintf("no base backup finished by %s; the oldest, %s, finished at %s",
+			at.UTC().Format(time.RFC3339), backups[0].ID, backups[0].End.UTC().Format(time.RFC3339)), nil
+	}
+	return backup.ID, "", nil
+}
+
+// work restores the volumes, then deletes the databases and follows them
+// until they are recovered.
+func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
+	if deadline, over := r.overdue(run); over {
+		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
+	}
+
+	waitReason, waitMessage := "", ""
+	volumesDone, volumesFailed := true, false
+	for i := range run.Status.Items {
+		item := &run.Status.Items[i]
+		if item.Kind != "PersistentVolumeClaim" {
+			continue
+		}
+		reason, message, err := r.restoreVolume(ctx, run, i, item)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if reason != "" {
+			waitReason, waitMessage = reason, message
+		}
+		switch item.Phase {
+		case backupv1alpha1.ItemPending, backupv1alpha1.ItemRunning:
+			volumesDone = false
+		case backupv1alpha1.ItemFailed:
+			volumesFailed = true
+		}
+	}
+
+	var recreate []string
+	if volumesDone {
+		for i := range run.Status.Items {
+			item := &run.Status.Items[i]
+			if item.Kind != "Cluster" {
+				continue
+			}
+			if volumesFailed && item.Phase == backupv1alpha1.ItemPending {
+				item.Phase, item.Message = backupv1alpha1.ItemSkipped, "left running because a volume restore failed"
+				continue
+			}
+			if err := r.restoreDatabase(ctx, run, item); err != nil {
+				return ctrl.Result{}, err
+			}
+			if item.Phase == backupv1alpha1.ItemDeleted {
+				recreate = append(recreate, item.Name)
+			}
+		}
+	}
+
+	if restoreDone(run.Status.Items) {
+		if failed := restoreFailures(run.Status.Items); failed != "" {
+			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, failed)
+		}
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, "every item holds the restored data")
+	}
 
 	switch {
-	case apierrors.IsNotFound(err):
-		holder, err := r.claimHolder(ctx, run.Namespace, run.Spec.Claim)
+	case len(recreate) > 0:
+		return ctrl.Result{RequeueAfter: pollInterval}, r.waitFor(ctx, run, backupv1alpha1.ReasonRecreate,
+			fmt.Sprintf("recreate %s to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it", strings.Join(recreate, ", ")))
+	case waitReason != "":
+		return ctrl.Result{RequeueAfter: pollInterval}, r.waitFor(ctx, run, waitReason, waitMessage)
+	}
+	run.Status.Phase = backupv1alpha1.RunPhaseRunning
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "restoring")
+	return ctrl.Result{RequeueAfter: pollInterval}, r.writeStatus(ctx, run)
+}
+
+// restoreVolume advances one in-place volume restore, and returns a waiting
+// reason while a pod still mounts the claim.
+func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (string, string, error) {
+	switch item.Phase {
+	case backupv1alpha1.ItemPending:
+		holder, err := claimHolder(ctx, r.Client, run.Namespace, item.Name)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("look for a pod holding claim %s: %w", run.Spec.Claim, err)
+			return "", "", fmt.Errorf("look for a pod holding claim %s: %w", item.Name, err)
 		}
 		if holder != "" {
-			return ctrl.Result{RequeueAfter: pollInterval}, r.wait(ctx, run, backupv1alpha1.ReasonClaimInUse,
-				fmt.Sprintf("claim %s is mounted by pod %s; stop the workload and this restore starts on its own", run.Spec.Claim, holder))
+			return backupv1alpha1.ReasonClaimInUse,
+				fmt.Sprintf("claim %s is mounted by pod %s; stop the workload and this restore starts on its own", item.Name, holder), nil
 		}
-		if err := r.Create(ctx, directDestination(run, repository, name)); err != nil {
-			return ctrl.Result{}, fmt.Errorf("create ReplicationDestination %s: %w", key, err)
+		settings, err := repositoryFor(ctx, r.Reader, run.Namespace, item.Name, run.Spec.Repository, run.Spec.MoverSecurityContext)
+		if err != nil {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
+			return "", "", nil
 		}
-		return ctrl.Result{RequeueAfter: pollInterval}, r.begin(ctx, run, name)
+		name := destinationName(run.UID, index)
+		if err := r.Create(ctx, directDestination(run, item.Name, settings, name)); err != nil && !apierrors.IsAlreadyExists(err) {
+			return "", "", fmt.Errorf("create ReplicationDestination %s: %w", name, err)
+		}
+		item.Phase, item.Destination = backupv1alpha1.ItemRunning, name
 
-	case err != nil:
-		return ctrl.Result{}, fmt.Errorf("get ReplicationDestination %s: %w", key, err)
-	}
-
-	if reason, failed := failedMover(destination); failed {
-		return ctrl.Result{}, r.cleanupThen(ctx, run, destination, backupv1alpha1.ReasonFailed, reason)
-	}
-	if destination.Status == nil || destination.Status.LastManualSync != string(run.UID) {
-		if expired, deadline := r.timedOut(run); expired {
-			return ctrl.Result{}, r.cleanupThen(ctx, run, destination, backupv1alpha1.ReasonTimedOut,
-				fmt.Sprintf("the mover had not finished by %s", deadline.Format(time.RFC3339)))
+	case backupv1alpha1.ItemRunning:
+		destination := &volsyncv1alpha1.ReplicationDestination{}
+		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Destination}, destination); err != nil {
+			return "", "", fmt.Errorf("get ReplicationDestination %s: %w", item.Destination, err)
 		}
-		return ctrl.Result{RequeueAfter: pollInterval}, nil
+		if reason, failed := failedMover(destination); failed {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, reason
+		} else if destination.Status != nil && destination.Status.LastManualSync == string(run.UID) {
+			item.Phase = backupv1alpha1.ItemSucceeded
+		} else {
+			return "", "", nil
+		}
+		if err := r.Delete(ctx, destination); err != nil && !apierrors.IsNotFound(err) {
+			return "", "", fmt.Errorf("delete ReplicationDestination %s: %w", item.Destination, err)
+		}
+		item.Destination = ""
 	}
-	return ctrl.Result{}, r.cleanupThen(ctx, run, destination, backupv1alpha1.ReasonSucceeded,
-		fmt.Sprintf("claim %s holds the restored data", run.Spec.Claim))
+	return "", "", nil
+}
+
+// restoreDatabase advances one database restore: it deletes the Cluster, then
+// follows the Cluster Flux or tofu creates again until it is healthy.
+//
+// The item is marked Deleted before the Cluster is deleted. The bootstrap
+// webhook recovers a Cluster only for a run whose item says Deleted, so the
+// mark has to be in place before anything can create the Cluster again.
+func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
+	switch item.Phase {
+	case backupv1alpha1.ItemPending:
+		item.Phase = backupv1alpha1.ItemDeleted
+		if err := r.writeStatus(ctx, run); err != nil {
+			return err
+		}
+		return r.deleteCluster(ctx, run.Namespace, item.Name)
+
+	case backupv1alpha1.ItemDeleted:
+		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
+		switch {
+		case err != nil:
+			return err
+		case !found || cluster.GetDeletionTimestamp() != nil:
+			return nil
+		case cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun] == run.Name:
+			item.Phase = backupv1alpha1.ItemRecovering
+		default:
+			// The webhook annotates every Cluster it recovers for a run whose
+			// item says Deleted, so a live Cluster without the annotation is
+			// the one the delete above did not reach.
+			return r.deleteCluster(ctx, run.Namespace, item.Name)
+		}
+
+	case backupv1alpha1.ItemRecovering:
+		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
+		switch {
+		case err != nil:
+			return err
+		case !found:
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, "the recovered Cluster was deleted"
+		case clusterPhase(cluster) == healthyPhase:
+			item.Phase = backupv1alpha1.ItemSucceeded
+		}
+	}
+	return nil
+}
+
+func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, namespace, name string) error {
+	cluster, found, err := getCluster(ctx, r.Reader, namespace, name)
+	if err != nil || !found {
+		return err
+	}
+	if err := r.Delete(ctx, cluster); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete Cluster %s/%s: %w", namespace, name, err)
+	}
+	return nil
 }
 
 // reconcileIntoNewClaim fills a second claim and leaves the app's alone.
 //
 // It writes a VolumeRestore carrying the chosen point in time and a claim
-// naming it, so the ordinary populator path does the work. Nothing here has to
-// stop, which is what makes this the shape to reach for when the question is
-// whether an older backup is any better.
-func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun, repository restoreSettings) (ctrl.Result, error) {
+// naming it, so the ordinary populator path does the work. It first checks
+// that a snapshot is in reach, because the populator would otherwise bind an
+// empty claim and report success.
+func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	run.Status.Target = run.Spec.Into
+	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
+	if err != nil {
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
 
-	vr := pointInTimeRestore(run, repository)
+	if run.Status.Phase == "" {
+		at, err := target(run)
+		if err != nil {
+			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+		}
+		snapshot, reason, err := r.selectSnapshot(ctx, run, settings.Secret, at)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if reason != "" {
+			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, reason)
+		}
+		now := metav1.NewTime(r.Now())
+		run.Status.Phase = backupv1alpha1.RunPhaseRunning
+		run.Status.StartedAt = &now
+		run.Status.Items = []backupv1alpha1.RestoreItem{{
+			Kind: "PersistentVolumeClaim", Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning, Snapshot: snapshot,
+		}}
+		backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning,
+			fmt.Sprintf("restoring into claim %s", run.Spec.Into))
+		if err := r.writeStatus(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	vr := pointInTimeRestore(run, settings)
 	if err := r.Create(ctx, vr); err != nil && !apierrors.IsAlreadyExists(err) {
 		return ctrl.Result{}, fmt.Errorf("create VolumeRestore %s/%s: %w", vr.Namespace, vr.Name, err)
 	}
-
-	claim := scratchClaim(run, repository, vr.Name)
+	claim := scratchClaim(run, settings, vr.Name)
 	if err := r.Create(ctx, claim); err != nil && !apierrors.IsAlreadyExists(err) {
 		return ctrl.Result{}, fmt.Errorf("create PersistentVolumeClaim %s/%s: %w", claim.Namespace, claim.Name, err)
 	}
 
 	bound := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
-	if err := r.Get(ctx, key, bound); err != nil {
+	if err := r.Reader.Get(ctx, key, bound); err != nil {
 		return ctrl.Result{}, fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
 	}
 	if bound.Status.Phase == corev1.ClaimBound {
-		return ctrl.Result{}, r.succeed(ctx, run,
+		for i := range run.Status.Items {
+			run.Status.Items[i].Phase = backupv1alpha1.ItemSucceeded
+		}
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonSucceeded,
 			fmt.Sprintf("claim %s is bound and holds the restored data", run.Spec.Into))
 	}
-	if expired, deadline := r.timedOut(run); expired {
-		return ctrl.Result{}, r.fail(ctx, run, backupv1alpha1.ReasonTimedOut,
-			fmt.Sprintf("claim %s had not bound by %s", run.Spec.Into, deadline.Format(time.RFC3339)))
-	}
-	if run.Status.StartedAt == nil {
-		return ctrl.Result{RequeueAfter: pollInterval}, r.begin(ctx, run, "")
+	if deadline, over := r.overdue(run); over {
+		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("claim %s had not bound by %s", run.Spec.Into, deadline.Format(time.RFC3339)))
 	}
 	return ctrl.Result{RequeueAfter: pollInterval}, nil
 }
 
+// abort ends a run early: every unfinished item fails and every destination
+// the run created is removed.
+func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) error {
+	for i := range run.Status.Items {
+		item := &run.Status.Items[i]
+		switch item.Phase {
+		case backupv1alpha1.ItemPending, backupv1alpha1.ItemRunning, backupv1alpha1.ItemDeleted, backupv1alpha1.ItemRecovering:
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+		}
+	}
+	return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, message)
+}
+
+// finish removes the destinations the run created and records the terminal
+// phase.
+func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
+	if err := r.removeDestinations(ctx, run); err != nil {
+		return err
+	}
+	now := metav1.NewTime(r.Now())
+	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
+	if reason != backupv1alpha1.ReasonSucceeded {
+		run.Status.Phase = backupv1alpha1.RunPhaseFailed
+	}
+	run.Status.CompletedAt = &now
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, reason, message)
+	if err := r.writeStatus(ctx, run); err != nil {
+		return err
+	}
+	return dropFinalizer(ctx, r.Client, run)
+}
+
+// finalize removes the destinations on the way to deletion. A run deleted
+// while its mover writes would otherwise leave a restore running against a
+// claim with nothing tracking it.
+func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+	if !controllerutil.ContainsFinalizer(run, Finalizer) {
+		return nil
+	}
+	if err := r.removeDestinations(ctx, run); err != nil {
+		return err
+	}
+	return dropFinalizer(ctx, r.Client, run)
+}
+
+func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+	for i := range run.Status.Items {
+		item := &run.Status.Items[i]
+		if item.Destination == "" {
+			continue
+		}
+		destination := &volsyncv1alpha1.ReplicationDestination{
+			ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: item.Destination},
+		}
+		if err := r.Delete(ctx, destination); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete ReplicationDestination %s: %w", item.Destination, err)
+		}
+		item.Destination = ""
+	}
+	return nil
+}
+
+func (r *RestoreRunReconciler) overdue(run *backupv1alpha1.RestoreRun) (time.Time, bool) {
+	if run.Status.StartedAt == nil || run.Spec.Timeout == nil {
+		return time.Time{}, false
+	}
+	deadline := run.Status.StartedAt.Add(run.Spec.Timeout.Duration)
+	return deadline, !r.Now().Before(deadline)
+}
+
+func (r *RestoreRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
+	run.Status.Phase = backupv1alpha1.RunPhaseWaiting
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
+	return r.writeStatus(ctx, run)
+}
+
+func (r *RestoreRunReconciler) writeStatus(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+	if err := r.Status().Update(ctx, run); err != nil {
+		return fmt.Errorf("set RestoreRun %s/%s status: %w", run.Namespace, run.Name, err)
+	}
+	return nil
+}
+
 // claimHolder returns the name of a pod mounting the claim, empty when none is.
-func (r *RestoreRunReconciler) claimHolder(ctx context.Context, namespace, claim string) (string, error) {
+func claimHolder(ctx context.Context, c client.Reader, namespace, claim string) (string, error) {
 	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(namespace)); err != nil {
+	if err := c.List(ctx, pods, client.InNamespace(namespace)); err != nil {
 		return "", err
 	}
 	for _, pod := range pods.Items {
-		if !pod.DeletionTimestamp.IsZero() {
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		for _, volume := range pod.Spec.Volumes {
@@ -178,118 +609,37 @@ func (r *RestoreRunReconciler) claimHolder(ctx context.Context, namespace, claim
 	return "", nil
 }
 
-// cleanupThen removes the destination and then records the terminal phase, so
-// nothing this run created outlives the run whichever way it ended.
-func (r *RestoreRunReconciler) cleanupThen(ctx context.Context, run *backupv1alpha1.RestoreRun, destination *volsyncv1alpha1.ReplicationDestination, reason, message string) error {
-	if err := r.Delete(ctx, destination); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete ReplicationDestination %s/%s: %w", destination.Namespace, destination.Name, err)
+// destinationName is the ReplicationDestination restoring the run's index-th
+// item. It is short: VolSync names its Job and pod labels after it.
+func destinationName(uid types.UID, index int) string {
+	short := string(uid)
+	if len(short) > 8 {
+		short = short[:8]
 	}
-	if reason == backupv1alpha1.ReasonSucceeded {
-		return r.succeed(ctx, run, message)
-	}
-	return r.fail(ctx, run, reason, message)
+	return fmt.Sprintf("restore-%s-%d", short, index)
 }
 
-func (r *RestoreRunReconciler) begin(ctx context.Context, run *backupv1alpha1.RestoreRun, destination string) error {
-	now := metav1.NewTime(r.Now())
-	run.Status.Phase = backupv1alpha1.RunPhaseRunning
-	run.Status.Destination = destination
-	if run.Status.StartedAt == nil {
-		run.Status.StartedAt = &now
-	}
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning,
-		fmt.Sprintf("restoring into claim %s", run.Status.Target))
-	return r.writeStatus(ctx, run)
-}
-
-func (r *RestoreRunReconciler) wait(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
-	run.Status.Phase = backupv1alpha1.RunPhaseWaiting
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
-	return r.writeStatus(ctx, run)
-}
-
-func (r *RestoreRunReconciler) succeed(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) error {
-	now := metav1.NewTime(r.Now())
-	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
-	run.Status.CompletedAt = &now
-	run.Status.Destination = ""
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, backupv1alpha1.ReasonSucceeded, message)
-	if err := r.writeStatus(ctx, run); err != nil {
-		return err
-	}
-	return r.release(ctx, run)
-}
-
-func (r *RestoreRunReconciler) fail(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
-	now := metav1.NewTime(r.Now())
-	run.Status.Phase = backupv1alpha1.RunPhaseFailed
-	run.Status.CompletedAt = &now
-	run.Status.Destination = ""
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, reason, message)
-	if err := r.writeStatus(ctx, run); err != nil {
-		return err
-	}
-	return r.release(ctx, run)
-}
-
-// finalize removes the destination on the way to deletion. A run deleted while
-// its mover writes would otherwise leave a Direct-mode restore running against
-// a claim with nothing tracking it.
-func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
-	if !controllerutil.ContainsFinalizer(run, Finalizer) {
-		return nil
-	}
-	if run.Status.Destination != "" {
-		destination := &volsyncv1alpha1.ReplicationDestination{
-			ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: run.Status.Destination},
-		}
-		if err := r.Delete(ctx, destination); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete ReplicationDestination %s/%s: %w", run.Namespace, run.Status.Destination, err)
+// restoreDone reports whether every item reached a terminal phase.
+func restoreDone(items []backupv1alpha1.RestoreItem) bool {
+	for _, item := range items {
+		switch item.Phase {
+		case backupv1alpha1.ItemSucceeded, backupv1alpha1.ItemFailed, backupv1alpha1.ItemSkipped:
+		default:
+			return false
 		}
 	}
-	return r.release(ctx, run)
+	return true
 }
 
-func (r *RestoreRunReconciler) release(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
-	if !controllerutil.ContainsFinalizer(run, Finalizer) {
-		return nil
+// restoreFailures names the failed items, empty when none failed.
+func restoreFailures(items []backupv1alpha1.RestoreItem) string {
+	var failed []string
+	for _, item := range items {
+		if item.Phase == backupv1alpha1.ItemFailed {
+			failed = append(failed, fmt.Sprintf("%s %s: %s", item.Kind, item.Name, item.Message))
+		}
 	}
-	controllerutil.RemoveFinalizer(run, Finalizer)
-	if err := r.Update(ctx, run); err != nil {
-		return fmt.Errorf("remove the finalizer from RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
-	}
-	return nil
-}
-
-// expire deletes a finished run once its TTL has passed. A run with no TTL is
-// kept as the record of what was restored and when.
-func (r *RestoreRunReconciler) expire(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	if run.Spec.TTLSecondsAfterFinished == nil || run.Status.CompletedAt == nil {
-		return ctrl.Result{}, nil
-	}
-	deadline := run.Status.CompletedAt.Add(time.Duration(*run.Spec.TTLSecondsAfterFinished) * time.Second)
-	if remaining := deadline.Sub(r.Now()); remaining > 0 {
-		return ctrl.Result{RequeueAfter: remaining}, nil
-	}
-	if err := r.Delete(ctx, run); err != nil && !apierrors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("delete the expired RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
-	}
-	return ctrl.Result{}, nil
-}
-
-func (r *RestoreRunReconciler) timedOut(run *backupv1alpha1.RestoreRun) (bool, time.Time) {
-	if run.Status.StartedAt == nil || run.Spec.Timeout == nil {
-		return false, time.Time{}
-	}
-	deadline := run.Status.StartedAt.Add(run.Spec.Timeout.Duration)
-	return !r.Now().Before(deadline), deadline
-}
-
-func (r *RestoreRunReconciler) writeStatus(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
-	if err := r.Status().Update(ctx, run); err != nil {
-		return fmt.Errorf("set RestoreRun %s/%s status: %w", run.Namespace, run.Name, err)
-	}
-	return nil
+	return strings.Join(failed, "; ")
 }
 
 // failedMover reports a destination whose mover gave up, with restic's message.

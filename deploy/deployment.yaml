@@ -36,6 +36,11 @@ spec:
         - name: metrics
           containerPort: 8080
           protocol: TCP
+        # The scheduler's series: each namespace's last successful backup
+        # and schedule interval, which the backup alerts read.
+        - name: runs-metrics
+          containerPort: 8081
+          protocol: TCP
         - name: webhook
           containerPort: 9443
           protocol: TCP
