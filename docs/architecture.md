@@ -1,6 +1,54 @@
 # Architecture
 
-## The library this is built on
+## Three parts in one binary
+
+| Part | Package | Acts on |
+| --- | --- | --- |
+| the populator | internal/populator, on lib-volume-populator | a claim whose `dataSourceRef` names a VolumeRestore, while it is Pending |
+| the run manager | internal/runs, on controller-runtime | BackupRun and RestoreRun objects, and the scheduler that creates a BackupRun at each tick of a Namespace's `backup.wlz.li/schedule` |
+| the bootstrap webhook | internal/bootstrap | a CloudNativePG Cluster on CREATE, and a recovered one on UPDATE |
+
+internal/volsync builds the ReplicationDestinations both the populator and a
+RestoreRun create, and internal/restic reads a repository's snapshots for the
+restore checks and each BackupRun's `snapshotTime`. The sections below this
+table are about the populator; the runs are in
+[namespace-backups.md](namespace-backups.md) and the webhook in
+[restores.md](restores.md).
+
+## Objects the controller writes
+
+In the app's namespace:
+
+| Object | Written by | Lifetime |
+| --- | --- | --- |
+| BackupRun `scheduled-<yyyymmdd-hhmm>` | the scheduler, once per tick | deleted 30 days after it finishes |
+| Kueue Workload, one per run, named in the run's `status.workload` | each BackupRun, which also writes its `PodsReady` condition | deleted when the run ends |
+| ReplicationSource named after each claim marked `backup.wlz.li/enabled` | each BackupRun, owned by the claim and labelled `app.kubernetes.io/managed-by: backup-controller` | stays, and goes with the claim |
+| CloudNativePG Backup `<cluster>-<suffix>` | each BackupRun, one per Cluster marked `backup.wlz.li/enabled` | stays, as CloudNativePG's backup record |
+| ReplicationDestination | an in-place RestoreRun | deleted when the restore ends |
+| VolumeRestore and a scratch claim named by `into:` | a RestoreRun with `into:`, both owned by the run | deleted with the RestoreRun, the claim's dataset included |
+
+In the controller's namespace, for each claim the populator fills: a copy of the
+repository Secret and a ReplicationDestination, both deleted when the fill ends,
+and the prime claim the library creates and hands over.
+
+On objects the controller does not own:
+
+| Object | Write | When |
+| --- | --- | --- |
+| Deployment or StatefulSet marked `backup.wlz.li/quiesce` | `spec.replicas` to 0, then back to the recorded value | during a run with `all: true` |
+| the workload's Flux Kustomization | `spec.suspend` on, then off, only when the run found it running | the same |
+| a new CloudNativePG Cluster | `bootstrap` swapped for `recovery`, an `externalClusters` entry, the `cnpg.io/skipEmptyWalArchiveCheck` annotation, and `backup.wlz.li/restore-run` when a run waits for it | on CREATE, in the webhook |
+| a recovered Cluster | the `initdb` a GitOps tool applies again, dropped | on UPDATE, in the webhook |
+| a Cluster in a database RestoreRun | deleted, so it is created again and recovered | when the restore starts |
+| a claim being filled | the library's `backup.wlz.li` annotations and finalizer | while the fill runs |
+
+Its own BackupRuns and RestoreRuns carry a finalizer, which releases whatever a
+run changed when the run fails, times out or is deleted. The sources it writes
+make VolSync create the clone claim `volsync-<claim>-src`, the restic cache
+claims and the mover Jobs; those are VolSync's objects.
+
+## Built on lib-volume-populator
 
 The controller is a thin provider on top of
 [kubernetes-csi/lib-volume-populator](https://github.com/kubernetes-csi/lib-volume-populator),
@@ -28,9 +76,8 @@ is what keeps a pod of our own out of the design entirely:
 
 Each callback receives `PopulatorParams`, which carries the Kubernetes client,
 the original claim, the prime claim, the storage class, the data source object
-and an event recorder. Verify the exact field names against the version pinned
-in go.mod before writing against them; the shape above is from
-`populator-machinery/controller.go` on master.
+and an event recorder. go.mod pins the library at
+`github.com/kubernetes-csi/lib-volume-populator/v3 v3.3.0`.
 
 ## What the library does around those three calls
 
@@ -127,11 +174,12 @@ a repository Secret that lives in the controller's namespace from the start.
 | the app's claim is deleted while the app runs | the pod loses its volume and stays down until the refill completes, which is what deleting a claim already does |
 | the app's claim is deleted mid-restore | the library's own garbage collection removes the prime claim; `PopulateCleanupFn` removes the destination and the Secret copy |
 
-## What runs where
+## What runs where for one fill
 
 | Object | Namespace | Lifetime |
 | --- | --- | --- |
 | the controller Deployment | the controller's namespace | always |
+| the webhook Service, its cert-manager Issuer and Certificate, and the MutatingWebhookConfiguration | the controller's namespace, and cluster-scoped for the configuration | always |
 | the VolumeRestore | the app's namespace | as long as the app declares it |
 | the prime claim | the controller's namespace | one restore |
 | the ReplicationDestination | the controller's namespace | one restore |

@@ -29,9 +29,12 @@ does.
 backup-controller/
 ├── cmd/backup-controller/      the binary's main package
 ├── internal/
+│   ├── api/v1alpha1/           VolumeRestore, BackupRun, RestoreRun and the annotations
 │   ├── populator/              the three provider callbacks
 │   ├── volsync/                building and reading ReplicationDestination
-│   └── api/v1alpha1/           the VolumeRestore types
+│   ├── runs/                   the BackupRun and RestoreRun reconcilers and the scheduler
+│   ├── bootstrap/              the Cluster webhook and the object store reads
+│   └── restic/                 reading a repository's snapshots over S3
 ├── config/
 │   ├── crd/                    generated CRD YAML, one file per kind
 │   └── samples/                a VolumeRestore and a claim that names it
@@ -41,7 +44,8 @@ backup-controller/
 │   ├── rbac.yaml
 │   ├── serviceaccount.yaml
 │   ├── deployment.yaml
-│   └── crds/                   copied from config/crd at release time
+│   ├── webhook.yaml            the webhook Service, Issuer, Certificate and MutatingWebhookConfiguration
+│   └── crds/                   copied from config/crd by make manifests
 ├── chart/
 │   ├── Chart.yaml
 │   ├── values.yaml
@@ -91,7 +95,7 @@ groups, so the render has to carry all of them:
 | --- | --- |
 | CustomResourceDefinition | applied first and waited on for `Established`, so a VolumeRestore can be created in the same apply |
 | Namespace | applied before the workload |
-| everything else | ServiceAccount, ClusterRole, ClusterRoleBinding, Deployment |
+| everything else | ServiceAccount, ClusterRole, ClusterRoleBinding, Deployment, and the webhook's Service, Issuer, Certificate and MutatingWebhookConfiguration |
 
 Do not split the install across two assets. One file is the whole install, which
 is what makes the module a single `data "http"` and a single version string.
@@ -102,26 +106,38 @@ is what makes the module a single `data "http"` and a single version string.
 | --- | --- |
 | Registry | `ghcr.io/walzen-group/backup-controller` |
 | Platforms | `linux/amd64` is enough for this cluster; add arm64 only when a node needs it |
-| Base | distroless or scratch. The binary needs no shell, no restic and no kubectl |
+| Base | scratch, with the public CA roots copied in from the build stage for the webhook's object store calls. The binary carries Go's zone database for `CRON_TZ=` schedules, and needs no shell, no restic and no kubectl |
 | User | non-root, no capabilities, read-only root filesystem |
 
 ## RBAC the controller needs
 
-Write it out in `deploy/rbac.yaml` as a ClusterRole, and keep it to what the
-library and the callbacks actually use:
+`deploy/rbac.yaml` writes it as one ClusterRole, and every rule traces to a
+caller in the controller:
 
 | Resources | Verbs | For |
 | --- | --- | --- |
-| `persistentvolumeclaims` | get, list, watch, create, patch, delete | the app's claim and the prime claim |
-| `persistentvolumes` | get, list, watch, patch | rebinding the volume to the app's claim |
-| `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used |
-| `volumerestores` (our group) | get, list, watch | reading the data source |
-| `volumerestores/status` | patch, update | reporting conditions |
-| `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per restore |
-| `secrets` | get, create, delete | copying the repository Secret for the length of a restore |
+| `persistentvolumeclaims` | get, list, watch, create, patch, delete | the app's claim, the prime claim, and an `into:` scratch claim |
+| `persistentvolumes` | get, list, watch, patch | rebinding the volume to the app's claim, and reading a volume's node for its mover |
 | `storageclasses` | get, list, watch | reading the binding mode |
+| `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used, and a RestoreRun finding the pod that holds a claim |
+| `volumerestores` (our group) | get, list, watch, create | reading the data source, and a RestoreRun writing the point-in-time one its scratch claim fills from |
+| `volumerestores/status` | patch, update | reporting conditions |
+| `backupruns` | get, list, watch, create, update, delete | the runs and their finalizer; create is the scheduler, delete the 30-day TTL |
+| `restoreruns` | get, list, watch, update, delete | the runs and their finalizer |
+| `backupruns/status`, `restoreruns/status` | patch, update | reporting phase, items and conditions |
+| `replicationsources.volsync.backube` | get, list, watch, create, update, patch | writing each enabled claim's source and its manual trigger |
+| `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill and per in-place restore |
+| `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
+| `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |
+| `clusters.postgresql.cnpg.io` | get, list, delete | the webhook's shared-archive check, a database run, and a database restore deleting its Cluster |
+| `objectstores.barmancloud.cnpg.io` | get | the webhook and the restore checks, reading where a Cluster archives |
+| `deployments`, `statefulsets` | get, list, patch | quiesce |
+| `kustomizations.kustomize.toolkit.fluxcd.io` | get, patch | suspending and resuming a quiesced workload's Kustomization |
+| `workloads.kueue.x-k8s.io` | get, create, delete | admitting a run as one Workload |
+| `workloads/status` | update | the PodsReady condition the run sets itself |
+| `localqueues.kueue.x-k8s.io` | list | finding the namespace's queue |
+| `secrets` | get, create, delete | copying the repository Secret for a fill, and the restic and object store reads |
 | `events` | create, patch | the recorder the library uses |
-| `objectstores.barmancloud.cnpg.io` | get | the bootstrap webhook, reading where a Cluster archives |
 
 Narrow `secrets` if it can be narrowed. A ClusterRole that can read every Secret
 in the cluster is the one line in this install worth arguing about, and
@@ -133,14 +149,14 @@ in the cluster is the one line in this install worth arguing about, and
 | --- | --- |
 | VolSync | the movers every volume backup and restore runs through |
 | CloudNativePG and the Barman Cloud plugin | the databases the bootstrap webhook acts on |
-| cert-manager | the webhook's serving certificate, issued and renewed with no operator step |
+| cert-manager | the webhook's serving certificate, issued and renewed with no admin step |
 
 cert-manager is a hard requirement when the webhook is enabled. It issues the
 certificate and injects the CA into the MutatingWebhookConfiguration through the
 `cert-manager.io/inject-ca-from` annotation, so neither has an expiry date
 anyone has to diary. A cluster without cert-manager installs with
 `webhook.enabled: false` in the chart, and then a rebuilt cluster brings its
-databases back empty; [restores.md](restores.md) says what that costs.
+databases back empty; [restores.md](restores.md) says why.
 
 ## Versioning
 

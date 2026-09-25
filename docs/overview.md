@@ -1,7 +1,10 @@
 # Overview
 
 backup-controller fills a new PersistentVolumeClaim from a restic repository
-without leaving a ZFS clone behind.
+without leaving a ZFS clone behind. This page is about that fill, the first of
+the controller's three jobs. The scheduled and on-demand runs are in
+[namespace-backups.md](namespace-backups.md), and the database recovery in
+[restores.md](restores.md).
 
 ## The mechanism it replaces
 
@@ -116,17 +119,28 @@ nothing drifts, and the destination keeps no permanent copy.
 | Requirement | Why |
 | --- | --- |
 | Kubernetes with `AnyVolumeDataSource` available | a claim has to be able to name a custom kind in `dataSourceRef`; the walzen test cluster runs v1.36.3 |
-| VolSync installed, with its ReplicationDestination CRD | the controller creates one per restore and never moves data itself |
+| VolSync installed, with its ReplicationSource and ReplicationDestination CRDs | the controller writes one source per backed-up claim and one destination per restore, and never moves data itself |
 | a CSI driver whose ordinary provisioning makes an independent volume | true of zfs-localpv, which only clones when the source is a snapshot |
-| a restic repository Secret in the app's namespace | the same Secret VolSync's ReplicationSource already uses |
+| a restic repository Secret in the app's namespace | named by the claim's VolumeRestore, and read by every mover of that volume |
+| Kueue, for namespace runs | each BackupRun is admitted as one Workload through the namespace's LocalQueue |
+| CloudNativePG and the barman-cloud plugin, for databases | the base backups the runs request, and the archives the webhook recovers from |
+| cert-manager, for the webhook | its serving certificate and the CA injected into the webhook configuration |
+
+[packaging.md](packaging.md) says what the install brings with it.
 
 ## Where the boundary sits
 
-The controller creates a ReplicationDestination, polls its status, and deletes
-it. It reads and writes PersistentVolumeClaims and patches one PersistentVolume
-per restore. It runs no mover, mounts no volume, holds no repository
-credentials, and contains no restic code. If a restore fails, the failure is
-VolSync's and is reported in VolSync's objects and events.
+For a fill, the controller creates a ReplicationDestination, polls its status,
+and deletes it. It reads and writes PersistentVolumeClaims and patches one
+PersistentVolume per restore. It runs no mover and mounts no volume. If a
+restore fails, the failure is VolSync's and is reported in VolSync's objects and
+events.
 
-[architecture.md](architecture.md) has the object flow and the library this is
-built on.
+It does read repositories. The restore checks and each BackupRun's
+`snapshotTime` read the restic repository's own files through the S3 client in
+internal/restic, with the password and keys from the repository Secret, and
+copying that Secret for a fill is why the ClusterRole can read Secrets.
+[decisions.md](decisions.md) records that choice.
+
+[architecture.md](architecture.md) has the object flow, the library this is
+built on, and every object the controller writes.

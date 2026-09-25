@@ -1,8 +1,9 @@
 # Restores
 
 Three operations bring data back, and they differ in what they discard. This
-page owns that distinction; [api.md](api.md) describes the VolumeRestore field
-by field and [architecture.md](architecture.md) has the object flow.
+page owns that distinction; [api.md](api.md) describes VolumeRestore and
+RestoreRun field by field and [architecture.md](architecture.md) has the object
+flow.
 
 ## Know this first
 
@@ -16,15 +17,15 @@ is how data is lost:
 ```mermaid
 flowchart TD
     Q{"Does the claim<br/>already exist?"}
-    Q -- "no, it is being created" --> P["VolumeRestore fills it<br/>backup-controller + VolSync"]
-    Q -- "yes, and the app is using it" --> D["ReplicationDestination overwrites it<br/>VolSync, copyMethod Direct"]
+    Q -- "no, it is being created" --> P["its VolumeRestore fills it<br/>the populator + VolSync"]
+    Q -- "yes, and the app is using it" --> D["a RestoreRun overwrites it<br/>a ReplicationDestination, copyMethod Direct"]
 
     P --> P1["the volume holds the<br/>newest backup"]
     D --> D1["the volume holds the<br/>snapshot you chose"]
 ```
 
-The left path is this controller. The right path is plain VolSync and is
-unchanged by this project.
+Both paths go through this controller. The left one acts on its own when a
+claim is created; the right one runs only when someone submits a RestoreRun.
 
 ## Choosing
 
@@ -33,8 +34,8 @@ flowchart TD
     S{"What do you want?"}
 
     S -- "the volume rebuilt from<br/>the newest backup" --> A["Delete the claim"]
-    S -- "an older snapshot, and<br/>keep the live volume" --> B["A second VolumeRestore<br/>with restoreAsOf,<br/>and a second claim"]
-    S -- "an older snapshot written<br/>into the volume you have" --> C["A Direct-mode<br/>ReplicationDestination"]
+    S -- "an older snapshot, and<br/>keep the live volume" --> B["A RestoreRun<br/>with into:"]
+    S -- "an older snapshot written<br/>into the volume you have" --> C["A RestoreRun<br/>naming the claim"]
 
     A --> A1["Discards everything the<br/>volume holds now"]
     B --> B1["Discards nothing.<br/>Two volumes, side by side"]
@@ -52,8 +53,8 @@ flowchart TD
 
 The middle row is the one to reach for when the question is whether an older
 backup is any better, because it answers that without betting the current data on
-the answer. A VolumeRestore is a standing declaration, so any number of them can
-exist at once, each naming its own point in time.
+the answer. Any number of `into:` runs can exist at once, each with its own
+point in time and its own claim.
 
 ## Which claim shapes each one works on
 
@@ -81,14 +82,14 @@ flowchart LR
 
 A fixed-name claim is never populated, because it is bound before anything could
 fill it. Delete it and recreate it and it rebinds the same dataset with the same
-contents, so restic reaches that volume only through a Direct-mode restore. That
-makes the in-place restore the only way back for a fixed-name volume, and one of
-two ways back for a dynamic one.
+contents, so restic reaches that volume only through an in-place RestoreRun.
+That makes the in-place restore the only way back for a fixed-name volume, and
+one of two ways back for a dynamic one. The runs find a fixed-name claim's
+repository through the VolumeRestore carrying the claim's own name.
 
-The Direct-mode restore itself is indifferent to the shape. It names
-`destinationPVC` and writes into whatever claim that is, without knowing how the
-claim was provisioned, so a volume moved onto a VolumeRestore keeps its in-place
-restore.
+The in-place restore itself is indifferent to the shape. Its
+ReplicationDestination names `destinationPVC` and writes into whatever claim
+that is, without knowing how the claim was provisioned.
 
 ## Why an in-place restore needs the workload stopped
 
@@ -97,11 +98,12 @@ one node rather than to one pod, and the mover and the app both land on the node
 holding the volume, so Kubernetes permits both to mount it at once. Two writers
 on one filesystem is how the volume being restored is corrupted.
 
-Stopping the workload is what prevents it, and who does the stopping depends on
-what deployed the app. The walzen infrastructure repository's terragrunt module
-scales its Deployment to zero from a `restore:` input and sequences the
-destination after it; a Flux app is suspended and scaled down by hand.
-[integration.md](integration.md) has both.
+Stopping the workload is what prevents it, and a RestoreRun does not do the
+stopping: it waits in phase Waiting, reason ClaimInUse, until no pod mounts the
+claim. Who stops the workload depends on what deployed it. In the walzen
+infrastructure repository a Flux app is suspended and scaled down by hand, and a
+terragrunt unit is applied with its workload at zero; that repository's
+docs/cluster/backups/ has both procedures.
 
 ## Back up before you discard
 
@@ -165,7 +167,9 @@ spec:
 
 The controller writes a VolumeRestore carrying that point in time and a claim
 naming it, so the ordinary populator path fills it. Mount `canary-backup-friday`
-from a throwaway pod and compare. Deleting the claim deletes its dataset too.
+from a throwaway pod and compare. Both objects are owned by the RestoreRun, so
+deleting the run deletes the claim and its dataset with it; keep the run until
+the comparison is done.
 
 Before it creates anything, a run lists the repository's snapshots and fails
 with reason NoBackupInReach when none is at or before `restoreAsOf`. VolSync's
@@ -298,7 +302,7 @@ The alternative is worse than it sounds. Allowing the Cluster through would
 create it exactly as written, which is `initdb`, which is an empty database
 beside a full archive, reported as success. That failure arrives during a
 cluster rebuild, when this controller is most likely to be starting up and an
-operator is least likely to be reading Cluster events.
+admin is least likely to be reading Cluster events.
 
 ### Starting a database empty
 

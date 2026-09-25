@@ -1,43 +1,58 @@
 # backup-controller
 
-A Kubernetes volume populator that fills a new PersistentVolumeClaim from a
-restic repository by asking VolSync to restore into it, so the resulting volume
-is an ordinary dataset with nothing behind it.
+A Kubernetes controller that schedules and runs a namespace's backups, and
+brings volumes and CloudNativePG databases back from them, with VolSync and the
+barman-cloud plugin moving every byte.
 
-It carries three kinds. A VolumeRestore is a standing declaration that fills a
-claim as the claim is created, from the newest backup, with no admin involved.
-A BackupRun takes one backup now, of one volume, one database, or a whole
-namespace. A RestoreRun writes a chosen moment back, of one volume, one
-database, or a whole namespace. [docs/restores.md](docs/restores.md) says which
-answers which question.
+It does three jobs in one binary:
 
-From v0.5.0 the controller also schedules a namespace's backups. A namespace
-names its schedule in `backup.wlz.li/schedule`, each claim and CloudNativePG
-Cluster opts in with `backup.wlz.li/enabled`, and every tick becomes a BackupRun
-that Kueue admits as one unit and that stops the workloads marked
-`backup.wlz.li/quiesce` while the volumes' clones are cut.
-[docs/namespace-backups.md](docs/namespace-backups.md) has the mechanism, with
-every mode measured on the walzen prod cluster on 2026-09-24.
+| Job | What it acts on | Page |
+| --- | --- | --- |
+| fill a new claim from its restic repository, with no ZFS clone behind it | a claim whose `dataSourceRef` names a VolumeRestore | [docs/overview.md](docs/overview.md) |
+| back up and restore on schedule or on demand | a Namespace's `backup.wlz.li/schedule`, BackupRun, RestoreRun | [docs/namespace-backups.md](docs/namespace-backups.md) |
+| recover a new database from its archive | a CloudNativePG Cluster at creation, through a mutating webhook | [docs/restores.md](docs/restores.md) |
 
-Status, 2026-09-14: released at v0.2.4. VolumeRestore and BackupRun are proven
-on the walzen test cluster. A canary's claim was destroyed and refilled from
-restic, with the repository showing the file's four lines before and five after,
-and a BackupRun took an off-schedule backup in 31 seconds and left the source's
-schedule exactly as it found it. RestoreRun's `into:` mode is fixed in v0.2.4
-and has not been rerun; its in-place mode has not run on a cluster at all.
+A namespace names its schedule in `backup.wlz.li/schedule`, and each claim and
+Cluster opts in with `backup.wlz.li/enabled`. At every tick the controller
+creates a BackupRun that Kueue admits as one unit. The run stops the workloads
+marked `backup.wlz.li/quiesce` while the volumes' clones are cut, writes each
+claim's ReplicationSource, and asks CloudNativePG for a base backup of each
+database. A RestoreRun restores one volume, one database or the whole namespace
+to the newest backup or a chosen moment.
 
-The Go module and its flake dev shell, the VolumeRestore API with its generated
-CRD, the internal/volsync and internal/populator packages with their fake-client
-tests, the binary in cmd/backup-controller bound to the populator library's
-provider callbacks, the deploy/ tree, the Helm chart under chart/ and the
-release workflow all exist, and their gates pass.
+Status, 2026-09-25: released at v0.5.4 and running on the walzen prod cluster,
+where the canary at the infrastructure repository's
+modules/testing/canary-namespace-backup ran every mode on 2026-09-24: a
+scheduled run, each form of BackupRun and RestoreRun, and automatic restore of
+the volume and the database after the namespace was destroyed.
+[docs/namespace-backups.md](docs/namespace-backups.md) quotes those runs.
 
-v0.1.0 was the first release. v0.1.1 adds the cacheStorageClassName and
-cacheCapacity passthroughs: VolSync's mover provisions a metadata cache claim
-for every restore, and without a class named for it that claim comes from the
-cluster's default storage class. Where that default reclaims Retain, each
-restore leaves a cache dataset on the pool, which is the shape this project
-exists to remove.
+## Releases
+
+| Tag | Change |
+| --- | --- |
+| v0.1.0 | the VolumeRestore populator |
+| v0.1.1 | cacheStorageClassName and cacheCapacity passthroughs |
+| v0.1.2 | pods get, list, watch for the library's pod informer |
+| v0.2.0 | BackupRun and RestoreRun, and a stop to the populator's status write loop |
+| v0.2.1 | a startup panic on a doubled `--kubeconfig` flag |
+| v0.2.2 | an error loop in the populator's cleanup |
+| v0.2.3 | a logger for controller-runtime |
+| v0.2.4 | the selected node carried onto an `into:` scratch claim |
+| v0.3.0 | the bootstrap webhook: a new Cluster recovers from its object store |
+| v0.3.1 | the public CA roots in the image |
+| v0.3.2 | an object store verified through its own `endpointCA` |
+| v0.3.3 | the database and owner carried into a recovery |
+| v0.4.0 | a Cluster refused when another database already archives to its prefix |
+| v0.4.1 | dry-run requests admitted without reading the object store |
+| v0.4.2 | `initdb` dropped from updates to a recovered Cluster |
+| v0.5.0 | namespace backups: the scheduler, BackupRun and RestoreRun with `database` and `all`, quiesce, controller-written ReplicationSources, the restore checks, the metrics |
+| v0.5.1 | a base backup named by its directory |
+| v0.5.2 | retention tiers from the `retain-` annotations |
+| v0.5.3 | the zone database compiled in, so a `CRON_TZ=` schedule loads its zone |
+| v0.5.4 | `backup.wlz.li/timeout` and `backup.wlz.li/prune-interval-days` per namespace, and a six-hour default timeout |
+
+The early fixes below explain behaviour that is still in the code.
 
 v0.1.2 adds `pods: get, list, watch` to the ClusterRole. The populator library
 builds a pod informer whether or not a populator pod is used, and waits for its
@@ -46,11 +61,18 @@ failed every few seconds and every claim stayed Pending. Only a cluster showed
 this: the offline check compared deploy/rbac.yaml against the table in
 [docs/packaging.md](docs/packaging.md), and the two agreed with each other.
 
-v0.2.0 adds the BackupRun and RestoreRun kinds and the manager that reconciles
-them, beside the populator's own loop. It also stops a write loop: the library
-has no early return for a claim it has already populated, so it calls the
-cleanup callback on every resync for the life of the claim, and the callback was
-writing VolumeRestore status each time without anything having changed.
+v0.2.0 stops a write loop: the library has no early return for a claim it has
+already populated, so it calls the cleanup callback on every resync for the life
+of the claim, and the callback was writing VolumeRestore status each time
+without anything having changed.
+
+v0.2.2 stops an error loop that had been there since v0.1.0. The library deletes
+the prime claim after calling the cleanup callback, so every pass after the one
+that finishes a restore arrives without it, and the callback rejected that. The
+library requeues on error, so one restored claim erred several times a second
+for as long as it existed, re-emitting PopulatorFinished as it went. Cleanup
+exists to remove things, and the prime claim being gone is the state it works
+towards.
 
 v0.2.4 carries the source claim's selected node onto the scratch claim a
 RestoreRun creates with `into:`. On a WaitForFirstConsumer class the populator
@@ -61,34 +83,11 @@ stayed Pending: observed on the walzen test cluster, eight minutes with no prime
 claim and nothing in the controller's log. Every class on that cluster binds
 WaitForFirstConsumer.
 
-v0.2.3 gives controller-runtime a logger. Without one it discards every line the
-BackupRun and RestoreRun reconcilers produce, so a run that failed would have
-said nothing anywhere. The manager now logs through klog like the rest of the
-binary.
-
-v0.2.2 stops an error loop that had been there since v0.1.0. The library deletes
-the prime claim after calling the cleanup callback, so every pass after the one
-that finishes a restore arrives without it, and the callback rejected that. The
-library requeues on error, so one restored claim erred several times a second
-for as long as it existed, re-emitting PopulatorFinished as it went. Cleanup
-exists to remove things, and the prime claim being gone is the state it works
-towards.
-
-v0.2.1 fixes a startup panic in v0.2.0. Importing controller-runtime brings in
-pkg/client/config, whose init registers a `--kubeconfig` flag, and main declared
-a second one, so the binary died with `flag redefined: kubeconfig` before it did
-anything. Every gate passed: nothing in the test path calls main. The binary now
-reuses whichever flag is registered, and cmd has tests that exercise the default
-FlagSet where the collision happened.
-
-The walzen infrastructure repository installs the release through a terragrunt
-unit and consumes it from its backup module, described in
+The walzen infrastructure repository installs each release through its
+cluster/backup-controller unit, described in
 [docs/integration.md](docs/integration.md).
-[.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md](.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md)
-is the cluster run, whose install and terragrunt canary steps have now been
-performed.
 
-## The problem it exists for
+## Why it exists
 
 An app whose claim names a VolSync ReplicationDestination in `dataSourceRef`
 comes back filled whenever the claim is recreated, with no procedure for anyone
@@ -109,25 +108,31 @@ empty volume by running a VolSync restore directly into it, then hands that
 volume to the app's claim. No VolumeSnapshot is taken, no clone exists, nothing
 is pinned, and the destination's permanent restored copy is gone.
 
+Scheduling came later, in v0.5.0. VolSync's per-source schedules started every
+mover at the same minute and Kueue admitted them one pod at a time, so a
+namespace's two volumes could be backed up hours apart, and an app could not be
+stopped for its backup at all.
+
 ## What it is not
 
-It does not move data. VolSync's mover does every byte, with the repository
-credentials and the backup queue it already uses. This controller creates one
-object, waits for it, and deletes it.
+It does not move data. VolSync's mover writes and reads every volume byte, and
+the barman-cloud plugin every database byte. The controller decides when each
+runs, writes the objects that start them, and reads the results.
 
-It does not replace VolSync, and an app can keep using VolSync's own populator
-on any volume where the clone is acceptable.
+It does not replace VolSync or the barman-cloud plugin, and it keeps no state of
+its own: every run is an object in the cluster, and the backups are the restic
+repositories and barman archives the two tools already write.
 
 ## Documents
 
 | Document | For |
 | --- | --- |
-| [docs/overview.md](docs/overview.md) | the problem, the mechanism, and what changes for an app |
-| [docs/architecture.md](docs/architecture.md) | the object flow, the library it builds on, and what runs where |
-| [docs/api.md](docs/api.md) | the custom resources: every field, their status, and a worked example |
-| [docs/restores.md](docs/restores.md) | what fills a claim, what overwrites one, and which to reach for |
+| [docs/overview.md](docs/overview.md) | the fill problem, the populator mechanism, and what changes for an app |
+| [docs/architecture.md](docs/architecture.md) | the three parts of the binary, every object the controller writes, and what runs where |
+| [docs/api.md](docs/api.md) | VolumeRestore, BackupRun and RestoreRun, field by field |
 | [docs/namespace-backups.md](docs/namespace-backups.md) | the annotations, the scheduler, the runs, quiesce and the metrics, measured on the prod canary |
-| [docs/packaging.md](docs/packaging.md) | the release: image, rendered manifests, Helm chart, and what each asset has to contain |
-| [docs/integration.md](docs/integration.md) | how the infrastructure repository installs and consumes it |
+| [docs/restores.md](docs/restores.md) | what fills a claim, what overwrites one, how a database restores, and which to reach for |
+| [docs/packaging.md](docs/packaging.md) | the release: image, rendered manifests, Helm chart, RBAC |
+| [docs/integration.md](docs/integration.md) | how the infrastructure repository installs and uses it |
 | [docs/decisions.md](docs/decisions.md) | why this shape rather than the alternatives that were rejected |
-| [docs/implementation-plan.md](docs/implementation-plan.md) | the work, in order, with what proves each step |
+| [docs/implementation-plan.md](docs/implementation-plan.md) | the original build plan for v0.1, kept as a record |

@@ -1,12 +1,16 @@
 # Implementation plan
 
-Status, 2026-09-14: milestones 1 through 5 are implemented in this repository,
-their gates pass, and v0.1.1 is released.
+Status, 2026-09-25: complete, and kept as the record of how v0.1 was built. All
+seven milestones are done; the populator has run on the walzen test and prod
+clusters since v0.2, and every backed-up claim the infrastructure repository
+writes names a VolumeRestore. The work after v0.1 (the runs, the webhook, the
+scheduler) was planned in the infrastructure repository's docs/agent/specs/,
+and [namespace-backups.md](namespace-backups.md) describes what it built.
 
-Milestones 6 and 7 have swapped order since this page was written. A cluster run
-needs a claim to run against, and the walzen infrastructure repository's own
-canary is that claim, so milestone 7's module, unit and backup path come first
-and milestone 6 is the canary standing on them. The steps are in
+Milestones 6 and 7 swapped order while the work ran. A cluster run needed a
+claim to run against, and the walzen infrastructure repository's own canary was
+that claim, so milestone 7's module, unit and backup path came first and
+milestone 6 was the canary standing on them. The steps are in
 [.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md](../.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md).
 
 Written for an agent starting from an empty repository with no memory of the

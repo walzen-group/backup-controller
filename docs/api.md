@@ -1,24 +1,21 @@
 # API
 
-This page covers the VolumeRestore, which a claim names in `dataSourceRef` to
-say which restic repository to restore from. BackupRun and RestoreRun, and the
-annotations a namespace declares its backups with, are in
-[namespace-backups.md](namespace-backups.md).
+Three kinds, all `backup.wlz.li/v1alpha1` and namespaced. The annotations a
+namespace declares its backups with are in
+[namespace-backups.md](namespace-backups.md), and which restore to reach for is
+in [restores.md](restores.md).
 
-## VolumeRestore
-
-| | |
-| --- | --- |
-| Group and version | `backup.wlz.li/v1alpha1` |
-| Kind | `VolumeRestore` |
-| Scope | namespaced, in the app's namespace beside the claim |
-| Short name | `vrestore` |
+| Kind | Short name | Is |
+| --- | --- | --- |
+| VolumeRestore | `vrestore` | a standing declaration of where a volume's backups live, named by the claim's `dataSourceRef` |
+| BackupRun | `brun` | one backup now, of a volume, a database or the namespace, and the record of every scheduled one |
+| RestoreRun | `rrun` | one restore, of a volume, a database or the namespace, to the newest backup or a chosen moment |
 
 The group matches the convention kuport set with `kuport.wlz.li`. v0.1.0 shipped
-the CRD under that group, so changing the group or the kind now changes every
-claim in the infrastructure repository with it.
+the VolumeRestore CRD under that group, so changing the group or a kind now
+changes every claim in the infrastructure repository with it.
 
-### Spec
+## VolumeRestore
 
 ```yaml
 apiVersion: backup.wlz.li/v1alpha1
@@ -28,8 +25,7 @@ metadata:
   namespace: notes
 spec:
   # The Secret in this namespace holding the restic repository URL, its
-  # password and the object store keys. The same Secret the app's
-  # ReplicationSource names, written by the backups/pvc component.
+  # password and the object store keys.
   repository: notes-restic-data
 
   # Optional. Restore the newest snapshot taken at or before this time, in
@@ -37,39 +33,44 @@ spec:
   restoreAsOf: "2026-09-13T00:00:00Z"
 
   # Optional, and set it. VolSync's mover provisions a metadata cache claim
-  # for every restore. Left out, that claim comes from the cluster's default
-  # storage class, and a default whose reclaim policy is Retain keeps the
-  # cache dataset after the restore that made it.
+  # for every backup and restore. Left out, that claim comes from the
+  # cluster's default storage class, and a default whose reclaim policy is
+  # Retain keeps the cache dataset after the run that made it.
   cacheStorageClassName: zfs-ephemeral
 
   # Optional. The size of that cache claim. Left out, VolSync picks its own
   # default.
   cacheCapacity: 2Gi
 
-  # Optional. Labels put on the mover pod, so the restore is admitted by the
-  # cluster's backup queue the way every other mover is.
+  # Optional. Labels put on a restore's mover pod, so the restore is admitted
+  # by the cluster's backup queue.
   moverPodLabels:
-    kueue.x-k8s.io/queue-name: backup
+    kueue.x-k8s.io/queue-name: backups
 
-  # Optional. Passed through to the ReplicationDestination unchanged.
+  # Optional. The user the movers run as, for an app whose files only that
+  # user can read.
   moverSecurityContext:
     runAsUser: 26
     runAsGroup: 26
     fsGroup: 26
 ```
 
+The populator reads it when a claim naming it is created, and every BackupRun
+and RestoreRun reads it for the claim it belongs to. A claim with no
+`dataSourceRef`, bound to a volume by name, is described by the VolumeRestore
+carrying the claim's own name.
+
 | Field | Required | Reaches |
 | --- | --- | --- |
-| `repository` | yes | ReplicationDestination `spec.restic.repository`, after the Secret is copied |
-| `restoreAsOf` | no | ReplicationDestination `spec.restic.restoreAsOf` |
-| `cacheStorageClassName` | no | ReplicationDestination `spec.restic.cacheStorageClassName` |
-| `cacheCapacity` | no | ReplicationDestination `spec.restic.cacheCapacity` |
-| `moverPodLabels` | no | ReplicationDestination `spec.restic.moverPodLabels` |
-| `moverSecurityContext` | no | ReplicationDestination `spec.restic.moverSecurityContext` |
+| `repository` | yes | `spec.restic.repository` of every source and destination for the claim; the populator copies the Secret into its own namespace first |
+| `restoreAsOf` | no | the populator's ReplicationDestination `spec.restic.restoreAsOf` |
+| `cacheStorageClassName` | no | `cacheStorageClassName` of every source and destination, and the source's clone class |
+| `cacheCapacity` | no | `cacheCapacity` of the claim's ReplicationSource and of the populator's destination; an in-place RestoreRun's destination leaves it to VolSync |
+| `moverPodLabels` | no | the restore destinations' `moverPodLabels`; a source carries none, because its run was admitted as a whole |
+| `moverSecurityContext` | no | `moverSecurityContext` of every source and destination |
 
-Every field that exists is a passthrough. Add a field only when a
-ReplicationDestination field has to be reachable from a claim, and name it
-after the field it reaches.
+Add a field only when a VolSync field has to be reachable from a claim, and
+name it after the field it reaches.
 
 ### Status
 
@@ -90,88 +91,89 @@ status:
 | Field | Holds |
 | --- | --- |
 | `conditions[type=Ready]` | False while any claim naming this object is being filled, True when none is |
-| `claims[]` | one entry per claim currently being populated from this object, with the phase and when it started |
+| `claims[]` | one entry per claim currently being filled from this object, with the phase, Restoring or Failed, and when it started |
 
-A VolumeRestore is a standing declaration rather than a one-shot job, so a
-restore that finished leaves no entry. What a reader wants from the status is
-whether something is happening now and where to look.
+A finished fill leaves no entry. What a reader wants from the status is whether
+something is happening now and where to look.
 
-Report kstatus-compatible conditions, so a Flux Kustomization with `wait: true`
-can gate on the object and a claim's restore shows up in `flux get`.
-
-## Worked example
-
-An app named notes, with one backed-up volume, on the infrastructure
-repository's Flux layout. Three files in the app's base change, and this is all
-of it:
-
-```yaml
-# base/volume-data/pvc.yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ${APP}
-  annotations:
-    backup.walzen.org/schedule: ${BACKUP_SCHEDULE}
-    backup.walzen.org/retain-last: "10"
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: zfs
-  resources:
-    requests:
-      storage: 1Gi
-  dataSourceRef:
-    apiGroup: backup.wlz.li
-    kind: VolumeRestore
-    name: ${APP}
----
-# base/volume-data/restore.yaml
-apiVersion: backup.wlz.li/v1alpha1
-kind: VolumeRestore
-metadata:
-  name: ${APP}
-spec:
-  repository: ${APP}-restic
-  cacheStorageClassName: zfs-ephemeral
-  moverPodLabels:
-    kueue.x-k8s.io/queue-name: ${BACKUP_QUEUE}
-```
-
-Two annotations the claim carries today are gone with the destination they
-configured: `backup.walzen.org/restore-trigger`, which existed to re-run a
-ReplicationDestination, and `backup.walzen.org/volume-at`, which existed to
-place a restore mover. The scheduler now places the volume.
-
-### What replaces the restore trigger
-
-A VolumeRestore fills a claim once, when the claim is created, so deleting the
-claim and letting it come back is what refills it from the newest backup. The
-delete discards whatever the volume holds at that moment, and on a storage class
-that reclaims Delete the dataset goes with it. Reach for it when you want the
-volume rebuilt, and back the current state up first if you might want it again.
-
-Two other operations cover the rest of what an admin asks for, and neither one
-goes through this API:
-
-| To do this | Create |
-| --- | --- |
-| read an older snapshot beside the live volume | a second VolumeRestore with restoreAsOf set, and a second claim naming it |
-| write an older snapshot into the claim the app already has | a VolSync ReplicationDestination in Direct mode, pointed at that claim, with the workload scaled to zero |
-
-The second is unchanged by this project. A Direct-mode restore mounts the claim
-and overwrites it, and it does not care whether that claim was provisioned
-dynamically or bound to a volume by name, so a dynamic claim keeps the in-place
-restore it always had. [integration.md](integration.md) has the full change to
-the Flux component.
-
-## Validation the CRD carries
+### Validation the CRD carries
 
 | Rule | Why |
 | --- | --- |
 | `repository` is a required, non-empty DNS-1123 name | a missing repository leaves claims Pending with nothing to read |
-| `restoreAsOf` matches RFC3339 when present | VolSync rejects it later and less clearly |
+| `restoreAsOf` is an RFC 3339 date-time when present | VolSync rejects it later and less clearly |
 | `cacheStorageClassName` is a non-empty name of at most 253 characters when present | an empty string reaches VolSync as a class name no provisioner answers, and the mover's cache claim stays Pending |
-| `moverPodLabels` keys and values are valid label syntax | the same |
+| `moverPodLabels` holds at most 8 entries, each with label syntax | the API server installs the label rules only for a map whose size is declared |
 
-Reject what the API server can reject. A claim that cannot be filled should fail
-at apply time rather than sit Pending while someone reads controller logs.
+## BackupRun
+
+```yaml
+apiVersion: backup.wlz.li/v1alpha1
+kind: BackupRun
+metadata:
+  name: before-upgrade
+  namespace: notes
+spec:
+  all: true
+```
+
+| Field | Required | Holds |
+| --- | --- | --- |
+| `source` | one of the three | the claim to back up, which has to carry `backup.wlz.li/enabled: "true"`; its ReplicationSource has the same name |
+| `database` | one of the three | the CloudNativePG Cluster to take a base backup of |
+| `all` | one of the three | every enabled claim and Cluster in the namespace, with the workloads marked `backup.wlz.li/quiesce` stopped until the clones are cut |
+| `timeout` | no | how long the run may work once admitted, e.g. `10h`. Omitted, the namespace's `backup.wlz.li/timeout`, and 6h without one |
+| `ttlSecondsAfterFinished` | no | delete the run that long after it finishes. Omitted, it stays as the record |
+
+A CEL rule on the CRD accepts exactly one of `source`, `database` and `all`. A
+scheduled run is an ordinary BackupRun named `scheduled-<yyyymmdd-hhmm>` with
+`all: true` and a 30-day TTL.
+
+| Status field | Holds |
+| --- | --- |
+| `phase` | Queued, Running, Waiting, Succeeded or Failed; the column `kubectl get brun` prints |
+| `workload` | the Kueue Workload admitting the run, while it exists |
+| `startedAt`, `completedAt` | when Kueue admitted the run, and when it finished |
+| `quiescedAt`, `restartedAt`, `quiesced[]` | when the run stopped and restarted the quiesced workloads, and the replicas it gave each back |
+| `suspendedKustomizations[]` | the Flux Kustomizations the run suspended, as namespace/name; it resumes exactly these |
+| `items[]` | one per volume and database: kind, name, phase, message, the manual `trigger`, the restic `snapshot` and its `snapshotTime`, `empty` for a volume with no files, and the CloudNativePG `backup` |
+| `conditions[type=Ready]` | the reason and message, kstatus-compatible, so a Flux Kustomization with `wait: true` can gate on the run |
+
+## RestoreRun
+
+```yaml
+apiVersion: backup.wlz.li/v1alpha1
+kind: RestoreRun
+metadata:
+  name: notes-back-to-monday
+  namespace: notes
+spec:
+  all: true
+  restoreAsOf: "2026-09-22T00:00:00Z"
+```
+
+| Field | Required | Holds |
+| --- | --- | --- |
+| `claim` | one of `claim`/`repository`, `database` and `all` | the claim whose repository to restore from, and the claim to write into unless `into` names another |
+| `repository` | the same | the restic Secret in this namespace, for a repository no claim here owns; needs `into` |
+| `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository` |
+| `intoSize` | no | the size of that claim; omitted, the source claim's request |
+| `database` | one of the three | the Cluster to restore; the run deletes it and it recovers when it is created again |
+| `all` | one of the three | every enabled claim in place, then every enabled Cluster |
+| `restoreAsOf` | no | the moment to restore to. A volume restores the newest snapshot at or before it, a database replays WAL to it exactly. Omitted, the newest snapshot and the end of the archive |
+| `previous` | no | how many snapshots further back than the selected one; one volume only |
+| `timeout` | no | how long to wait for the movers and the recovered databases; defaults to `4h` |
+| `moverSecurityContext` | no | passed to the restore's ReplicationDestination; omitted, the source claim's VolumeRestore supplies it |
+| `ttlSecondsAfterFinished` | no | delete the run that long after it finishes; an `into` claim and its VolumeRestore go with it |
+
+| Status field | Holds |
+| --- | --- |
+| `phase` | Queued, Running, Waiting, Succeeded or Failed; the column `kubectl get rrun` prints |
+| `target` | the claim an `into` restore creates and fills |
+| `startedAt`, `completedAt` | when the run passed its checks and began, and when it finished |
+| `items[]` | one per volume restored in place and per database: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message, the `destination` while it exists, the `snapshot` and the `baseBackup` a recovery starts from |
+| `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, ClaimInUse, or `recreate <cluster> to finish the restore` |
+
+Three CEL rules on the CRD: exactly one of `claim` or `repository`, `database`
+and `all`; `previous` only with one volume; `into` only with `claim` or
+`repository`.
