@@ -23,10 +23,11 @@ In the app's namespace:
 | --- | --- | --- |
 | BackupRun `scheduled-<yyyymmdd-hhmm>` | the scheduler, once per tick | deleted 30 days after it finishes |
 | Kueue Workload, one per run, named in the run's `status.workload` | each BackupRun, which also writes its `PodsReady` condition | deleted when the run ends |
-| ReplicationSource named after each claim marked `backup.wlz.li/enabled` | each BackupRun, owned by the claim and labelled `app.kubernetes.io/managed-by: backup-controller` | stays, and goes with the claim |
+| ReplicationSource named after each claim marked `backup.wlz.li/enabled` | each BackupRun, owned by the claim and labelled `app.kubernetes.io/managed-by: backup-controller` | stays, and goes with the claim; a BackupRun whose mover failed deletes it, and the next run writes it again |
 | CloudNativePG Backup `<cluster>-<suffix>` | each BackupRun, one per Cluster marked `backup.wlz.li/enabled` | stays, as CloudNativePG's backup record |
-| ReplicationDestination | an in-place RestoreRun | deleted when the restore ends |
-| VolumeRestore and a scratch claim named by `into:` | a RestoreRun with `into:`, both owned by the run | deleted with the RestoreRun, the claim's dataset included |
+| ReplicationDestination | an in-place RestoreRun, and a RestoreRun with `repository:` and `into:` | deleted once the item's end is in the run's status |
+| VolumeRestore named by `into:`, with the finalizer `backup.wlz.li/volume-populator` | a RestoreRun with `claim:` and `into:`, owned by the run | deleted with the RestoreRun; the run removes the finalizer itself when it fails or is deleted before the populator started |
+| a scratch claim named by `into:` | a RestoreRun with `into:`, owned by the run; with `claim:` it names the VolumeRestore in `dataSourceRef`, with `repository:` it has no data source | deleted with the RestoreRun, the claim's dataset included |
 
 In the controller's namespace, for each claim the populator fills: a copy of the
 repository Secret and a ReplicationDestination, both deleted when the fill ends,
@@ -38,12 +39,13 @@ On objects the controller does not own:
 | --- | --- | --- |
 | Deployment or StatefulSet marked `backup.wlz.li/quiesce` | `spec.replicas` to 0, then back to the recorded value | during a BackupRun with `all: true` |
 | Deployment or StatefulSet a RestoreRun's `quiesce` lists | the same | from the RestoreRun's start until its volumes are restored and its databases deleted |
-| the workload's Flux Kustomization | `spec.suspend` on, then off, only when the run found it running | the same as its workload |
+| the workload's Flux Kustomization | `spec.suspend` on, then off, only when the run found it running and its `status.inventory` lists the workload | the same as its workload |
 | a snapshot in the volume's restic repository | a new snapshot file at the run's `restartedAt`, tagged `quiesced`, replacing the one the mover wrote, under a lock file in locks/ | after the mover of a BackupRun that stopped workloads |
 | a new CloudNativePG Cluster | `bootstrap` swapped for `recovery`, an `externalClusters` entry, the `cnpg.io/skipEmptyWalArchiveCheck` annotation, and `backup.wlz.li/restore-run` when a run waits for it | on CREATE, in the webhook |
 | a recovered Cluster | the `initdb` a GitOps tool applies again, dropped | on UPDATE, in the webhook |
 | a Cluster in a database RestoreRun | deleted, so it is created again and recovered | when the restore starts |
 | a claim being filled | the library's `backup.wlz.li` annotations and finalizer | while the fill runs |
+| the VolumeRestore a claim fills from | the finalizer `backup.wlz.li/volume-populator` | while any claim is listed in its `status.claims` |
 
 Its own BackupRuns and RestoreRuns carry a finalizer, which releases whatever a
 run changed when the run fails, times out or is deleted. The sources it writes
@@ -77,10 +79,13 @@ database operation leaves it alone.
 | `endpointCA`, when present | the Secret and key it names | a PEM bundle added to the image's public roots |
 
 `bootstrap.S3Prober` answers two questions at that location with the minio
-client. HasBaseBackup lists `<prefix>/base/` with MaxKeys 1, so the store
-returns one object however many years of backups it holds. BaseBackups lists the whole of `base/`, reads
-every `backup.info`, keeps the ones whose `status` is `DONE`, and orders them by
-`end_time`. barman-cloud writes no `backup_id` into backup.info, so the ID is the
+client. HasBaseBackup walks `<prefix>/base/` in key order, reads each
+`backup.info` it meets, and stops at the first whose `status` is `DONE`. barman
+names each backup's directory by its start time, so the oldest is read first,
+and in a store that keeps its backups the oldest is usually done. A store whose
+only base backups failed or never finished answers false. BaseBackups lists
+the whole of `base/`, reads every `backup.info`, keeps the ones whose `status`
+is `DONE`, and orders them by `end_time`. barman-cloud writes no `backup_id` into backup.info, so the ID is the
 directory's name, such as `20260924T221544`.
 
 ### A base backup
@@ -126,20 +131,37 @@ sequenceDiagram
 ```
 
 The item is marked Deleted before the Cluster is deleted, because the webhook
-recovers a Cluster for a run only when that run's item says Deleted. A Cluster
-that comes back without `backup.wlz.li/restore-run` naming the run was not
-recovered for it, so the run deletes it again. A recovered Cluster deleted
-before it turns healthy fails the item.
+recovers a Cluster for a run only when that run's item says Deleted. The same
+status write records the old Cluster's UID in `status.items[].clusterUID`, and
+the delete carries that UID as a precondition, so it never reaches a Cluster of
+the same name created since the run read it.
+
+While the item says Deleted, the run sorts the Cluster it finds by name:
+
+| Cluster found | What the run does |
+| --- | --- |
+| none, or one being deleted | waits |
+| one carrying `backup.wlz.li/bootstrap: initdb` | marks the item Skipped and never deletes it |
+| the UID in `clusterUID` | deletes it again: the old Cluster, which a failed delete or a controller restart after the mark did not reach |
+| another UID, with `backup.wlz.li/restore-run` naming the run | marks the item Recovering |
+| another UID, without that annotation | deletes it again: it was not created through this run |
+
+The UID settles what the annotation alone cannot. The webhook's
+`backup.wlz.li/restore-run` stays on a recovered Cluster for good, so a run
+created again under the same name would find it on the old Cluster too, and
+take the old database for its recovery. A recovered Cluster deleted before it
+turns healthy fails the item.
 
 ### A Cluster being created
 
 The webhook's checks run in this order: dry-run requests pass unchanged, then
 the `backup.wlz.li/bootstrap: initdb` opt-out, then a Cluster that archives
 nowhere, then ResolveLocation, whose failure refuses the Cluster. Next come the
-shared-archive check across every Cluster on the cluster, the waiting RestoreRun
-and a recovery the Cluster declares itself, the target from the run or from
-`backup.wlz.li/restore-as-of`, HasBaseBackup, and BaseBackups when there is a
-target. [restores.md](restores.md) has what each outcome does.
+shared-archive check across every Cluster on the cluster, which reads each
+other Cluster's ObjectStore and none of their Secrets, the waiting RestoreRun
+and a bootstrap method other than `initdb` the Cluster declares itself, the
+target from the run or from `backup.wlz.li/restore-as-of`, HasBaseBackup, and
+BaseBackups when there is a target. [restores.md](restores.md) has what each outcome does.
 
 A Cluster it recovers gets, in one patch:
 
@@ -159,6 +181,50 @@ and the `<cluster>-app` Secret pointing at the empty one.
 On UPDATE of a Cluster whose stored recovery has `source: backup-controller`,
 the webhook drops the `initdb` a GitOps tool applies from its source again,
 which CloudNativePG would otherwise refuse as a second bootstrap method.
+
+## Process, probes and rollout
+
+One pod runs all three parts. The populator library runs in the main goroutine,
+and a controller-runtime manager runs the run reconcilers, the scheduler and
+the webhook server beside it. The container listens on four ports:
+
+| Port | Flag | Serves |
+| --- | --- | --- |
+| 8080 | `--metrics-addr` | the populator library's metrics |
+| 8081 | `--runs-metrics-addr` | the scheduler's metrics, listed in [namespace-backups.md](namespace-backups.md#metrics) |
+| 8082 | `--health-probe-addr` | `/healthz` and `/readyz` for the manager; `0` serves neither |
+| 9443 | `--webhook-port` | the bootstrap webhook, when `--webhook-cert-dir` is set |
+
+The Deployment probes `/healthz` every 20 seconds for liveness and `/readyz`
+every 5 seconds for readiness. `/healthz` answers while the manager runs.
+`/readyz` answers once the webhook server accepts TLS connections, so the
+webhook's Service sends the API server to a pod only once that pod can answer
+an admission request. A controller started without a webhook is ready at once.
+The populator library serves no health route of its own.
+
+When the manager stops while the process is still meant to run, for example
+because its caches failed to sync, the process logs `the run controllers
+stopped, exiting so the pod restarts` and exits with status 1. Without the
+manager the pod would serve no webhook and reconcile no run, and the webhook's
+`failurePolicy: Fail` would refuse every Cluster create on the cluster until
+someone restarted it. The exit makes the kubelet restart the container. The
+populator library ends the process itself when it fails, through
+`klog.Fatalf`.
+
+The controller runs without leader election, so two pods would run two
+schedulers and two sets of reconcilers. The Deployment's strategy is Recreate:
+a rollout stops the old pod before it starts the new one, where the default
+RollingUpdate would run both for a while.
+
+The run manager's client and the populator callbacks' client carry no
+client-side rate limit. client-go's default of 5 requests a second, with a
+burst of 10, would make every Cluster create time out on a cluster with a few
+dozen databases: the webhook reads an ObjectStore for every archiving Cluster within
+its 15-second timeout, and fails closed. The API server's priority and
+fairness shares out the requests.
+
+The ClusterRole the process runs under is listed in
+[packaging.md](packaging.md#rbac-the-controller-needs), rule by rule.
 
 ## Built on lib-volume-populator
 
@@ -279,8 +345,10 @@ a repository Secret that lives in the controller's namespace from the start.
 | Case | What happens |
 | --- | --- |
 | the repository has no snapshot yet, a first deploy | VolSync completes with nothing to write; the prime claim binds empty, the app starts on an empty volume, which matches what the snapshot path does today |
-| the restore fails | `PopulateCompleteFn` keeps returning false, the prime claim never binds, the app's claim stays Pending and its pod does not start. The reason is in the ReplicationDestination's status and events |
-| the controller is down | claims stay Pending. Nothing is half-written and no app starts on an empty volume |
+| the restore fails | `PopulateCompleteFn` keeps returning false, the prime claim never binds, the app's claim stays Pending and its pod does not start. The VolumeRestore reports RestoreFailed with the mover's logs for as long as VolSync keeps retrying the mover, and the ReplicationDestination's status and events hold the rest |
+| the claim's `restoreAsOf` is older than every snapshot | the VolumeRestore reports NoBackupInReach, the controller creates no ReplicationDestination, and the claim stays Pending until the moment is changed or the claim is recreated without it |
+| the VolumeRestore is deleted mid-restore | its finalizer `backup.wlz.li/volume-populator` keeps it Terminating until every claim it fills has finished or been deleted, and each claim's cleanup deletes that claim's destination and Secret copy first |
+| the controller is down | claims stay Pending. Nothing is half-written and no app starts on an empty volume. A process whose run manager stopped exits, so the kubelet restarts it |
 | the controller restarts mid-restore | every object is named from the app claim's UID, so the next reconcile finds the existing destination rather than creating a second one |
 | two apps restore at once | each destination carries the backup queue label, so Kueue admits them the way it admits every other mover |
 | the app's claim is deleted while the app runs | the pod loses its volume and stays down until the refill completes, which is what deleting a claim already does |

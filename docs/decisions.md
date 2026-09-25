@@ -147,6 +147,63 @@ Cluster comes back only when Flux or tofu creates it again, a Kustomization the
 run suspended creates nothing, and resuming it reapplies the workload's
 replicas along with the Cluster.
 
+## Restore a repository into a plain claim through a Direct ReplicationDestination
+
+From v0.8.0 a RestoreRun with `repository:` and `into:` creates a plain claim
+of `intoSize` with no data source, and a ReplicationDestination with
+`copyMethod: Direct` whose mover writes the selected snapshot into that claim.
+A run with `claim:` and `into:` keeps the populator path.
+
+The populator path is what v0.7.x ran for both shapes: the run writes a
+VolumeRestore and a claim naming it in `dataSourceRef`. On a
+WaitForFirstConsumer class, the populator library fills a claim only once
+`volume.kubernetes.io/selected-node` is set on it, and only the scheduler sets that annotation, when it places a pod that uses the claim. A run
+with `claim:` copies the source claim's node onto the new claim, which is the
+v0.2.4 fix in the README. A run with `repository:` has no source claim to copy
+from, and no pod uses the new claim until the restore is done, so nothing ever
+writes the annotation. The claim stays Pending, the controller's log says
+nothing, and the run ends TimedOut. Every class on the walzen cluster binds
+WaitForFirstConsumer.
+
+The controller could pick a node and write the annotation itself. To pick one
+that works, it would have to repeat the scheduler's checks of topology,
+capacity and taints, and keep them in step with the scheduler. A node that
+fails a check the controller skipped gets a volume the provisioner cannot
+create or no pod can reach, and the claim does not say why.
+
+With a Direct destination, the mover pod is the claim's first consumer. The
+scheduler places the mover, and the claim is provisioned on the mover's node,
+the way VolSync places a destination claim it creates itself. The claim is
+Bound while the mover still writes into it, so the run's Succeeded phase is
+what says the data is there. [restores.md](restores.md#submitting-a-restore)
+shows the run.
+
+## Leave an opted-out Cluster out of a RestoreRun
+
+From v0.8.0 a RestoreRun does not delete a Cluster that carries
+`backup.wlz.li/bootstrap: initdb`. Under `all: true` its item is Skipped, and a
+run whose `database:` names it ends Invalid.
+
+A run that treated it like any other Cluster would delete it, and Flux or tofu
+would create it again, still carrying the annotation. The webhook admits an
+opted-out Cluster as written, empty, and never writes
+`backup.wlz.li/restore-run` on it. The run would find a new Cluster that does
+not name it, delete that one too, and repeat until its timeout. The operator
+would see the run end TimedOut and the database come back empty each time.
+
+The webhook could instead ignore the opt-out while a run waits for the
+Cluster. The annotation is how the Cluster's owner asks for an empty database
+on purpose, and that owner would get a recovered one it did not ask for.
+
+The opt-out means the controller stays out of that database's bootstrap, and a
+database restore works only through the bootstrap, so the run leaves the
+Cluster alone. Under `all: true` the rest of the namespace still restores, and
+the Skipped item's message names the annotation. A run that names the Cluster
+has nothing it could do, so it ends Invalid before it touches anything. A
+Cluster that gains the annotation after the run marked it Deleted, or comes back
+with it, is Skipped and never deleted again. [restores.md](restores.md#starting-a-database-empty)
+has the messages.
+
 ## Read namespace settings from annotations, and treat an empty one as absent
 
 The timeout and the prune interval live beside the schedule, as

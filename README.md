@@ -63,6 +63,7 @@ the volume and the database back ending on the same tick.
 | v0.7.0 | `quiesce` on a RestoreRun: the workloads it lists are stopped while it restores |
 | v0.7.1 | a database restore gives the app back only once the old Cluster's instance pods and PVCs are gone |
 | v0.7.2 | a RestoreRun that can't stop a workload fails at once with reason `Failed`; a retime whose delete failed reuses its copy; an `endpointURL` of `host:port` reads as HTTPS |
+| v0.8.0 | a restore from a repository with `into:` writes through a Direct ReplicationDestination, a restore keeps the snapshot its checks selected and leaves an opted-out Cluster alone, a quiesce records its plan before it stops anything, a failed mover fails its item, the webhook ignores failed base backups and compares endpoints, and the controller gets health probes and a Recreate rollout |
 
 The early fixes below explain behaviour that is still in the code.
 

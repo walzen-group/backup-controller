@@ -134,14 +134,14 @@ is the one moment the choice can be made.
 
 | When | What happens |
 | --- | --- |
-| a Cluster is created | the bootstrap webhook finds the Cluster's archive through its ObjectStore. With a base backup there, it rewrites `initdb` to a `recovery` from that archive: to the end of the WAL, or to the moment a waiting RestoreRun or the Cluster's `backup.wlz.li/restore-as-of` names |
+| a Cluster is created | the bootstrap webhook finds the Cluster's archive through its ObjectStore. With a completed base backup there, it rewrites `initdb` to a `recovery` from that archive: to the end of the WAL, or to the moment a waiting RestoreRun or the Cluster's `backup.wlz.li/restore-as-of` names |
 | a namespace run, scheduled or on demand | a CloudNativePG Backup through the barman-cloud plugin for each Cluster marked `backup.wlz.li/enabled`, skipping a hibernated one |
-| a RestoreRun with `database:` or `all: true` | the run checks a base backup reaches the moment, deletes the Cluster, and waits; the webhook recovers the Cluster Flux or tofu creates again |
+| a RestoreRun with `database:` or `all: true` | the run checks a base backup reaches the moment, deletes the Cluster, and waits; the webhook recovers the Cluster Flux or tofu creates again. A Cluster carrying `backup.wlz.li/bootstrap: initdb` is left alone |
 
 The webhook refuses a Cluster in three cases, and each refusal names what it
-found: another database already archives to the same bucket and prefix, the
-moment asked for comes before the oldest base backup, or the object store cannot
-be read. The last one matters most during a rebuild, when the controller may
+found: another database already archives to the same bucket and prefix on the
+same S3 service, the moment asked for comes before the oldest base backup, or
+the object store cannot be read. The last one matters most during a rebuild, when the controller may
 still be starting: letting the Cluster through would create the empty database
 this page exists to prevent.
 

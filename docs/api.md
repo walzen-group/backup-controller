@@ -63,7 +63,7 @@ carrying the claim's own name.
 | Field | Required | Reaches |
 | --- | --- | --- |
 | `repository` | yes | `spec.restic.repository` of every source and destination for the claim; the populator copies the Secret into its own namespace first |
-| `restoreAsOf` | no | the populator's ReplicationDestination `spec.restic.restoreAsOf` |
+| `restoreAsOf` | no | the populator's ReplicationDestination `spec.restic.restoreAsOf`, unless the claim carries `backup.wlz.li/restore-as-of`, which wins |
 | `cacheStorageClassName` | no | `cacheStorageClassName` of every source and destination, and the source's clone class |
 | `cacheCapacity` | no | `cacheCapacity` of the claim's ReplicationSource and of the populator's destination; an in-place RestoreRun's destination leaves it to VolSync |
 | `moverPodLabels` | no | the restore destinations' `moverPodLabels`; a source carries none, because its run was admitted as a whole |
@@ -95,6 +95,23 @@ status:
 
 A finished fill leaves no entry. What a reader wants from the status is whether
 something is happening now and where to look.
+
+| Ready reason | When |
+| --- | --- |
+| Restoring | a claim is being filled; the message names the ReplicationDestination and the controller's namespace |
+| RestoreFailed | the mover failed; the message holds its logs, and the reason stays while VolSync retries the mover, until a sync succeeds |
+| NoBackupInReach | the moment the claim's `backup.wlz.li/restore-as-of` or `spec.restoreAsOf` asks for is older than every snapshot; the message names which of the two it came from, the claim stays Pending, and the controller creates no destination |
+| Restored | no claim is being filled |
+
+While any claim is listed in `status.claims`, the VolumeRestore carries the
+finalizer `backup.wlz.li/volume-populator`. The populator adds it before it
+creates anything for a claim, and removes it once `status.claims` is empty.
+A VolumeRestore deleted mid-restore therefore stays Terminating until its
+claims finish or are deleted. Each claim's cleanup deletes that claim's
+ReplicationDestination and Secret copy, and the cleanup that empties
+`status.claims` removes the finalizer, which lets the deletion finish. A
+VolumeRestore that is already being deleted without the
+finalizer starts no new restore.
 
 ### Validation the CRD carries
 
@@ -134,10 +151,20 @@ scheduled run is an ordinary BackupRun named `scheduled-<yyyymmdd-hhmm>` with
 | `phase` | Queued, Running, Waiting, Succeeded or Failed; the column `kubectl get brun` prints |
 | `workload` | the Kueue Workload admitting the run, while it exists |
 | `startedAt`, `completedAt` | when Kueue admitted the run, and when it finished |
-| `quiescedAt`, `restartedAt`, `quiesced[]` | when the run stopped and restarted the quiesced workloads, and the replicas it gave each back |
-| `suspendedKustomizations[]` | the Flux Kustomizations the run suspended, as namespace/name; it resumes exactly these |
+| `quiescedAt`, `restartedAt` | when the run stopped and restarted the quiesced workloads, in whole seconds |
+| `restartPending` | true from the moment the run records `restartedAt` until it has given every workload its replicas back and resumed every Kustomization; a pass that finds it set repeats the restart and keeps the recorded `restartedAt` |
+| `quiesced[]` | the workloads the run stops, each with the replica count it had before the run touched it, which the run gives back |
+| `suspendedKustomizations[]` | the Flux Kustomizations the run suspends, as namespace/name; it resumes exactly these |
 | `items[]` | one per volume and database: kind, name, phase, message, the manual `trigger`, the restic `snapshot` and its `snapshotTime`, `empty` for a volume with no files, and the CloudNativePG `backup` |
 | `conditions[type=Ready]` | the reason and message, kstatus-compatible, so a Flux Kustomization with `wait: true` can gate on the run |
+
+The run writes `quiesced[]` and `suspendedKustomizations[]` as its plan, before
+it suspends or scales anything, so both lists can name a workload that is still
+running for the length of one pass. When a stop fails partway, the run cuts both
+lists down to what is in effect, the workloads standing at zero replicas and the
+Kustomizations that are suspended, and then gives those back. Which
+Kustomizations a run suspends at all is in
+[namespace-backups.md](namespace-backups.md#which-kustomization-a-run-suspends).
 
 A run that stopped workloads rewrites each volume's snapshot to its
 `restartedAt` and tags it `quiesced`, so `items[].snapshot` is the rewritten
@@ -170,16 +197,16 @@ spec:
 | Field | Required | Holds |
 | --- | --- | --- |
 | `claim` | one of `claim`/`repository`, `database` and `all` | the claim whose repository to restore from, and the claim to write into unless `into` names another |
-| `repository` | the same | the restic Secret in this namespace, for a repository no claim here owns; needs `into` |
-| `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository` |
-| `intoSize` | no | the size of that claim; omitted, the source claim's request |
-| `database` | one of the three | the Cluster to restore; the run deletes it and it recovers when it is created again |
-| `all` | one of the three | every enabled claim in place, then every enabled Cluster |
+| `repository` | the same | the restic Secret in this namespace, for a repository no claim here owns; needs `into` and `intoSize` |
+| `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository`. With `claim`, a VolumeRestore fills it on the source claim's node; with `repository`, a mover writes into it directly, and the scheduler places it with the mover pod |
+| `intoSize` | with `repository` and `into` | the size of that claim; omitted with `claim`, the source claim's request |
+| `database` | one of the three | the Cluster to restore; the run deletes it and it recovers when it is created again. A Cluster carrying `backup.wlz.li/bootstrap: initdb` ends the run Invalid |
+| `all` | one of the three | every enabled claim in place, then every enabled Cluster; a Cluster carrying `backup.wlz.li/bootstrap: initdb` gets a Skipped item |
 | `restoreAsOf` | no | the moment to restore to. A volume restores the newest snapshot at or before it, a database replays WAL to it exactly. Omitted, the newest snapshot and the end of the archive |
 | `previous` | no | how many snapshots further back than the selected one; one volume only |
 | `syncDatabaseToVolume` | no | with `all` only: recover the databases to the moment of the volumes' newest `quiesced` snapshot at or before `restoreAsOf`, so the files and the rows agree. Refused when a volume has no such snapshot, or two volumes' snapshots are from different moments |
 | `quiesce` | no | Deployments and StatefulSets, as `{kind, name}`, to stop while the run restores; not with `into`. The run gives them back once the volumes are restored and the databases deleted |
-| `timeout` | no | how long to wait for the movers and the recovered databases; defaults to `4h` |
+| `timeout` | no | how long to wait for the movers and the recovered databases, counted from when the run passes its checks, or from its creation while its checks keep failing; defaults to `4h` |
 | `moverSecurityContext` | no | passed to the restore's ReplicationDestination; omitted, the source claim's VolumeRestore supplies it |
 | `ttlSecondsAfterFinished` | no | delete the run that long after it finishes; an `into` claim and its VolumeRestore go with it |
 
@@ -190,12 +217,31 @@ spec:
 | `startedAt`, `completedAt` | when the run passed its checks and began, and when it finished |
 | `syncedTo` | the moment a `syncDatabaseToVolume` run restores the volumes and recovers the databases to |
 | `quiescedAt`, `restartedAt`, `quiesced[]`, `suspendedKustomizations[]` | when the run stopped and gave back the workloads `quiesce` lists, the replicas it gave each back, and the Flux Kustomizations it suspended and resumed |
-| `items[]` | one per volume restored in place and per database: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message, the `destination` while it exists, the `snapshot` and the `baseBackup` a recovery starts from |
-| `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, ClaimInUse, or `recreate <cluster> to finish the restore` |
+| `items[]` | one per volume and per database: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message, the `destination` while it exists, the `snapshot` and `snapshotTime` a volume restores, the `baseBackup` a recovery starts from, and the `clusterUID` of the Cluster a database item deletes |
+| `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, ClaimInUse, Retrying, or `recreate <cluster> to finish the restore` |
+
+`items[].snapshotTime` is the time of the snapshot the run's checks selected,
+and the mover gets it as `restoreAsOf`;
+[restores.md](restores.md#which-snapshot-a-run-restores) says why.
+`items[].clusterUID` is the UID of the Cluster a database item deletes, written
+with the Deleted mark; [architecture.md](architecture.md#a-database-restore)
+shows how the run tells the old Cluster from the recovered one by it. Ready
+reason Retrying marks a run whose checks keep failing with an error a retry may
+fix, such as a repository with the wrong password, with the phase still empty;
+[namespace-backups.md](namespace-backups.md#checks-before-anything-is-touched)
+has how long it retries.
 
 A RestoreRun records an event at each new Ready reason, the same way a
 [BackupRun](#backuprun) does.
 
-Five CEL rules on the CRD: exactly one of `claim` or `repository`, `database`
+Six CEL rules on the CRD: exactly one of `claim` or `repository`, `database`
 and `all`; `previous` only with one volume; `into` only with `claim` or
-`repository`; `syncDatabaseToVolume` only with `all`; `quiesce` not with `into`.
+`repository`; `intoSize` with `repository` and `into`; `syncDatabaseToVolume`
+only with `all`; `quiesce` not with `into`. The fourth rejects a run without
+`intoSize` with `into from a repository needs intoSize, because there is no
+source claim to copy a size from`, and a run the API server admitted before that
+rule existed ends Invalid at its checks, naming `spec.intoSize`.
+
+The `quiesced[]` and `suspendedKustomizations[]` of a RestoreRun follow the
+same rules as a [BackupRun's](#backuprun): written as the plan before anything
+is patched, and cut down to what is in effect after a failed stop.

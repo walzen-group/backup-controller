@@ -99,6 +99,11 @@ the gap is the first install on a new cluster.
 | cluster/authentik/db, cluster/seaweedfs | a `dependencies` entry on cluster/backup-controller |
 | Flux apps | the `backup-controller-ready` Kustomization in flux/environments/\<env\>/, which health-checks the controller's Deployment; each app Kustomization lists it in `dependsOn` |
 
+The controller's Deployment reports Ready only once its webhook server accepts
+TLS connections, through the readiness probe on `/readyz` that
+[architecture.md](architecture.md#process-probes-and-rollout) describes, so
+`backup-controller-ready` holds the apps back until the webhook can answer.
+
 The Flux unit cannot depend on backup-controller in terragrunt: volsync writes
 its substitution sources into flux-system and backup-controller depends on
 volsync, so that edge would close a cycle.

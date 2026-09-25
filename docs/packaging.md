@@ -117,16 +117,18 @@ caller in the controller:
 | Resources | Verbs | For |
 | --- | --- | --- |
 | `persistentvolumeclaims` | get, list, watch, create, patch, delete | the app's claim, the prime claim, and an `into:` scratch claim |
+| `persistentvolumeclaims/finalizers` | update | each ReplicationSource names its claim as owner with `blockOwnerDeletion`, which the OwnerReferencesPermissionEnforcement admission plugin allows only to a writer that may update the owner's finalizers |
 | `persistentvolumes` | get, list, watch, patch | rebinding the volume to the app's claim, and reading a volume's node for its mover |
 | `storageclasses` | get, list, watch | reading the binding mode |
 | `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used, and a RestoreRun finding the pod that holds a claim |
-| `volumerestores` (our group) | get, list, watch, create | reading the data source, and a RestoreRun writing the point-in-time one its scratch claim fills from |
+| `volumerestores` (our group) | get, list, watch, create, update | reading the data source, a RestoreRun writing the point-in-time one its scratch claim fills from, and adding and removing the `backup.wlz.li/volume-populator` finalizer |
 | `volumerestores/status` | patch, update | reporting conditions |
 | `backupruns` | get, list, watch, create, update, delete | the runs and their finalizer; create is the scheduler, delete the 30-day TTL |
 | `restoreruns` | get, list, watch, update, delete | the runs and their finalizer |
 | `backupruns/status`, `restoreruns/status` | patch, update | reporting phase, items and conditions |
-| `replicationsources.volsync.backube` | get, list, watch, create, update, patch | writing each enabled claim's source and its manual trigger |
-| `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill and per in-place restore |
+| `backupruns/finalizers`, `restoreruns/finalizers` | update | the Workload, scratch claim and VolumeRestore a run creates name the run as their controller with `blockOwnerDeletion`, which OwnerReferencesPermissionEnforcement allows only with this verb |
+| `replicationsources.volsync.backube` | get, list, watch, create, update, patch, delete | writing each enabled claim's source and its manual trigger, and deleting a source whose mover failed |
+| `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill, per in-place restore, and per restore from `repository:` into a new claim |
 | `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
 | `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |
 | `clusters.postgresql.cnpg.io` | get, list, delete | the webhook's shared-archive check, a database run, and a database restore deleting its Cluster |

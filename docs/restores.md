@@ -98,12 +98,16 @@ one node rather than to one pod, and the mover and the app both land on the node
 holding the volume, so Kubernetes permits both to mount it at once. Two writers
 on one filesystem is how the volume being restored is corrupted.
 
-Stopping the workload is what prevents it, and a RestoreRun does not do the
-stopping: it waits in phase Waiting, reason ClaimInUse, until no pod mounts the
-claim. Who stops the workload depends on what deployed it. In the walzen
-infrastructure repository a Flux app is suspended and scaled down by hand, and a
-terragrunt unit is applied with its workload at zero; that repository's
-docs/cluster/backups/ has both procedures.
+Stopping the workload is what prevents it. A RestoreRun with `quiesce` stops the
+workloads that list names itself, as
+[namespace-backups.md](namespace-backups.md#restore-a-whole-namespace-to-one-moment)
+shows. Without that list the run stops nothing: it waits in phase Waiting,
+reason ClaimInUse, until no pod mounts the claim. It lists the pods straight
+from the API server on every pass, because a cached list that had not yet seen
+a new pod would report the claim free. Who stops the workload then depends on
+what deployed it. In the walzen infrastructure repository a Flux app is
+suspended and scaled down by hand, and a terragrunt unit is applied with its
+workload at zero; that repository's docs/cluster/backups/ has both procedures.
 
 ## Back up before you discard
 
@@ -150,8 +154,8 @@ spec:
   restoreAsOf: "2026-09-13T00:00:00Z"
 ```
 
-That is the in-place restore, and it stops nothing itself. While
-a pod still mounts the claim the run sits in phase Waiting, with the reason
+That is the in-place restore. Without `quiesce` it stops nothing itself: while
+a pod still mounts the claim, the run sits in phase Waiting, with the reason
 ClaimInUse and a message naming the pod that holds it. Stop the workload however
 that app is deployed and the restore begins on its own.
 
@@ -165,11 +169,11 @@ spec:
   restoreAsOf: "2026-09-13T00:00:00Z"
 ```
 
-The controller writes a VolumeRestore carrying that point in time and a claim
-naming it, so the ordinary populator path fills it. Mount `canary-backup-friday`
-from a throwaway pod and compare. Both objects are owned by the RestoreRun, so
-deleting the run deletes the claim and its dataset with it; keep the run until
-the comparison is done.
+The controller writes a VolumeRestore carrying the time of the snapshot the
+run selected, and a claim naming it, so the ordinary populator path fills it on
+the source claim's node. Mount `canary-backup-friday` from a throwaway pod and
+compare. Both objects are owned by the RestoreRun, so deleting the run deletes
+the claim and its dataset with it; keep the run until the comparison is done.
 
 Before it creates anything, a run lists the repository's snapshots and fails
 with reason NoBackupInReach when none is at or before `restoreAsOf`. VolSync's
@@ -190,7 +194,37 @@ that.
 spec:
   repository: other-app-restic
   into: scratch
+  intoSize: 5Gi
 ```
+
+With no source claim, the run has no size to copy and no node to put the new
+claim on, so `intoSize` is required. The run creates `scratch` as a plain claim
+of that size with no data source, and a ReplicationDestination with
+`copyMethod: Direct` whose mover writes the selected snapshot into it. The
+mover pod is the claim's first consumer, so on a WaitForFirstConsumer class the
+scheduler places the claim wherever the mover pod runs.
+[decisions.md](decisions.md#restore-a-repository-into-a-plain-claim-through-a-direct-replicationdestination)
+records why this path skips the populator.
+
+`scratch` is Bound while the mover still writes into it, so wait for the run to
+reach Succeeded before you mount it. A mover that fails ends the run Failed
+with its logs, and a restore still unfinished at `timeout` ends it TimedOut with
+`claim scratch had not been restored by <time>`.
+
+### Which snapshot a run restores
+
+The run compares `restoreAsOf` with each snapshot's time in whole seconds, the
+way VolSync's mover does: the mover drops the fraction of a second from both
+before it compares them. A snapshot taken at 06:00:00.7 is in reach of
+`restoreAsOf: "2026-09-13T06:00:00Z"`, which is also the time a BackupRun
+reports for it.
+
+The run records the snapshot it selected in `status.items[].snapshot` and its
+time in `status.items[].snapshotTime`. The mover, or the VolumeRestore of an
+`into` restore, gets that time in whole seconds as `restoreAsOf`, with no
+`previous`. Were the mover handed the run's own `restoreAsOf` and `previous`,
+it would choose again when it starts, and a scheduled backup that finished in
+between would change which snapshot is the newest, or the one before it.
 
 ## Databases restore themselves
 
@@ -208,13 +242,27 @@ store the Cluster archives through:
 
 | What it finds | What it does |
 | --- | --- |
-| no base backup | nothing; the Cluster bootstraps as written |
-| a base backup | rewrites the Cluster to recover from it, to the end of the archive |
-| a base backup, and a RestoreRun that deleted this Cluster | rewrites it to recover to the run's `restoreAsOf`, and names the run in `backup.wlz.li/restore-run` |
-| a base backup, and `backup.wlz.li/restore-as-of` on the Cluster | rewrites it to recover to that moment |
-| no base backup at or before the moment a run or the annotation asks for | refuses the Cluster, naming the oldest base backup |
-| the Cluster already declares a recovery | nothing, unless a RestoreRun waits for this Cluster; then it refuses it, so two targets cannot race |
+| no completed base backup | nothing; the Cluster bootstraps as written |
+| a completed base backup | rewrites the Cluster to recover from it, to the end of the archive |
+| a completed base backup, and a RestoreRun that deleted this Cluster | rewrites it to recover to the run's `restoreAsOf`, and names the run in `backup.wlz.li/restore-run` |
+| a completed base backup, and `backup.wlz.li/restore-as-of` on the Cluster | rewrites it to recover to that moment |
+| no completed base backup, and a RestoreRun or the annotation asks for a recovery | refuses the Cluster: `... holds no completed base backup to recover from.` |
+| no base backup finished by the moment a run or the annotation asks for | refuses the Cluster, naming the oldest base backup |
+| the Cluster declares a bootstrap method other than `initdb`, such as `recovery` or `pg_basebackup` | nothing, unless a RestoreRun waits for this Cluster; then it refuses it with `declares its own spec.bootstrap.<method>. Remove the declared bootstrap ..., or delete the RestoreRun.`, so two sources cannot race |
 | `backup.wlz.li/bootstrap: initdb` | nothing; an empty database was asked for on purpose |
+
+A completed base backup is one whose backup.info says `status: DONE`. barman
+writes a backup's directory under base/ when the backup starts, so a store
+whose only base backups failed or never finished holds objects there and
+nothing a recovery can start from. The webhook reads each backup.info in key
+order and stops at the first DONE one. When it finds none, it admits the
+Cluster as written and logs the reason `no completed base backup in the store`.
+A RestoreRun's checks against such a store fail before the run deletes
+anything, for the same reason.
+
+The webhook leaves every bootstrap method but `initdb` alone because it can
+only replace `initdb`. Adding a `recovery` beside a `pg_basebackup` would give
+the Cluster two methods, which CloudNativePG refuses.
 
 Neither kustomize nor OpenTofu can make that choice, because both render their
 manifests before anything has spoken to the object store. Admission is the one
@@ -251,7 +299,8 @@ and blocks no update to any other Cluster.
 ### Refusing a shared archive
 
 Before admitting a Cluster, the webhook checks that no other database already
-archives to the same bucket and prefix, and refuses it if one does:
+archives to the same bucket and prefix on the same S3 service, and refuses it if
+one does:
 
 ```text
 other/app-pg already archives to backups/app/app-pg. Two databases writing one
@@ -268,14 +317,29 @@ gone can never reach consistency again.
 A Cluster that declares its own recovery is checked like any other: where a
 Cluster archives does not depend on how it bootstraps.
 
-It compares resolved destinations rather than names, because two Clusters can
-reach one prefix through differently named ObjectStores. The Cluster being
-admitted is skipped by namespace and name, so recreating a database is not a
-collision with the record of itself, which is what makes restores work.
+For every other archiving Cluster on the cluster, the webhook reads the
+ObjectStore it names and compares three values with the new Cluster's:
 
-A Cluster whose own store cannot be read is skipped rather than counted as a
-holder. Refusing a new database because an unrelated one is misconfigured would
-block work this check has no business blocking.
+| Value | From | Compared |
+| --- | --- | --- |
+| endpoint | `spec.configuration.endpointURL` | host and port, ignoring letter case, so `https://s3.example.com` and `S3.example.com` match |
+| bucket | `spec.configuration.destinationPath` | exactly |
+| prefix | the rest of `destinationPath`, plus the server name | exactly |
+
+A holder matches only when all three do, so the same bucket and prefix on
+another S3 service is admitted. Two Clusters can reach one prefix through
+differently named ObjectStores, which is why the webhook compares these values
+and never the store names. The Cluster being admitted is skipped by namespace
+and name, so recreating a database is not a collision with the record of
+itself, which is what makes restores work.
+
+The check reads no Secret of any other Cluster. Where a database archives is
+written in its ObjectStore, so a holder whose credentials Secret is missing
+still counts. Each other Cluster needs one read, which keeps a create inside the
+webhook's timeout on a cluster with many databases. A Cluster whose ObjectStore
+cannot be read, or names no s3:// destination, is skipped: refusing a new
+database because an unrelated one is misconfigured would block work this check
+has no business blocking.
 
 ### Reaching an object store over TLS
 
@@ -317,3 +381,16 @@ metadata:
 ```
 
 Any other value is ignored, so a typo does not silently wipe a database.
+
+A RestoreRun leaves an opted-out Cluster alone too:
+
+| Run | What happens to the opted-out Cluster |
+| --- | --- |
+| `all: true` | its item is Skipped with `the Cluster carries backup.wlz.li/bootstrap: initdb, which asks for an empty database, so the run leaves it alone`, and the run restores everything else |
+| `database: <cluster>` | the run ends Invalid before it touches anything |
+| a Cluster that gains the annotation after the run marked it Deleted, or is created again with it | its item is Skipped, and the run never deletes it again |
+
+The webhook admits an opted-out Cluster empty and never marks it as a run's
+recovery. A run that deleted one would find it back empty, delete it again, and
+repeat until its timeout. [decisions.md](decisions.md#leave-an-opted-out-cluster-out-of-a-restorerun)
+has the decision.

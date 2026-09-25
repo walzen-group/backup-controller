@@ -160,17 +160,21 @@ restartedAt: "2026-09-24T22:15:45Z"
    while the run waits. It sets the Workload's PodsReady condition itself,
    because the Workload has no pods and Kueue's waitForPodsReady would evict it.
    A namespace with no LocalQueue starts at once.
-2. It records whether the Flux Kustomization named in a quiesced workload's
-   `kustomize.toolkit.fluxcd.io/name` label is suspended, suspends it if not,
-   and scales every workload marked `backup.wlz.li/quiesce` to zero. It then
-   waits until none of their pods is left, terminating ones included: a pod
-   shutting down can still write.
+2. It writes its plan into the status before it changes anything: every
+   workload marked `backup.wlz.li/quiesce` in `status.quiesced`, with the
+   replicas it has now, and the Flux Kustomizations to suspend in
+   `status.suspendedKustomizations`. Then it suspends those Kustomizations and
+   scales the workloads to zero, and waits until none of their pods is left,
+   terminating ones included: a pod shutting down can still write. A pod in
+   phase Succeeded or Failed, such as an evicted one, does not count, because
+   its containers have ended.
 3. It writes each enabled claim's ReplicationSource with the run's manual tag,
    and creates a CloudNativePG Backup for each enabled Cluster. A Cluster
    carrying `cnpg.io/hibernation: "on"` is skipped.
-4. Once every clone claim `volsync-<claim>-src` is Bound, it gives each workload
-   its replicas back and resumes only the Kustomizations it suspended. The
-   upload continues from the clone.
+4. Once every volume's clone is cut, it records `restartedAt` with
+   `restartPending: true` and writes the status. Then it gives each workload its
+   replicas back, resumes only the Kustomizations it suspended, and clears
+   `restartPending`. The upload continues from the clone.
 5. It reads the snapshot each mover logged, `snapshot d1cb7739 saved`, and the
    time restic stamped on it from the repository itself. When step 2 stopped a
    workload, it writes the snapshot again at `restartedAt`, as the next section
@@ -180,6 +184,36 @@ A finalizer performs step 4 and deletes the Workload on failure, on timeout and
 when the run is deleted. The canary's writer was down 34 seconds, most of it the
 pod's 30-second termination grace, because its shell loop does not handle
 SIGTERM.
+
+The run writes each plan before it acts on it, so a pass that stops the
+workloads and then loses its status write is retried from the recorded plan.
+Reading the workloads again at that point would find them at zero replicas, and
+the run would give back nothing. For the same reason `restartedAt` is written
+before the restart, and a pass that finds `restartPending` set repeats the
+restart with the recorded moment. When a stop fails partway, the run cuts the
+plan down to the workloads that stand at zero and the Kustomizations that are
+suspended, starts those again, and ends Failed. `quiescedAt` and `restartedAt`
+are whole seconds.
+
+A clone claim `volsync-<claim>-src` counts as cut in step 4 when it is Bound,
+not being deleted, and was created after `quiescedAt`. VolSync marks a sync
+done before its cleanup deletes the clone, so the previous sync's clone can
+still be Bound when a run starts, holding the data from before the app stopped.
+The app stays down until the run's own clone exists.
+
+### Which Kustomization a run suspends
+
+The kustomize-controller labels `kustomize.toolkit.fluxcd.io/name` and
+`kustomize.toolkit.fluxcd.io/namespace` on a workload name the Kustomization
+that applied it. The run suspends that Kustomization only when its
+`status.inventory.entries` lists the workload, with the id
+`<namespace>_<name>_apps_<Kind>`, such as `notes_notes_apps_Deployment`. Anyone
+who can edit a workload can set its labels, and suspending a Kustomization is a
+write in another namespace, so the labels alone are not enough. A workload
+without the labels, whose Kustomization is gone, or whose Kustomization does
+not list it, is scaled down with nothing suspended. A Kustomization that is
+already suspended is left out, because the run did not suspend it and must not
+resume it. A failed read of a Kustomization is retried at the next pass.
 
 ### Quiesced snapshots
 
@@ -194,8 +228,12 @@ and the tag `quiesced`, and names the snapshot the mover wrote as its
 `original`; the controller then deletes that one. `restic rewrite --forget
 --new-time` makes the same change, and `restic tag --add` the tag. Nothing
 wrote between the last pod stopping and `restartedAt`: the controller reads the
-clock at the start of the reconcile that gives the replicas back, and that
-reconcile runs after the one that found the pods gone.
+clock at the start of the reconcile that gives the replicas back, drops the
+fraction of a second, and writes that moment to the status before it scales
+anything up. That reconcile runs after the one that found the pods gone. The
+rewritten snapshot carries the same whole-second time, which is the precision
+VolSync's mover compares at. Under v0.7.x and earlier the rewritten snapshot
+kept the fraction, and the status showed it cut to the second.
 
 The 11:45 scheduled run on the prod canary, on v0.6.0. Its mover logged, in the
 ReplicationSource's `status.latestMoverStatus.logs`:
@@ -238,7 +276,13 @@ Restic completed in 3s
 The controller holds restic's exclusive lock while it writes, and restic's own
 `prune` holds the same one. Any other lock in locks/ keeps the rewrite waiting,
 shared ones included, apart from a lock older than restic's 30-minute stale
-limit. While one is held, the volume's item stays Running with a message naming
+limit. The controller deletes a stale lock whose username is
+`backup-controller`, whatever host and PID it names: a controller pod replaced
+before it removed its lock leaves one with a hostname no later pod has, and
+that lock would stop every prune, and as an exclusive lock every backup, since
+VolSync runs `restic unlock` only when `spec.restic.unlock` changes. The
+controller tries three times, a second apart, to remove its own lock after a
+rewrite. While another process's lock is held, the volume's item stays Running with a message naming
 the lock's host, and the run tries again at its next poll, so it never reports
 Succeeded for a snapshot left untagged.
 
@@ -297,6 +341,16 @@ source still completing another run's tag waits for it (reason SourceBusy). A
 source of the same name the controller did not write is left alone, and the
 item fails naming it.
 
+A mover Job that fails leaves the tag open. VolSync writes the Job's logs into
+`status.latestMoverStatus`, deletes the Job and starts another, for as long as
+the tag stays, and a later run would wait on that tag with reason SourceBusy.
+So when the source still carries the run's tag, has not completed it, and
+reports a Failed mover in a sync VolSync started after the run's `startedAt`,
+the run fails the item with the mover's logs and deletes the ReplicationSource.
+The next run writes a fresh one. When the delete fails, the item's message
+adds `the ReplicationSource could not be deleted, so VolSync keeps retrying it
+and later runs wait for it`, followed by the error.
+
 ## Back up now
 
 | Run | Backs up | Measured |
@@ -308,12 +362,27 @@ item fails naming it.
 A CEL rule on the CRD accepts exactly one of the three. The claim or Cluster
 has to carry `backup.wlz.li/enabled: "true"`.
 
+A BackupRun ends with reason Invalid only for a spec no retry can fix: a named
+claim or Cluster that is missing or not marked, or nothing marked in the
+namespace. Once the run has its items, an item fails only for what the item
+itself holds: `the claim <name> no longer exists`, `claim <name> is bound to
+the PersistentVolume <pv>, which does not exist`, a claim's retain- annotations
+that don't parse, or a source or Backup the API server rejects as invalid. A
+timeout or a 5xx from the API server while the run plans, stops workloads or
+starts an item is returned, and the next reconcile tries again.
+
+A cluster without the CloudNativePG CRDs holds no Clusters. The scheduler and
+every run with `all: true` find none there, and a BackupRun with
+`database: <name>` ends Invalid with `no Cluster <name> in this namespace; the
+cluster has no CloudNativePG CRDs`.
+
 ## Restore
 
 | Run | Restores |
 | --- | --- |
 | `claim: <claim>` | one volume, in place, once nothing mounts it |
 | `claim:` with `into: <new claim>` | one volume into a new claim; the app keeps running |
+| `repository:` with `into: <new claim>` and `intoSize` | a repository no claim here owns, into a new claim |
 | `database: <cluster>` | one database |
 | `all: true` | every enabled volume in place, then every enabled database |
 
@@ -345,9 +414,24 @@ Cluster canary-namespace-backup-pg: no base backup finished by 2026-09-24T22:12:
 Without the first check, VolSync's mover prints `No eligible snapshots found`,
 exits 0, and the restore reports success having written nothing.
 
+A missing repository Secret fails the check with `no repository Secret <name>
+in this namespace`. A check that fails with an error a retry may fix, such as a
+timeout from the API server or a repository the controller can't open, leaves
+the phase empty and sets Ready to reason Retrying with the error as the
+message, and the controller tries again. A run still retrying once its
+`timeout` has passed since it was created ends Failed with reason TimedOut, so
+a wrong repository password shows up in `kubectl get rrun` and ends the run.
+The same kind of error while a volume item waits to start is retried with the
+item left as it was.
+
 ### A database restore
 
-The run marks the item Deleted, then deletes the Cluster. Deleting the Cluster
+The run marks the item Deleted and records the Cluster's UID in
+`status.items[].clusterUID`, then deletes the Cluster;
+[architecture.md](architecture.md#a-database-restore) says how the UID tells the
+old Cluster from the recovered one. A Cluster carrying
+`backup.wlz.li/bootstrap: initdb` is never deleted, as
+[restores.md](restores.md#starting-a-database-empty) describes. Deleting the Cluster
 only starts its instance pod's shutdown: Postgres does a smart shutdown, which
 refuses new connections and waits for open sessions until the Cluster's
 `smartShutdownTimeout`, 180 seconds by default. On the Flux canary on
@@ -393,8 +477,8 @@ kept running through it; its report before and after:
 
 The rows from 22:20:25 to 22:22:33 are gone, the table ends at 22:18:25, the
 last tick before the target, and new writes continue. A Cluster that declares
-its own recovery while a run waits for it is refused, so the two targets cannot
-race.
+its own bootstrap method, such as `recovery` or `pg_basebackup`, while a run
+waits for it is refused, so the two sources cannot race.
 
 ### Restore a whole namespace
 
@@ -438,10 +522,12 @@ spec:
    BackupRun that stopped the workloads writes one`, and so do two claims whose
    snapshots carry different times. A listed workload the namespace does not
    hold fails it too.
-2. It suspends each listed workload's Flux Kustomization, scales the workload to
-   zero, and waits until no pod of it is left.
-3. It restores each volume with `restoreAsOf` set to `syncedTo`. The quiesced
-   snapshot carries exactly that time, so the mover selects it.
+2. It suspends each listed workload's Flux Kustomization, by the rule in
+   [Which Kustomization a run suspends](#which-kustomization-a-run-suspends),
+   scales the workload to zero, and waits until no pod of it is left.
+3. It restores each volume with `restoreAsOf` set to the time of the quiesced
+   snapshot it selected, which is `syncedTo`, so the mover selects that
+   snapshot.
 4. It deletes each Cluster and waits until the Cluster's instance pods and
    PVCs are gone, as [A database restore](#a-database-restore) describes. Then
    it gives the workloads their replicas back and resumes the Kustomizations it
@@ -504,7 +590,8 @@ admission webhook "bootstrap.backup.wlz.li" denied the request: annotation backu
 ```
 
 A claim pinned before every snapshot stays Pending, with reason NoBackupInReach
-on its VolumeRestore, once a pod is scheduled for it. The populator's test
+on its VolumeRestore, once a pod is scheduled for it. The populator
+checks a VolumeRestore's own `spec.restoreAsOf` the same way. The populator's test
 covers that; on the canary the writer depends on the refused Cluster, so no pod
 was scheduled and the populator never ran.
 
@@ -541,7 +628,9 @@ restic 0.18.1's internal/restic/lock.go: check locks/ for other locks, write
 its own, wait 200 ms, check again, and remove its own on a conflict. A lock
 carrying the controller's own hostname and PID is one it failed to remove
 earlier, and the next rewrite deletes it, because restic's `prune` never skips
-a stale lock.
+a stale lock. The next rewrite also deletes any lock older than 30 minutes
+that carries the username `backup-controller`, as
+[Quiesced snapshots](#quiesced-snapshots) describes.
 
 The tests read, and rewrite a copy of, a fixture restic 0.19.1 wrote. The
 controller runs no restic binary and pins no image beside VolSync's.
