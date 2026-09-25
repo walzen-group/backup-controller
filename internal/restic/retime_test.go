@@ -64,14 +64,15 @@ func writableFixture(t *testing.T) (DirStore, *Repository) {
 	return store, repo
 }
 
-// withoutLockWait sets lockCheckDelay to zero for the length of the test, so
-// the tests don't sleep through restic's pause between writing a lock and
-// checking for others.
+// withoutLockWait sets lockCheckDelay and unlockRetryDelay to zero for the
+// length of the test, so the tests don't sleep through restic's pause between
+// writing a lock and checking for others, or through the pause between two
+// tries to remove a lock.
 func withoutLockWait(t *testing.T) {
 	t.Helper()
-	saved := lockCheckDelay
-	lockCheckDelay = 0
-	t.Cleanup(func() { lockCheckDelay = saved })
+	savedCheck, savedRetry := lockCheckDelay, unlockRetryDelay
+	lockCheckDelay, unlockRetryDelay = 0, 0
+	t.Cleanup(func() { lockCheckDelay, unlockRetryDelay = savedCheck, savedRetry })
 }
 
 // document decrypts one file of the repository and returns its JSON fields.
@@ -103,7 +104,19 @@ const moverHost = "volsync-src-notes-data-abcde"
 // and PID given.
 func placeLock(t *testing.T, store DirStore, repo *Repository, at time.Time, exclusive bool, host string, pid int) {
 	t.Helper()
-	plain, err := json.Marshal(map[string]any{"time": at, "exclusive": exclusive, "hostname": host, "pid": pid})
+	placeUserLock(t, store, repo, at, exclusive, host, pid, "")
+}
+
+// placeUserLock writes a lock file like placeLock does, with the username
+// given as well. An empty username leaves the field out, as a VolSync mover
+// running as no named user does.
+func placeUserLock(t *testing.T, store DirStore, repo *Repository, at time.Time, exclusive bool, host string, pid int, user string) {
+	t.Helper()
+	fields := map[string]any{"time": at, "exclusive": exclusive, "hostname": host, "pid": pid}
+	if user != "" {
+		fields["username"] = user
+	}
+	plain, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,6 +285,81 @@ func TestRetimeRemovesALockThisProcessLeftBehind(t *testing.T) {
 		t.Fatalf("retime past this process's own lock: %v", err)
 	}
 	if left := lockFiles(t, store); len(left) != 0 {
+		t.Errorf("locks left behind: %v", left)
+	}
+}
+
+// TestRetimeRemovesAStaleLockAnEarlierControllerLeft checks that Retime
+// removes a stale lock that carries the controller's username, whatever host
+// and PID it names. A controller pod that was replaced between writing its
+// lock and removing it leaves such a lock, and no later pod shares its host.
+// restic's prune never skips a stale lock, and VolSync runs restic unlock only
+// when spec.restic.unlock changes, so the lock would stop every prune. A stale
+// lock a mover left stays, because it isn't the controller's to remove.
+func TestRetimeRemovesAStaleLockAnEarlierControllerLeft(t *testing.T) {
+	store, repo := writableFixture(t)
+	placeUserLock(t, store, repo, time.Now().Add(-31*time.Minute), true, "backup-controller-7c9f-old", 1, lockUser)
+	placeLock(t, store, repo, time.Now().Add(-31*time.Minute), false, moverHost, 12)
+
+	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err != nil {
+		t.Fatalf("retime: %v", err)
+	}
+	left := lockFiles(t, store)
+	if len(left) != 1 {
+		t.Fatalf("locks = %v, want only the mover's stale lock", left)
+	}
+	if host := string(document(t, store, repo, path.Join("locks", left[0]))["hostname"]); host != `"`+moverHost+`"` {
+		t.Errorf("the lock left is %s's, want the mover's", host)
+	}
+}
+
+// TestRetimeKeepsALiveLockFromAnotherControllerPod checks that a lock with the
+// controller's username but another host blocks Retime while it is younger
+// than restic's stale age. The pod that wrote it may still be running.
+func TestRetimeKeepsALiveLockFromAnotherControllerPod(t *testing.T) {
+	store, repo := writableFixture(t)
+	placeUserLock(t, store, repo, time.Now().Add(-time.Minute), true, "backup-controller-7c9f-old", 1, lockUser)
+
+	_, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	var locked *LockedError
+	if !errors.As(err, &locked) {
+		t.Fatalf("err = %v, want a LockedError", err)
+	}
+	if left := lockFiles(t, store); len(left) != 1 {
+		t.Errorf("locks = %v, want the other pod's lock only", left)
+	}
+}
+
+// failLockRemove is a Store that refuses the first Remove under locks/, the way
+// an S3 DELETE can fail once.
+type failLockRemove struct {
+	DirStore
+	failed bool
+}
+
+func (s *failLockRemove) Remove(ctx context.Context, name string) error {
+	if path.Dir(name) == "locks" && !s.failed {
+		s.failed = true
+		return errors.New("delete refused")
+	}
+	return s.DirStore.Remove(ctx, name)
+}
+
+// TestRetimeRetriesTheRemovalOfItsLock checks that Retime tries again when the
+// removal of its own lock fails once, so one failed DELETE leaves no lock
+// behind to block the movers.
+func TestRetimeRetriesTheRemovalOfItsLock(t *testing.T) {
+	dir, _ := writableFixture(t)
+	store := &failLockRemove{DirStore: dir}
+	repo, err := Open(context.Background(), store, "backup")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err != nil {
+		t.Fatalf("retime: %v", err)
+	}
+	if left := lockFiles(t, dir); len(left) != 0 {
 		t.Errorf("locks left behind: %v", left)
 	}
 }

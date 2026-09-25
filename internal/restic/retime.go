@@ -25,9 +25,15 @@ const QuiescedTag = "quiesced"
 // running restic refreshes its lock every five minutes, so a lock older than
 // staleLockAge belongs to a process that is gone. lockCheckDelay is a variable
 // so the tests can set it to zero.
+//
+// unlockAttempts and unlockRetryDelay are the controller's own: how often it
+// tries to remove its lock, and how long it waits between tries. A lock it
+// leaves blocks every VolSync backup and prune until a later Retime removes it.
 var (
-	lockCheckDelay = 200 * time.Millisecond
-	staleLockAge   = 30 * time.Minute
+	lockCheckDelay   = 200 * time.Millisecond
+	staleLockAge     = 30 * time.Minute
+	unlockAttempts   = 3
+	unlockRetryDelay = time.Second
 )
 
 // lockUser is the username the controller writes into its lock files. restic
@@ -223,8 +229,10 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 // cancels the wait, and the lock is removed then too.
 //
 // On success it returns a function that removes the lock. That function
-// ignores the cancellation of ctx, so the lock is removed even after the
-// caller's context has ended.
+// ignores the cancellation of the context, so the lock is removed even after
+// the caller's context has ended. It tries unlockAttempts times, with
+// unlockRetryDelay between tries, and returns the last error when every try
+// fails.
 func (r *Repository) lockExclusive(ctx context.Context) (func() error, error) {
 	host, _ := os.Hostname()
 	pid := os.Getpid()
@@ -241,7 +249,16 @@ func (r *Repository) lockExclusive(ctx context.Context) (func() error, error) {
 		return nil, err
 	}
 	unlock := func() error {
-		return r.store.Remove(context.WithoutCancel(ctx), path.Join("locks", id))
+		var err error
+		for attempt := range unlockAttempts {
+			if attempt > 0 {
+				time.Sleep(unlockRetryDelay)
+			}
+			if err = r.store.Remove(context.WithoutCancel(ctx), path.Join("locks", id)); err == nil {
+				return nil
+			}
+		}
+		return err
 	}
 
 	select {
@@ -267,9 +284,16 @@ func (r *Repository) lockExclusive(ctx context.Context) (func() error, error) {
 //
 // Any lock from another process blocks an exclusive lock, whether that lock is
 // shared or exclusive. A lock older than staleLockAge is skipped, and so is a
-// file whose name isn't a storage ID. A lock that this process left behind is
-// removed. restic's prune doesn't skip stale locks, so a leftover lock would
-// stop every prune until someone ran restic unlock.
+// file whose name isn't a storage ID.
+//
+// Two kinds of leftover lock are removed. One is a lock that this process left
+// behind. The other is a stale lock that carries lockUser, whatever its host
+// and PID. Only this controller writes that username, and a controller pod
+// that was replaced before it removed its lock leaves one with a host no later
+// pod has. restic's prune doesn't skip stale locks, and VolSync runs restic
+// unlock only when spec.restic.unlock changes, so a leftover lock would stop
+// every prune, and a leftover exclusive lock every backup, until someone
+// removed it by hand.
 //
 // It returns an error when it can't list, read or decode a lock file, or can't
 // remove a leftover one.
@@ -294,6 +318,10 @@ func (r *Repository) checkLocks(ctx context.Context, own, host string, pid int) 
 		case lock.Hostname == host && lock.PID == pid:
 			if err := r.store.Remove(ctx, path.Join("locks", name)); err != nil {
 				return fmt.Errorf("remove the controller's earlier lock %s: %w", name, err)
+			}
+		case lock.Username == lockUser && time.Since(lock.Time) > staleLockAge:
+			if err := r.store.Remove(ctx, path.Join("locks", name)); err != nil {
+				return fmt.Errorf("remove the stale controller lock %s from %s: %w", name, lock.Hostname, err)
 			}
 		case time.Since(lock.Time) > staleLockAge:
 		default:
