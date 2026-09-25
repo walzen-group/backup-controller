@@ -143,7 +143,7 @@ type listing struct {
 		LastModified string `xml:"LastModified"`
 		// Owner is a pointer so a missing element and an empty one differ:
 		// RustFS 1.0.0 sends none without fetch-owner=true.
-		Owner        *struct {
+		Owner *struct {
 			DisplayName string `xml:"DisplayName"`
 			ID          string `xml:"ID"`
 		} `xml:"Owner"`
