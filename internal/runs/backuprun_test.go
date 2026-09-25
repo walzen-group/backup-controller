@@ -895,3 +895,37 @@ func TestANamespaceRunWithoutCloudNativePGBacksUpTheVolumes(t *testing.T) {
 		t.Fatalf("phase = %q (%s), items = %+v; want Queued with the claim", run.Status.Phase, readyMessage(run.Status.Conditions), run.Status.Items)
 	}
 }
+
+// A workload whose kustomize-controller labels name a Kustomization that does
+// not list it in its inventory is scaled down with nothing suspended. The
+// labels are only labels, and anyone who can edit the Deployment could point
+// them at another team's Kustomization.
+func TestAKustomizationThatDoesNotListTheWorkloadIsNotSuspended(t *testing.T) {
+	app := deployment()
+	app.Labels = map[string]string{fluxNameLabel: "billing", fluxNamespaceLabel: "billing"}
+	billing := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"suspend": false},
+		"status": map[string]any{"inventory": map[string]any{"entries": []any{
+			map[string]any{"id": "billing_api_apps_Deployment", "v": "v1"},
+		}}},
+	}}
+	billing.SetGroupVersionKind(KustomizationGVK)
+	billing.SetNamespace("billing")
+	billing.SetName("billing")
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), app, billing)
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+
+	if got := replicasOf(t, c); got != 0 {
+		t.Errorf("replicas = %d after the quiesce, want 0", got)
+	}
+	k, _ := getUnstructured(t, c, KustomizationGVK, "billing", "billing")
+	if on, _, _ := unstructured.NestedBool(k.Object, "spec", "suspend"); on {
+		t.Error("the run suspended a Kustomization that does not apply the app")
+	}
+	if run := readBackupRun(t, c); len(run.Status.SuspendedKustomizations) != 0 {
+		t.Errorf("suspended = %v, want none", run.Status.SuspendedKustomizations)
+	}
+}

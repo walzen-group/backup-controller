@@ -267,9 +267,16 @@ func deployment() *appsv1.Deployment {
 }
 
 // kustomization returns the Flux Kustomization that applies the app, with
-// spec.suspend set to the value given in suspended.
+// spec.suspend set to the value given in suspended. Its inventory lists the
+// app's Deployment, the way kustomize-controller records each object it
+// applied.
 func kustomization(suspended bool) *unstructured.Unstructured {
-	k := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{"suspend": suspended}}}
+	k := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"suspend": suspended},
+		"status": map[string]any{"inventory": map[string]any{"entries": []any{
+			map[string]any{"id": ns + "_" + appN + "_apps_Deployment", "v": "v1"},
+		}}},
+	}}
 	k.SetGroupVersionKind(KustomizationGVK)
 	k.SetNamespace("flux-system")
 	k.SetName(appN)

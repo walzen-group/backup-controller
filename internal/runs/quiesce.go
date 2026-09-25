@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -25,7 +26,8 @@ var KustomizationGVK = schema.GroupVersionKind{Group: "kustomize.toolkit.fluxcd.
 
 // fluxNameLabel and fluxNamespaceLabel are the labels kustomize-controller
 // writes on every object it applies. Together they name the Kustomization
-// that applied the object, which is the one planStop picks to suspend.
+// that applied the object. planStop suspends that Kustomization when its
+// inventory lists the object.
 const (
 	fluxNameLabel      = "kustomize.toolkit.fluxcd.io/name"
 	fluxNamespaceLabel = "kustomize.toolkit.fluxcd.io/namespace"
@@ -166,7 +168,7 @@ func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 // the run would give back nothing.
 //
 // Parameters:
-//   - reader reads each Kustomization's current spec.suspend.
+//   - reader reads each Kustomization's spec.suspend and inventory.
 //   - targets are the workloads to stop, from quiesceTargets or namedTargets.
 //
 // It returns each workload with the replica count it has now, which is the
@@ -174,14 +176,18 @@ func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 // "namespace/name" keys. It returns an error when a Kustomization can't be
 // read.
 //
-// A target without the kustomize-controller labels, or whose Kustomization
-// no longer exists, is stopped with nothing suspended. A Kustomization that
-// is already suspended is left out, because the run didn't suspend it and
-// must not resume it. A Kustomization that applies several targets is listed
-// once.
+// The kustomize-controller labels on a target name its Kustomization, and
+// that Kustomization is suspended only when its status.inventory lists the
+// target. Anyone who can edit a workload can set its labels, and suspending a
+// Kustomization is a cluster-wide write, so the labels alone would let a
+// workload suspend a Kustomization in any namespace. A target without the
+// labels, whose Kustomization no longer exists, or whose Kustomization
+// doesn't list it is stopped with nothing suspended. A Kustomization that is
+// already suspended is left out, because the run didn't suspend it and must
+// not resume it. A Kustomization that applies several targets is listed once.
 func planStop(ctx context.Context, reader client.Reader, targets []workload) ([]backupv1alpha1.QuiescedWorkload, []string, error) {
 	var suspend []string
-	seen := map[string]bool{}
+	read := map[string]*unstructured.Unstructured{}
 	for _, t := range targets {
 		name := t.object.GetLabels()[fluxNameLabel]
 		namespace := t.object.GetLabels()[fluxNamespaceLabel]
@@ -189,18 +195,20 @@ func planStop(ctx context.Context, reader client.Reader, targets []workload) ([]
 			continue
 		}
 		key := namespace + "/" + name
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-
-		kustomization := &unstructured.Unstructured{}
-		kustomization.SetGroupVersionKind(KustomizationGVK)
-		if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, kustomization); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
+		kustomization, done := read[key]
+		if !done {
+			kustomization = &unstructured.Unstructured{}
+			kustomization.SetGroupVersionKind(KustomizationGVK)
+			if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, kustomization); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return nil, nil, fmt.Errorf("get Kustomization %s: %w", key, err)
+				}
+				kustomization = nil
 			}
-			return nil, nil, fmt.Errorf("get Kustomization %s: %w", key, err)
+			read[key] = kustomization
+		}
+		if kustomization == nil || !inventoryLists(kustomization, t) || slices.Contains(suspend, key) {
+			continue
 		}
 		if already, _, _ := unstructured.NestedBool(kustomization.Object, "spec", "suspend"); already {
 			continue
@@ -213,6 +221,21 @@ func planStop(ctx context.Context, reader client.Reader, targets []workload) ([]
 		stop = append(stop, backupv1alpha1.QuiescedWorkload{Kind: t.kind, Name: t.object.GetName(), Replicas: t.replicas})
 	}
 	return stop, suspend, nil
+}
+
+// inventoryLists reports whether a Kustomization's status.inventory.entries
+// lists a workload. kustomize-controller records each object it applied as
+// an entry whose id is "<namespace>_<name>_<group>_<kind>", such as
+// notes_notes_apps_Deployment.
+func inventoryLists(kustomization *unstructured.Unstructured, t workload) bool {
+	id := t.object.GetNamespace() + "_" + t.object.GetName() + "_apps_" + t.kind
+	entries, _, _ := unstructured.NestedSlice(kustomization.Object, "status", "inventory", "entries")
+	for _, entry := range entries {
+		if fields, ok := entry.(map[string]any); ok && fields["id"] == id {
+			return true
+		}
+	}
+	return false
 }
 
 // applyStop carries out a plan from planStop. It suspends the Kustomizations
