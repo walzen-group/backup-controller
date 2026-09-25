@@ -34,8 +34,9 @@ type BackupRunSpec struct {
 
 	// Timeout is how long the run waits for its movers and base backups
 	// before it gives up. Admission by the queue does not count toward it.
+	// Omitted, the namespace's backup.wlz.li/timeout annotation applies, and
+	// six hours without one.
 	// +optional
-	// +kubebuilder:default="1h"
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
 	// TTLSecondsAfterFinished deletes this object that long after it reaches a

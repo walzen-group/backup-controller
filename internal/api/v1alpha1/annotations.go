@@ -8,6 +8,15 @@ const (
 	// namespace's backups run on.
 	AnnotationSchedule = "backup.wlz.li/schedule"
 
+	// AnnotationTimeout, on a Namespace, is how long a run there may work
+	// once admitted, as a Go duration such as 10h. A run's own spec.timeout
+	// wins over it.
+	AnnotationTimeout = "backup.wlz.li/timeout"
+
+	// AnnotationPruneIntervalDays, on a Namespace, is how many days pass
+	// between prunes of each repository its sources write.
+	AnnotationPruneIntervalDays = "backup.wlz.li/prune-interval-days"
+
 	// AnnotationEnabled, set to "true" on a claim or a CloudNativePG Cluster,
 	// includes it in the namespace's backups.
 	AnnotationEnabled = "backup.wlz.li/enabled"

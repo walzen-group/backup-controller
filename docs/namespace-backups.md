@@ -48,6 +48,8 @@ metadata:
 | Annotation | On | Decides |
 | --- | --- | --- |
 | backup.wlz.li/schedule | Namespace | when the namespace's backups run, five-field cron in UTC, or on a zone's clock with a prefix such as `CRON_TZ=Europe/Berlin 0 4 * * *` |
+| backup.wlz.li/timeout | Namespace | how long a run there may work once admitted, a Go duration such as `10h`; 6h without it, and a run's own `spec.timeout` wins |
+| backup.wlz.li/prune-interval-days | Namespace | days between prunes of each repository the namespace's sources write; 1 without it |
 | backup.wlz.li/enabled | claim, Cluster | whether a run includes it; nothing else is read to find what to back up |
 | backup.wlz.li/retain-last and the six other retain- annotations | claim | which snapshots the volume's repository keeps; see [Retention](#retention) |
 | backup.wlz.li/quiesce | Deployment, StatefulSet | whether the workload stops while the volumes' clones are cut |
@@ -98,6 +100,13 @@ At each tick of a Namespace's schedule the controller creates a BackupRun named
 30 days. A tick missed while the controller was down runs once when it comes
 back. While another run with `all: true` in the namespace is unfinished, the
 tick waits for it.
+
+A scheduled run carries no timeout of its own, so it gives up at the same point
+a manual run without one does: `backup.wlz.li/timeout` on the Namespace, or six
+hours after Kueue admits it. The clock starts at admission, so the time a run
+spends in Queued does not count. On the deadline the run marks its unfinished
+items Failed, restarts what it quiesced and releases its Workload; a VolSync
+mover or a CloudNativePG Backup still in progress keeps running.
 
 The canary's first scheduled run, on a `*/15` schedule, sampled every three
 seconds; lines repeating the one before are left out:

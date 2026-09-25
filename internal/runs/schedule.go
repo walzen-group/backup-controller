@@ -21,12 +21,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// How long a scheduled run may work before it fails, and how long its record
-// is kept afterwards.
-const (
-	scheduledTimeout = 12 * time.Hour
-	scheduledTTL     = int32(30 * 24 * 60 * 60)
-)
+// How long a scheduled run's record is kept after it finishes. Its timeout
+// comes from the namespace, the way a manual run's does.
+const scheduledTTL = int32(30 * 24 * 60 * 60)
 
 // refresh is the longest a namespace goes between two reconciles. Cluster
 // annotations are not watched, so the restore-as-of series of a Cluster
@@ -144,7 +141,6 @@ func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 // create writes the BackupRun for one tick. Its name and label both carry the
 // tick, so a second reconcile for the same tick finds it already there.
 func (s *Scheduler) create(ctx context.Context, namespace string, tick time.Time) error {
-	timeout := metav1.Duration{Duration: scheduledTimeout}
 	ttl := scheduledTTL
 	run := &backupv1alpha1.BackupRun{
 		ObjectMeta: metav1.ObjectMeta{
@@ -152,7 +148,7 @@ func (s *Scheduler) create(ctx context.Context, namespace string, tick time.Time
 			Namespace: namespace,
 			Labels:    map[string]string{backupv1alpha1.LabelScheduledFor: strconv.FormatInt(tick.Unix(), 10)},
 		},
-		Spec: backupv1alpha1.BackupRunSpec{All: true, Timeout: &timeout, TTLSecondsAfterFinished: &ttl},
+		Spec: backupv1alpha1.BackupRunSpec{All: true, TTLSecondsAfterFinished: &ttl},
 	}
 	if err := s.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create BackupRun %s/%s: %w", namespace, run.Name, err)

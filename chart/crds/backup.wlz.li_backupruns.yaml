@@ -87,10 +87,11 @@ spec:
                 maxLength: 253
                 type: string
               timeout:
-                default: 1h
                 description: |-
                   Timeout is how long the run waits for its movers and base backups
                   before it gives up. Admission by the queue does not count toward it.
+                  Omitted, the namespace's backup.wlz.li/timeout annotation applies, and
+                  six hours without one.
                 type: string
               ttlSecondsAfterFinished:
                 description: |-

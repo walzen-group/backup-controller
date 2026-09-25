@@ -19,10 +19,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// pruneIntervalDays is how often VolSync prunes a repository the controller
-// writes a source for.
-const pruneIntervalDays = int32(1)
-
 // errSourceBusy is a source still completing another run's tag. The run waits
 // for it; writing a second tag would leave the first run waiting for a backup
 // that is never taken.
@@ -160,7 +156,8 @@ func positiveCount(value string) (int32, error) {
 //
 // The controller owns every field: the repository, the cache class and the
 // mover's security context come from the claim's VolumeRestore, the retention
-// from the claim's annotations, and the node from the claim's volume. The
+// from the claim's annotations, the prune interval from the namespace's, and
+// the node from the claim's volume. The
 // source is owned by the claim, so a claim deleted for a restore takes its
 // source with it and the next run writes a new one.
 //
@@ -177,6 +174,10 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 		return nil, err
 	}
 	retain, err := retention(claim)
+	if err != nil {
+		return nil, err
+	}
+	pruneInterval, err := pruneIntervalFor(ctx, reader, claim.Namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +216,7 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 					StorageClassName: vr.Spec.CacheStorageClassName,
 				},
 				Repository:            vr.Spec.Repository,
-				PruneIntervalDays:     new(pruneIntervalDays),
+				PruneIntervalDays:     &pruneInterval,
 				Retain:                retain,
 				CacheCapacity:         vr.Spec.CacheCapacity,
 				CacheStorageClassName: vr.Spec.CacheStorageClassName,

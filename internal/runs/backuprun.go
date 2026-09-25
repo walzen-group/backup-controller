@@ -179,6 +179,16 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 		}
 	}
 
+	// A namespace timeout that does not parse fails the run before it starts
+	// anything, since no deadline could be kept.
+	if _, err := timeoutFor(ctx, r.Reader, run); err != nil {
+		var bad invalidSetting
+		if errors.As(err, &bad) {
+			return ctrl.Result{}, r.abort(ctx, run, bad.Error())
+		}
+		return ctrl.Result{}, err
+	}
+
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	run.Status.StartedAt = newTime(metav1.NewTime(r.Now()))
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "backing up")
@@ -189,7 +199,11 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // workloads once every clone is cut, and collects the results.
 func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
 	now := metav1.NewTime(r.Now())
-	if deadline, over := r.overdue(run); over {
+	deadline, over, err := r.overdue(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if over {
 		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
 	}
 
@@ -492,13 +506,19 @@ func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.
 	return dropFinalizer(ctx, r.Client, run)
 }
 
-// overdue reports whether the run has worked past its timeout.
-func (r *BackupRunReconciler) overdue(run *backupv1alpha1.BackupRun) (time.Time, bool) {
-	if run.Status.StartedAt == nil || run.Spec.Timeout == nil {
-		return time.Time{}, false
+// overdue reports whether the run has worked past its timeout, which
+// timeoutFor resolves on every check, so a namespace annotation changed during
+// a run moves its deadline.
+func (r *BackupRunReconciler) overdue(ctx context.Context, run *backupv1alpha1.BackupRun) (time.Time, bool, error) {
+	if run.Status.StartedAt == nil {
+		return time.Time{}, false, nil
 	}
-	deadline := run.Status.StartedAt.Add(run.Spec.Timeout.Duration)
-	return deadline, !r.Now().Before(deadline)
+	timeout, err := timeoutFor(ctx, r.Reader, run)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	deadline := run.Status.StartedAt.Add(timeout)
+	return deadline, !r.Now().Before(deadline), nil
 }
 
 func (r *BackupRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
