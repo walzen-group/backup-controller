@@ -579,6 +579,50 @@ func TestADeclaredRecoveryIsLeftAlone(t *testing.T) {
 	}
 }
 
+// cloned builds a Cluster that bootstraps with pg_basebackup from another
+// server, the way a replica cluster or a migration clone is written.
+func cloned(t *testing.T) *unstructured.Unstructured {
+	return cluster(t, func(object map[string]any) {
+		spec, _ := object["spec"].(map[string]any)
+		spec["bootstrap"] = map[string]any{
+			"pg_basebackup": map[string]any{"source": "origin"},
+		}
+	})
+}
+
+// TestAPgBasebackupClusterIsLeftAlone checks that a Cluster bootstrapping with
+// pg_basebackup is admitted without a patch, even though its store holds a
+// base backup.
+//
+// Adding a recovery beside pg_basebackup gives the Cluster two bootstrap
+// methods, and CloudNativePG refuses that with "Only one bootstrap method can
+// be specified at a time". The owner chose where the data comes from.
+func TestAPgBasebackupClusterIsLeftAlone(t *testing.T) {
+	response := decide(t, cloned(t), stubProber{has: true})
+
+	if !response.Allowed {
+		t.Fatalf("the cluster was refused: %v", response.Result)
+	}
+	if len(response.Patches) != 0 {
+		t.Fatalf("a pg_basebackup Cluster was rewritten: %v", response.Patches)
+	}
+}
+
+// TestAPgBasebackupClusterIsRefusedWhileARunWaits checks that a Cluster
+// bootstrapping with pg_basebackup is refused while a RestoreRun waits for it,
+// as a declared recovery is, and that the refusal names the run and the
+// method. The run and the Cluster name two sources for one database.
+func TestAPgBasebackupClusterIsRefusedWhileARunWaits(t *testing.T) {
+	response := decide(t, cloned(t), stubProber{has: true}, waiting(nil))
+
+	if response.Allowed {
+		t.Fatal("a pg_basebackup Cluster was admitted while a RestoreRun waits for it")
+	}
+	if !strings.Contains(response.Result.Message, "back-to-monday") || !strings.Contains(response.Result.Message, "pg_basebackup") {
+		t.Errorf("the refusal does not name the run and the method: %q", response.Result.Message)
+	}
+}
+
 // TestAClusterThatArchivesNowhereIsLeftAlone checks that a Cluster with no
 // plugins is admitted without a patch.
 func TestAClusterThatArchivesNowhereIsLeftAlone(t *testing.T) {

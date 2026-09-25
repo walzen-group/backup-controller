@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -78,8 +79,9 @@ type Decider struct {
 //     set to OptOutValue, or when it has no archiving plugin (see Archiver).
 //   - A create is refused when the ObjectStore can't be resolved, or when
 //     another Cluster anywhere already archives to the same bucket and prefix.
-//   - A Cluster that declares its own spec.bootstrap.recovery is allowed
-//     unchanged, unless a RestoreRun is waiting for it. Then it's refused.
+//   - A Cluster that declares a bootstrap other than initdb, such as
+//     recovery or pg_basebackup (see declaredBootstrap), is allowed unchanged,
+//     unless a RestoreRun is waiting for it. Then it's refused.
 //   - A create is refused when a RestoreRun's restoreAsOf or the Cluster's
 //     restore-as-of annotation isn't an RFC 3339 time.
 //   - A create is refused when a RestoreRun or the restore-as-of annotation
@@ -134,7 +136,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Allowed("opted out")
 	}
 
-	_, declared, _ := unstructured.NestedMap(cluster.Object, "spec", "bootstrap", "recovery")
+	method := declaredBootstrap(cluster)
 
 	store, serverName, found := Archiver(cluster)
 	if !found {
@@ -155,7 +157,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	// archive unrestorable, which is silent and permanent. Nothing else on the
 	// cluster can see this coming: each Cluster is valid on its own, and the
 	// pair is the problem. Where a Cluster archives does not depend on how it
-	// bootstraps, so a Cluster declaring its own recovery is checked too.
+	// bootstraps, so a Cluster declaring its own bootstrap is checked too.
 	holder, err := archiveHolder(ctx, d.Client, req.Namespace, req.Name, at)
 	if err != nil {
 		logger.Error(err, "cannot check which databases archive here")
@@ -175,19 +177,20 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
-	// A Cluster that already asks for a recovery was written that way on
-	// purpose, by the Flux component or a unit's restore input. It keeps its
-	// own target, unless a RestoreRun is waiting to recover it: then two
-	// targets name one database, and neither may win by accident.
-	if declared {
+	// A Cluster that already names a bootstrap other than initdb was written
+	// that way on purpose: a recovery by the Flux component or a unit's
+	// restore input, a pg_basebackup by a replica or a migration. It keeps its
+	// own source, unless a RestoreRun is waiting to recover it: then two
+	// sources name one database, and neither may win by accident.
+	if method != "" {
 		if run != nil {
 			return admission.Denied(fmt.Sprintf(
-				"RestoreRun %s is waiting to recover %s/%s, and the Cluster declares its own spec.bootstrap.recovery. Remove the declared recovery (the terragrunt restore input or the postgres-recovery component), or delete the RestoreRun.",
-				run.Name, req.Namespace, req.Name,
+				"RestoreRun %s is waiting to recover %s/%s, and the Cluster declares its own spec.bootstrap.%s. Remove the declared bootstrap (for a recovery, the terragrunt restore input or the postgres-recovery component), or delete the RestoreRun.",
+				run.Name, req.Namespace, req.Name, method,
 			))
 		}
-		logger.Info("leaving the Cluster alone", "reason", "it already declares a recovery")
-		return admission.Allowed("already recovering")
+		logger.Info("leaving the Cluster alone", "reason", "it declares its own bootstrap", "method", method)
+		return admission.Allowed("declares its own bootstrap")
 	}
 
 	target, source, err := restoreTarget(cluster, run)
@@ -243,6 +246,30 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	}
 	logger.Info("recovering the Cluster from its object store", "prefix", at.BasePrefix(), "target", target, "for", source)
 	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
+}
+
+// declaredBootstrap names the bootstrap method a Cluster declares for itself,
+// one the webhook must leave alone.
+//
+// It returns the first key under spec.bootstrap, in sorted order, other than
+// initdb, such as "recovery" or "pg_basebackup". It returns an empty string
+// when spec.bootstrap is missing or holds initdb alone. Those are the Clusters
+// the webhook may rewrite: CloudNativePG runs initdb when no method is named,
+// and setRecovery replaces initdb and nothing else. Adding a recovery beside
+// any other method gives the Cluster two, and CloudNativePG refuses that.
+func declaredBootstrap(cluster *unstructured.Unstructured) string {
+	bootstrap, _, _ := unstructured.NestedMap(cluster.Object, "spec", "bootstrap")
+	methods := make([]string, 0, len(bootstrap))
+	for method := range bootstrap {
+		if method != "initdb" {
+			methods = append(methods, method)
+		}
+	}
+	if len(methods) == 0 {
+		return ""
+	}
+	sort.Strings(methods)
+	return methods[0]
 }
 
 // waitingRun finds the RestoreRun that deleted a Cluster and is waiting for it
