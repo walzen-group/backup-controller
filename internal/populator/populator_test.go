@@ -316,6 +316,38 @@ func TestAPinnedClaimNoSnapshotReachesStaysPending(t *testing.T) {
 	}
 }
 
+// TestAVolumeRestorePinnedBeforeEverySnapshotStaysPending checks that
+// Populate checks the VolumeRestore's own spec.restoreAsOf when the claim has
+// no annotation. The destination takes that time as its restoreAsOf, and when
+// it is before every snapshot VolSync prints "No eligible snapshots found",
+// exits 0, and the claim binds an empty volume. Populate returns an error,
+// creates no destination, and reports NoBackupInReach.
+func TestAVolumeRestorePinnedBeforeEverySnapshotStaysPending(t *testing.T) {
+	ops := populatedOperations()
+	callbacks := New(ops, "backup-system", fixedSnapshots{monday})
+	p := params()
+	vr := &backupv1alpha1.VolumeRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3},
+		Spec:       backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret", RestoreAsOf: new("2026-09-01T00:00:00Z")},
+	}
+	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Unstructured = &unstructured.Unstructured{Object: object}
+
+	if err := callbacks.Populate(context.Background(), p); err == nil {
+		t.Fatal("Populate() filled a claim whose VolumeRestore is pinned before every snapshot")
+	}
+	if len(ops.createdRD) != 0 {
+		t.Fatalf("a destination was created: %v", ops.createdRD)
+	}
+	last := ops.statuses[len(ops.statuses)-1]
+	if cond := last.Status.Conditions[0]; cond.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(cond.Message, "spec.restoreAsOf") {
+		t.Fatalf("condition = %+v, want NoBackupInReach naming spec.restoreAsOf", cond)
+	}
+}
+
 // params returns the library's parameters for the claim notes (UID claim-123)
 // in apps, its prime claim in backup-system, and a VolumeRestore that names
 // the Secret repo-secret.
