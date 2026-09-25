@@ -1,11 +1,11 @@
 # Overview
 
-backup-controller fills a new PersistentVolumeClaim from a restic repository
-without leaving a ZFS clone behind. This page is about that fill, the first of
-the controller's three jobs. The scheduled and on-demand runs are in
-[namespace-backups.md](namespace-backups.md), the database recovery in
-[restores.md](restores.md), and how every database operation finds and reads
-a Cluster's archive in [architecture.md](architecture.md#databases).
+backup-controller brings an app's data back when its objects are created again,
+with no procedure anyone has to remember. A new PersistentVolumeClaim fills from
+its restic repository without a ZFS clone behind it, and a new CloudNativePG
+Cluster recovers from its barman archive. This page covers both of those; the
+scheduled and on-demand runs the backups come from are in
+[namespace-backups.md](namespace-backups.md).
 
 ## The mechanism it replaces
 
@@ -115,6 +115,61 @@ nothing drifts, and the destination keeps no permanent copy.
 | repository credentials live only where VolSync reads them | yes | yes |
 | steady-state disk | one shared set of blocks, plus everything overwritten since | one dataset |
 
+## Databases
+
+### Why a database needs it
+
+A CloudNativePG Cluster reads `spec.bootstrap` once, when it is created. A
+Cluster whose manifest says `initdb`, which is every Cluster an app ships, comes
+up as an empty database whenever it is created again: after a cluster rebuild,
+after its namespace was destroyed, after someone deleted it. It reports healthy,
+and its full archive sits untouched in the bucket beside it. Nobody is told.
+
+Neither kustomize nor OpenTofu can choose `recovery` in its place, because both
+render the manifest before anything has read the object store. An admission
+webhook runs after the store can be read and before the Cluster is stored, which
+is the one moment the choice can be made.
+
+### What the controller does
+
+| When | What happens |
+| --- | --- |
+| a Cluster is created | the bootstrap webhook finds the Cluster's archive through its ObjectStore. With a base backup there, it rewrites `initdb` to a `recovery` from that archive: to the end of the WAL, or to the moment a waiting RestoreRun or the Cluster's `backup.wlz.li/restore-as-of` names |
+| a namespace run, scheduled or on demand | a CloudNativePG Backup through the barman-cloud plugin for each Cluster marked `backup.wlz.li/enabled`, skipping a hibernated one |
+| a RestoreRun with `database:` or `all: true` | the run checks a base backup reaches the moment, deletes the Cluster, and waits; the webhook recovers the Cluster Flux or tofu creates again |
+
+The webhook refuses a Cluster in three cases, and each refusal names what it
+found: another database already archives to the same bucket and prefix, the
+moment asked for comes before the oldest base backup, or the object store cannot
+be read. The last one matters most during a rebuild, when the controller may
+still be starting: letting the Cluster through would create the empty database
+this page exists to prevent.
+
+```mermaid
+flowchart LR
+    archive[("barman archive<br/>base backups + WAL")]
+    hook["bootstrap webhook"]
+    cluster["the new Cluster<br/>bootstrap.recovery"]
+
+    hook -- "lists base/ in the bucket" --> archive
+    hook -- "rewrites initdb at creation" --> cluster
+    archive -- "the plugin replays WAL" --> cluster
+```
+
+### What a database keeps
+
+| Property | Before | After |
+| --- | --- | --- |
+| delete the Cluster and it comes back with its data | no, it comes back empty | yes, recovered to the end of its archive |
+| a rebuilt cluster comes back with its databases | no | yes |
+| restore to a moment | a git commit swapping the bootstrap, reverted afterwards | a RestoreRun with `restoreAsOf` |
+| WAL archiving and base backup storage | the barman-cloud plugin | the same plugin, unchanged |
+| start a database empty on purpose | the default | the annotation `backup.wlz.li/bootstrap: initdb` |
+
+[restores.md](restores.md) has every case the webhook decides, and
+[architecture.md](architecture.md#databases) how the controller resolves a
+Cluster's archive, reads its base backups and follows a restore.
+
 ## What it needs from the cluster
 
 | Requirement | Why |
@@ -142,6 +197,14 @@ It does read repositories. The restore checks and each BackupRun's
 internal/restic, with the password and keys from the repository Secret, and
 copying that Secret for a fill is why the ClusterRole can read Secrets.
 [decisions.md](decisions.md) records that choice.
+
+For a database, the controller creates CloudNativePG Backup objects, deletes a
+Cluster for a restore, and patches a Cluster's bootstrap as it is created. It
+reads the ObjectStore, the Secret holding its keys and the archive's
+`backup.info` files, and writes nothing to the bucket. The barman-cloud plugin
+archives every WAL segment, writes every base backup and replays every recovery;
+a failed base backup or recovery is reported on the plugin's and
+CloudNativePG's own objects.
 
 [architecture.md](architecture.md) has the object flow, the library this is
 built on, and every object the controller writes.
