@@ -23,7 +23,7 @@ In the app's namespace:
 | --- | --- | --- |
 | BackupRun `scheduled-<yyyymmdd-hhmm>` | the scheduler, once per tick | deleted 30 days after it finishes |
 | Kueue Workload, one per run, named in the run's `status.workload` | each BackupRun, which also writes its `PodsReady` condition | deleted when the run ends |
-| ReplicationSource named after each claim marked `backup.wlz.li/enabled` | each BackupRun, owned by the claim and labelled `app.kubernetes.io/managed-by: backup-controller` | stays, and goes with the claim; a BackupRun whose mover failed deletes it, and the next run writes it again |
+| ReplicationSource named after each claim marked `backup.wlz.li/enabled` | each BackupRun, owned by the claim and labelled `app.kubernetes.io/managed-by: backup-controller` | stays, and goes with the claim; a failed mover leaves it in place, and VolSync keeps retrying |
 | CloudNativePG Backup `<cluster>-<suffix>` | each BackupRun, one per Cluster marked `backup.wlz.li/enabled` | stays, as CloudNativePG's backup record |
 | ReplicationDestination | an in-place RestoreRun, and a RestoreRun with `repository:` and `into:` | deleted once the item's end is in the run's status |
 | VolumeRestore named by `into:`, with the finalizer `backup.wlz.li/volume-populator` | a RestoreRun with `claim:` and `into:`, owned by the run | deleted with the RestoreRun; the run removes the finalizer itself when it fails or is deleted before the populator started |

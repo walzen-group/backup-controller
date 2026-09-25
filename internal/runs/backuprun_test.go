@@ -739,10 +739,10 @@ func failMover(t *testing.T, c client.Client, started time.Time) {
 }
 
 // A mover that fails during the run's sync fails the item with the mover's
-// logs, and the run ends Failed. VolSync would retry the Job forever and
-// never complete the trigger. The run deletes the source, which stops those
-// retries, so the next run writes a fresh source and does not wait on the
-// dead trigger.
+// logs, and the run ends Failed. The run leaves the ReplicationSource alone:
+// by the time VolSync reports the failure it has already started a new mover
+// Job, and deleting the source would kill that mover mid-backup and leave
+// restic's lock in the repository, which stops every later forget.
 func TestAFailedMoverFailsTheItem(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
@@ -761,8 +761,11 @@ func TestAFailedMoverFailsTheItem(t *testing.T) {
 		t.Errorf("item = %+v, want it Failed with the mover's logs", item)
 	}
 	source := &volsyncv1alpha1.ReplicationSource{}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: claimN}, source); err == nil {
-		t.Errorf("the source still holds the dead trigger %q, and the next run would wait on it", manualTag(source))
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: claimN}, source); err != nil {
+		t.Fatalf("the source is gone (%v); deleting it kills the mover VolSync has already started again, and restic's lock stays behind", err)
+	}
+	if got := manualTag(source); got != run.Status.Items[0].Trigger {
+		t.Errorf("source trigger = %q, want the run's %q left for VolSync to retry", got, run.Status.Items[0].Trigger)
 	}
 }
 

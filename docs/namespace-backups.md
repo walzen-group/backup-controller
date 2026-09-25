@@ -343,13 +343,31 @@ item fails naming it.
 
 A mover Job that fails leaves the tag open. VolSync writes the Job's logs into
 `status.latestMoverStatus`, deletes the Job and starts another, for as long as
-the tag stays, and a later run would wait on that tag with reason SourceBusy.
-So when the source still carries the run's tag, has not completed it, and
-reports a Failed mover in a sync VolSync started after the run's `startedAt`,
-the run fails the item with the mover's logs and deletes the ReplicationSource.
-The next run writes a fresh one. When the delete fails, the item's message
-adds `the ReplicationSource could not be deleted, so VolSync keeps retrying it
-and later runs wait for it`, followed by the error.
+the tag stays. When the source still carries the run's tag, has not completed
+it, and reports a Failed mover in a sync VolSync started after the run's
+`startedAt`, the run fails the item with the mover's logs, so the run reports
+the failure at once instead of at its timeout. It leaves the ReplicationSource
+alone. VolSync keeps retrying, and a later run waits with reason SourceBusy
+until one of those retries completes the tag. While it waits, a quiesced
+namespace's later runs back up nothing, because a run checks every source
+before it stops the app. A retry that succeeds backs up the clone the failed
+run cut, and restic stamps the snapshot with the retry's time, so that
+snapshot can hold data older than its time. v0.9.0 changes this.
+
+v0.8.0 and v0.8.1 deleted the ReplicationSource at this point. By the time
+VolSync reports the failure it has already started the next mover Job, so the
+delete killed that mover mid-backup. The mover's PID 1 is bash, which ignores
+SIGTERM, so restic died by SIGKILL and left its lock in the repository, and
+every later `restic forget` of that claim failed until someone ran
+`restic unlock`. v0.8.2 removed the delete.
+
+When you upgrade to v0.8.2, run `restic unlock` once against the repository of
+every claim that had a mover failure under v0.8.0 or v0.8.1 (`restic list locks`
+shows whether a repository holds one). Without it, each retry saves a snapshot,
+fails at `forget` with `repository is already locked`, and VolSync retries
+again, so the repository grows by several hundred snapshots a day that are
+never forgotten. A plain `restic unlock` removes only locks older than 30
+minutes, which a lock left under v0.8.1 is by the time you run it.
 
 ## Back up now
 

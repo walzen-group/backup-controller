@@ -74,10 +74,10 @@ rules:
     resources: ["persistentvolumeclaims/finalizers"]
     verbs: ["update"]
   # The controller writes each enabled claim's source and triggers it with a
-  # manual tag. A BackupRun whose mover failed deletes the claim's source.
+  # manual tag. It never deletes one: a source belongs to its claim.
   - apiGroups: ["volsync.backube"]
     resources: ["replicationsources"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   # The scheduler reads each namespace's backup.wlz.li/schedule annotation.
   - apiGroups: [""]
     resources: ["namespaces"]

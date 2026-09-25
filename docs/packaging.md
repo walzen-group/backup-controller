@@ -127,7 +127,7 @@ caller in the controller:
 | `restoreruns` | get, list, watch, update, delete | the runs and their finalizer |
 | `backupruns/status`, `restoreruns/status` | patch, update | reporting phase, items and conditions |
 | `backupruns/finalizers`, `restoreruns/finalizers` | update | the Workload, scratch claim and VolumeRestore a run creates name the run as their controller with `blockOwnerDeletion`, which OwnerReferencesPermissionEnforcement allows only with this verb |
-| `replicationsources.volsync.backube` | get, list, watch, create, update, patch, delete | writing each enabled claim's source and its manual trigger, and deleting a source whose mover failed |
+| `replicationsources.volsync.backube` | get, list, watch, create, update, patch | writing each enabled claim's source and its manual trigger; v0.8.2 dropped delete, which v0.8.0 and v0.8.1 used after a failed mover |
 | `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill, per in-place restore, and per restore from `repository:` into a new claim |
 | `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
 | `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |

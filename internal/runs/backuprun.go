@@ -535,11 +535,12 @@ func (r *BackupRunReconciler) clonesCut(ctx context.Context, run *backupv1alpha1
 // status.latestMoverStatus, deletes the Job and starts another, for as long
 // as the tag stays. So while the tag is open, a Failed result that
 // moverFailed places in this run's sync fails the item with the mover's
-// logs, and collectItem deletes the source to stop the retries. The next run
-// writes a fresh source, where the dead tag would have kept it waiting with
-// reason SourceBusy. When the delete fails, the item's message says so. A
-// volume with no files succeeds with Empty set, since
-// VolSync takes no snapshot of it. Otherwise the item records the snapshot ID
+// logs. collectItem leaves the source alone: VolSync has already started the
+// next mover Job by then, and deleting the source would kill that mover
+// mid-backup and leave restic's lock in the repository. VolSync keeps
+// retrying, and a later run waits with reason SourceBusy until one of those
+// retries completes the tag. A volume with no files succeeds with Empty set,
+// since VolSync takes no snapshot of it. Otherwise the item records the snapshot ID
 // the mover logged and the time restic stamped on it. On a quiesced run, the
 // snapshot is first moved to status.restartedAt and tagged quiesced, and the
 // item stays Running until that rewrite succeeds.
@@ -554,13 +555,11 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 		}
 		if lastManual(source) != item.Trigger {
 			if logs, failed := moverFailed(source, item.Trigger, run.Status.StartedAt); failed {
-				// VolSync retries a failed Job forever and keeps the trigger
-				// until one succeeds. Deleting the source stops the retries,
-				// and the next run writes a fresh one.
+				// The source is left alone. VolSync writes the failure after
+				// it has already started a new mover Job, and deleting the
+				// source would kill that mover mid-backup and leave restic's
+				// lock in the repository.
 				item.Phase, item.Message = backupv1alpha1.ItemFailed, logs
-				if err := r.Delete(ctx, source); err != nil && !apierrors.IsNotFound(err) {
-					item.Message += fmt.Sprintf("\nthe ReplicationSource could not be deleted, so VolSync keeps retrying it and later runs wait for it: %v", err)
-				}
 			}
 			return
 		}

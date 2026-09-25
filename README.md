@@ -65,6 +65,7 @@ the volume and the database back ending on the same tick.
 | v0.7.2 | a RestoreRun that can't stop a workload fails at once with reason `Failed`; a retime whose delete failed reuses its copy; an `endpointURL` of `host:port` reads as HTTPS |
 | v0.8.0 | a restore from a repository with `into:` writes through a Direct ReplicationDestination, a restore keeps the snapshot its checks selected and leaves an opted-out Cluster alone, a quiesce records its plan before it stops anything, a failed mover fails its item, the webhook ignores failed base backups and compares endpoints, and the controller gets health probes and a Recreate rollout |
 | v0.8.1 | a RestoreRun leaves a Cluster alone when its owner declares its own bootstrap method, such as `pg_basebackup` |
+| v0.8.2 | a failed mover no longer deletes the ReplicationSource, which killed the retry mover and left a restic lock that stopped every later `forget`. Upgrading needs `restic unlock` on each repository that had a mover failure under v0.8.0 or v0.8.1, see [namespace-backups.md](docs/namespace-backups.md) |
 
 The early fixes below explain behaviour that is still in the code.
 
