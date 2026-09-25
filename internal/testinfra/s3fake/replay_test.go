@@ -53,14 +53,8 @@ func TestReplayRecordedStoreTranscripts(t *testing.T) {
 			}
 			t.Run(name+"/"+server, func(t *testing.T) {
 				srv := s3fake.New(t, "recorded")
-				// Store.Upload drops the recorded ETag, so the objects go in
-				// here with it.
-				for _, o := range store.Objects {
-					obj := s3fake.Object{Size: o.Size, LastModified: o.LastModified, ETag: o.ETag}
-					if o.Body != nil {
-						obj.Body = []byte(*o.Body)
-					}
-					srv.Put("recorded", name+"/"+o.Key, obj)
+				if err := store.Upload(srv, "recorded", name); err != nil {
+					t.Fatal(err)
 				}
 				replay(t, srv, exchanges)
 			})
