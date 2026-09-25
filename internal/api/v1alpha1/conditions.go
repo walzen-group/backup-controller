@@ -1,5 +1,7 @@
-// Package-level condition vocabulary for VolumeRestore. The reconcile that
-// reports these reasons lives in internal/populator.
+// This file holds the Ready condition and the reasons it carries, for
+// VolumeRestore, BackupRun and RestoreRun. internal/populator reports them on
+// a VolumeRestore, and internal/runs reports them on the two run kinds.
+
 package v1alpha1
 
 import (
@@ -7,26 +9,29 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ConditionReady reports whether the object's claims have been filled: False
-// while a claim is being populated from this VolumeRestore, True when none is.
+// ConditionReady is the condition type every kind in this package reports. On
+// a VolumeRestore it is False while a claim is being populated from it, and
+// True when none is. On a run it is False while the run works, and True once
+// the run has finished.
 const ConditionReady = "Ready"
 
-// Reasons the Ready condition carries.
+// The reasons a VolumeRestore's Ready condition carries.
 const (
 	// ReasonRestoring reports a claim that is being populated now.
 	ReasonRestoring = "Restoring"
 
-	// ReasonRestoreFailed reports a claim whose mover failed: its volume will
-	// not be filled until something changes.
+	// ReasonRestoreFailed reports a claim whose mover failed. The claim's
+	// volume stays unfilled until something about the restore changes.
 	ReasonRestoreFailed = "RestoreFailed"
 
 	// ReasonRestored reports that nothing is being populated from this object.
 	ReasonRestored = "Restored"
 )
 
-// Reasons a BackupRun or a RestoreRun carries on its Ready condition. A run is
-// Ready False while it works and True once it has finished, either way, so a
-// Flux Kustomization with wait: true gates on it the way it gates on a Job.
+// The reasons a BackupRun or a RestoreRun carries on its Ready condition. A
+// run is Ready False while it works, and Ready True once it has finished,
+// whether it succeeded or failed. A Flux Kustomization with wait: true
+// therefore waits for a run the way it waits for a Job.
 const (
 	// ReasonRunning reports work under way.
 	ReasonRunning = "Running"
@@ -34,8 +39,8 @@ const (
 	// ReasonSucceeded reports work that finished.
 	ReasonSucceeded = "Succeeded"
 
-	// ReasonFailed reports a run that gave up. Whatever it created is removed
-	// before it says so.
+	// ReasonFailed reports a run that gave up. The run removes what it created
+	// and gives back any workloads it stopped before it reports this.
 	ReasonFailed = "Failed"
 
 	// ReasonQueued reports a run waiting for Kueue to admit it.
@@ -45,9 +50,10 @@ const (
 	// same volume to finish.
 	ReasonSourceBusy = "SourceBusy"
 
-	// ReasonNoBackupInReach reports a restore whose moment predates every
-	// backup of an item. The run fails before it deletes or overwrites
-	// anything.
+	// ReasonNoBackupInReach reports a restore whose moment is older than every
+	// backup of one of its items. A RestoreRun fails with it before it deletes
+	// or overwrites anything. A VolumeRestore reports it for a claim whose
+	// backup.wlz.li/restore-as-of is older than every snapshot.
 	ReasonNoBackupInReach = "NoBackupInReach"
 
 	// ReasonRecreate reports a restore waiting for the Clusters it deleted to
@@ -55,28 +61,42 @@ const (
 	ReasonRecreate = "WaitingForRecreate"
 
 	// ReasonShutdown reports a restore waiting for a deleted Cluster's instance
-	// pods and PVCs to be gone. Until they are, the app stays stopped and a
+	// pods and PVCs to be gone. Until they are, the app stays stopped and any
 	// Kustomization the run suspended stays suspended.
 	ReasonShutdown = "WaitingForShutdown"
 
-	// ReasonClaimInUse reports an in-place restore waiting for a pod to let go
-	// of the claim it has to write into. Two writers on one filesystem is how
-	// the volume being restored is corrupted, so the run waits.
+	// ReasonClaimInUse reports an in-place restore waiting for a pod to stop
+	// mounting the claim the restore writes into. The run waits because a
+	// second writer on the same filesystem would corrupt the restored volume.
 	ReasonClaimInUse = "ClaimInUse"
 
-	// ReasonTimedOut reports a mover still running at the run's timeout. The
-	// trigger is cleared and the destination removed before this is reported,
-	// so a stuck mover never leaves a source holding a spent tag.
+	// ReasonTimedOut reports a RestoreRun that had not finished by the end of
+	// its spec.timeout, or an into restore whose claim had not bound by then.
+	// The run removes its ReplicationDestinations and gives back any workloads
+	// it stopped before it reports this. A BackupRun that runs out of time
+	// reports ReasonFailed.
 	ReasonTimedOut = "TimedOut"
 
-	// ReasonInvalid reports a spec the controller will not act on, with the
-	// field named in the message.
+	// ReasonInvalid reports a spec the controller will not act on. The
+	// condition's message names the field at fault.
 	ReasonInvalid = "Invalid"
 )
 
-// SetReady sets or replaces the Ready condition on conditions, stamped with the
-// generation the caller observed. It is the only way this package writes the
-// condition, so the type and the transition time are never retyped by callers.
+// SetReady sets or replaces the Ready condition in a status's condition list.
+// Every reconciler in this project writes Ready through it, so no caller
+// spells out the condition type.
+//
+// Parameters:
+//   - conditions is the status's condition list, which SetReady changes in
+//     place.
+//   - generation is the object's metadata.generation as the caller read it.
+//     It becomes the condition's observedGeneration.
+//   - status, reason and message become the condition's fields of the same
+//     names.
+//
+// meta.SetStatusCondition keeps the old lastTransitionTime unless the status
+// changes, so a run that moves from one waiting reason to another keeps the
+// time it first went False.
 func SetReady(conditions *[]metav1.Condition, generation int64, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(conditions, metav1.Condition{
 		Type:               ConditionReady,

@@ -8,68 +8,71 @@ import (
 )
 
 // VolumeRestoreSpec names the restic repository a claim is restored from, and
-// how the mover that does the restore should run. Every field is a passthrough
-// to a field of the ReplicationDestination the controller creates, and carries
-// that field's name.
+// says how the mover that runs the restore should be set up. Each field is
+// passed to the field of the same name on the ReplicationDestination the
+// controller creates.
 type VolumeRestoreSpec struct {
-	// Repository is the Secret in this namespace holding the restic repository
-	// URL, its password and the object store keys. It is the Secret the app's
-	// ReplicationSource names, and the controller copies it into its own
-	// namespace for the length of the restore.
+	// Repository is the name of the Secret in this namespace that holds the
+	// restic repository URL, its password and the object store keys. It is
+	// the same Secret the app's ReplicationSource names. The controller
+	// copies it into its own namespace while a restore runs.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	Repository string `json:"repository"`
 
-	// RestoreAsOf selects the newest snapshot taken at or before this time.
-	// Omitted, the newest snapshot in the repository is used.
+	// RestoreAsOf selects the newest snapshot taken at or before this RFC 3339
+	// time. When omitted, the newest snapshot in the repository is used. A
+	// claim's own backup.wlz.li/restore-as-of annotation takes precedence over
+	// it for that claim.
 	// +optional
 	// +kubebuilder:validation:Format="date-time"
 	RestoreAsOf *string `json:"restoreAsOf,omitempty"`
 
-	// CacheStorageClassName is the class the restic mover's metadata cache
-	// claim is provisioned from. Omitted, the cluster's default class
-	// provisions it, and on a cluster whose default class reclaims Retain that
-	// leaves a dataset behind after every restore. Name a class that reclaims
-	// Delete.
+	// CacheStorageClassName is the storage class for the claim that holds the
+	// restic mover's metadata cache. When omitted, the cluster's default class
+	// provisions it. If that class has reclaimPolicy Retain, every restore
+	// leaves a volume behind, so name a class whose reclaimPolicy is Delete.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	CacheStorageClassName *string `json:"cacheStorageClassName,omitempty"`
 
-	// CacheCapacity is the size of that cache claim. Omitted, VolSync picks
-	// its own default.
+	// CacheCapacity is the size of the cache claim. When omitted, VolSync
+	// picks its own default.
 	// +optional
 	CacheCapacity *resource.Quantity `json:"cacheCapacity,omitempty"`
 
-	// MoverPodLabels are put on the mover pod, so the restore is admitted by
-	// the cluster's backup queue the way every other mover is. Keys and values
-	// must be label syntax, and the object carries at most 8 of them: the API
-	// server installs the label rules only for a map whose size is declared.
+	// MoverPodLabels are added to the mover pod, so that the cluster's backup
+	// queue admits the restore the same way it admits every other mover. Keys
+	// and values must be valid label syntax. The map holds at most 8 entries,
+	// because the API server installs the label syntax rules only for a map
+	// whose maximum size is declared.
 	// +optional
 	// +kubebuilder:validation:MaxProperties=8
 	// +kubebuilder:validation:XValidation:rule="self.all(k, k.matches('^([a-z0-9]([-a-z0-9_.]*[a-z0-9])?/)?[a-zA-Z0-9]([-a-zA-Z0-9_.]*[a-zA-Z0-9])?$'))",message="moverPodLabels keys must be a valid label key"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k].matches('^([a-zA-Z0-9]([-a-zA-Z0-9_.]*[a-zA-Z0-9])?)?$'))",message="moverPodLabels values must be a valid label value"
 	MoverPodLabels map[string]MoverPodLabelValue `json:"moverPodLabels,omitempty"`
 
-	// MoverSecurityContext is passed through to the ReplicationDestination
+	// MoverSecurityContext is copied onto the ReplicationDestination
 	// unchanged.
 	// +optional
 	MoverSecurityContext *corev1.PodSecurityContext `json:"moverSecurityContext,omitempty"`
 }
 
-// MoverPodLabelValue is one value of a mover label.
+// MoverPodLabelValue is one value in MoverPodLabels.
 //
-// The generated schema bounds a map's values only through their type, and the
-// API server refuses to install a CEL rule over a map of unbounded strings:
-// the rule's estimated cost runs past its budget by the size such a value may
-// reach. 63 is the length Kubernetes gives a label value.
+// It exists as its own type so that the generated schema can bound its length.
+// The schema bounds a map's values only through their type, and the API server
+// refuses to install a CEL rule over a map of unbounded strings, because the
+// rule's estimated cost exceeds its budget by the size such a value could
+// reach. 63 is the maximum length Kubernetes allows for a label value.
 // +kubebuilder:validation:MaxLength=63
 type MoverPodLabelValue string
 
-// MoverLabels returns MoverPodLabels as the plain map a ReplicationDestination
-// takes, converting the bounded value type back to string.
+// MoverLabels returns MoverPodLabels as the plain string map a
+// ReplicationDestination takes. It returns nil when no labels are set.
 func (s VolumeRestoreSpec) MoverLabels() map[string]string {
 	if s.MoverPodLabels == nil {
 		return nil
@@ -82,15 +85,15 @@ func (s VolumeRestoreSpec) MoverLabels() map[string]string {
 }
 
 // VolumeRestoreStatus reports what is being populated from this object right
-// now. A VolumeRestore is a standing declaration rather than a one-shot job,
-// so a restore that finished leaves no entry here.
+// now. A VolumeRestore is a standing declaration that fills claims as they
+// appear, so a restore that has finished leaves no entry here.
 type VolumeRestoreStatus struct {
-	// Conditions carry the object's kstatus-compatible state, so a Flux
-	// Kustomization with wait: true can gate on this object.
+	// Conditions holds the object's kstatus-compatible state, so a Flux
+	// Kustomization with wait: true can wait for this object.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// Claims has one entry per claim currently being populated from this
+	// Claims has one entry for each claim currently being populated from this
 	// object.
 	// +optional
 	Claims []ClaimRestoreStatus `json:"claims,omitempty"`
@@ -98,11 +101,12 @@ type VolumeRestoreStatus struct {
 
 // ClaimRestoreStatus is one claim being populated from a VolumeRestore.
 type ClaimRestoreStatus struct {
-	// Name is the claim in the VolumeRestore's namespace that named this
-	// object in its dataSourceRef.
+	// Name is the name of the claim, in the VolumeRestore's namespace, that
+	// names this VolumeRestore in its dataSourceRef.
 	Name string `json:"name"`
 
-	// UID is that claim's UID, which names the objects the restore created.
+	// UID is the claim's UID. The objects the restore creates are named
+	// after it.
 	UID types.UID `json:"uid"`
 
 	// Phase is how far the claim's restore has got.
@@ -120,7 +124,8 @@ const (
 	// RestorePhaseRestoring is a claim whose volume is being filled.
 	RestorePhaseRestoring RestorePhase = "Restoring"
 
-	// RestorePhaseFailed is a claim whose mover reported a failure.
+	// RestorePhaseFailed is a claim whose restore failed: its mover reported
+	// a failure, or no snapshot reaches its restore-as-of time.
 	RestorePhaseFailed RestorePhase = "Failed"
 )
 
@@ -129,8 +134,10 @@ const (
 // +kubebuilder:resource:scope=Namespaced,shortName=vrestore
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 
-// VolumeRestore is a namespaced declaration that a claim in this namespace is
-// restored from a restic repository. A claim names it in its dataSourceRef.
+// VolumeRestore declares that claims in this namespace are restored from a
+// restic repository. A claim names the VolumeRestore in its dataSourceRef,
+// and the controller fills the claim's volume from the repository before the
+// claim binds.
 type VolumeRestore struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

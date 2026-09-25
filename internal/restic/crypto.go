@@ -15,30 +15,37 @@ import (
 	"golang.org/x/crypto/scrypt"
 )
 
-// The layout restic's design document gives every encrypted file:
-// IV || CIPHERTEXT || MAC, with a 16-byte IV and a 16-byte Poly1305-AES MAC.
+// ivSize and macSize are the sizes of the parts of an encrypted file. restic's
+// design document lays out every encrypted file as IV || CIPHERTEXT || MAC,
+// with a 16-byte IV and a 16-byte Poly1305-AES MAC.
 const (
 	ivSize  = 16
 	macSize = 16
 )
 
-// errWrongKey is what a MAC mismatch means in practice: the key tried was not
-// this repository's, because the password was wrong or the key file belongs to
-// another repository.
+// errWrongKey is the error for a MAC that doesn't verify. In practice it means
+// the key isn't this repository's: the password was wrong, or the key file
+// belongs to another repository. Open skips a key file that fails this way and
+// tries the next one.
 var errWrongKey = errors.New("MAC does not verify: wrong password or wrong key")
 
-// key is one encryption key and its MAC key, as restic splits them.
+// key is one restic key, split into three parts the way restic splits it: an
+// AES-256 key that encrypts the data, and the two parts of the Poly1305-AES MAC
+// key.
 //
-// A key file's key comes out of scrypt as 64 bytes, a 32-byte AES-256 key then
-// the 16-byte AES key k and the 16-byte Poly1305 key r. The master key it
-// unlocks carries the same three parts as base64 in JSON.
+// For a key file, scrypt turns the password into 64 bytes. The first 32 are
+// the AES-256 key, the next 16 are the MAC's AES key k, and the last 16 are the
+// Poly1305 key r. The master key that a key file unlocks holds the same three
+// parts, as base64 in JSON.
 type key struct {
 	encrypt [32]byte
 	macK    [16]byte
 	macR    [16]byte
 }
 
-// masterKeyJSON is the document a key file's data decrypts to.
+// masterKeyJSON is the JSON document that a key file's data decrypts to. It
+// holds the repository's master key, with each part in base64, which
+// encoding/json decodes into the byte slices.
 type masterKeyJSON struct {
 	MAC struct {
 		K []byte `json:"k"`
@@ -47,7 +54,9 @@ type masterKeyJSON struct {
 	Encrypt []byte `json:"encrypt"`
 }
 
-// keyFile is one document under keys/.
+// keyFile is the JSON document in one file under keys/. It holds the scrypt
+// parameters (N, r, p and the salt) and, in Data, the master key encrypted with
+// the key that those parameters derive from the password.
 type keyFile struct {
 	KDF  string `json:"kdf"`
 	N    int    `json:"N"`
@@ -57,7 +66,9 @@ type keyFile struct {
 	Data []byte `json:"data"`
 }
 
-// deriveKey runs scrypt over the password with the key file's parameters.
+// deriveKey runs scrypt over the password with the parameters from a key file,
+// and splits the 64 bytes it produces into a key. It returns an error when the
+// key file names a KDF other than scrypt.
 func deriveKey(password string, file keyFile) (key, error) {
 	if file.KDF != "scrypt" {
 		return key{}, fmt.Errorf("key file uses kdf %q, and only scrypt is supported", file.KDF)
@@ -73,7 +84,11 @@ func deriveKey(password string, file keyFile) (key, error) {
 	return k, nil
 }
 
-// masterKey decrypts a key file's data with the password-derived key.
+// masterKey opens one key file with a password and returns the master key
+// inside it. The raw argument is the key file's content as stored. masterKey
+// derives a key from the password, decrypts the file's data with it, and
+// decodes the master key from the result. It returns errWrongKey when the
+// password doesn't open this key file.
 func masterKey(password string, raw []byte) (key, error) {
 	var file keyFile
 	if err := json.Unmarshal(raw, &file); err != nil {
@@ -102,7 +117,9 @@ func masterKey(password string, raw []byte) (key, error) {
 	return master, nil
 }
 
-// decrypt checks the MAC over the ciphertext and then decrypts it.
+// decrypt opens one encrypted file, laid out as IV || CIPHERTEXT || MAC. It
+// checks the MAC over the ciphertext first and returns errWrongKey when it
+// doesn't match. Then it decrypts the ciphertext with AES-256 in CTR mode.
 func (k key) decrypt(sealed []byte) ([]byte, error) {
 	if len(sealed) < ivSize+macSize {
 		return nil, fmt.Errorf("an encrypted file of %d bytes is shorter than its overhead", len(sealed))
@@ -128,8 +145,9 @@ func (k key) decrypt(sealed []byte) ([]byte, error) {
 	return plain, nil
 }
 
-// seal encrypts under a fresh random IV and appends the MAC over the
-// ciphertext, giving the IV || CIPHERTEXT || MAC layout decrypt reads.
+// seal encrypts a plaintext with AES-256 in CTR mode under a new random IV, and
+// returns IV || CIPHERTEXT || MAC, the layout decrypt reads. The MAC covers the
+// ciphertext.
 func (k key) seal(plain []byte) ([]byte, error) {
 	iv := make([]byte, ivSize)
 	if _, err := rand.Read(iv); err != nil {
@@ -152,8 +170,10 @@ func (k key) seal(plain []byte) ([]byte, error) {
 	return append(sealed, mac[:]...), nil
 }
 
-// mac computes Poly1305-AES: the one-time key is r followed by AES_k(IV).
-// poly1305 clamps r itself, which is the masking restic applies to it.
+// mac computes the Poly1305-AES MAC of a message under the given IV. The
+// one-time Poly1305 key is r followed by AES_k(IV), where k and r are the key's
+// two MAC parts. The poly1305 package clamps r itself, which is the same
+// masking restic applies to it.
 func (k key) mac(iv, message []byte) ([16]byte, error) {
 	block, err := aes.NewCipher(k.macK[:])
 	if err != nil {
@@ -168,9 +188,12 @@ func (k key) mac(iv, message []byte) ([16]byte, error) {
 	return out, nil
 }
 
-// unpack strips repository version 2's encoding header from a decrypted
-// unpacked file. A plaintext opening with '{' or '[' is JSON as it stands; one
-// opening with the byte 2 is zstd-compressed JSON.
+// unpack removes the encoding header that repository version 2 puts on a
+// decrypted file stored outside the pack files, such as a snapshot or a lock.
+// A plaintext that starts with '{' or '[' is uncompressed JSON, and unpack
+// returns it as it is. A plaintext that starts with the byte 2 is
+// zstd-compressed JSON, and unpack decompresses it. Any other first byte is an
+// error.
 func unpack(plain []byte) ([]byte, error) {
 	if len(plain) == 0 {
 		return nil, fmt.Errorf("the file is empty")

@@ -1,8 +1,12 @@
-// Command backup-controller populates PersistentVolumeClaims from a restic
-// repository. It binds the callbacks in internal/populator to
-// lib-volume-populator's provider-function mode, so a claim naming a
-// VolumeRestore in its dataSourceRef is filled by a VolSync mover rather than
-// by a populator pod this binary would have to build.
+// Command backup-controller runs the backup.wlz.li controllers in one process.
+//
+// It fills PersistentVolumeClaims from restic repositories. It hands the
+// callbacks in internal/populator to lib-volume-populator's provider-function
+// mode, so a VolSync mover fills a claim whose dataSourceRef names a
+// VolumeRestore, and this binary builds no populator pod of its own. It also
+// runs a controller-runtime manager that reconciles BackupRun and RestoreRun,
+// runs the namespace backup scheduler, and serves the bootstrap webhook for
+// CloudNativePG Clusters when a certificate directory is given.
 package main
 
 import (
@@ -23,20 +27,23 @@ import (
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	// The image is FROM scratch, so a CRON_TZ schedule loads its zone from the
-	// copy of the zone database compiled in here.
+	// The image is FROM scratch and has no zone files, so a schedule with a
+	// CRON_TZ prefix loads its zone from the copy of the zone database this
+	// import compiles into the binary.
 	_ "time/tzdata"
 )
 
-// version is stamped at build time with -ldflags "-X main.version=...". The
+// version is set at build time with -ldflags "-X main.version=...". The
 // Dockerfile passes its VERSION build argument through to it.
 var version = "dev"
 
-// prefix names the annotation and finalizer domain the library writes onto the
-// claims it manages. It is the API group, so every mark this controller leaves
-// on an object is traceable to this project.
+// prefix is the domain of the annotations and finalizers the populator library
+// writes onto the claims it fills. It is the API group, so every mark this
+// controller leaves on an object can be traced to this project.
 const prefix = "backup.wlz.li"
 
+// main parses the flags, starts the run controllers, and then runs the
+// populator library until it stops.
 func main() {
 	var (
 		kubeconfig  = kubeconfigFlag(flag.CommandLine)
@@ -63,10 +70,11 @@ func main() {
 	}
 	callbacks := populator.New(operations, *namespace, restic.S3Lister{})
 
+	// The populator library drives only the one kind it is given, so
 	// BackupRun and RestoreRun are reconciled by a controller-runtime manager
-	// of this binary's own, because the populator library drives only the one
-	// kind it is given. It is started here and cancelled after the library
-	// returns, which is the only shutdown signal this process gets.
+	// that this binary starts itself. The deferred cancel stops that manager
+	// once the library returns, which is the only shutdown signal this process
+	// gets.
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
@@ -75,11 +83,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The library registers its own SIGTERM and interrupt handler and closes
-	// the stop channel itself, so this binary installs no second handler: two
-	// closers race on one channel and the loser panics. RunControllerWithConfig
-	// returns once the controller has stopped, and returning from main here is
-	// the clean exit.
+	// The library registers its own handler for SIGTERM and interrupt, and it
+	// closes the stop channel itself. This binary installs no second handler,
+	// because two handlers closing one channel race and the loser panics.
+	// RunControllerWithConfig returns once the controller has stopped, and
+	// returning from main after it is the clean exit.
 	populatormachinery.RunControllerWithConfig(populatormachinery.VolumePopulatorConfig{
 		Kubeconfig:   kubeconfig(),
 		HttpEndpoint: *metricsAddr,
@@ -98,8 +106,13 @@ func main() {
 	klog.Info("stopping backup-controller")
 }
 
-// newClientOperations builds the cluster operations the callbacks run through,
-// backed by a client that knows this project's types and VolSync's.
+// newClientOperations builds the cluster operations the populator callbacks
+// run through. They use a client whose scheme knows the core, VolSync and
+// backup.wlz.li types. The kubeconfig argument is the path from the
+// --kubeconfig flag, and an empty path means the in-cluster configuration.
+//
+// It returns an error when the client configuration can't be built or a
+// scheme fails to register.
 func newClientOperations(kubeconfig string) (populator.Operations, error) {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {

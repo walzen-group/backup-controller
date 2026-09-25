@@ -18,8 +18,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// restoreUID is the UID of the RestoreRun back-to-monday. The run's
+// ReplicationDestinations use it as their manual trigger, so a test marks a
+// restore done by writing it to the destination's lastManualSync.
 const restoreUID = types.UID("9b7d4e21-0000-4000-8000-000000000002")
 
+// restoreRun returns the RestoreRun back-to-monday with a four-hour timeout,
+// after applying each of the mutate functions to it.
 func restoreRun(mutate ...func(*backupv1alpha1.RestoreRun)) *backupv1alpha1.RestoreRun {
 	run := &backupv1alpha1.RestoreRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "back-to-monday", Namespace: ns, UID: restoreUID, Generation: 1},
@@ -31,10 +36,16 @@ func restoreRun(mutate ...func(*backupv1alpha1.RestoreRun)) *backupv1alpha1.Rest
 	return run
 }
 
+// asOf returns a mutate function for restoreRun that sets spec.restoreAsOf to
+// the given value.
 func asOf(value string) func(*backupv1alpha1.RestoreRun) {
 	return func(r *backupv1alpha1.RestoreRun) { r.Spec.RestoreAsOf = &value }
 }
 
+// restoreReconciler returns a RestoreRunReconciler over a fake client that
+// holds the given objects, and the client itself. The reconciler runs on the
+// frozen clock, its lister holds sunday's and monday's snapshots, and its
+// Prober returns the base backups passed in backups.
 func restoreReconciler(t *testing.T, backups prober, objects ...client.Object) (*RestoreRunReconciler, client.Client) {
 	t.Helper()
 	c := newClient(t, objects...)
@@ -44,6 +55,8 @@ func restoreReconciler(t *testing.T, backups prober, objects ...client.Object) (
 	}, c
 }
 
+// restoreStep reconciles the RestoreRun back-to-monday once and returns the
+// result. An error from the reconcile fails the test.
 func restoreStep(t *testing.T, r *RestoreRunReconciler) ctrl.Result {
 	t.Helper()
 	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
@@ -53,6 +66,7 @@ func restoreStep(t *testing.T, r *RestoreRunReconciler) ctrl.Result {
 	return result
 }
 
+// readRestoreRun reads the RestoreRun back-to-monday back from the client.
 func readRestoreRun(t *testing.T, c client.Client) *backupv1alpha1.RestoreRun {
 	t.Helper()
 	run := &backupv1alpha1.RestoreRun{}
@@ -60,8 +74,10 @@ func readRestoreRun(t *testing.T, c client.Client) *backupv1alpha1.RestoreRun {
 	return run
 }
 
-// VolSync restores nothing and reports success when no snapshot reaches the
-// moment. The run fails before it creates anything.
+// A restore to a moment before the oldest snapshot fails with reason
+// NoBackupInReach, names the oldest snapshot, and creates no
+// ReplicationDestination. VolSync itself would restore nothing and report
+// success.
 func TestARestoreBeforeEverySnapshotFailsBeforeTouchingAnything(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-01T00:00:00Z")),
@@ -82,7 +98,9 @@ func TestARestoreBeforeEverySnapshotFailsBeforeTouchingAnything(t *testing.T) {
 	}
 }
 
-// A time between two snapshots rounds back to the one before it.
+// A claim restore to a time between two snapshots selects the earlier one,
+// hands the time to its ReplicationDestination, and deletes the destination
+// once the restore succeeds.
 func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
@@ -117,13 +135,15 @@ func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 	}
 }
 
-// quiet is a snapshot a quiesced BackupRun moved to its restart moment, taken
-// between sunday's and monday's.
+// quiet is a snapshot tagged quiesced, as a quiesced BackupRun leaves it after
+// moving it to its restart moment. Its time falls between sunday's and
+// monday's.
 var quiet = restic.Snapshot{ID: "c0ffee00" + "00000000", Time: time.Date(2026, 9, 21, 3, 0, 5, 0, time.UTC), Tags: []string{restic.QuiescedTag}}
 
-// A synced restore takes the newest quiesced snapshot, passes over monday's
-// untagged one, and restores the volume and the database to that snapshot's
-// moment.
+// A synced restore selects the newest quiesced snapshot and passes over
+// monday's newer untagged one. It records that snapshot's time in syncedTo and
+// hands the same time to the volume's ReplicationDestination, with no
+// previous, so the mover selects the quiesced snapshot too.
 func TestASyncedRestoreRestoresEverythingToTheQuiescedMoment(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true }),
@@ -149,8 +169,10 @@ func TestASyncedRestoreRestoresEverythingToTheQuiescedMoment(t *testing.T) {
 	}
 }
 
-// A snapshot without the tag was taken while the app ran, so no moment makes
-// the database match it. The run refuses before touching anything.
+// A synced restore of a repository with no quiesced snapshot fails with
+// reason NoBackupInReach and leaves the Cluster in place. An untagged
+// snapshot was taken while the app ran, so no moment makes the database match
+// it.
 func TestASyncedRestoreRefusesUntaggedSnapshots(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true }),
@@ -170,7 +192,8 @@ func TestASyncedRestoreRefusesUntaggedSnapshots(t *testing.T) {
 	}
 }
 
-// Two writers on one filesystem corrupt the volume, so the run waits.
+// A restore in place waits with reason ClaimInUse while a pod mounts the
+// claim, because two writers on one filesystem corrupt the volume.
 func TestAMountedClaimMakesTheRestoreWait(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "notes-5d9f", Namespace: ns},
@@ -189,8 +212,9 @@ func TestAMountedClaimMakesTheRestoreWait(t *testing.T) {
 	}
 }
 
-// The database restore: the run deletes the Cluster, the webhook recovers the
-// one created next, and the run follows it until it is healthy.
+// A database restore deletes the Cluster and waits for it to be created
+// again. It follows the Cluster the webhook marked as its recovery until the
+// Cluster is healthy, then succeeds.
 func TestADatabaseRestoreDeletesAndFollowsTheCluster(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }, asOf("2026-09-22T00:00:00Z")),
@@ -234,7 +258,8 @@ func TestADatabaseRestoreDeletesAndFollowsTheCluster(t *testing.T) {
 	}
 }
 
-// readyMessage is the message on a run's Ready condition.
+// readyMessage returns the message on a run's Ready condition, or an empty
+// string when there is none.
 func readyMessage(conditions []metav1.Condition) string {
 	for _, c := range conditions {
 		if c.Type == "Ready" {
@@ -244,7 +269,7 @@ func readyMessage(conditions []metav1.Condition) string {
 	return ""
 }
 
-// writerPod is the app's pod, mounting the claim.
+// writerPod returns the app's running pod, which mounts the claim.
 func writerPod() *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "notes-5d9f", Namespace: ns, Labels: map[string]string{"app": appN}},
@@ -255,6 +280,8 @@ func writerPod() *corev1.Pod {
 	}
 }
 
+// quiescedRestore returns a namespace restore whose spec.quiesce lists the
+// app's Deployment.
 func quiescedRestore() *backupv1alpha1.RestoreRun {
 	return restoreRun(func(r *backupv1alpha1.RestoreRun) {
 		r.Spec.All = true
@@ -262,6 +289,7 @@ func quiescedRestore() *backupv1alpha1.RestoreRun {
 	})
 }
 
+// replicasOf returns the replica count of the app's Deployment.
 func replicasOf(t *testing.T, c client.Client) int32 {
 	t.Helper()
 	d := &appsv1.Deployment{}
@@ -269,6 +297,7 @@ func replicasOf(t *testing.T, c client.Client) int32 {
 	return *d.Spec.Replicas
 }
 
+// suspended reports whether the app's Flux Kustomization is suspended.
 func suspended(t *testing.T, c client.Client) bool {
 	t.Helper()
 	k, _ := getUnstructured(t, c, KustomizationGVK, "flux-system", appN)
@@ -403,7 +432,8 @@ func TestAQuiescedRestoreWaitsForTheOldInstanceToShutDown(t *testing.T) {
 	}
 }
 
-// A run that gives up after stopping the app starts it again.
+// A quiesced restore that times out starts the app again and resumes the
+// Kustomization it suspended.
 func TestATimedOutQuiescedRestoreGivesTheAppBack(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
@@ -426,8 +456,8 @@ func TestATimedOutQuiescedRestoreGivesTheAppBack(t *testing.T) {
 	}
 }
 
-// A workload the run cannot find is refused at the checks, before the run
-// stops anything or deletes a database.
+// A spec.quiesce entry naming a workload the namespace does not hold fails
+// the run at the checks, before it stops anything or deletes a database.
 func TestAQuiescedRestoreOfAMissingWorkloadFailsBeforeStoppingAnything(t *testing.T) {
 	run := quiescedRestore()
 	run.Spec.Quiesce = append(run.Spec.Quiesce, backupv1alpha1.WorkloadRef{Kind: "StatefulSet", Name: "notes-worker"})
@@ -445,8 +475,9 @@ func TestAQuiescedRestoreOfAMissingWorkloadFailsBeforeStoppingAnything(t *testin
 	}
 }
 
-// The backup.wlz.li/quiesce annotation is the BackupRun's. A restore without
-// quiesce leaves the app alone, annotated or not, and waits for its pod to stop.
+// A restore without spec.quiesce leaves the app running and waits with reason
+// ClaimInUse for its pod to stop. The backup.wlz.li/quiesce annotation only
+// tells a BackupRun what to stop, so it makes no difference here.
 func TestARestoreWithoutQuiesceLeavesTheAppRunning(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday}, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
@@ -462,7 +493,9 @@ func TestARestoreWithoutQuiesceLeavesTheAppRunning(t *testing.T) {
 	}
 }
 
-// Deleting a Cluster with no base backup in reach would bring it back empty.
+// A database restore to a moment before every base backup fails with reason
+// NoBackupInReach and leaves the Cluster in place. Deleting it would bring it
+// back empty.
 func TestADatabaseWithoutABaseBackupIsNotDeleted(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }, asOf("2026-09-01T00:00:00Z")),
@@ -479,8 +512,8 @@ func TestADatabaseWithoutABaseBackupIsNotDeleted(t *testing.T) {
 	}
 }
 
-// The namespace restore: volumes first, then the databases. A failed volume
-// leaves the databases running.
+// A namespace restore restores the volumes before the databases. When a volume
+// restore fails, the run fails and skips the Cluster, which keeps running.
 func TestANamespaceRestoreLeavesTheDatabasesWhenAVolumeFails(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
@@ -512,6 +545,8 @@ func TestANamespaceRestoreLeavesTheDatabasesWhenAVolumeFails(t *testing.T) {
 	}
 }
 
+// A restore into a new claim fails with reason NoBackupInReach, and creates
+// no claim, when no snapshot reaches its moment.
 func TestAnIntoRestoreChecksBeforeCreatingAnything(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN; r.Spec.Into = "notes-data-monday" },

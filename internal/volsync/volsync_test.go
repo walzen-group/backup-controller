@@ -12,6 +12,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// TestNewPassesThroughSpecFields checks that New names the destination after
+// the claim UID, restores Direct into the prime claim, names the Secret copy,
+// and copies every optional field from the VolumeRestore's spec. When those
+// fields are unset, the destination leaves them unset too.
 func TestNewPassesThroughSpecFields(t *testing.T) {
 	restoreAsOf := "2026-09-14T12:00:00Z"
 	cacheClass := "zfs-ephemeral"
@@ -48,19 +52,18 @@ func TestNewPassesThroughSpecFields(t *testing.T) {
 		t.Errorf("destination PVC = %#v, want prime-claim-123", rd.Spec.Restic.DestinationPVC)
 	}
 	// VolSync reads the repository Secret in the destination's own namespace,
-	// so the destination names the copy the controller made there, not
-	// vr.Spec.Repository, which only exists in the app's namespace. Naming the
-	// original here would send every real restore looking for a Secret that
-	// does not exist.
+	// so the destination has to name the copy the controller made there.
+	// vr.Spec.Repository exists only in the app's namespace. Naming it here
+	// would send every real restore looking for a Secret that doesn't exist.
 	if rd.Spec.Restic.Repository != "claim-123" {
 		t.Errorf("repository = %q, want the copied Secret claim-123", rd.Spec.Restic.Repository)
 	}
 	if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != restoreAsOf {
 		t.Errorf("restore as of = %#v, want %q", rd.Spec.Restic.RestoreAsOf, restoreAsOf)
 	}
-	// Without a class the mover's cache claim comes from the cluster default,
-	// and a default that reclaims Retain leaves its dataset on the pool after
-	// every restore.
+	// Without a class, the mover's cache claim comes from the cluster's
+	// default class, and a default class that reclaims Retain leaves its
+	// dataset on the pool after every restore.
 	if rd.Spec.Restic.CacheStorageClassName == nil || *rd.Spec.Restic.CacheStorageClassName != cacheClass {
 		t.Errorf("cache storage class = %#v, want %q", rd.Spec.Restic.CacheStorageClassName, cacheClass)
 	}
@@ -81,6 +84,7 @@ func TestNewPassesThroughSpecFields(t *testing.T) {
 	}
 }
 
+// TestTriggerUsesClaimUID checks that the manual trigger is the claim's UID.
 func TestTriggerUsesClaimUID(t *testing.T) {
 	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{UID: types.UID("claim-123")}}
 	if got := Trigger(claim); got != "claim-123" {
@@ -88,6 +92,8 @@ func TestTriggerUsesClaimUID(t *testing.T) {
 	}
 }
 
+// TestCompleteMatchesManualTrigger checks that Complete is true only when
+// status.lastManualSync equals the trigger.
 func TestCompleteMatchesManualTrigger(t *testing.T) {
 	for name, test := range map[string]struct {
 		last, trigger string
@@ -106,6 +112,8 @@ func TestCompleteMatchesManualTrigger(t *testing.T) {
 	}
 }
 
+// TestFailureReportsMoverLogs checks that Failure reports a failed mover run
+// and returns its logs.
 func TestFailureReportsMoverLogs(t *testing.T) {
 	rd := &volsyncv1alpha1.ReplicationDestination{Status: &volsyncv1alpha1.ReplicationDestinationStatus{
 		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "restic failed"},
@@ -116,6 +124,9 @@ func TestFailureReportsMoverLogs(t *testing.T) {
 	}
 }
 
+// TestSecretCopyPreservesDataAndType checks that SecretCopy names the copy
+// after the claim UID and keeps the type and data. It also checks that the
+// data bytes are copied, so a change to the copy leaves the original alone.
 func TestSecretCopyPreservesDataAndType(t *testing.T) {
 	repo := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "repo-secret", Namespace: "apps"},

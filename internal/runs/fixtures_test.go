@@ -21,10 +21,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// frozen is the clock every test runs on, so a deadline is a subtraction rather
-// than a sleep.
+// frozen is the time the tests' clocks stand at. A test reaches a deadline by
+// setting the clock to a later time, so no test sleeps.
 var frozen = time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
 
+// The names of the test namespace and of the objects in it, and the UID that
+// every test run gets.
 const (
 	ns     = "notes"
 	claimN = "notes-data"
@@ -34,14 +36,17 @@ const (
 	runUID = types.UID("3f2a1c7e-0000-4000-8000-000000000001")
 )
 
-// The kinds the package reads as unstructured, registered by GVK so the fake
-// client can store them.
+// unstructuredKinds are the kinds the package reads as unstructured objects.
+// scheme registers each one, and its list kind, so the fake client can store
+// them.
 var unstructuredKinds = []schema.GroupVersionKind{
 	ClusterGVK, BackupGVK, KustomizationGVK, WorkloadGVK,
 	{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueue"},
 	bootstrap.ObjectStoreGVK,
 }
 
+// scheme returns a scheme that holds the typed kinds the package uses and the
+// kinds in unstructuredKinds.
 func scheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -59,8 +64,9 @@ func scheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-// newClient builds a fake client holding objects, with the status subresource
-// on every kind the package writes status to.
+// newClient builds a fake client that holds the given objects. Every kind the
+// package writes status to has the status subresource, as it does on a real
+// API server.
 func newClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
 	workload := &unstructured.Unstructured{}
@@ -73,32 +79,38 @@ func newClient(t *testing.T, objects ...client.Object) client.Client {
 		Build()
 }
 
-// snapshots is a restic.Lister holding a fixed list.
+// snapshots is a restic.Lister that returns a fixed list of snapshots.
 type snapshots []restic.Snapshot
 
+// Snapshots returns the fixed list, whatever repository it is asked about.
 func (s snapshots) Snapshots(context.Context, *corev1.Secret) ([]restic.Snapshot, error) {
 	return s, nil
 }
 
+// sunday and monday are two snapshots taken a day apart, each at 05:00:02
+// UTC.
 var (
 	sunday = restic.Snapshot{ID: "2edf5bab" + "00000000", Time: time.Date(2026, 9, 20, 5, 0, 2, 0, time.UTC)}
 	monday = restic.Snapshot{ID: "6e473100" + "00000000", Time: time.Date(2026, 9, 21, 5, 0, 2, 0, time.UTC)}
 )
 
-// retimeCall is one question a retimer was asked.
+// retimeCall holds the arguments of one call to retimer.Retime.
 type retimeCall struct {
 	short string
 	at    time.Time
 	tag   string
 }
 
-// retimer is a restic.Retimer that records what it was asked and answers with
-// the snapshot rewritten as c0ffee00, or with err while err is set.
+// retimer is a restic.Retimer that records each call. It answers with the
+// snapshot rewritten under an ID that starts with c0ffee00, or with the error
+// in err while err is set.
 type retimer struct {
 	calls []retimeCall
 	err   error
 }
 
+// Retime records the call and returns the rewritten snapshot, which carries
+// the requested time and tag, or returns r.err when it is set.
 func (r *retimer) Retime(_ context.Context, _ *corev1.Secret, short string, at time.Time, tag string) (restic.Snapshot, error) {
 	r.calls = append(r.calls, retimeCall{short: short, at: at, tag: tag})
 	if r.err != nil {
@@ -107,24 +119,31 @@ func (r *retimer) Retime(_ context.Context, _ *corev1.Secret, short string, at t
 	return restic.Snapshot{ID: "c0ffee00" + "00000000", Time: at, Tags: []string{tag}, Original: short}, nil
 }
 
-// prober answers the base backup questions without an object store.
+// prober answers the questions about a Cluster's base backups from a fixed
+// list, with no object store behind it.
 type prober []bootstrap.BaseBackup
 
+// HasBaseBackup reports whether the list holds any base backup.
 func (p prober) HasBaseBackup(context.Context, bootstrap.Location) (bool, error) {
 	return len(p) > 0, nil
 }
 
+// BaseBackups returns the fixed list.
 func (p prober) BaseBackups(context.Context, bootstrap.Location) ([]bootstrap.BaseBackup, error) {
 	return p, nil
 }
 
+// saturday is a base backup that ended at 03:00:40 UTC on 19 September 2026.
 var saturday = bootstrap.BaseBackup{ID: "20260919T030000", End: time.Date(2026, 9, 19, 3, 0, 40, 0, time.UTC)}
 
+// enabled returns the annotations that mark a claim for backup and keep its
+// newest 10 snapshots.
 func enabled() map[string]string {
 	return map[string]string{backupv1alpha1.AnnotationEnabled: "true", backupv1alpha1.AnnotationRetainLast: "10"}
 }
 
-// claim is a backed-up dynamic claim, bound to a zfs-localpv volume.
+// claim returns a dynamic claim that is marked for backup, filled from the
+// VolumeRestore of the same name, and bound to a zfs-localpv volume.
 func claim() *corev1.PersistentVolumeClaim {
 	class := "zfs"
 	group := backupv1alpha1.GroupVersion.Group
@@ -143,8 +162,8 @@ func claim() *corev1.PersistentVolumeClaim {
 	}
 }
 
-// volume is the claim's PersistentVolume, with the node affinity zfs-localpv
-// writes on every volume it provisions.
+// volume returns the claim's PersistentVolume, with the node affinity that
+// zfs-localpv writes on every volume it provisions.
 func volume() *corev1.PersistentVolume {
 	return &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-notes-data"},
@@ -158,6 +177,8 @@ func volume() *corev1.PersistentVolume {
 	}
 }
 
+// volumeRestore returns the claim's VolumeRestore. It names the repository
+// Secret, a cache class, and the Kueue queue label for the mover.
 func volumeRestore() *backupv1alpha1.VolumeRestore {
 	class := "zfs-ephemeral"
 	return &backupv1alpha1.VolumeRestore{
@@ -170,11 +191,14 @@ func volumeRestore() *backupv1alpha1.VolumeRestore {
 	}
 }
 
+// repository returns the claim's restic repository Secret.
 func repository() *corev1.Secret {
 	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: repoN, Namespace: ns}}
 }
 
-// cluster is a Cluster archiving through the plugin, marked enabled.
+// cluster returns a Cluster that is marked for backup and archives its WAL
+// through the barman-cloud plugin. Each function passed in mutate changes the
+// Cluster before it is returned.
 func cluster(mutate ...func(*unstructured.Unstructured)) *unstructured.Unstructured {
 	c := &unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{
@@ -195,7 +219,9 @@ func cluster(mutate ...func(*unstructured.Unstructured)) *unstructured.Unstructu
 	return c
 }
 
-// objectStore and storeSecret are what ResolveLocation reads for the Cluster.
+// objectStore returns the barman-cloud ObjectStore the Cluster archives to.
+// bootstrap.ResolveLocation reads it and storeSecret to find where the
+// Cluster's backups are.
 func objectStore() *unstructured.Unstructured {
 	s := &unstructured.Unstructured{}
 	s.SetGroupVersionKind(bootstrap.ObjectStoreGVK)
@@ -212,6 +238,7 @@ func objectStore() *unstructured.Unstructured {
 	return s
 }
 
+// storeSecret returns the Secret that holds the ObjectStore's credentials.
 func storeSecret() *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: pgN + "-backup", Namespace: ns},
@@ -219,7 +246,8 @@ func storeSecret() *corev1.Secret {
 	}
 }
 
-// deployment is the app, marked for quiesce and applied by Flux.
+// deployment returns the app's Deployment with two replicas. It is marked for
+// quiesce and carries the labels of the Flux Kustomization that applies it.
 func deployment() *appsv1.Deployment {
 	replicas := int32(2)
 	return &appsv1.Deployment{
@@ -235,6 +263,8 @@ func deployment() *appsv1.Deployment {
 	}
 }
 
+// kustomization returns the Flux Kustomization that applies the app, with
+// spec.suspend set to the value given in suspended.
 func kustomization(suspended bool) *unstructured.Unstructured {
 	k := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{"suspend": suspended}}}
 	k.SetGroupVersionKind(KustomizationGVK)
@@ -243,6 +273,8 @@ func kustomization(suspended bool) *unstructured.Unstructured {
 	return k
 }
 
+// localQueueObject returns a Kueue LocalQueue named backups in the test
+// namespace.
 func localQueueObject() *unstructured.Unstructured {
 	q := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{"clusterQueue": "backups"}}}
 	q.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueue"})
@@ -251,6 +283,7 @@ func localQueueObject() *unstructured.Unstructured {
 	return q
 }
 
+// get reads one object into object and fails the test when it can't.
 func get(t *testing.T, c client.Client, namespace, name string, object client.Object) {
 	t.Helper()
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: name}, object); err != nil {
@@ -258,6 +291,9 @@ func get(t *testing.T, c client.Client, namespace, name string, object client.Ob
 	}
 }
 
+// getUnstructured reads one object of the given kind as unstructured. It
+// returns false when the read fails, so a test can check that an object is
+// absent.
 func getUnstructured(t *testing.T, c client.Client, gvk schema.GroupVersionKind, namespace, name string) (*unstructured.Unstructured, bool) {
 	t.Helper()
 	u := &unstructured.Unstructured{}

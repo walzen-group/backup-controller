@@ -12,26 +12,30 @@ import (
 	"time"
 )
 
-// QuiescedTag marks a snapshot a quiesced BackupRun moved to the moment its
-// workloads were stopped. A restore that recovers the databases to a volume's
-// snapshot takes only a snapshot carrying it.
+// QuiescedTag is the restic tag that a quiesced BackupRun adds to each snapshot
+// it moves to its restartedAt time, the moment it gave the stopped workloads
+// their replicas back. A RestoreRun with syncDatabaseToVolume restores a volume
+// only from a snapshot that carries this tag.
 const QuiescedTag = "quiesced"
 
-// The two numbers restic's lock protocol runs on, from internal/restic/lock.go
-// in restic 0.18.1: the pause between writing a lock and checking for others,
-// and the age past which restic calls a lock stale. A live restic refreshes its
-// lock every five minutes, so a lock older than that belongs to a process that
-// is gone.
+// lockCheckDelay and staleLockAge are the two timings restic's lock protocol
+// uses, taken from internal/restic/lock.go in restic 0.18.1. lockCheckDelay is
+// how long restic waits after it writes its lock before it checks again for
+// other locks. staleLockAge is the age at which restic calls a lock stale. A
+// running restic refreshes its lock every five minutes, so a lock older than
+// staleLockAge belongs to a process that is gone. lockCheckDelay is a variable
+// so the tests can set it to zero.
 var (
 	lockCheckDelay = 200 * time.Millisecond
 	staleLockAge   = 30 * time.Minute
 )
 
-// lockUser is the username the controller's locks carry, which restic prints
-// when it reports the repository locked.
+// lockUser is the username the controller writes into its lock files. restic
+// prints it when it reports that the repository is locked.
 const lockUser = "backup-controller"
 
-// lockJSON is a lock document, as restic writes and reads it.
+// lockJSON is the content of one lock file under locks/, in the JSON form
+// restic writes and reads.
 type lockJSON struct {
 	Time      time.Time `json:"time"`
 	Exclusive bool      `json:"exclusive"`
@@ -40,14 +44,22 @@ type lockJSON struct {
 	PID       int       `json:"pid"`
 }
 
-// LockedError is another process's lock, which keeps the exclusive lock a
-// rewrite needs. The rewrite is tried again once that process lets go.
+// LockedError reports a lock that another process holds on the repository.
+// Retime needs restic's exclusive lock, and it can't take that lock while any
+// other lock is in place. So it returns this error and changes nothing, and a
+// BackupRun tries the rewrite again on a later reconcile.
 type LockedError struct {
-	Hostname  string
-	Time      time.Time
+	// Hostname is the host named in the other lock. For a VolSync mover it's
+	// the mover pod's name.
+	Hostname string
+	// Time is the time written in the other lock.
+	Time time.Time
+	// Exclusive is true for an exclusive lock and false for a shared one.
 	Exclusive bool
 }
 
+// Error names the host that holds the lock, the kind of lock, and the time in
+// it.
 func (e *LockedError) Error() string {
 	kind := "a shared"
 	if e.Exclusive {
@@ -56,14 +68,36 @@ func (e *LockedError) Error() string {
 	return fmt.Sprintf("%s has held %s lock on the repository since %s", e.Hostname, kind, e.Time.UTC().Format(time.RFC3339))
 }
 
-// Retime writes the snapshot whose ID starts with short again, at the time at
-// and carrying tag, and removes the original: what restic rewrite --forget
-// --new-time does, with the tag restic tag --add would add. The new snapshot
-// names the old one as its original, the way restic's rewrite does.
+// Retime changes the time of one snapshot and adds a tag to it, so that a
+// volume snapshot carries the same time as the database state it belongs with.
 //
-// It holds restic's exclusive lock while it writes, so it never runs beside a
-// mover. Asked again for a snapshot it already rewrote, it returns the rewrite,
-// so a controller that restarts before recording the new ID loses nothing.
+// Parameters:
+//   - ctx cancels the wait for the lock and the calls to the storage backend.
+//   - short is the snapshot's ID, or the start of it. A BackupRun passes the
+//     eight characters a mover logs in "snapshot da4d7eb4 saved", because that
+//     log line is the only place it learns the ID.
+//   - at is the time the snapshot should carry. A BackupRun passes its
+//     restartedAt: the volume didn't change between the last pod stopping and
+//     that moment, so a database recovered to at matches the files.
+//   - tag is added to the snapshot's tags. A BackupRun passes QuiescedTag, which
+//     is how a RestoreRun with syncDatabaseToVolume finds the snapshots it can
+//     recover a database alongside.
+//
+// It returns the snapshot as written, with its new ID. When another process
+// holds a lock on the repository, it returns a *LockedError and changes
+// nothing, and the caller tries again later.
+//
+// restic names each snapshot file after the SHA-256 of its encrypted contents,
+// so a snapshot can't keep its ID once its time changes. Retime therefore
+// writes a copy with the new time and tag, then deletes the old snapshot file.
+// The copy points at the same tree, so no backed-up data is removed, and it
+// records the old ID in its original field. This is the same change restic
+// rewrite --forget --new-time makes.
+//
+// Retime holds restic's exclusive lock while it writes, so it never runs at the
+// same time as a mover. If the snapshot was already retimed, Retime finds the
+// copy through its original field and returns it. A controller that restarts
+// before it records the new ID gets the same snapshot back.
 func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag string) (Snapshot, error) {
 	if short == "" {
 		return Snapshot{}, errors.New("no snapshot named")
@@ -79,6 +113,21 @@ func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag
 	return written, err
 }
 
+// retime does the work of Retime once the exclusive lock is held. It takes the
+// same parameters.
+//
+// It looks for the snapshot whose ID starts with the prefix in short. If no ID
+// matches, the snapshot may have been rewritten already. retime then looks for
+// a snapshot whose original field starts with that prefix and which carries
+// the tag, and returns it without writing anything. If neither exists, it
+// returns an error.
+//
+// To rewrite a snapshot, it copies every field of the old snapshot document,
+// sets the time field to the time in at, and adds the tag to the tags when it
+// isn't there yet. It records the old ID in the original field, unless the old
+// snapshot was itself a rewrite and already has one. It saves the copy under
+// its new ID and then removes the old snapshot file. If that removal fails, the
+// copy stays in the repository and the error names both IDs.
 func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag string) (Snapshot, error) {
 	files, err := r.snapshotFiles(ctx)
 	if err != nil {
@@ -139,10 +188,19 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 	return written.snapshot, nil
 }
 
-// lockExclusive takes restic's exclusive lock the way restic does: check for
-// other locks, write its own, wait, and check again, giving its own lock back
-// when the second check finds another. It returns the function that removes
-// the lock.
+// lockExclusive takes restic's exclusive lock on the repository, with the same
+// steps restic uses. It checks locks/ for locks held by other processes, writes
+// its own lock file, waits for lockCheckDelay, and checks again. The second
+// check finds a process that wrote its lock at about the same time. The lock
+// file carries this host's name, this process's PID and lockUser.
+//
+// If either check finds another lock, it returns the *LockedError from
+// checkLocks. After the second check it removes its own lock first. ctx
+// cancels the wait, and the lock is removed then too.
+//
+// On success it returns a function that removes the lock. That function
+// ignores the cancellation of ctx, so the lock is removed even after the
+// caller's context has ended.
 func (r *Repository) lockExclusive(ctx context.Context) (func() error, error) {
 	host, _ := os.Hostname()
 	pid := os.Getpid()
@@ -173,12 +231,24 @@ func (r *Repository) lockExclusive(ctx context.Context) (func() error, error) {
 	return unlock, nil
 }
 
-// checkLocks returns a LockedError for the first lock another process holds.
-// Every other lock conflicts with an exclusive one, shared or not. A lock
-// older than restic's stale age is passed over. A lock carrying this process's
-// host and PID, other than own, is one it failed to remove before, and is
-// removed now: restic's prune does not pass over stale locks, so one left
-// behind would stop every prune until someone ran restic unlock.
+// checkLocks reads the lock files under locks/ and returns a *LockedError for
+// the first one that blocks an exclusive lock.
+//
+// Parameters:
+//   - own is the ID of the lock file this process has just written, which the
+//     check skips. lockExclusive passes "" on its first check, before it has
+//     written one.
+//   - host and pid are this process's hostname and process ID. A lock that
+//     carries both was written by this process earlier and never removed.
+//
+// Any lock from another process blocks an exclusive lock, whether that lock is
+// shared or exclusive. A lock older than staleLockAge is skipped, and so is a
+// file whose name isn't a storage ID. A lock that this process left behind is
+// removed. restic's prune doesn't skip stale locks, so a leftover lock would
+// stop every prune until someone ran restic unlock.
+//
+// It returns an error when it can't list, read or decode a lock file, or can't
+// remove a leftover one.
 func (r *Repository) checkLocks(ctx context.Context, own, host string, pid int) error {
 	names, err := r.store.List(ctx, "locks")
 	if err != nil {

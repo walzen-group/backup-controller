@@ -22,40 +22,53 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// How long a scheduled run's record is kept after it finishes. Its timeout
-// comes from the namespace, the way a manual run's does.
+// scheduledTTL is the spec.ttlSecondsAfterFinished of each BackupRun the
+// scheduler creates: 30 days, in seconds. The scheduler sets no spec.timeout,
+// so a scheduled run takes its timeout from the namespace, the same way a
+// manual run does.
 const scheduledTTL = int32(30 * 24 * 60 * 60)
 
-// refresh is the longest a namespace goes between two reconciles. Cluster
-// annotations are not watched, so the restore-as-of series of a Cluster
-// catches up within this.
+// refresh is the longest the scheduler waits before it reconciles a namespace
+// again. The scheduler doesn't watch Clusters, so when a Cluster's
+// backup.wlz.li/restore-as-of annotation changes, the
+// backup_controller_restore_pinned series catches up within this time. The
+// exception is a schedule that doesn't parse, which is read again after 10
+// minutes.
 const refresh = 5 * time.Minute
 
-// Scheduler creates a BackupRun with all set at each tick of a namespace's
-// backup.wlz.li/schedule, and exports the series the backup alerts read.
+// Scheduler is the reconciler that runs each namespace's backup schedule. At
+// each tick of the cron schedule in a Namespace's backup.wlz.li/schedule
+// annotation, it creates a BackupRun with spec.all set. It also exports the
+// metrics that the backup alerts read.
 //
-// It keeps no state of its own. The last tick a namespace ran for is the
-// newest backup.wlz.li/scheduled-for label among its BackupRuns, so a
-// controller that restarts picks up where the runs say it was. A tick missed
-// while the controller was down runs once when it comes back; several missed
-// ticks run once, for the newest. A due tick in a namespace with nothing marked
-// backup.wlz.li/enabled creates no run and records a Warning on the Namespace.
+// It keeps no state of its own. The last tick it ran for a namespace is the
+// newest backup.wlz.li/scheduled-for label among the namespace's BackupRuns,
+// so a controller that restarts picks up where the runs say it was. The ticks
+// missed while the controller was down produce one run, for the newest of
+// them. When a tick is due and nothing in the namespace carries
+// backup.wlz.li/enabled: "true", the scheduler creates no run and records a
+// Warning event on the Namespace.
 type Scheduler struct {
 	client.Client
 
-	// Reader lists Clusters without the informer cache.
+	// Reader reads CloudNativePG Clusters. The manager passes its API reader,
+	// which reads from the API server without the informer cache.
 	Reader client.Reader
 
-	// Recorder writes a Warning on the Namespace when a tick is due and
-	// nothing in it is marked backup.wlz.li/enabled.
+	// Recorder records the Warning event on a Namespace whose tick is due
+	// while nothing in it carries backup.wlz.li/enabled: "true". When it is
+	// nil, no event is recorded.
 	Recorder events.EventRecorder
 
-	// Now is the clock, injected so tests can move time without sleeping.
+	// Now returns the current time. Tests set it to move the clock without
+	// sleeping, and SetupWithManager sets it to time.Now when it is nil.
 	Now func() time.Time
 }
 
-// SetupWithManager registers the scheduler. A BackupRun changing requeues its
-// namespace, so the tick a finished run was holding back is taken at once.
+// SetupWithManager registers the scheduler with the manager. It reconciles
+// Namespaces, and a change to a BackupRun or a claim requeues the namespace
+// that holds it. A finished run therefore lets the tick it was holding back
+// run at once, and a newly marked claim lets a waiting tick run.
 func (s *Scheduler) SetupWithManager(mgr ctrl.Manager) error {
 	if s.Now == nil {
 		s.Now = time.Now
@@ -71,8 +84,20 @@ func (s *Scheduler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(s)
 }
 
-// Reconcile creates the run a namespace's schedule is due for, and requeues
-// for the next tick.
+// Reconcile creates the BackupRun that a namespace's schedule is due for, if
+// there is one, and requeues the namespace for its next tick.
+//
+// Each reconcile also exports the namespace's metrics: the restore-pinned
+// series and, for a namespace with a schedule, the last success, the schedule
+// interval and whether the schedule parses. A namespace without
+// backup.wlz.li/schedule, or one being deleted, loses its schedule series. A
+// namespace that no longer exists loses all of its series.
+//
+// A due tick waits while a BackupRun with spec.all set is unfinished, and
+// while nothing in the namespace is marked enabled. Reconcile returns an
+// error when the BackupRuns can't be listed or the new run can't be created.
+// A schedule that doesn't parse is logged and sets the schedule-invalid series
+// to 1, with no error returned.
 func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("namespace", req.Name)
 
@@ -128,16 +153,17 @@ func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 		for next := schedule.Next(due); !next.After(now); next = schedule.Next(next) {
 			due = next
 		}
-		// One namespace backup at a time: a second would find every source
-		// busy and hold its workloads down waiting. The tick is taken as soon
-		// as the running one finishes, because finishing requeues this.
+		// Only one namespace backup runs at a time. A second one would find
+		// every source busy, and it would hold its workloads down while it
+		// waited. The tick runs as soon as the current run finishes, because
+		// the change to that BackupRun requeues the namespace.
 		if unfinished {
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
 		}
-		// Flux writes a Namespace before the claims in it, so a tick already
-		// due when the schedule arrives waits here until a claim is marked.
-		// The claim's change requeues this, and a Cluster is seen at the next
-		// refresh.
+		// Flux creates a Namespace before the claims in it, so a tick can
+		// already be due when the schedule arrives. The tick waits here until
+		// something is marked enabled. A marked claim requeues the namespace
+		// at once, and a marked Cluster is seen at the next refresh.
 		marked, err := s.anythingEnabled(ctx, req.Name)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -158,8 +184,9 @@ func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 	return ctrl.Result{RequeueAfter: wait}, nil
 }
 
-// anythingEnabled reports whether a claim or a Cluster in the namespace is
-// marked backup.wlz.li/enabled, which a namespace run needs to back anything up.
+// anythingEnabled reports whether a claim or a Cluster in the namespace
+// carries backup.wlz.li/enabled: "true". A BackupRun with spec.all set fails
+// when nothing does, so the scheduler checks this before it creates one.
 func (s *Scheduler) anythingEnabled(ctx context.Context, namespace string) (bool, error) {
 	claims, err := enabledClaims(ctx, s.Client, namespace)
 	if err != nil || len(claims) > 0 {
@@ -169,8 +196,11 @@ func (s *Scheduler) anythingEnabled(ctx context.Context, namespace string) (bool
 	return len(clusters) > 0, err
 }
 
-// create writes the BackupRun for one tick. Its name and label both carry the
-// tick, so a second reconcile for the same tick finds it already there.
+// create creates the BackupRun for one tick of the namespace's schedule. The
+// run is named scheduled-YYYYMMDD-HHMM after the tick in UTC, and its
+// backup.wlz.li/scheduled-for label holds the tick in Unix seconds. Because
+// the name comes from the tick, a second reconcile for the same tick gets
+// AlreadyExists, which create treats as success.
 func (s *Scheduler) create(ctx context.Context, namespace string, tick time.Time) error {
 	ttl := scheduledTTL
 	run := &backupv1alpha1.BackupRun{
@@ -187,11 +217,15 @@ func (s *Scheduler) create(ctx context.Context, namespace string, tick time.Time
 	return nil
 }
 
-// exportSchedule sets the namespace's last success and its schedule interval.
+// exportSchedule sets the namespace's last-success and schedule-interval
+// series.
 //
-// A namespace that has never finished a backup reports its creation time, so
-// the overdue alert measures from when the namespace first asked for backups
-// rather than firing on a namespace created a minute ago.
+// The last success is the newest completion time among the namespace's
+// succeeded BackupRuns with spec.all set. A namespace that has never finished
+// such a backup reports its creation time, so the overdue alert measures from
+// when the namespace first asked for backups, and a namespace created a
+// minute ago doesn't fire it. The interval is the time between the next two
+// ticks after now.
 func (s *Scheduler) exportSchedule(namespace *corev1.Namespace, schedule cron.Schedule, runs []backupv1alpha1.BackupRun, now time.Time) {
 	last := namespace.CreationTimestamp.Time
 	for _, run := range runs {
@@ -205,9 +239,11 @@ func (s *Scheduler) exportSchedule(namespace *corev1.Namespace, schedule cron.Sc
 	scheduleInterval.WithLabelValues(namespace.Name).Set(schedule.Next(first).Sub(first).Seconds())
 }
 
-// exportPinned sets one series per claim and Cluster in the namespace carrying
-// backup.wlz.li/restore-as-of, and drops the series of any that no longer
-// does.
+// exportPinned sets the restore-pinned series to 1 for each claim and Cluster
+// in the namespace that carries backup.wlz.li/restore-as-of. It first deletes
+// all of the namespace's restore-pinned series, so an object that has lost
+// the annotation loses its series. It returns an error when the claims or the
+// Clusters can't be listed.
 func (s *Scheduler) exportPinned(ctx context.Context, namespace string) error {
 	restorePinned.DeletePartialMatch(prometheus.Labels{"namespace": namespace})
 
@@ -234,16 +270,20 @@ func (s *Scheduler) exportPinned(ctx context.Context, namespace string) error {
 	return nil
 }
 
-// scheduleLabels is the label set of one namespace's schedule series.
+// scheduleLabels is a namespace name, used as the label value of that
+// namespace's schedule series.
 type scheduleLabels string
 
+// deleteAll deletes the namespace's last-success, schedule-interval and
+// schedule-invalid series.
 func (n scheduleLabels) deleteAll() {
 	lastSuccess.DeleteLabelValues(string(n))
 	scheduleInterval.DeleteLabelValues(string(n))
 	scheduleInvalid.DeleteLabelValues(string(n))
 }
 
-// forget drops every series of a namespace that no longer exists.
+// forget deletes every series of a namespace. Reconcile calls it when the
+// Namespace no longer exists.
 func forget(namespace string) {
 	scheduleLabels(namespace).deleteAll()
 	restorePinned.DeletePartialMatch(prometheus.Labels{"namespace": namespace})

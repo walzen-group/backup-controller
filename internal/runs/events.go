@@ -10,11 +10,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// maxNote is the longest note events.k8s.io/v1 accepts. The API server rejects
-// a longer one, and a failed mover's logs run past it.
+// maxNote is the longest note, in bytes, that events.k8s.io/v1 accepts. The
+// API server rejects an event with a longer note, and a failed mover's logs
+// run past it.
 const maxNote = 1024
 
-// readyReason is the reason on a run's Ready condition, empty before the first.
+// readyReason returns the reason on a run's Ready condition, or an empty
+// string when the run has no Ready condition yet.
 func readyReason(conditions []metav1.Condition) string {
 	for _, c := range conditions {
 		if c.Type == backupv1alpha1.ConditionReady {
@@ -24,9 +26,21 @@ func readyReason(conditions []metav1.Condition) string {
 	return ""
 }
 
-// announce records an event on a run whose Ready condition moved to another
-// reason during a reconcile, with the condition's message as the note. A run
-// that finished any way but Succeeded records a Warning.
+// announce records an event on a run when its Ready condition moved to a new
+// reason during a reconcile. The event's reason is the condition's reason,
+// and its note is the condition's message, cut to fit by fitNote.
+//
+// Parameters:
+//   - recorder records the event. When it is nil, announce does nothing.
+//   - run is the BackupRun or RestoreRun the event is recorded on.
+//   - conditions are the run's status.conditions after the reconcile.
+//   - before is the reason the Ready condition had when the reconcile began,
+//     from readyReason. When the reason hasn't changed, no event is recorded.
+//   - action is the event's action, "Backup" or "Restore".
+//
+// The event is a Warning when the Ready condition is True with a reason other
+// than Succeeded, which is how a run that finished any other way reports. In
+// every other case it is Normal.
 func announce(recorder events.EventRecorder, run client.Object, conditions []metav1.Condition, before, action string) {
 	if recorder == nil {
 		return
@@ -43,8 +57,9 @@ func announce(recorder events.EventRecorder, run client.Object, conditions []met
 	}
 }
 
-// fitNote cuts a note to maxNote bytes on a character boundary. The Ready
-// condition keeps the whole message.
+// fitNote cuts a note to at most maxNote bytes, ending on a whole UTF-8
+// character. Only the event's note is cut. The Ready condition keeps the
+// whole message.
 func fitNote(note string) string {
 	if len(note) <= maxNote {
 		return note

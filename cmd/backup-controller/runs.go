@@ -20,35 +20,48 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-// configureLogging points controller-runtime at klog.
+// configureLogging sends controller-runtime's log output to klog.
 //
-// Until a logger is set, controller-runtime discards every line its manager and
-// reconcilers produce and says so once, after thirty seconds, with a stack
-// trace. Reconcilers whose errors reach nothing cannot be diagnosed, and every
-// defect found in this controller so far was found by reading a log.
+// Until a logger is set, controller-runtime discards every line its manager
+// and reconcilers write, and it says so only once, after thirty seconds, with
+// a stack trace. A reconciler whose errors go nowhere can't be diagnosed, and
+// every defect found in this controller so far was found by reading a log.
 func configureLogging() {
 	ctrl.SetLogger(klog.Background())
 }
 
-// BootstrapWebhook is where the Cluster admission webhook listens and finds
-// its serving certificate. An empty CertDir leaves the webhook unregistered,
-// which is how the binary runs in a cluster that has not installed it.
+// BootstrapWebhook says where the admission webhook for CloudNativePG
+// Clusters listens. CertDir is the directory holding its serving certificate
+// as tls.crt and tls.key, and Port is the port it listens on. An empty CertDir
+// leaves the webhook unregistered, which is how the binary runs in a cluster
+// that has not installed the webhook.
 type BootstrapWebhook struct {
 	CertDir string
 	Port    int
 }
 
-// startRunControllers brings up the manager that reconciles BackupRun and
-// RestoreRun, runs the scheduler, serves the bootstrap webhook when one is
-// configured, and returns as soon as it is running.
+// startRunControllers starts the controller-runtime manager that reconciles
+// BackupRun and RestoreRun, runs the namespace scheduler, and serves the
+// bootstrap webhook when one is configured. It returns as soon as the manager
+// is starting, and the manager keeps running in a goroutine.
 //
-// The manager is given a context of the caller's rather than
-// ctrl.SetupSignalHandler, because the populator library installs the process's
-// only signal handler and a second one on the same channel panics. Cancelling
-// that context after the library returns is what stops this manager.
+// Parameters:
+//   - ctx stops the manager when it is cancelled. main passes a context it
+//     cancels once the populator library returns. The manager doesn't use
+//     ctrl.SetupSignalHandler, because the populator library installs the
+//     process's only signal handler and a second one on the same channel
+//     panics.
+//   - kubeconfig is the path from the --kubeconfig flag. Empty means the
+//     in-cluster configuration.
+//   - metricsAddr is the address where the manager serves the scheduler's
+//     metrics. The populator library serves its own registry on another port,
+//     and nothing else can register metrics into that one.
+//   - hook says where the bootstrap webhook listens. An empty hook.CertDir
+//     serves no webhook.
 //
-// metricsAddr is where the manager serves the scheduler's series. The library
-// serves its own registry on another port, and nothing can register into it.
+// It returns an error when the client configuration can't be built, a scheme
+// fails to register, or the manager or one of its controllers can't be set
+// up. An error from the running manager is only logged.
 func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook) error {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
@@ -87,10 +100,11 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 	}
 
 	if hook.CertDir != "" {
-		// The uncached reader, so the webhook's Secret and ObjectStore reads
-		// need get alone. The manager's cached client would require list and
-		// watch on every Secret in the cluster and would hold them in memory
-		// for the life of the process.
+		// The webhook reads through the uncached API reader, so its reads of
+		// Secrets and ObjectStores need only the get verb. The manager's
+		// cached client would need list and watch on every Secret in the
+		// cluster, and would hold all of them in memory for the life of the
+		// process.
 		decider := &bootstrap.Decider{
 			Client: manager.GetAPIReader(),
 			Prober: bootstrap.S3Prober{},

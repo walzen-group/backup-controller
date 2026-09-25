@@ -4,16 +4,20 @@ import (
 	"flag"
 	"testing"
 
-	// Imported for its side effect, which is the point of this test file:
-	// pkg/client/config registers a --kubeconfig flag in its init, so the
-	// default FlagSet carries one before main runs. This package imports
-	// controller-runtime through runs.go, so the collision is real here.
+	// This import is here for its side effect. pkg/client/config registers a
+	// --kubeconfig flag in its init function, so the default FlagSet already
+	// has one before main runs. This package imports controller-runtime
+	// through runs.go as well, so the collision these tests guard against is
+	// real here.
 	_ "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
-// v0.2.0 crashlooped on the cluster with "flag redefined: kubeconfig" the
-// moment controller-runtime came into the binary. Every gate passed, because
-// nothing in the test path calls main and nothing registered flags twice.
+// TestKubeconfigFlagReusesOneSomethingElseRegistered checks that
+// kubeconfigFlag reads a --kubeconfig flag another package already registered,
+// both before and after the command line is parsed. v0.2.0 crashlooped on the
+// cluster with "flag redefined: kubeconfig" as soon as controller-runtime came
+// into the binary. Every gate passed, because nothing in the test path called
+// main and nothing registered the flag twice.
 func TestKubeconfigFlagReusesOneSomethingElseRegistered(t *testing.T) {
 	fs := flag.NewFlagSet("t", flag.ContinueOnError)
 	fs.String("kubeconfig", "/from/elsewhere", "registered by a dependency")
@@ -31,6 +35,9 @@ func TestKubeconfigFlagReusesOneSomethingElseRegistered(t *testing.T) {
 	}
 }
 
+// TestKubeconfigFlagRegistersItsOwnWhenNothingHas checks that kubeconfigFlag
+// registers the flag on a FlagSet that lacks one. The flag defaults to empty,
+// and it reads the value the command line passes.
 func TestKubeconfigFlagRegistersItsOwnWhenNothingHas(t *testing.T) {
 	fs := flag.NewFlagSet("t", flag.ContinueOnError)
 
@@ -47,9 +54,10 @@ func TestKubeconfigFlagRegistersItsOwnWhenNothingHas(t *testing.T) {
 	}
 }
 
-// The default FlagSet is the one main uses, and it is where the collision
-// happened. Registering against it must not panic however many dependencies
-// have already put a kubeconfig flag there.
+// TestKubeconfigFlagOnTheDefaultFlagSetDoesNotPanic checks that kubeconfigFlag
+// works on the default FlagSet, which main uses and where the collision
+// happened. It must not panic, however many dependencies have already put a
+// kubeconfig flag there.
 func TestKubeconfigFlagOnTheDefaultFlagSetDoesNotPanic(t *testing.T) {
 	read := kubeconfigFlag(flag.CommandLine)
 	if read == nil {

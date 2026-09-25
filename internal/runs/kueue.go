@@ -14,22 +14,26 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// The Kueue kinds a run uses. Read as unstructured, so the controller carries
-// no dependency on Kueue's Go module and runs in a cluster without Kueue.
+// WorkloadGVK and LocalQueueListGVK are the Kueue kinds a run uses. The
+// controller reads and writes them as unstructured objects, so it doesn't
+// depend on Kueue's Go module, and it runs in a cluster without Kueue.
 var (
 	WorkloadGVK       = schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"}
 	LocalQueueListGVK = schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueueList"}
 )
 
-// admissionImage is the image the Workload's pod template names. Kueue reads
-// the template to count the Workload against its quota and never runs it.
+// admissionImage is the image named in the pod template of a run's Workload.
+// Kueue reads the template to count the Workload against its quota, and it
+// never runs the image.
 const admissionImage = "registry.k8s.io/pause:3.10"
 
-// localQueue returns the LocalQueue a namespace's runs are admitted through,
-// or empty when the namespace has none and runs start without admission.
+// localQueue returns the name of the LocalQueue that admits a namespace's
+// runs. It returns an empty name when the namespace has no LocalQueue, or
+// when the cluster has no Kueue, and the run then starts without admission.
 //
-// A namespace normally holds one. With several, the one named backups is
-// used, and otherwise the first by name, so the choice is stable.
+// A namespace normally holds one LocalQueue. When it holds several, the one
+// named backups is used, or else the first by name, so the choice stays the
+// same from one reconcile to the next.
 func localQueue(ctx context.Context, c client.Reader, namespace string) (string, error) {
 	queues := &unstructured.UnstructuredList{}
 	queues.SetGroupVersionKind(LocalQueueListGVK)
@@ -53,15 +57,26 @@ func localQueue(ctx context.Context, c client.Reader, namespace string) (string,
 	return names[0], nil
 }
 
-// workloadName is the Workload a run creates, derived from its UID so a
-// restarted controller finds the one it made.
+// workloadName returns the name of a run's Workload: "backuprun-" followed by
+// the run's UID. Because the name comes from the UID, a restarted controller
+// finds the Workload it made.
 func workloadName(uid types.UID) string {
 	return "backuprun-" + string(uid)
 }
 
-// ensureWorkload creates the run's Workload, counted as one pod, and returns
-// it as it stands. ownerKind is the run's kind, which a typed object read
-// through the client does not carry.
+// ensureWorkload creates the Kueue Workload through which a run waits for
+// admission, and returns the Workload as it stands.
+//
+// Parameters:
+//   - owner is the run. The Workload is named after its UID and carries a
+//     controller reference to it.
+//   - ownerKind is the run's kind. A typed object read through the client
+//     carries no kind, so the caller passes it for the owner reference.
+//   - queue is the name of the LocalQueue to submit to, from localQueue.
+//
+// The Workload has one pod set with a count of 1, so Kueue counts the run as
+// one pod against the queue's quota. A Workload that already exists is
+// returned unchanged, so calling this on every reconcile is safe.
 func ensureWorkload(ctx context.Context, c client.Client, owner client.Object, ownerKind schema.GroupVersionKind, queue string) (*unstructured.Unstructured, error) {
 	name := workloadName(owner.GetUID())
 	workload := &unstructured.Unstructured{}
@@ -102,16 +117,20 @@ func ensureWorkload(ctx context.Context, c client.Client, owner client.Object, o
 	return workload, nil
 }
 
-// admitted reports whether Kueue admitted the Workload.
+// admitted reports whether Kueue has admitted the Workload, which it shows
+// with an Admitted condition set to True.
 func admitted(workload *unstructured.Unstructured) bool {
 	return conditionTrue(workload, "Admitted")
 }
 
-// markPodsReady tells Kueue the admitted work is running.
+// markPodsReady adds a PodsReady condition set to True to the Workload's
+// status, which tells Kueue that the admitted work is running. The
+// condition's lastTransitionTime is the time given in now. When the condition
+// is already True, it does nothing.
 //
 // Kueue's waitForPodsReady evicts an admitted Workload whose PodsReady
-// condition stays false past its timeout. The job integrations set that
-// condition from their pods; this Workload has no pods, so the run sets it.
+// condition stays false past its timeout. Kueue's job integrations set that
+// condition from their pods. This Workload has no pods, so the run sets it.
 func markPodsReady(ctx context.Context, c client.Client, workload *unstructured.Unstructured, now metav1.Time) error {
 	if conditionTrue(workload, "PodsReady") {
 		return nil
@@ -133,7 +152,9 @@ func markPodsReady(ctx context.Context, c client.Client, workload *unstructured.
 	return nil
 }
 
-// deleteWorkload removes the run's Workload, which gives its quota back.
+// deleteWorkload deletes the Workload of the run whose UID is given, which
+// gives the run's quota back to the queue. A Workload that is already gone
+// counts as deleted.
 func deleteWorkload(ctx context.Context, c client.Client, namespace string, uid types.UID) error {
 	workload := &unstructured.Unstructured{}
 	workload.SetGroupVersionKind(WorkloadGVK)
@@ -145,7 +166,8 @@ func deleteWorkload(ctx context.Context, c client.Client, namespace string, uid 
 	return nil
 }
 
-// conditionTrue reads one condition off an unstructured object's status.
+// conditionTrue reports whether an unstructured object's status.conditions
+// holds a condition of the type given in kind with status "True".
 func conditionTrue(object *unstructured.Unstructured, kind string) bool {
 	conditions, _, _ := unstructured.NestedSlice(object.Object, "status", "conditions")
 	for _, entry := range conditions {

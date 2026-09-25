@@ -1,10 +1,10 @@
 //go:build envtest
 
-// The validation in docs/api.md is the API server's, not the Go types': the
-// required repository, the RFC3339 restoreAsOf and the label syntax rules live
-// in the generated CRD. Only a real API server shows whether they reject what
-// they claim to, so this suite starts an envtest control plane, installs
-// config/crd and reads the server's answer.
+// The validation rules listed in docs/api.md live in the generated CRD: the
+// required repository, the RFC 3339 restoreAsOf and the label syntax rules.
+// The Go types enforce none of them, and only a real API server shows whether
+// they reject what they should. This suite starts an envtest control plane,
+// installs config/crd, creates objects and reads the server's answer.
 //
 // Run it with the envtest assets on the path:
 //
@@ -26,11 +26,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
-// crdDirectory is config/crd relative to this package directory.
+// crdDirectory is config/crd, relative to this package's directory.
 var crdDirectory = filepath.Join("..", "..", "..", "config", "crd")
 
+// k8sClient talks to the envtest API server that TestMain starts.
 var k8sClient client.Client
 
+// TestMain starts an envtest control plane with the CRDs from config/crd
+// installed, builds k8sClient against it, runs the tests and stops the control
+// plane.
 func TestMain(m *testing.M) {
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{crdDirectory},
@@ -62,9 +66,9 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// TestCRDValidation is the API server's answer for one object per row of the
-// validation table in docs/api.md: the valid object is accepted, and each
-// malformed one comes back as an Invalid rejection rather than being stored.
+// TestCRDValidation creates one VolumeRestore for each row of the validation
+// table in docs/api.md. It checks that the API server accepts the valid object
+// and rejects each malformed one with an Invalid error.
 func TestCRDValidation(t *testing.T) {
 	pointer := func(s string) *string { return &s }
 
@@ -162,8 +166,10 @@ func TestCRDValidation(t *testing.T) {
 	}
 }
 
-// TestRunsNameExactlyOneScope is the API server's answer for the rules that a
-// run names one volume, one database, or the whole namespace, and never two.
+// TestRunsNameExactlyOneScope checks the CEL rules on BackupRun and RestoreRun
+// specs. A run names one volume, one database, or the whole namespace, and
+// never two of them. The RestoreRun cases also cover the rules for previous,
+// into, syncDatabaseToVolume and quiesce.
 func TestRunsNameExactlyOneScope(t *testing.T) {
 	previous := int32(1)
 	backups := []struct {
@@ -215,6 +221,8 @@ func TestRunsNameExactlyOneScope(t *testing.T) {
 	}
 }
 
+// check fails the test when the API server's answer to creating a run does not
+// match wantErr. A wanted error has to be an Invalid rejection.
 func check(t *testing.T, err error, wantErr bool) {
 	t.Helper()
 	switch {
@@ -227,9 +235,9 @@ func check(t *testing.T, err error, wantErr bool) {
 	}
 }
 
-// TestCRDRoundTrip reads a stored object back. A schema that accepted the
-// object while dropping a field would leave a claim with nothing to restore
-// from, so the field the API server hands back is part of the contract.
+// TestCRDRoundTrip creates a VolumeRestore and reads it back, and checks that
+// each field it set survives. A schema that accepted the object but dropped a
+// field would leave a claim with nothing to restore from.
 func TestCRDRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	created := &VolumeRestore{

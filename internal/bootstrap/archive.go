@@ -1,11 +1,16 @@
-// Package bootstrap decides how a CloudNativePG Cluster starts. A Cluster
-// whose object store already holds a base backup is recovered from it; one
-// whose store is empty is left to bootstrap an empty database with initdb.
+// Package bootstrap decides how a new CloudNativePG Cluster starts. When the
+// Cluster's object store already holds a base backup, the package rewrites the
+// Cluster to recover from it. When the store is empty, the Cluster keeps its
+// initdb bootstrap and starts as an empty database.
 //
 // Neither kustomize nor OpenTofu can make that choice, because both render
 // their manifests before anything has spoken to the object store. An admission
 // webhook runs after the object store can be read and before the Cluster is
-// persisted, which is the one moment the choice is available.
+// persisted. That is the one moment the choice can be made.
+//
+// The RestoreRun controller in internal/runs also uses Archiver,
+// ResolveLocation and a Prober from this package, to check that a database has
+// a base backup before it deletes the Cluster.
 package bootstrap
 
 import (
@@ -21,58 +26,90 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// ClusterListGVK is CloudNativePG's Cluster list, read to find whether a
-// database already archives where a new one is about to.
+// ClusterListGVK is the GroupVersionKind of CloudNativePG's ClusterList. The
+// webhook lists every Cluster with it to find out whether another database
+// already archives to the prefix a new Cluster is about to use.
 var ClusterListGVK = schema.GroupVersionKind{
 	Group:   "postgresql.cnpg.io",
 	Version: "v1",
 	Kind:    "ClusterList",
 }
 
-// ObjectStoreGVK is the Barman Cloud plugin's store, which holds the bucket,
-// the endpoint and the credential references a Cluster archives through.
+// ObjectStoreGVK is the GroupVersionKind of the Barman Cloud plugin's
+// ObjectStore. An ObjectStore holds the bucket, the endpoint and the Secret
+// references that a Cluster archives through. ResolveLocation reads it.
 var ObjectStoreGVK = schema.GroupVersionKind{
 	Group:   "barmancloud.cnpg.io",
 	Version: "v1",
 	Kind:    "ObjectStore",
 }
 
-// Location is everything needed to ask the object store whether one database
-// has a base backup in it.
-//
-// CABundle is empty for an endpoint signed by a public authority and holds a
-// PEM bundle for one that is not. It comes from the store's own endpointCA,
-// the field the Barman Cloud plugin already reads for the same reason, so an
-// endpoint is described once and both the plugin and this controller trust it.
+// Location holds everything needed to ask an object store which base backups
+// one database has. ResolveLocation builds it from a Cluster's ObjectStore and
+// the Secrets that store names.
 type Location struct {
-	Endpoint  string
-	Bucket    string
-	Prefix    string
+	// Endpoint is the store's spec.configuration.endpointURL.
+	Endpoint string
+	// Bucket is the bucket named in the store's destinationPath.
+	Bucket string
+	// Prefix is the path inside the bucket that one database archives under.
+	// It's the destinationPath's prefix followed by the server name, with no
+	// slash at either end.
+	Prefix string
+	// AccessKey and SecretKey are the S3 credentials, read from the Secrets
+	// that the store's s3Credentials name.
 	AccessKey string
 	SecretKey string
-	CABundle  []byte
+	// CABundle is the PEM bundle of the authority that signs the endpoint's
+	// certificate. It's empty when a public authority signs it. It comes from
+	// the store's own endpointCA, the field the Barman Cloud plugin reads for
+	// the same reason, so an endpoint's CA is described once and both the
+	// plugin and this controller trust it.
+	CABundle []byte
 }
 
-// BasePrefix is the key prefix barman writes base backups under. A listing
-// that returns anything below it means this database has something to recover
-// from.
+// BasePrefix returns the key prefix that barman writes base backups under:
+// Prefix followed by "/base/", or just "base/" when Prefix is empty. Any
+// object below it means the database has something to recover from.
 func (l Location) BasePrefix() string {
 	return strings.TrimPrefix(l.Prefix+"/base/", "/")
 }
 
-// Prober answers what base backups exist at a location. The interface exists
-// so the decision logic is testable without an object store.
+// Prober asks an object store which base backups exist at a Location.
+// S3Prober is the real one. The interface exists so the webhook and the
+// RestoreRun controller can be tested without an object store.
 type Prober interface {
+	// HasBaseBackup reports whether anything is stored under the
+	// location's base prefix.
 	HasBaseBackup(ctx context.Context, at Location) (bool, error)
+	// BaseBackups lists the location's completed base backups, oldest
+	// first.
 	BaseBackups(ctx context.Context, at Location) ([]BaseBackup, error)
 }
 
-// ResolveLocation reads the named ObjectStore and the Secret it points at, and
-// returns where serverName's backups would be.
+// ResolveLocation works out where one database's backups live and how to
+// reach them, by reading its ObjectStore and the Secrets that store names.
 //
-// The returned error says which object was missing. A Cluster naming a store
-// that does not exist is a configuration mistake, and the webhook reports it
-// rather than guessing that the store is empty.
+// Parameters:
+//   - c reads the ObjectStore and the Secrets. The webhook and the RestoreRun
+//     controller both pass the manager's uncached API reader.
+//   - namespace is the Cluster's namespace. The ObjectStore and its Secrets
+//     are read from the same namespace.
+//   - objectStore is the ObjectStore's name, taken from the barmanObjectName
+//     parameter of the Cluster's archiving plugin (see Archiver).
+//   - serverName is the directory the database archives under inside the
+//     store's prefix. It also comes from Archiver.
+//
+// It returns a Location whose Prefix joins the destinationPath's prefix and
+// serverName. It returns an error when the ObjectStore can't be read, when its
+// spec.configuration.destinationPath is missing or isn't an s3:// URL with a
+// bucket, when a Secret or key named under s3Credentials or endpointCA is
+// missing, or when endpointCA names a Secret with no key. The error says which
+// object or field was missing.
+//
+// A Cluster that names a store that doesn't exist is a configuration mistake.
+// The webhook refuses such a Cluster with this error, so nobody gets an empty
+// database beside a full archive because a store was misnamed.
 func ResolveLocation(
 	ctx context.Context,
 	c client.Reader,
@@ -121,9 +158,15 @@ func ResolveLocation(
 	}, nil
 }
 
-// endpointCA reads the store's endpointCA bundle, and returns nothing when the
-// store declares none. An endpoint signed by a public authority needs no
-// bundle, and the image ships the public roots for that case.
+// endpointCA reads the PEM bundle that the ObjectStore's
+// spec.configuration.endpointCA points at, from a Secret in the given
+// namespace.
+//
+// It returns nil and no error when the store names no endpointCA Secret. An
+// endpoint signed by a public authority needs no bundle, and the image ships
+// the public roots for that case. It returns an error when endpointCA names a
+// Secret with no key, when the Secret can't be read, or when the Secret has no
+// entry under that key.
 func endpointCA(
 	ctx context.Context,
 	c client.Reader,
@@ -150,10 +193,14 @@ func endpointCA(
 	return bundle, nil
 }
 
-// splitDestination turns s3://bucket/some/prefix/ into its bucket and its
-// prefix. Only s3:// is handled: the other schemes barman supports name
-// providers this cluster does not use, and guessing at one would produce a
-// listing against the wrong service.
+// splitDestination splits a destinationPath such as s3://bucket/some/prefix/
+// into its bucket ("bucket") and its prefix ("some/prefix", with the slashes
+// at either end trimmed).
+//
+// It accepts only s3:// URLs. It returns an error for any other scheme, for a
+// URL that doesn't parse, and for one with no bucket. The other schemes barman
+// supports name providers this cluster doesn't use, and guessing at one would
+// list objects on the wrong service.
 func splitDestination(destination string) (bucket, prefix string, err error) {
 	parsed, err := url.Parse(destination)
 	if err != nil {
@@ -168,7 +215,14 @@ func splitDestination(destination string) (bucket, prefix string, err error) {
 	return parsed.Host, strings.Trim(parsed.Path, "/"), nil
 }
 
-// credential reads one of the store's two S3 keys out of the Secret it names.
+// credential reads one of the ObjectStore's two S3 credentials from the Secret
+// the store names for it.
+//
+// The field argument is "accessKeyId" or "secretAccessKey". The function
+// follows spec.configuration.s3Credentials.<field> to a Secret name and key in
+// the given namespace, and returns the value stored there. It returns an error
+// when the store doesn't name both a Secret and a key, when the Secret can't be
+// read, or when the key is missing from it.
 func credential(
 	ctx context.Context,
 	c client.Reader,

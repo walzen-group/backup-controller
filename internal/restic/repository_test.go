@@ -13,8 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// testdata/repo is a version 2 repository restic 0.19.1 wrote with the
-// password "backup", holding two snapshots of one file:
+// fixture is testdata/repo, a version 2 repository that restic 0.19.1 wrote
+// with the password "backup". It holds two snapshots of one file, made with
+// these commands:
 //
 //	restic init --repository-version 2
 //	restic backup --host volsync --time "2026-09-20 05:00:00" data
@@ -23,6 +24,8 @@ import (
 // restic snapshots listed them as 49319ee8 and 88dc3648.
 const fixture = DirStore("testdata/repo")
 
+// TestTheFixtureListsBothSnapshotsWithResticsTimes checks that Snapshots reads
+// both fixture snapshots with the IDs and times restic gave them, oldest first.
 func TestTheFixtureListsBothSnapshotsWithResticsTimes(t *testing.T) {
 	repo, err := Open(context.Background(), fixture, "backup")
 	if err != nil {
@@ -53,6 +56,8 @@ func TestTheFixtureListsBothSnapshotsWithResticsTimes(t *testing.T) {
 	}
 }
 
+// TestAWrongPasswordOpensNothing checks that Open fails when no key file opens
+// with the password.
 func TestAWrongPasswordOpensNothing(t *testing.T) {
 	_, err := Open(context.Background(), fixture, "not-the-password")
 	if err == nil {
@@ -60,8 +65,10 @@ func TestAWrongPasswordOpensNothing(t *testing.T) {
 	}
 }
 
-// S3 lists an absent prefix as empty, which is what a claim that has never been
-// backed up looks like; an empty keys/ stands in for it here.
+// TestALocationWithNoKeysIsNoRepository checks that Open returns
+// ErrNoRepository for a location whose keys/ directory is empty. S3 lists a
+// prefix that doesn't exist as empty, and that's how the location of a claim
+// that has never been backed up looks. The empty keys/ stands in for it here.
 func TestALocationWithNoKeysIsNoRepository(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, "keys"), 0o700); err != nil {
@@ -72,9 +79,11 @@ func TestALocationWithNoKeysIsNoRepository(t *testing.T) {
 	}
 }
 
-// A VolSync restore with restoreAsOf selects the newest snapshot at or before
-// that time, and restores nothing when none is. AtOrBefore answers the same
-// question before the restore is started.
+// TestAtOrBeforeRoundsBackToTheSnapshotBefore checks that AtOrBefore picks the
+// newest snapshot at or before the time, and nothing when every snapshot is
+// later. A VolSync restore with restoreAsOf picks the same snapshot, or
+// restores nothing, and AtOrBefore answers that question before the restore
+// starts.
 func TestAtOrBeforeRoundsBackToTheSnapshotBefore(t *testing.T) {
 	snapshots := []Snapshot{
 		{ID: "a", Time: time.Date(2026, 9, 20, 5, 0, 0, 0, time.UTC)},
@@ -98,6 +107,9 @@ func TestAtOrBeforeRoundsBackToTheSnapshotBefore(t *testing.T) {
 	}
 }
 
+// TestByShortIDFindsTheSnapshotTheMoverLogged checks that ByShortID finds a
+// snapshot by the eight-character ID a mover logs, and that an empty ID
+// matches nothing.
 func TestByShortIDFindsTheSnapshotTheMoverLogged(t *testing.T) {
 	snapshots := []Snapshot{{ID: "6e473100aaaa"}, {ID: "2edf5babbbbb"}}
 	got, ok := ByShortID(snapshots, "6e473100")
@@ -109,6 +121,9 @@ func TestByShortIDFindsTheSnapshotTheMoverLogged(t *testing.T) {
 	}
 }
 
+// TestParseRepositoryReadsResticsS3Form checks that ParseRepository reads
+// restic's s3 form with and without a scheme, and rejects another backend,
+// another scheme, and a string that names no bucket.
 func TestParseRepositoryReadsResticsS3Form(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -138,6 +153,9 @@ func TestParseRepositoryReadsResticsS3Form(t *testing.T) {
 	}
 }
 
+// TestFromSecretNamesTheMissingKey checks that FromSecret's error names the key
+// a Secret is missing, and that a complete Secret gives the password, the
+// prefix and the access key.
 func TestFromSecretNamesTheMissingKey(t *testing.T) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "app-restic-data", Namespace: "app"},
@@ -162,6 +180,8 @@ func TestFromSecretNamesTheMissingKey(t *testing.T) {
 	}
 }
 
+// TestUnpackRejectsAnUnknownEncoding checks that unpack rejects an unknown
+// encoding byte and returns plain JSON unchanged.
 func TestUnpackRejectsAnUnknownEncoding(t *testing.T) {
 	if _, err := unpack([]byte{7, 1, 2}); err == nil {
 		t.Fatal("an unknown encoding byte was accepted")

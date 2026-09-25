@@ -21,36 +21,43 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// RestoreRunReconciler restores volumes and databases to a chosen moment.
+// RestoreRunReconciler runs RestoreRuns. A RestoreRun puts volumes and
+// databases back to the state they were in at a chosen moment.
 //
-// A volume restores in place through a Direct-mode ReplicationDestination
-// mounting the claim, once nothing else mounts it. A database restores by
-// being created again: the run deletes its Cluster, and the bootstrap webhook
-// recovers the Cluster Flux or tofu creates next to the run's moment. With
-// Into set, a volume restores into a new claim instead, through the ordinary
-// populator path, and nothing of the app's is touched.
+// A volume restores in place. Once no pod mounts the claim, the run creates a
+// ReplicationDestination in Direct mode, whose mover mounts the claim and
+// writes the selected snapshot into it. A database restores by being created
+// again. The run deletes the Cluster, and when Flux or tofu creates it again,
+// the bootstrap webhook makes the new Cluster recover to the run's moment.
+// With spec.into set, a volume restores into a new claim through the ordinary
+// VolumeRestore populator path, and the app's own claims and databases are
+// left alone.
 type RestoreRunReconciler struct {
 	client.Client
 
-	// Reader reads without the informer cache: Secrets, ObjectStores and
-	// Clusters.
+	// Reader reads straight from the API server, without the informer cache.
+	// The run reads claims, VolumeRestores, Secrets, ObjectStores, Clusters,
+	// ReplicationDestinations, Deployments, StatefulSets and pods through it.
 	Reader client.Reader
 
-	// Snapshots lists a repository's snapshots, for the check that a volume
-	// has one the run's moment reaches.
+	// Snapshots lists the snapshots in a restic repository. plan uses it to
+	// check that each volume has a snapshot the run's moment reaches.
 	Snapshots restic.Lister
 
-	// Prober lists a database's base backups, for the same check.
+	// Prober lists a database's base backups in its object store. plan uses it
+	// to check that each database has a base backup the run's moment reaches.
 	Prober bootstrap.Prober
 
 	// Recorder writes an event on the run each time its Ready reason changes.
 	Recorder events.EventRecorder
 
-	// Now is the clock, injected so tests can move time without sleeping.
+	// Now returns the current time. Tests replace it so they can move time
+	// forward without sleeping.
 	Now func() time.Time
 }
 
-// SetupWithManager registers the reconciler.
+// SetupWithManager registers the reconciler with mgr so it runs for every
+// RestoreRun. It sets Now to time.Now when the caller left it unset.
 func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Now == nil {
 		r.Now = time.Now
@@ -61,7 +68,16 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// Reconcile drives one RestoreRun from submitted to finished.
+// Reconcile moves the RestoreRun that req names one step further, and requeues
+// until the run has finished.
+//
+// A run with spec.into set goes to reconcileIntoNewClaim. Any other run starts
+// in plan, which checks that every item has a backup in reach before anything
+// is changed, and then continues in work. Before either, Reconcile adds the
+// run's finalizer. A run being deleted gets its changes put back by finalize,
+// and a finished run is deleted once spec.ttlSecondsAfterFinished has passed.
+// Whenever the Ready reason changes during a reconcile, Reconcile records an
+// event on the run.
 func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.RestoreRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -91,7 +107,9 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return r.work(ctx, run)
 }
 
-// target parses the run's moment, nil for the newest backup.
+// target parses the run's spec.restoreAsOf. It returns nil when the field is
+// unset, which means the newest backup, and an error when the value is not an
+// RFC 3339 time.
 func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 	if run.Spec.RestoreAsOf == nil {
 		return nil, nil
@@ -103,8 +121,28 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 	return &t, nil
 }
 
-// plan lists the run's items and checks, before it touches anything, that a
-// backup reaches the run's moment for every one of them.
+// plan lists the run's items and checks, before it changes anything, that a
+// backup reaches the run's moment for every one of them. When every item
+// passes, plan moves the run to Running and records status.startedAt.
+//
+// For a volume, the check selects the snapshot the restore would use and
+// records its ID on the item. For a database, it selects the base backup the
+// recovery would start from and records its ID. An item with nothing in reach
+// is marked Failed with the reason. If any item fails, plan marks every other
+// Pending item Skipped and ends the run as Failed with reason NoBackupInReach,
+// naming each item it cannot reach. Nothing has been deleted or overwritten
+// at that point.
+//
+// With spec.syncDatabaseToVolume set, each volume may only select a snapshot
+// tagged quiesced, and all the selected snapshots must carry the same time.
+// plan records that time in status.syncedTo and checks each database against
+// it in place of spec.restoreAsOf.
+//
+// A spec that can't work ends the run as Failed with reason Invalid: a
+// restoreAsOf that doesn't parse, a spec.quiesce entry the namespace does not
+// hold, or a synced run with no claim to take the moment from. plan returns
+// an error, and writes nothing, when listing the snapshots or the base
+// backups fails.
 func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	items, err := r.items(ctx, run)
 	if err != nil {
@@ -119,8 +157,8 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 	}
 
 	// A synced run takes its databases' moment from the volumes' quiesced
-	// snapshots. items lists the claims before the Clusters, so the moment is
-	// known by the time the first Cluster is checked.
+	// snapshots. The items method lists the claims before the Clusters, so
+	// the moment is known by the time the first Cluster is checked.
 	sync := run.Spec.SyncDatabaseToVolume
 	var synced *time.Time
 	var unreachable []string
@@ -167,8 +205,8 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 
 	run.Status.Items = items
 	if len(unreachable) > 0 {
-		// Nothing has been deleted or overwritten yet, so the other items stay
-		// as they were and the run reports every item it cannot reach.
+		// Nothing has been deleted or overwritten yet. The other items are
+		// left as they were, and the run reports every item it cannot reach.
 		for i := range run.Status.Items {
 			if run.Status.Items[i].Phase == backupv1alpha1.ItemPending {
 				run.Status.Items[i].Phase = backupv1alpha1.ItemSkipped
@@ -192,7 +230,15 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 	return after(time.Second, r.writeStatus(ctx, run))
 }
 
-// items lists what the run's spec names.
+// items returns one Pending item for each thing the run's spec names.
+// spec.claim names one claim and spec.database names one Cluster. A run with
+// neither takes every claim and every Cluster in the namespace marked
+// backup.wlz.li/enabled: "true", claims first. A Cluster that archives nowhere
+// has no backup to restore, so its item starts out Skipped.
+//
+// items returns an error when spec.repository is set and spec.claim is not,
+// because a restore in place needs a claim to write into, and when nothing in
+// the namespace is marked.
 func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	pending := func(kind, name string) backupv1alpha1.RestoreItem {
 		return backupv1alpha1.RestoreItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
@@ -231,10 +277,20 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	return items, nil
 }
 
-// checkVolume finds the snapshot a restore of the claim would select, and
-// returns a reason when there is none. VolSync itself restores nothing and
-// reports success when no snapshot matches, so this is the only place the
-// missing snapshot is caught.
+// checkVolume finds the snapshot that a restore of the claim named claimName
+// would select.
+//
+// Parameters:
+//   - at is the moment to restore to, or nil for the newest snapshot.
+//   - quiescedOnly limits the choice to snapshots tagged quiesced. plan sets
+//     it on a run with spec.syncDatabaseToVolume.
+//
+// It returns the snapshot, or a reason when there is none. It also returns a
+// reason when the claim's repository can't be resolved. It returns an error
+// only when listing the repository fails.
+//
+// This is the only place a missing snapshot is caught. VolSync restores
+// nothing and still reports success when no snapshot matches.
 func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
@@ -243,9 +299,22 @@ func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alp
 	return r.selectSnapshot(ctx, run, settings.Secret, at, quiescedOnly)
 }
 
-// selectSnapshot returns the snapshot the run would restore from the
-// repository Secret, or a reason when there is none. quiescedOnly passes over
-// every snapshot not tagged quiesced.
+// selectSnapshot returns the snapshot the run would restore, picked the way
+// the VolSync mover picks it from restoreAsOf and previous.
+//
+// Parameters:
+//   - secretName names the restic repository Secret in the run's namespace.
+//   - at is the moment to restore to. selectSnapshot takes the newest
+//     snapshot at or before it, or the newest of all when it is nil.
+//   - quiescedOnly passes over every snapshot not tagged quiesced.
+//
+// When spec.previous is set, selectSnapshot then steps that many snapshots
+// further back. It relies on the lister returning the snapshots oldest first.
+//
+// It returns a reason, and no error, when the Secret can't be read, when no
+// snapshot qualifies, when none is at or before the moment, and when
+// spec.previous reaches past the oldest snapshot. It returns an error when
+// listing the repository fails.
 func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
 	secret := &corev1.Secret{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: secretName}, secret); err != nil {
@@ -287,8 +356,17 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 	return snapshots[index], "", nil
 }
 
-// checkDatabase finds the base backup a recovery of the Cluster would start
-// from, and returns a reason when there is none.
+// checkDatabase finds the base backup that a recovery of one Cluster would
+// start from. The Cluster is the one its namespace and name arguments give.
+// The base backup is the newest one that finished at or before the time given
+// in at, or the newest of all when no time is given.
+//
+// It returns the base backup's ID, or a reason when there is none. It also
+// returns a reason when the Cluster is missing, archives nowhere, or names an
+// object store that can't be resolved. A store with no completed base backup
+// is a reason too, because deleting the Cluster would bring it back empty. It
+// returns an error when the Cluster can't be read or listing the base backups
+// fails.
 func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, name string, at *time.Time) (string, string, error) {
 	cluster, found, err := getCluster(ctx, r.Reader, namespace, name)
 	if err != nil {
@@ -323,8 +401,22 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 	return backup.ID, "", nil
 }
 
-// work restores the volumes, then deletes the databases and follows them
-// until they are recovered.
+// work makes one pass over a run that plan has checked, and returns when to
+// look again. It restores the volumes first, then deletes the databases and
+// follows them until they are recovered.
+//
+// With spec.quiesce set, the first pass calls quiesce to stop the listed
+// workloads, and later passes restore nothing until every pod of those
+// workloads is gone. The databases wait until every volume item is done. When
+// a volume restore failed, the databases still Pending are skipped and left
+// running.
+//
+// After a Cluster is deleted, work waits with reason WaitingForShutdown until
+// the old Cluster's instance pods and PVCs are gone. Only then does it start
+// the stopped workloads again and resume the Kustomizations it suspended. It
+// then waits with reason WaitingForRecreate, whose message asks for the
+// Cluster to be created again. The run finishes once every item is
+// Succeeded, Failed or Skipped. A run past spec.timeout is aborted.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if deadline, over := r.overdue(run); over {
 		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
@@ -398,10 +490,10 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 		}
 	}
 
-	// The databases come back only when their owner creates them again, and a
+	// A database comes back only when its owner creates it again, and a
 	// Kustomization this run suspended creates nothing. So the app is given
-	// back once every volume is restored and every database deleted, down to
-	// its last instance pod and PVC.
+	// back once every volume is restored and every database is deleted, down
+	// to its last instance pod and PVC.
 	if stopped(run) && volumesDone && !anyRestorePending(run.Status.Items) && len(shuttingDown) == 0 {
 		if err := r.restart(ctx, run); err != nil {
 			return ctrl.Result{}, err
@@ -430,8 +522,23 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	return after(pollInterval, r.writeStatus(ctx, run))
 }
 
-// restoreVolume advances one in-place volume restore, and returns a waiting
-// reason while a pod still mounts the claim.
+// restoreVolume moves one in-place volume restore a step further.
+//
+// Parameters:
+//   - index is the item's position in status.items. It goes into the name of
+//     the item's ReplicationDestination.
+//   - item is the volume item, which restoreVolume updates in place.
+//
+// A Pending item waits until no pod mounts the claim. restoreVolume then
+// creates the item's ReplicationDestination and moves the item to Running.
+// A Running item succeeds once the destination has completed the run's
+// trigger, or fails with the mover's logs. Either way, restoreVolume then
+// deletes the destination. A claim whose repository can't be resolved fails
+// the item.
+//
+// It returns reason ClaimInUse and a message naming the pod while a pod
+// mounts the claim, and empty strings otherwise. It returns an error when an
+// API call fails.
 func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (string, string, error) {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
@@ -474,12 +581,16 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 	return "", "", nil
 }
 
-// restoreDatabase advances one database restore: it deletes the Cluster, then
-// follows the Cluster Flux or tofu creates again until it is healthy.
+// restoreDatabase moves one database restore a step further. A Pending item
+// has its Cluster deleted. A Deleted item waits until Flux or tofu creates the
+// Cluster again and the bootstrap webhook marks it as this run's recovery,
+// which moves the item to Recovering. A Recovering item succeeds once the
+// Cluster is healthy, and fails if the recovered Cluster is deleted.
 //
-// The item is marked Deleted before the Cluster is deleted. The bootstrap
-// webhook recovers a Cluster only for a run whose item says Deleted, so the
-// mark has to be in place before anything can create the Cluster again.
+// The item is marked Deleted, and the status written, before the Cluster is
+// deleted. The bootstrap webhook recovers a Cluster only for a run whose item
+// says Deleted, so the mark has to be in place before anything can create the
+// Cluster again.
 func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
@@ -499,9 +610,9 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		case cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun] == run.Name:
 			item.Phase = backupv1alpha1.ItemRecovering
 		default:
-			// The webhook annotates every Cluster it recovers for a run whose
-			// item says Deleted, so a live Cluster without the annotation is
-			// the one the delete above did not reach.
+			// The webhook writes backup.wlz.li/restore-run on every Cluster it
+			// recovers for a run whose item says Deleted. A live Cluster
+			// without it is one the earlier delete did not reach.
 			return r.deleteCluster(ctx, run.Namespace, item.Name)
 		}
 
@@ -519,6 +630,8 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 	return nil
 }
 
+// deleteCluster deletes a Cluster, given by its namespace and name. A Cluster
+// that is already gone is not an error.
 func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, namespace, name string) error {
 	cluster, found, err := getCluster(ctx, r.Reader, namespace, name)
 	if err != nil || !found {
@@ -530,12 +643,15 @@ func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, namespace, nam
 	return nil
 }
 
-// reconcileIntoNewClaim fills a second claim and leaves the app's alone.
+// reconcileIntoNewClaim restores a volume into the new claim that spec.into
+// names, and leaves the app's claim alone.
 //
-// It writes a VolumeRestore carrying the chosen point in time and a claim
-// naming it, so the ordinary populator path does the work. It first checks
-// that a snapshot is in reach, because the populator would otherwise bind an
-// empty claim and report success.
+// It creates a VolumeRestore carrying spec.restoreAsOf and a claim whose data
+// source names it, so the ordinary populator path does the work. On the first
+// pass it checks that a snapshot is in reach, because the populator would
+// otherwise bind an empty claim and report success. The run succeeds once the
+// new claim is Bound, and is aborted when the claim has not bound by
+// spec.timeout.
 func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	run.Status.Target = run.Spec.Into
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
@@ -595,8 +711,10 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 	return ctrl.Result{RequeueAfter: pollInterval}, nil
 }
 
-// abort ends a run early: every unfinished item fails and every destination
-// the run created is removed.
+// abort ends a run early as Failed with reason TimedOut. It marks every item
+// that has not finished as Failed with the given message, then calls finish,
+// which deletes the run's ReplicationDestinations and starts any workload the
+// run stopped.
 func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
@@ -608,8 +726,16 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 	return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, message)
 }
 
-// quiesce stops the workloads spec.quiesce lists and records what it changed
-// before anything else happens, so a failure halfway is still undone.
+// quiesce stops the workloads spec.quiesce lists, and records in the status
+// what it changed before the run does anything else.
+//
+// stopWorkloads suspends the Flux Kustomizations that apply the workloads,
+// then scales each workload to zero. quiesce writes status.quiesced,
+// status.suspendedKustomizations and status.quiescedAt even when stopping
+// fails partway, so finish and finalize can still put back what was changed.
+// It then returns the error, and it does not try the stop again on a later
+// pass. A spec.quiesce entry the namespace does not hold ends the run as
+// Failed with reason Invalid before anything is stopped.
 func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
 	if err != nil {
@@ -627,8 +753,9 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 }
 
-// restart gives the stopped workloads their replicas back and resumes the
-// Kustomizations the run suspended.
+// restart gives the stopped workloads their replicas back, resumes the
+// Kustomizations the run suspended, and records status.restartedAt. The
+// caller writes the status.
 func (r *RestoreRunReconciler) restart(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
 	if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 		return err
@@ -638,12 +765,14 @@ func (r *RestoreRunReconciler) restart(ctx context.Context, run *backupv1alpha1.
 	return nil
 }
 
-// stopped reports whether the run stopped workloads it has not given back.
+// stopped reports whether the run has stopped workloads and not yet started
+// them again.
 func stopped(run *backupv1alpha1.RestoreRun) bool {
 	return run.Status.QuiescedAt != nil && run.Status.RestartedAt == nil
 }
 
-// anyRestorePending reports whether an item has not been started.
+// anyRestorePending reports whether any item is still Pending, which means
+// the run has not started it yet.
 func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 	for _, item := range items {
 		if item.Phase == backupv1alpha1.ItemPending {
@@ -653,8 +782,11 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 	return false
 }
 
-// finish removes the destinations the run created, gives back whatever it
-// stopped, and records the terminal phase.
+// finish ends the run. It deletes the ReplicationDestinations the run
+// created, starts any workload it still holds stopped, and records the
+// terminal phase: Succeeded when reason is ReasonSucceeded and Failed for any
+// other reason. It sets the Ready condition to reason and message, records
+// status.completedAt, and removes the finalizer.
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
 	if err := r.removeDestinations(ctx, run); err != nil {
 		return err
@@ -677,9 +809,11 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 	return dropFinalizer(ctx, r.Client, run)
 }
 
-// finalize removes the destinations on the way to deletion. A run deleted
-// while its mover writes would otherwise leave a restore running against a
-// claim with nothing tracking it.
+// finalize runs when the run is deleted before it finished. It deletes the
+// run's ReplicationDestinations, starts any workload the run still holds
+// stopped, and removes the finalizer so the deletion can complete. Without
+// it, a run deleted while its mover writes would leave a restore running
+// against a claim with nothing tracking it.
 func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return nil
@@ -695,6 +829,9 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	return dropFinalizer(ctx, r.Client, run)
 }
 
+// removeDestinations deletes the ReplicationDestination each item still
+// names, and clears the item's destination. A destination that is already
+// gone is not an error.
 func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
@@ -712,6 +849,9 @@ func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *back
 	return nil
 }
 
+// overdue returns the run's deadline, status.startedAt plus spec.timeout, and
+// reports whether the run has worked past it. A run that has not started, or
+// has no timeout, is never overdue.
 func (r *RestoreRunReconciler) overdue(run *backupv1alpha1.RestoreRun) (time.Time, bool) {
 	if run.Status.StartedAt == nil || run.Spec.Timeout == nil {
 		return time.Time{}, false
@@ -720,12 +860,15 @@ func (r *RestoreRunReconciler) overdue(run *backupv1alpha1.RestoreRun) (time.Tim
 	return deadline, !r.Now().Before(deadline)
 }
 
+// waitFor moves the run to Waiting, sets its Ready condition to False with
+// reason and message, and writes the status.
 func (r *RestoreRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
 	run.Status.Phase = backupv1alpha1.RunPhaseWaiting
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
 	return r.writeStatus(ctx, run)
 }
 
+// writeStatus writes the run's status subresource.
 func (r *RestoreRunReconciler) writeStatus(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
 	if err := r.Status().Update(ctx, run); err != nil {
 		return fmt.Errorf("set RestoreRun %s/%s status: %w", run.Namespace, run.Name, err)
@@ -733,7 +876,9 @@ func (r *RestoreRunReconciler) writeStatus(ctx context.Context, run *backupv1alp
 	return nil
 }
 
-// claimHolder returns the name of a pod mounting the claim, empty when none is.
+// claimHolder returns the name of a pod in the namespace that mounts the
+// claim, or an empty string when none does. Pods that have Succeeded or
+// Failed don't count.
 func claimHolder(ctx context.Context, c client.Reader, namespace, claim string) (string, error) {
 	pods := &corev1.PodList{}
 	if err := c.List(ctx, pods, client.InNamespace(namespace)); err != nil {
@@ -752,8 +897,10 @@ func claimHolder(ctx context.Context, c client.Reader, namespace, claim string) 
 	return "", nil
 }
 
-// destinationName is the ReplicationDestination restoring the run's index-th
-// item. It is short: VolSync names its Job and pod labels after it.
+// destinationName returns the name of the ReplicationDestination that
+// restores one item of a run: restore-, the first eight characters of the
+// run's UID, a dash, and the item's position in status.items. The name is
+// kept short because VolSync names its Job and pod labels after it.
 func destinationName(uid types.UID, index int) string {
 	short := string(uid)
 	if len(short) > 8 {
@@ -762,7 +909,8 @@ func destinationName(uid types.UID, index int) string {
 	return fmt.Sprintf("restore-%s-%d", short, index)
 }
 
-// restoreDone reports whether every item reached a terminal phase.
+// restoreDone reports whether every item is Succeeded, Failed or Skipped, so
+// none has anything more to do.
 func restoreDone(items []backupv1alpha1.RestoreItem) bool {
 	for _, item := range items {
 		switch item.Phase {
@@ -774,7 +922,9 @@ func restoreDone(items []backupv1alpha1.RestoreItem) bool {
 	return true
 }
 
-// restoreFailures names the failed items, empty when none failed.
+// restoreFailures returns one line per failed item, naming its kind, its name
+// and its message, joined with "; ". It returns an empty string when no item
+// failed.
 func restoreFailures(items []backupv1alpha1.RestoreItem) string {
 	var failed []string
 	for _, item := range items {
@@ -785,7 +935,8 @@ func restoreFailures(items []backupv1alpha1.RestoreItem) string {
 	return strings.Join(failed, "; ")
 }
 
-// failedMover reports a destination whose mover gave up, with restic's message.
+// failedMover reports whether the destination's latest mover failed, and
+// returns the mover's logs, which hold restic's error.
 func failedMover(destination *volsyncv1alpha1.ReplicationDestination) (string, bool) {
 	if destination.Status == nil || destination.Status.LatestMoverStatus == nil {
 		return "", false

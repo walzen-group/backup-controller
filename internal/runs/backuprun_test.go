@@ -18,6 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// backupRun returns the BackupRun before-upgrade with a one-hour timeout,
+// after applying each of the mutate functions to it.
 func backupRun(mutate ...func(*backupv1alpha1.BackupRun)) *backupv1alpha1.BackupRun {
 	run := &backupv1alpha1.BackupRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "before-upgrade", Namespace: ns, UID: runUID, Generation: 1},
@@ -29,13 +31,18 @@ func backupRun(mutate ...func(*backupv1alpha1.BackupRun)) *backupv1alpha1.Backup
 	return run
 }
 
+// backupReconciler returns a BackupRunReconciler over a fake client that
+// holds the given objects, and the client itself. The reconciler runs on the
+// frozen clock, its lister holds sunday's and monday's snapshots, and its
+// Retimer is a fake that records each call.
 func backupReconciler(t *testing.T, objects ...client.Object) (*BackupRunReconciler, client.Client) {
 	t.Helper()
 	c := newClient(t, objects...)
 	return &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}, c
 }
 
-// step reconciles the run once and returns what the reconcile asked for.
+// step reconciles the BackupRun before-upgrade once and returns the result.
+// An error from the reconcile fails the test.
 func step(t *testing.T, r *BackupRunReconciler) ctrl.Result {
 	t.Helper()
 	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}})
@@ -45,6 +52,7 @@ func step(t *testing.T, r *BackupRunReconciler) ctrl.Result {
 	return result
 }
 
+// readBackupRun reads the BackupRun before-upgrade back from the client.
 func readBackupRun(t *testing.T, c client.Client) *backupv1alpha1.BackupRun {
 	t.Helper()
 	run := &backupv1alpha1.BackupRun{}
@@ -52,7 +60,9 @@ func readBackupRun(t *testing.T, c client.Client) *backupv1alpha1.BackupRun {
 	return run
 }
 
-// complete stands in for VolSync finishing the tag the run wrote.
+// complete stands in for VolSync finishing a backup. It marks the claim's
+// ReplicationSource as having completed its current trigger tag, with a
+// successful mover that printed the given logs.
 func complete(t *testing.T, c client.Client, logs string) {
 	t.Helper()
 	source := &volsyncv1alpha1.ReplicationSource{}
@@ -66,8 +76,10 @@ func complete(t *testing.T, c client.Client, logs string) {
 	}
 }
 
-// A volume run writes the claim's ReplicationSource itself, placed by the
-// volume's node, and reports the time restic stamped on the snapshot.
+// A volume run writes the claim's ReplicationSource itself, with the
+// VolumeRestore's repository, the claim's retention and a mover pinned to the
+// volume's node. Once the mover finishes, the run reports the snapshot and the
+// time restic stamped on it.
 func TestAVolumeRunWritesTheSourceAndReportsResticsTime(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
@@ -116,15 +128,17 @@ func TestAVolumeRunWritesTheSourceAndReportsResticsTime(t *testing.T) {
 		t.Error("the finished run kept its finalizer")
 	}
 
-	// The spent tag stays: a source with no trigger at all syncs in a loop.
+	// The spent tag stays on the source, because VolSync syncs a source with
+	// no trigger at all in a loop.
 	get(t, c, ns, claimN, source)
 	if manualTag(source) == "" {
 		t.Error("the tag was cleared, which leaves VolSync syncing continuously")
 	}
 }
 
-// startVolumeRun runs a volume run on the claim up to the source being written,
-// and returns the client.
+// startVolumeRun gives the claim the given annotations, runs a volume run on
+// it up to the point where the run writes the ReplicationSource, and returns
+// the client.
 func startVolumeRun(t *testing.T, annotations map[string]string) client.Client {
 	t.Helper()
 	pvc := claim()
@@ -137,8 +151,9 @@ func startVolumeRun(t *testing.T, annotations map[string]string) client.Client {
 	return c
 }
 
-// A claim keeping snapshots by age gets restic's tiers on its source, the way
-// VolSync's own retain block takes them.
+// A claim that keeps snapshots by age, through the retain-hourly to
+// retain-yearly and retain-within annotations, gets those values in its
+// source's retain block, and no retain-last.
 func TestTieredRetentionReachesTheSource(t *testing.T) {
 	c := startVolumeRun(t, map[string]string{
 		backupv1alpha1.AnnotationEnabled:       "true",
@@ -173,7 +188,9 @@ func TestTieredRetentionReachesTheSource(t *testing.T) {
 	}
 }
 
-// A claim with no retention would keep every snapshot forever.
+// A claim with no retention annotation fails its item, because its repository
+// would keep every snapshot forever. The message names the annotations that
+// would fix it.
 func TestAClaimWithNoRetentionFails(t *testing.T) {
 	c := startVolumeRun(t, map[string]string{backupv1alpha1.AnnotationEnabled: "true"})
 
@@ -189,6 +206,8 @@ func TestAClaimWithNoRetentionFails(t *testing.T) {
 	}
 }
 
+// A retention annotation that does not parse, or asks to keep zero
+// snapshots, fails the item with a message naming the annotation.
 func TestAnUnparseableRetentionFails(t *testing.T) {
 	for annotation, value := range map[string]string{
 		backupv1alpha1.AnnotationRetainWeekly: "four",
@@ -206,6 +225,8 @@ func TestAnUnparseableRetentionFails(t *testing.T) {
 	}
 }
 
+// A run that names a claim not marked backup.wlz.li/enabled fails at once
+// with reason Invalid.
 func TestAClaimNotMarkedEnabledIsRefused(t *testing.T) {
 	unmarked := claim()
 	unmarked.Annotations = nil
@@ -219,6 +240,8 @@ func TestAClaimNotMarkedEnabledIsRefused(t *testing.T) {
 	}
 }
 
+// A volume with no files, which VolSync skips without taking a snapshot,
+// succeeds with Empty set and no snapshot ID.
 func TestAnEmptyVolumeSucceedsWithoutASnapshot(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
@@ -235,8 +258,10 @@ func TestAnEmptyVolumeSucceedsWithoutASnapshot(t *testing.T) {
 	}
 }
 
-// A source still completing another run's tag keeps it: writing a second tag
-// would leave the first run waiting for a backup that is never taken.
+// A run waits with reason SourceBusy while the claim's source is still
+// completing another run's tag, and leaves that tag in place. Writing a
+// second tag would leave the first run waiting for a backup that is never
+// taken.
 func TestABusySourceMakesTheRunWait(t *testing.T) {
 	busySource := &volsyncv1alpha1.ReplicationSource{
 		ObjectMeta: metav1.ObjectMeta{Name: claimN, Namespace: ns,
@@ -261,6 +286,8 @@ func TestABusySourceMakesTheRunWait(t *testing.T) {
 	}
 }
 
+// A ReplicationSource of the claim's name that the controller did not write
+// is left alone, and the item fails saying so.
 func TestASourceSomethingElseWroteIsLeftAlone(t *testing.T) {
 	foreign := &volsyncv1alpha1.ReplicationSource{ObjectMeta: metav1.ObjectMeta{Name: claimN, Namespace: ns}}
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
@@ -275,6 +302,8 @@ func TestASourceSomethingElseWroteIsLeftAlone(t *testing.T) {
 	}
 }
 
+// A database run creates a CloudNativePG Backup with method plugin, and
+// succeeds once the Backup completes.
 func TestADatabaseRunTakesABaseBackup(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
 	step(t, r)
@@ -301,6 +330,8 @@ func TestADatabaseRunTakesABaseBackup(t *testing.T) {
 	}
 }
 
+// A hibernated Cluster gets no Backup. Its item is Skipped and the run still
+// succeeds.
 func TestAHibernatedDatabaseIsSkipped(t *testing.T) {
 	sleeping := cluster(func(u *unstructured.Unstructured) {
 		annotations := u.GetAnnotations()
@@ -321,7 +352,8 @@ func TestAHibernatedDatabaseIsSkipped(t *testing.T) {
 	}
 }
 
-// admitAll lets Kueue admit the run's Workload.
+// admitAll stands in for Kueue admitting the run: it sets the Admitted
+// condition on the run's Workload.
 func admitAll(t *testing.T, c client.Client) {
 	t.Helper()
 	workload, ok := getUnstructured(t, c, WorkloadGVK, ns, workloadName(runUID))
@@ -336,8 +368,10 @@ func admitAll(t *testing.T, c client.Client) {
 	}
 }
 
-// The whole namespace: admitted as one Workload, the app stopped while the
-// clones are cut and started again before the uploads finish.
+// A namespace run waits for Kueue to admit its one Workload, then stops the
+// app and suspends its Kustomization while the clones are cut. It starts the
+// app again as soon as the clone exists, before the upload finishes, and
+// deletes the Workload when it succeeds.
 func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false), localQueueObject())
@@ -473,8 +507,9 @@ func TestAQuiescedRunMovesTheSnapshotToItsRestartMoment(t *testing.T) {
 }
 
 // The rewrite needs restic's exclusive lock. While another process holds a
-// lock the volume's item waits, and the run finishes once the rewrite goes
-// through, so a run never reports success for a snapshot left untagged.
+// lock, the volume's item stays Running with a message naming the lock's
+// host. The run finishes once the rewrite goes through, so it never reports
+// success for a snapshot left untagged.
 func TestAQuiescedRunWaitsForTheRepositoryLock(t *testing.T) {
 	r, c := quiescedRunToUpload(t)
 	fake := r.Retimer.(*retimer)
@@ -498,7 +533,8 @@ func TestAQuiescedRunWaitsForTheRepositoryLock(t *testing.T) {
 	}
 }
 
-// A Kustomization someone else suspended stays suspended after the run.
+// A Kustomization someone else suspended is left out of the run's
+// suspendedKustomizations, so the run does not resume it afterwards.
 func TestAKustomizationAlreadySuspendedIsNotResumed(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(true))
@@ -512,7 +548,8 @@ func TestAKustomizationAlreadySuspendedIsNotResumed(t *testing.T) {
 	}
 }
 
-// A run that times out with the app stopped starts it again before it fails.
+// A run that times out while the app is stopped starts the app again and
+// fails.
 func TestATimedOutRunRestartsTheApp(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))

@@ -8,8 +8,8 @@ import (
 	"k8s.io/client-go/tools/events"
 )
 
-// recorded drains what a fake recorder has received, one "type reason note"
-// line per event.
+// recorded drains the events a fake recorder has received and returns one
+// "type reason note" line per event.
 func recorded(recorder *events.FakeRecorder) []string {
 	var lines []string
 	for {
@@ -22,8 +22,9 @@ func recorded(recorder *events.FakeRecorder) []string {
 	}
 }
 
-// A namespace run that finds nothing to back up says why on the run's events,
-// where kubectl describe and a UI's event list look.
+// TestARefusedRunRecordsAWarningWithTheReason checks that a namespace run that
+// finds nothing to back up records a Warning event on the run that says why.
+// kubectl describe and a UI's event list show the run's events.
 func TestARefusedRunRecordsAWarningWithTheReason(t *testing.T) {
 	r, _ := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }))
 	recorder := events.NewFakeRecorder(10)
@@ -38,8 +39,9 @@ func TestARefusedRunRecordsAWarningWithTheReason(t *testing.T) {
 	}
 }
 
-// Each move of the Ready condition to another reason is one event, and a
-// reconcile that leaves the reason where it was records none.
+// TestARunRecordsOneEventPerReason checks that each change of the Ready
+// condition's reason records one event, and that a reconcile which leaves the
+// reason as it was records none.
 func TestARunRecordsOneEventPerReason(t *testing.T) {
 	r, _ := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
@@ -61,7 +63,8 @@ func TestARunRecordsOneEventPerReason(t *testing.T) {
 	}
 }
 
-// A restore that fails records a Warning carrying the condition's message.
+// TestAFailedRestoreRecordsAWarning checks that a RestoreRun that fails
+// records a Warning event with the Ready condition's reason.
 func TestAFailedRestoreRecordsAWarning(t *testing.T) {
 	r, _ := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-01T00:00:00Z")),
@@ -77,8 +80,9 @@ func TestAFailedRestoreRecordsAWarning(t *testing.T) {
 	}
 }
 
-// A note past what events.k8s.io/v1 accepts is cut to fit, so the API server
-// keeps the event instead of rejecting it.
+// TestALongNoteIsCutToTheAPILimit checks that fitNote cuts a note longer than
+// events.k8s.io/v1 accepts to at most maxNote bytes, on a character boundary,
+// so the API server accepts the event.
 func TestALongNoteIsCutToTheAPILimit(t *testing.T) {
 	note := strings.Repeat("ä", maxNote)
 	cut := fitNote(note)

@@ -20,6 +20,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// fakeOperations is an in-memory Operations. It keeps objects by
+// namespace/name, and records every create, delete and status write so the
+// tests can check them.
 type fakeOperations struct {
 	destinations map[string]*volsyncv1alpha1.ReplicationDestination
 	secrets      map[string]*corev1.Secret
@@ -30,6 +33,7 @@ type fakeOperations struct {
 	statuses     []*backupv1alpha1.VolumeRestore
 }
 
+// newFakeOperations returns a fakeOperations that holds no objects.
 func newFakeOperations() *fakeOperations {
 	return &fakeOperations{
 		destinations: make(map[string]*volsyncv1alpha1.ReplicationDestination),
@@ -96,6 +100,9 @@ func (f *fakeOperations) SetStatus(_ context.Context, vr *backupv1alpha1.VolumeR
 	return nil
 }
 
+// TestPopulateCopiesRepositorySecret checks that Populate copies the repository
+// Secret from the app's namespace into the controller namespace with the same
+// data.
 func TestPopulateCopiesRepositorySecret(t *testing.T) {
 	ops := newFakeOperations()
 	ops.secrets[namespacedName("apps", "repo-secret")] = &corev1.Secret{
@@ -115,6 +122,8 @@ func TestPopulateCopiesRepositorySecret(t *testing.T) {
 	}
 }
 
+// TestPopulateNamesFromClaimUID checks that Populate names the destination
+// restore-<claim UID> and names the Secret copy after the claim UID.
 func TestPopulateNamesFromClaimUID(t *testing.T) {
 	ops := populatedOperations()
 	callbacks := New(ops, "backup-system", nil)
@@ -129,6 +138,8 @@ func TestPopulateNamesFromClaimUID(t *testing.T) {
 	}
 }
 
+// TestPopulateReusesExistingDestination checks that Populate leaves an existing
+// ReplicationDestination exactly as it is and creates no second one.
 func TestPopulateReusesExistingDestination(t *testing.T) {
 	ops := populatedOperations()
 	existing := &volsyncv1alpha1.ReplicationDestination{
@@ -149,6 +160,9 @@ func TestPopulateReusesExistingDestination(t *testing.T) {
 	}
 }
 
+// TestPopulateReportsRestoring checks that Populate writes the status once,
+// with Ready False and reason Restoring, and a Restoring entry for the claim
+// that has a start time.
 func TestPopulateReportsRestoring(t *testing.T) {
 	ops := populatedOperations()
 	callbacks := New(ops, "backup-system", nil)
@@ -173,6 +187,8 @@ func TestPopulateReportsRestoring(t *testing.T) {
 	}
 }
 
+// TestCompleteTriggerMatching checks that Complete reports the restore finished
+// only when status.lastManualSync equals the claim's trigger.
 func TestCompleteTriggerMatching(t *testing.T) {
 	for name, test := range map[string]struct {
 		last string
@@ -194,6 +210,9 @@ func TestCompleteTriggerMatching(t *testing.T) {
 	}
 }
 
+// TestCompleteReportsFailedMover checks that after a failed mover run, Complete
+// returns false and writes a Failed entry for the claim and a Ready condition
+// with reason RestoreFailed and the mover's logs as the message.
 func TestCompleteReportsFailedMover(t *testing.T) {
 	ops := restoringOperations()
 	ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{
@@ -217,6 +236,8 @@ func TestCompleteReportsFailedMover(t *testing.T) {
 	}
 }
 
+// TestCleanupDeletesDestinationAndSecret checks that Cleanup deletes the
+// destination and the Secret copy.
 func TestCleanupDeletesDestinationAndSecret(t *testing.T) {
 	ops := restoringOperations()
 	callbacks := New(ops, "backup-system", nil)
@@ -228,6 +249,8 @@ func TestCleanupDeletesDestinationAndSecret(t *testing.T) {
 	}
 }
 
+// TestCleanupToleratesMissingObjects checks that Cleanup succeeds when the
+// destination and the Secret copy are already gone.
 func TestCleanupToleratesMissingObjects(t *testing.T) {
 	callbacks := New(newFakeOperations(), "backup-system", nil)
 	if err := callbacks.Cleanup(context.Background(), params()); err != nil {
@@ -235,23 +258,29 @@ func TestCleanupToleratesMissingObjects(t *testing.T) {
 	}
 }
 
-// fixedSnapshots is a lister holding one snapshot.
+// fixedSnapshots is a restic.Lister that returns the same snapshots for every
+// Secret.
 type fixedSnapshots []restic.Snapshot
 
 func (f fixedSnapshots) Snapshots(context.Context, *corev1.Secret) ([]restic.Snapshot, error) {
 	return f, nil
 }
 
+// monday is the one snapshot in the repository of the pinned-claim tests,
+// taken at 05:00 UTC on Monday 21 September 2026.
 var monday = restic.Snapshot{ID: "6e473100aaaa", Time: time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)}
 
+// pinned returns the default params with the claim pinned by the
+// backup.wlz.li/restore-as-of annotation to the time given in at.
 func pinned(at string) populatormachinery.PopulatorParams {
 	p := params()
 	p.Pvc.Annotations = map[string]string{backupv1alpha1.AnnotationRestoreAsOf: at}
 	return p
 }
 
-// A claim pinned to a moment restores that moment, where the VolumeRestore
-// alone would restore the newest snapshot.
+// TestAPinnedClaimRestoresItsMoment checks that a claim pinned to a moment gets
+// a destination whose restoreAsOf is that moment. The VolumeRestore alone
+// would restore the newest snapshot.
 func TestAPinnedClaimRestoresItsMoment(t *testing.T) {
 	ops := populatedOperations()
 	callbacks := New(ops, "backup-system", fixedSnapshots{monday})
@@ -265,8 +294,11 @@ func TestAPinnedClaimRestoresItsMoment(t *testing.T) {
 	}
 }
 
-// VolSync restores nothing and reports success when no snapshot reaches the
-// moment, and the claim would bind an empty volume. The populator stops first.
+// TestAPinnedClaimNoSnapshotReachesStaysPending checks that Populate returns an
+// error and creates no destination for a claim pinned before every snapshot,
+// and that it reports NoBackupInReach with the oldest snapshot's ID. VolSync
+// would restore nothing and report success, and the claim would bind an empty
+// volume.
 func TestAPinnedClaimNoSnapshotReachesStaysPending(t *testing.T) {
 	ops := populatedOperations()
 	callbacks := New(ops, "backup-system", fixedSnapshots{monday})
@@ -284,6 +316,9 @@ func TestAPinnedClaimNoSnapshotReachesStaysPending(t *testing.T) {
 	}
 }
 
+// params returns the library's parameters for the claim notes (UID claim-123)
+// in apps, its prime claim in backup-system, and a VolumeRestore that names
+// the Secret repo-secret.
 func params() populatormachinery.PopulatorParams {
 	return populatormachinery.PopulatorParams{
 		Pvc:          &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "notes", Namespace: "apps", UID: types.UID("claim-123"), Generation: 3}},
@@ -292,6 +327,8 @@ func params() populatormachinery.PopulatorParams {
 	}
 }
 
+// volumeRestoreUnstructured returns the VolumeRestore notes-data as an
+// unstructured object, the form in which the library passes it.
 func volumeRestoreUnstructured() *unstructured.Unstructured {
 	vr := &backupv1alpha1.VolumeRestore{ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3}, Spec: backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"}}
 	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vr)
@@ -301,16 +338,18 @@ func volumeRestoreUnstructured() *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: object}
 }
 
+// populatedOperations returns a fake cluster that holds only the repository
+// Secret repo-secret in apps.
 func populatedOperations() *fakeOperations {
 	ops := newFakeOperations()
 	ops.secrets[namespacedName("apps", "repo-secret")] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "repo-secret", Namespace: "apps"}, Data: map[string][]byte{"repository": []byte("s3://bucket")}}
 	return ops
 }
 
-// restoringOperations holds what a completed Populate leaves behind: the
-// repository Secret copied into the controller namespace and the destination
-// for claim-123. Complete and Cleanup read those objects, so their tests start
-// from this state rather than from an empty cluster.
+// restoringOperations returns a fake cluster in the state a finished Populate
+// leaves: the repository Secret copied into the controller namespace and the
+// destination for claim-123. Complete and Cleanup read those objects, so their
+// tests start from this state.
 func restoringOperations() *fakeOperations {
 	ops := populatedOperations()
 	ops.secrets[namespacedName("backup-system", "claim-123")] = &corev1.Secret{
@@ -323,8 +362,11 @@ func restoringOperations() *fakeOperations {
 	return ops
 }
 
+// namespacedName returns the namespace/name key the fake stores objects under.
 func namespacedName(namespace, name string) string { return namespace + "/" + name }
 
+// findCondition returns the condition of the given type, or nil when there is
+// none.
 func findCondition(conditions []metav1.Condition, typ string) *metav1.Condition {
 	for i := range conditions {
 		if conditions[i].Type == typ {
@@ -334,6 +376,7 @@ func findCondition(conditions []metav1.Condition, typ string) *metav1.Condition 
 	return nil
 }
 
+// mapKeys returns a map's keys, for failure messages.
 func mapKeys[T any](values map[string]T) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -344,14 +387,18 @@ func mapKeys[T any](values map[string]T) []string {
 
 var _ Operations = (*fakeOperations)(nil)
 
-// api.md's status table says the Ready condition is True when no claim is being
-// filled from the object, and that claims[] holds only the claims being
-// populated now. Cleanup is the only callback that runs when a restore ends, so
-// it is the one place that can retire the entry and report the object Ready.
-// The library deletes the prime claim after calling PopulateCleanupFn, so every
-// pass after the one that finished the restore arrives without it. Rejecting
-// that failed the sync, and the library requeues on error, so one restored
-// claim erred several times a second for as long as it existed:
+// TestCleanupToleratesTheAlreadyDeletedPrimeClaim checks that Cleanup succeeds
+// without a prime claim and still writes the status that ends the restore.
+//
+// api.md's status table says the Ready condition is True when no claim is
+// being filled from the VolumeRestore, and that claims[] holds only the claims
+// being populated now. Cleanup is the only callback that runs when a restore
+// ends, so it's the one place that can remove the entry and report the
+// VolumeRestore Ready. The library deletes the prime claim after it calls
+// PopulateCleanupFn, so every pass after the one that finished the restore
+// arrives without it. Rejecting those passes failed the sync, and the library
+// requeues on error, so one restored claim errored several times a second for
+// as long as it existed:
 //
 //	error syncing 'pvc/canary-backup/canary-backup': populator parameters
 //	have no prime PVC, requeuing
@@ -374,12 +421,16 @@ func TestCleanupToleratesTheAlreadyDeletedPrimeClaim(t *testing.T) {
 	}
 }
 
-// The library has no early return for a claim it has already populated: every
+// TestCleanupWritesNothingWhenThereIsNothingToChange checks that a second
+// Cleanup with nothing to change writes no status.
+//
+// The library has no early return for a claim it has already populated. Every
 // resync walks the whole path, reaches the completion branch and calls Cleanup
-// again, for the life of the claim. Writing status each time would be one
-// update per volume every resync interval, forever, none of them changing
-// anything. Observed as a PopulatorFinished event repeating on a long-bound
-// claim, which is the library's own and harmless; the writes behind it were not.
+// again, for the life of the claim. Writing status each time would send one
+// update per volume every resync interval, forever, and none of them would
+// change anything. It was seen as a PopulatorFinished event that repeated on a
+// claim bound long before. The event is the library's own and harmless. The
+// status writes behind it were the problem.
 func TestCleanupWritesNothingWhenThereIsNothingToChange(t *testing.T) {
 	ops := restoringOperations()
 	callbacks := New(ops, "backup-system", nil)
@@ -395,8 +446,8 @@ func TestCleanupWritesNothingWhenThereIsNothingToChange(t *testing.T) {
 	}
 
 	// Feed back what the first call wrote, which is what the next resync reads
-	// off the cluster: the claim already retired and the condition already
-	// saying so, leaving the second call nothing to write.
+	// from the cluster. The claim is already retired and the condition already
+	// says so, so the second call has nothing to write.
 	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ops.statuses[0])
 	if err != nil {
 		t.Fatalf("convert the written status back: %v", err)
@@ -411,6 +462,9 @@ func TestCleanupWritesNothingWhenThereIsNothingToChange(t *testing.T) {
 	}
 }
 
+// TestCleanupRetiresTheClaimAndReportsRestored checks that Cleanup removes the
+// entry of the last claim being filled and sets Ready to True with reason
+// Restored.
 func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
 	ops := restoringOperations()
 	callbacks := New(ops, "backup-system", nil)
@@ -434,8 +488,10 @@ func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
 	}
 }
 
-// A VolumeRestore can populate more than one claim at a time, so retiring one
-// claim must leave the others reported and the object not Ready.
+// TestCleanupLeavesOtherClaimsRestoring checks that Cleanup removes only the
+// finished claim's entry. A VolumeRestore can populate more than one claim at
+// a time, so the other claims stay reported, and Ready stays False with reason
+// Restoring.
 func TestCleanupLeavesOtherClaimsRestoring(t *testing.T) {
 	ops := restoringOperations()
 	callbacks := New(ops, "backup-system", nil)
@@ -457,6 +513,8 @@ func TestCleanupLeavesOtherClaimsRestoring(t *testing.T) {
 	}
 }
 
+// paramsWithClaims returns the default params with a VolumeRestore whose
+// status.claims holds the given entries.
 func paramsWithClaims(claims ...backupv1alpha1.ClaimRestoreStatus) populatormachinery.PopulatorParams {
 	p := params()
 	vr := &backupv1alpha1.VolumeRestore{

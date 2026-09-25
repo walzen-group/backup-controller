@@ -5,9 +5,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
-// The series the backup alerts read, served on the manager's metrics
-// listener. The populator library serves a registry of its own on another
-// port, which nothing outside it can register into.
+// lastSuccess, scheduleInterval, scheduleInvalid and restorePinned are the
+// series the backup alerts read. They are registered in controller-runtime's
+// registry, so the manager's metrics listener serves them. The populator
+// library serves a registry of its own on another port, and nothing outside
+// the library can register into that one.
 var (
 	lastSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "backup_controller_namespace_last_success_timestamp_seconds",
@@ -30,6 +32,7 @@ var (
 	}, []string{"namespace", "kind", "name"})
 )
 
+// init registers the series in controller-runtime's metrics registry.
 func init() {
 	metrics.Registry.MustRegister(lastSuccess, scheduleInterval, scheduleInvalid, restorePinned)
 }

@@ -26,7 +26,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-// stubProber answers the base backup question without an object store.
+// stubProber is a Prober that returns fixed answers, so the handler can be
+// tested without an object store. Both methods also return the err field.
 type stubProber struct {
 	has     bool
 	err     error
@@ -41,6 +42,8 @@ func (s stubProber) BaseBackups(context.Context, Location) ([]BaseBackup, error)
 	return s.backups, s.err
 }
 
+// scheme registers the core and backup types, plus ObjectStore and Cluster as
+// unstructured kinds, for the fake client.
 func scheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -50,16 +53,18 @@ func scheme(t *testing.T) *runtime.Scheme {
 	if err := backupv1alpha1.AddToScheme(s); err != nil {
 		t.Fatalf("register the backup types: %v", err)
 	}
-	// The handler reads both kinds as unstructured, so the fake client needs
-	// them by GVK rather than by Go type.
+	// The handler reads both kinds as unstructured, so the fake client knows
+	// them by GVK. There are no Go types for them.
 	s.AddKnownTypeWithName(ObjectStoreGVK, &unstructured.Unstructured{})
 	s.AddKnownTypeWithName(ClusterListGVK, &unstructured.UnstructuredList{})
 	s.AddKnownTypeWithName(ClusterListGVK.GroupVersion().WithKind("Cluster"), &unstructured.Unstructured{})
 	return s
 }
 
-// cluster builds a Cluster that archives through the plugin, which is the
-// shape every case here starts from.
+// cluster builds the Cluster app/app-pg, bootstrapped with initdb and archiving
+// through the plugin to the ObjectStore app-pg-store. Every case here starts
+// from it. The mutate function, when given, edits the object before it is
+// returned.
 func cluster(t *testing.T, mutate func(map[string]any)) *unstructured.Unstructured {
 	t.Helper()
 	object := map[string]any{
@@ -89,7 +94,9 @@ func cluster(t *testing.T, mutate func(map[string]any)) *unstructured.Unstructur
 	return &unstructured.Unstructured{Object: object}
 }
 
-// store and secret are the two objects ResolveLocation reads.
+// store builds the ObjectStore app/app-pg-store, which archives to
+// s3://backups/app/ and takes its credentials from the Secret that secret()
+// builds. ResolveLocation reads both.
 func store() *unstructured.Unstructured {
 	s := &unstructured.Unstructured{}
 	s.SetGroupVersionKind(ObjectStoreGVK)
@@ -106,6 +113,8 @@ func store() *unstructured.Unstructured {
 	return s
 }
 
+// secret builds the Secret app/app-pg-backup, which holds the credentials that
+// the ObjectStore from store() names.
 func secret() *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "app-pg-backup", Namespace: "app"},
@@ -116,6 +125,9 @@ func secret() *corev1.Secret {
 	}
 }
 
+// decide sends a create of the Cluster c in namespace app to a Decider with
+// the given Prober. Its fake client holds store(), secret() and any extra
+// objects passed in existing.
 func decide(t *testing.T, c *unstructured.Unstructured, prober Prober, existing ...runtime.Object) admission.Response {
 	t.Helper()
 	raw, err := json.Marshal(c)
@@ -138,8 +150,8 @@ func decide(t *testing.T, c *unstructured.Unstructured, prober Prober, existing 
 	})
 }
 
-// applied replays the response's patches so a test can read the Cluster the
-// API server would have stored.
+// applied applies the response's patches to the original Cluster and returns
+// the result, which is the Cluster the API server would have stored.
 func applied(t *testing.T, original *unstructured.Unstructured, response admission.Response) map[string]any {
 	t.Helper()
 	raw, err := json.Marshal(original)
@@ -161,8 +173,8 @@ func applied(t *testing.T, original *unstructured.Unstructured, response admissi
 	return out
 }
 
-// jsonpatchApply replays the RFC 6902 patch the webhook returned, which is
-// what the API server does with it.
+// jsonpatchApply applies an RFC 6902 JSON patch to a JSON document, the way
+// the API server applies the patch a webhook returns.
 func jsonpatchApply(original, patch []byte) ([]byte, error) {
 	decoded, err := jsonpatch.DecodePatch(patch)
 	if err != nil {
@@ -171,11 +183,15 @@ func jsonpatchApply(original, patch []byte) ([]byte, error) {
 	return decoded.Apply(original)
 }
 
+// TestAClusterIsRefusedWhenAnotherArchivesThere checks that a new Cluster is
+// refused when a Cluster in another namespace already archives to the same
+// bucket and prefix, and that the refusal names that Cluster.
+//
 // Two databases archiving to one prefix interleave their WAL and leave the
-// archive unrestorable, silently and permanently. Neither Cluster is invalid
-// on its own, so only something that can see both can catch it. Measured on
-// the test cluster on 2026-09-15, when a new canary and an existing Flux
-// canary both wanted canary-postgres-pg.
+// archive unrestorable, silently and permanently. Each Cluster is valid on its
+// own, so only something that can see both can catch it. Measured on the test
+// cluster on 2026-09-15, when a new canary and an existing Flux canary both
+// wanted canary-postgres-pg.
 func TestAClusterIsRefusedWhenAnotherArchivesThere(t *testing.T) {
 	// Same object store and the same server name, in another namespace.
 	other := cluster(t, func(object map[string]any) {
@@ -219,7 +235,9 @@ func TestAClusterIsRefusedWhenAnotherArchivesThere(t *testing.T) {
 	}
 }
 
-// Recreating the same database is not a collision with the record of itself.
+// TestARecreateOfTheSameClusterIsNotACollision checks that a Cluster whose own
+// namespace and name are still in the Cluster list is admitted and recovered
+// from its own archive. The collision check skips the Cluster's own record.
 func TestARecreateOfTheSameClusterIsNotACollision(t *testing.T) {
 	existing := cluster(t, nil)
 	existing.SetAPIVersion("postgresql.cnpg.io/v1")
@@ -235,6 +253,8 @@ func TestARecreateOfTheSameClusterIsNotACollision(t *testing.T) {
 	}
 }
 
+// TestAnEmptyStoreLeavesTheClusterOnInitdb checks that a Cluster whose store
+// holds no base backup is admitted without a patch.
 func TestAnEmptyStoreLeavesTheClusterOnInitdb(t *testing.T) {
 	response := decide(t, cluster(t, nil), stubProber{has: false})
 
@@ -246,6 +266,10 @@ func TestAnEmptyStoreLeavesTheClusterOnInitdb(t *testing.T) {
 	}
 }
 
+// TestAStoreWithABackupRecoversTheCluster checks the rewrite of a Cluster
+// whose store holds a base backup: initdb is gone, the recovery reads through
+// one externalClusters entry named RecoverySource with the Cluster's own name
+// as serverName, and SkipCheckAnnotation is "enabled".
 func TestAStoreWithABackupRecoversTheCluster(t *testing.T) {
 	original := cluster(t, nil)
 	response := decide(t, original, stubProber{has: true})
@@ -284,6 +308,9 @@ func TestAStoreWithABackupRecoversTheCluster(t *testing.T) {
 	}
 }
 
+// TestTheDatabaseAndOwnerSurviveTheRewrite checks that initdb's database,
+// owner and secret are copied into the recovery.
+//
 // CloudNativePG defaults a recovery's database and owner to "app". A Cluster
 // created with another database name would then come back with its data in
 // that database and an empty "app" beside it, and the <cluster>-app Secret the
@@ -318,6 +345,9 @@ func TestTheDatabaseAndOwnerSurviveTheRewrite(t *testing.T) {
 	}
 }
 
+// TestTheOptOutAnnotationKeepsTheDatabaseEmpty checks that a Cluster carrying
+// OptOutAnnotation set to OptOutValue is admitted without a patch, even though
+// its store holds a base backup.
 func TestTheOptOutAnnotationKeepsTheDatabaseEmpty(t *testing.T) {
 	c := cluster(t, func(object map[string]any) {
 		metadata, _ := object["metadata"].(map[string]any)
@@ -334,8 +364,9 @@ func TestTheOptOutAnnotationKeepsTheDatabaseEmpty(t *testing.T) {
 	}
 }
 
-// declaredRecovery is a Cluster written the way the terragrunt restore input
-// and the Flux postgres-recovery component write one.
+// declaredRecovery builds a Cluster that declares its own point-in-time
+// recovery, the way the terragrunt restore input and the Flux
+// postgres-recovery component write one.
 func declaredRecovery(t *testing.T) *unstructured.Unstructured {
 	return cluster(t, func(object map[string]any) {
 		spec, _ := object["spec"].(map[string]any)
@@ -348,7 +379,9 @@ func declaredRecovery(t *testing.T) *unstructured.Unstructured {
 	})
 }
 
-// waiting is a RestoreRun that deleted app-pg and waits for it to come back.
+// waiting builds the RestoreRun app/back-to-monday, which has deleted app-pg
+// and waits for it to be created again. The asOf argument becomes the run's
+// spec.restoreAsOf, and nil leaves it unset.
 func waiting(asOf *string) *backupv1alpha1.RestoreRun {
 	return &backupv1alpha1.RestoreRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "back-to-monday", Namespace: "app"},
@@ -360,11 +393,14 @@ func waiting(asOf *string) *backupv1alpha1.RestoreRun {
 	}
 }
 
+// monday is midnight UTC on Monday 2026-09-21, the reference moment for the
+// base backup times in the RestoreRun cases.
 var monday = time.Date(2026, 9, 21, 0, 0, 0, 0, time.UTC)
 
-// A declared recovery archives like any other Cluster, so it collides like
-// one: two databases writing one prefix interleave their WAL whatever either
-// bootstrapped from.
+// TestADeclaredRecoveryIsRefusedWhenAnotherArchivesThere checks that the
+// collision check also applies to a Cluster that declares its own recovery. A
+// declared recovery archives like any other Cluster, and two databases writing
+// one prefix interleave their WAL whatever either bootstrapped from.
 func TestADeclaredRecoveryIsRefusedWhenAnotherArchivesThere(t *testing.T) {
 	other := cluster(t, func(object map[string]any) {
 		metadata, _ := object["metadata"].(map[string]any)
@@ -388,6 +424,9 @@ func TestADeclaredRecoveryIsRefusedWhenAnotherArchivesThere(t *testing.T) {
 	}
 }
 
+// TestARunWaitingForTheClusterSetsItsTarget checks that a RestoreRun waiting
+// for the Cluster sets the recovery target to its restoreAsOf, and that the
+// Cluster is annotated with the run's name.
 func TestARunWaitingForTheClusterSetsItsTarget(t *testing.T) {
 	asOf := "2026-09-22T00:00:00Z"
 	original := cluster(t, nil)
@@ -409,8 +448,9 @@ func TestARunWaitingForTheClusterSetsItsTarget(t *testing.T) {
 	}
 }
 
-// A run syncing the databases to the volumes recovers to the moment it found
-// on the volumes' quiesced snapshots, which it records in status.syncedTo.
+// TestASyncedRunRecoversToTheVolumesMoment checks that a RestoreRun with
+// syncDatabaseToVolume recovers the database to its status.syncedTo. That is
+// the moment the run found on the volumes' quiesced snapshots.
 func TestASyncedRunRecoversToTheVolumesMoment(t *testing.T) {
 	original := cluster(t, nil)
 	prober := stubProber{has: true, backups: []BaseBackup{{ID: "20260920T030000", End: monday.Add(-24 * time.Hour)}}}
@@ -430,6 +470,9 @@ func TestASyncedRunRecoversToTheVolumesMoment(t *testing.T) {
 	}
 }
 
+// TestARunWithoutAMomentRecoversToTheEndOfTheArchive checks that a RestoreRun
+// with no restoreAsOf gets a recovery with no recoveryTarget, and that the
+// Cluster is still annotated with the run's name.
 func TestARunWithoutAMomentRecoversToTheEndOfTheArchive(t *testing.T) {
 	original := cluster(t, nil)
 	response := decide(t, original, stubProber{has: true}, waiting(nil))
@@ -444,6 +487,9 @@ func TestARunWithoutAMomentRecoversToTheEndOfTheArchive(t *testing.T) {
 	}
 }
 
+// TestADeclaredRecoveryIsRefusedWhileARunWaits checks that a Cluster declaring
+// its own recovery is refused while a RestoreRun waits for it, and that the
+// refusal names the run.
 func TestADeclaredRecoveryIsRefusedWhileARunWaits(t *testing.T) {
 	response := decide(t, declaredRecovery(t), stubProber{has: true}, waiting(nil))
 
@@ -455,6 +501,9 @@ func TestADeclaredRecoveryIsRefusedWhileARunWaits(t *testing.T) {
 	}
 }
 
+// TestTheRestoreAsOfAnnotationSetsTheTarget checks that, with no RestoreRun
+// waiting, the Cluster's backup.wlz.li/restore-as-of annotation sets the
+// recovery target.
 func TestTheRestoreAsOfAnnotationSetsTheTarget(t *testing.T) {
 	original := cluster(t, func(object map[string]any) {
 		metadata, _ := object["metadata"].(map[string]any)
@@ -471,8 +520,9 @@ func TestTheRestoreAsOfAnnotationSetsTheTarget(t *testing.T) {
 	}
 }
 
-// A target before the oldest base backup finished is one Postgres can never
-// reach, so the Cluster is refused with the oldest backup named.
+// TestATargetBeforeEveryBaseBackupIsRefused checks that a target before the
+// oldest base backup finished is refused, and that the refusal names that
+// backup. Postgres can never reach such a target.
 func TestATargetBeforeEveryBaseBackupIsRefused(t *testing.T) {
 	asOf := "2026-09-01T00:00:00Z"
 	prober := stubProber{has: true, backups: []BaseBackup{{ID: "20260920T030000", End: monday}}}
@@ -487,7 +537,9 @@ func TestATargetBeforeEveryBaseBackupIsRefused(t *testing.T) {
 	}
 }
 
-// A run that asks for a recovery must not come back as an empty database.
+// TestARunIsRefusedWhenTheStoreHoldsNoBaseBackup checks that a Cluster a
+// RestoreRun waits for is refused when its store holds no base backup. A run
+// that asks for a recovery must never get an empty database back.
 func TestARunIsRefusedWhenTheStoreHoldsNoBaseBackup(t *testing.T) {
 	response := decide(t, cluster(t, nil), stubProber{has: false}, waiting(nil))
 
@@ -496,6 +548,9 @@ func TestARunIsRefusedWhenTheStoreHoldsNoBaseBackup(t *testing.T) {
 	}
 }
 
+// TestADeclaredRecoveryIsLeftAlone checks that a Cluster declaring its own
+// point-in-time recovery is admitted without a patch when no RestoreRun waits
+// for it.
 func TestADeclaredRecoveryIsLeftAlone(t *testing.T) {
 	c := cluster(t, func(object map[string]any) {
 		spec, _ := object["spec"].(map[string]any)
@@ -517,6 +572,8 @@ func TestADeclaredRecoveryIsLeftAlone(t *testing.T) {
 	}
 }
 
+// TestAClusterThatArchivesNowhereIsLeftAlone checks that a Cluster with no
+// plugins is admitted without a patch.
 func TestAClusterThatArchivesNowhereIsLeftAlone(t *testing.T) {
 	c := cluster(t, func(object map[string]any) {
 		spec, _ := object["spec"].(map[string]any)
@@ -533,9 +590,10 @@ func TestAClusterThatArchivesNowhereIsLeftAlone(t *testing.T) {
 	}
 }
 
-// An unreadable store is refused rather than allowed. Allowing would create an
-// empty database beside a full archive and report success, which is the
-// failure this webhook exists to remove.
+// TestAnUnreadableStoreRefusesTheCluster checks that a Cluster is refused when
+// the object store can't be listed. Allowing it would create an empty database
+// beside a full archive and report success, which is the failure this webhook
+// exists to remove.
 func TestAnUnreadableStoreRefusesTheCluster(t *testing.T) {
 	response := decide(t, cluster(t, nil), stubProber{err: errors.New("the endpoint refused the connection")})
 
@@ -544,8 +602,9 @@ func TestAnUnreadableStoreRefusesTheCluster(t *testing.T) {
 	}
 }
 
-// A dry-run request is allowed without reading anything, even where a real
-// request on the same Cluster would be refused.
+// TestADryRunIsAllowedWithoutReadingTheStore checks that a dry-run create is
+// allowed without a patch and without reading anything, even where a real
+// request for the same Cluster would be refused.
 //
 // Flux dry-runs every object in a Kustomization before it applies any of them,
 // so on an app's first deploy this handler sees a Cluster whose ObjectStore is
@@ -587,8 +646,10 @@ func TestADryRunIsAllowedWithoutReadingTheStore(t *testing.T) {
 	}
 }
 
-// update sends an update of old to new, as a dry run when dryRun is set, with
-// a client that holds nothing, so a handler that reads anything fails.
+// update sends a Decider an update of the Cluster app/app-pg from the old
+// object to the new one, as a dry run when dryRun is true. The Decider's
+// client holds nothing and its Prober always fails, so the request fails if
+// the handler reads anything.
 func update(t *testing.T, old, new *unstructured.Unstructured, dryRun bool) admission.Response {
 	t.Helper()
 	oldRaw, err := json.Marshal(old)
@@ -615,7 +676,8 @@ func update(t *testing.T, old, new *unstructured.Unstructured, dryRun bool) admi
 	})
 }
 
-// recovered is a Cluster as this webhook left it after a restore.
+// recovered builds a Cluster the way this webhook leaves it after a restore,
+// with a recovery whose source is RecoverySource.
 func recovered(t *testing.T) *unstructured.Unstructured {
 	t.Helper()
 	return cluster(t, func(object map[string]any) {
@@ -626,6 +688,10 @@ func recovered(t *testing.T) *unstructured.Unstructured {
 	})
 }
 
+// TestAnUpdateDropsInitdbFromARecoveredCluster checks that an update adding
+// initdb back to a Cluster this webhook recovered gets a patch that removes
+// initdb and keeps the recovery, on a dry run and on a real request.
+//
 // Flux applies the Cluster from git on every reconcile, and git still holds
 // initdb. Server-side apply keeps the recovery the webhook wrote and adds initdb
 // back, and CloudNativePG refuses the result. Measured on 2026-09-17 as:
@@ -654,7 +720,8 @@ func TestAnUpdateDropsInitdbFromARecoveredCluster(t *testing.T) {
 	}
 }
 
-// A Cluster this webhook did not recover keeps whatever its update says.
+// TestAnUpdateOfAnInitdbClusterIsLeftAlone checks that an update of a Cluster
+// this webhook didn't recover is allowed without a patch.
 func TestAnUpdateOfAnInitdbClusterIsLeftAlone(t *testing.T) {
 	response := update(t, cluster(t, nil), cluster(t, nil), true)
 
@@ -666,7 +733,10 @@ func TestAnUpdateOfAnInitdbClusterIsLeftAlone(t *testing.T) {
 	}
 }
 
-// A point-in-time restore someone wrote by hand is theirs to get right.
+// TestAnUpdateOfADeclaredRecoveryIsLeftAlone checks that an update of a
+// Cluster whose recovery someone wrote by hand gets no patch, even when it
+// carries initdb too. A hand-written point-in-time restore is theirs to get
+// right.
 func TestAnUpdateOfADeclaredRecoveryIsLeftAlone(t *testing.T) {
 	declared := func() *unstructured.Unstructured {
 		return cluster(t, func(object map[string]any) {
@@ -685,6 +755,8 @@ func TestAnUpdateOfADeclaredRecoveryIsLeftAlone(t *testing.T) {
 	}
 }
 
+// TestTheServerNameParameterWinsOverTheClusterName checks that the recovery
+// reads from the plugin's serverName parameter when the Cluster sets one.
 func TestTheServerNameParameterWinsOverTheClusterName(t *testing.T) {
 	original := cluster(t, func(object map[string]any) {
 		spec, _ := object["spec"].(map[string]any)
@@ -705,6 +777,8 @@ func TestTheServerNameParameterWinsOverTheClusterName(t *testing.T) {
 	}
 }
 
+// TestBasePrefixIsTheServersBackupDirectory checks that BasePrefix appends
+// "/base/" to the location's prefix.
 func TestBasePrefixIsTheServersBackupDirectory(t *testing.T) {
 	at := Location{Bucket: "backups", Prefix: "app/app-pg"}
 	if got, want := at.BasePrefix(), "app/app-pg/base/"; got != want {
@@ -712,6 +786,9 @@ func TestBasePrefixIsTheServersBackupDirectory(t *testing.T) {
 	}
 }
 
+// TestSplitDestinationSeparatesBucketFromPrefix checks that splitDestination
+// returns the bucket and a prefix with its slashes trimmed, for an empty,
+// one-level and two-level prefix.
 func TestSplitDestinationSeparatesBucketFromPrefix(t *testing.T) {
 	for _, tc := range []struct {
 		in     string
@@ -732,8 +809,10 @@ func TestSplitDestinationSeparatesBucketFromPrefix(t *testing.T) {
 	}
 }
 
-// A store fronted by a public authority declares no endpointCA, and the client
-// verifies against the roots the image ships.
+// TestNoEndpointCAMeansThePublicRoots checks that tlsTransport with no bundle
+// still builds a root pool and requires TLS 1.2. A store fronted by a public
+// authority declares no endpointCA, and the client verifies against the roots
+// the image ships.
 func TestNoEndpointCAMeansThePublicRoots(t *testing.T) {
 	transport, err := tlsTransport(nil)
 	if err != nil {
@@ -747,8 +826,10 @@ func TestNoEndpointCAMeansThePublicRoots(t *testing.T) {
 	}
 }
 
-// A store fronted by a private authority carries the bundle that signs it, and
-// nothing about that authority is configured on this controller.
+// TestAnEndpointCAIsAddedToTheRoots checks that a PEM bundle passed to
+// tlsTransport ends up in the root pool. A store fronted by a private
+// authority carries the bundle that signs it, and this controller has no CA
+// settings of its own.
 func TestAnEndpointCAIsAddedToTheRoots(t *testing.T) {
 	// A throwaway self-signed certificate, generated in this test so the
 	// repository carries no certificate material of its own.
@@ -781,12 +862,16 @@ func TestAnEndpointCAIsAddedToTheRoots(t *testing.T) {
 	}
 }
 
+// TestAnUnparsableEndpointCAIsRejected checks that tlsTransport returns an
+// error for a bundle holding no PEM certificate.
 func TestAnUnparsableEndpointCAIsRejected(t *testing.T) {
 	if _, err := tlsTransport([]byte("this is not a certificate")); err == nil {
 		t.Fatal("a bundle holding no PEM certificate was accepted")
 	}
 }
 
+// TestSplitDestinationRejectsAnotherProvider checks that splitDestination
+// returns an error for a destination with a scheme other than s3://.
 func TestSplitDestinationRejectsAnotherProvider(t *testing.T) {
 	if _, _, err := splitDestination("azure://container/"); err == nil {
 		t.Fatal("an azure:// destination was accepted")

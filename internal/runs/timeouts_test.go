@@ -11,12 +11,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// annotatedNamespace returns the test namespace with the given annotations.
 func annotatedNamespace(annotations map[string]string) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Annotations: annotations}}
 }
 
-// startedVolumeRun reconciles a volume run up to its start, with the source
-// left unfinished, and returns the reconciler.
+// startedVolumeRun creates a BackupRun of the test claim and reconciles it
+// until it has started. The fake client holds the given Namespace object. The
+// claim's source never finishes, so the run stays Running until its timeout.
+// The timeout argument becomes the run's spec.timeout, and nil leaves it
+// unset.
 func startedVolumeRun(t *testing.T, timeout *metav1.Duration, namespace *corev1.Namespace) *BackupRunReconciler {
 	t.Helper()
 	r, _ := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) {
@@ -29,8 +33,8 @@ func startedVolumeRun(t *testing.T, timeout *metav1.Duration, namespace *corev1.
 	return r
 }
 
-// phaseAt reconciles the run once at a moment after its start and returns its
-// phase.
+// phaseAt sets the clock to the given duration after frozen, reconciles the
+// run once, and returns the run's phase.
 func phaseAt(t *testing.T, r *BackupRunReconciler, after time.Duration) backupv1alpha1.RunPhase {
 	t.Helper()
 	r.Now = func() time.Time { return frozen.Add(after) }
@@ -38,6 +42,8 @@ func phaseAt(t *testing.T, r *BackupRunReconciler, after time.Duration) backupv1
 	return readBackupRun(t, r.Client).Status.Phase
 }
 
+// TestARunWithoutATimeoutGivesUpAfterSixHours checks that a run with no
+// timeout of its own, in a namespace without one, fails at six hours.
 func TestARunWithoutATimeoutGivesUpAfterSixHours(t *testing.T) {
 	r := startedVolumeRun(t, nil, annotatedNamespace(nil))
 
@@ -49,6 +55,9 @@ func TestARunWithoutATimeoutGivesUpAfterSixHours(t *testing.T) {
 	}
 }
 
+// TestANamespaceTimeoutReplacesTheDefault checks that a namespace's
+// backup.wlz.li/timeout of 10h keeps a run going past six hours and fails it
+// at ten.
 func TestANamespaceTimeoutReplacesTheDefault(t *testing.T) {
 	r := startedVolumeRun(t, nil, annotatedNamespace(map[string]string{backupv1alpha1.AnnotationTimeout: "10h"}))
 
@@ -60,8 +69,10 @@ func TestANamespaceTimeoutReplacesTheDefault(t *testing.T) {
 	}
 }
 
-// An empty annotation reads as none, so a Flux component can write the key
-// from a substitution that defaults to "" and leave the default here.
+// TestEmptyNamespaceSettingsFallBackToTheDefaults checks that an empty
+// timeout or prune-interval annotation counts as no annotation. A Flux
+// component can then write the key from a substitution that defaults to "",
+// and the controller's default applies.
 func TestEmptyNamespaceSettingsFallBackToTheDefaults(t *testing.T) {
 	r := startedVolumeRun(t, nil, annotatedNamespace(map[string]string{
 		backupv1alpha1.AnnotationTimeout:           "",
@@ -78,6 +89,8 @@ func TestEmptyNamespaceSettingsFallBackToTheDefaults(t *testing.T) {
 	}
 }
 
+// TestARunsOwnTimeoutWinsOverTheNamespace checks that a run's spec.timeout of
+// one hour takes precedence over the namespace's 10h.
 func TestARunsOwnTimeoutWinsOverTheNamespace(t *testing.T) {
 	r := startedVolumeRun(t, &metav1.Duration{Duration: time.Hour},
 		annotatedNamespace(map[string]string{backupv1alpha1.AnnotationTimeout: "10h"}))
@@ -87,6 +100,9 @@ func TestARunsOwnTimeoutWinsOverTheNamespace(t *testing.T) {
 	}
 }
 
+// TestANamespaceTimeoutThatDoesNotParseFailsTheRun checks that a namespace
+// timeout that isn't a Go duration fails the run, with a message that names
+// the annotation.
 func TestANamespaceTimeoutThatDoesNotParseFailsTheRun(t *testing.T) {
 	r := startedVolumeRun(t, nil, annotatedNamespace(map[string]string{backupv1alpha1.AnnotationTimeout: "six hours"}))
 
@@ -100,8 +116,10 @@ func TestANamespaceTimeoutThatDoesNotParseFailsTheRun(t *testing.T) {
 	}
 }
 
-// The scheduler leaves the timeout to the namespace, so a manual run and a
-// scheduled one in the same namespace give up at the same point.
+// TestAScheduledRunLeavesTheTimeoutToItsNamespace checks that the scheduler
+// creates runs without a spec.timeout. The namespace's timeout then applies,
+// so a manual run and a scheduled one in the same namespace give up at the
+// same point.
 func TestAScheduledRunLeavesTheTimeoutToItsNamespace(t *testing.T) {
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	_, c := schedule(t, time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC), scheduledNamespace("0 5 * * *", created), claim())
@@ -112,6 +130,9 @@ func TestAScheduledRunLeavesTheTimeoutToItsNamespace(t *testing.T) {
 	}
 }
 
+// TestTheNamespacePruneIntervalReachesTheSource checks that the
+// ReplicationSource's pruneIntervalDays is 1 without an annotation, and the
+// annotation's value when the namespace sets one.
 func TestTheNamespacePruneIntervalReachesTheSource(t *testing.T) {
 	for name, tc := range map[string]struct {
 		annotations map[string]string
@@ -132,6 +153,8 @@ func TestTheNamespacePruneIntervalReachesTheSource(t *testing.T) {
 	}
 }
 
+// TestAPruneIntervalThatDoesNotParseFailsTheItem checks that a prune interval
+// of 0 fails the claim's item, with a message that names the annotation.
 func TestAPruneIntervalThatDoesNotParseFailsTheItem(t *testing.T) {
 	r := startedVolumeRun(t, nil, annotatedNamespace(map[string]string{backupv1alpha1.AnnotationPruneIntervalDays: "0"}))
 

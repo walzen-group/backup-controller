@@ -19,17 +19,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// errSourceBusy is a source still completing another run's tag. The run waits
-// for it; writing a second tag would leave the first run waiting for a backup
-// that is never taken.
+// errSourceBusy is the error ensureSource returns when the claim's
+// ReplicationSource carries another run's manual tag and VolSync hasn't
+// finished that backup yet. The run waits and tries again later. If it wrote
+// its own tag at that point, the tag would replace the first run's, and the
+// first run would wait for a backup that is never taken.
 var errSourceBusy = errors.New("the ReplicationSource is still completing another run's backup")
 
-// moverCPU is the mover's CPU request: its share on a busy worker, and what the
-// scheduler has to find free on the volume's worker.
+// moverCPU is the CPU request on each backup mover. It sets the mover's share
+// of CPU on a busy worker, and it is the amount the scheduler must find free
+// on the worker that holds the volume.
 var moverCPU = resource.MustParse("500m")
 
-// enabledClaims lists the claims in a namespace marked backup.wlz.li/enabled,
-// by name.
+// enabledClaims lists the claims in a namespace that carry the annotation
+// backup.wlz.li/enabled: "true", sorted by name. A claim that is being deleted
+// is left out.
 func enabledClaims(ctx context.Context, c client.Reader, namespace string) ([]corev1.PersistentVolumeClaim, error) {
 	claims := &corev1.PersistentVolumeClaimList{}
 	if err := c.List(ctx, claims, client.InNamespace(namespace)); err != nil {
@@ -45,9 +49,12 @@ func enabledClaims(ctx context.Context, c client.Reader, namespace string) ([]co
 	return enabled, nil
 }
 
-// volumeRestoreFor returns the VolumeRestore that describes a claim's
-// repository: the one its dataSourceRef names, or for a fixed-name claim,
-// which names none, the one carrying the claim's own name.
+// volumeRestoreFor returns the VolumeRestore that describes a claim's restic
+// repository. For a claim whose spec.dataSourceRef names a VolumeRestore, it
+// is that one. A fixed-name claim names none, and for it the VolumeRestore
+// with the claim's own name is used.
+//
+// It returns an error naming the claim when that VolumeRestore doesn't exist.
 func volumeRestoreFor(ctx context.Context, c client.Reader, claim *corev1.PersistentVolumeClaim) (*backupv1alpha1.VolumeRestore, error) {
 	name := claim.Name
 	if ref := claim.Spec.DataSourceRef; ref != nil && ref.Kind == "VolumeRestore" {
@@ -63,9 +70,13 @@ func volumeRestoreFor(ctx context.Context, c client.Reader, claim *corev1.Persis
 	return vr, nil
 }
 
-// volumeAffinity returns node affinity that places a pod where the claim's
-// volume is, copied from the PersistentVolume's own. zfs-localpv writes it on
-// every volume, and it holds whether or not a pod mounts the claim.
+// volumeAffinity returns a node affinity that places a pod on the node that
+// holds the claim's volume. It copies the required node affinity from the
+// claim's PersistentVolume. zfs-localpv writes that affinity on every volume
+// it provisions, and it holds whether or not a pod mounts the claim.
+//
+// It returns an error when the claim isn't bound yet, or when the
+// PersistentVolume declares no required node affinity.
 func volumeAffinity(ctx context.Context, c client.Reader, claim *corev1.PersistentVolumeClaim) (*corev1.Affinity, error) {
 	if claim.Spec.VolumeName == "" || claim.Status.Phase != corev1.ClaimBound {
 		return nil, fmt.Errorf("claim %s is not bound to a volume yet", claim.Name)
@@ -84,12 +95,19 @@ func volumeAffinity(ctx context.Context, c client.Reader, claim *corev1.Persiste
 	}, nil
 }
 
-// resticSpan is a restic --keep-within span: counts of years, months, days and
-// hours, such as 30d or 1y6m.
+// resticSpan matches a span in the form restic's --keep-within takes: one or
+// more counts of years, months, days or hours, such as 30d or 1y6m.
 var resticSpan = regexp.MustCompile(`^([0-9]+[ymdh])+$`)
 
-// retention reads the claim's retention annotations into restic's policy. A
-// claim names at least one; with none, restic would keep every snapshot.
+// retention builds the restic retention policy for a claim's
+// ReplicationSource from the claim's annotations: backup.wlz.li/retain-last,
+// retain-hourly, retain-daily, retain-weekly, retain-monthly, retain-yearly
+// and retain-within.
+//
+// It returns an error naming the claim and the annotation when a count isn't
+// a positive integer, or when retain-within isn't a span such as 30d. It also
+// returns an error when the claim sets none of them, because a policy with
+// no rule would make restic keep every snapshot.
 func retention(claim *corev1.PersistentVolumeClaim) (*volsyncv1alpha1.ResticRetainPolicy, error) {
 	policy := &volsyncv1alpha1.ResticRetainPolicy{}
 	counts := []struct {
@@ -104,7 +122,9 @@ func retention(claim *corev1.PersistentVolumeClaim) (*volsyncv1alpha1.ResticReta
 	}
 	set := false
 
-	// last is a string in VolSync's CRD and the tiers are integers.
+	// VolSync's CRD types the last count as a string and the other counts as
+	// integers, so retain-last is parsed only to check it and is stored as
+	// the annotation wrote it.
 	if value, ok := claim.Annotations[backupv1alpha1.AnnotationRetainLast]; ok {
 		if _, err := positiveCount(value); err != nil {
 			return nil, fmt.Errorf("claim %s has %s %q, which is not a positive count", claim.Name, backupv1alpha1.AnnotationRetainLast, value)
@@ -142,7 +162,8 @@ func retention(claim *corev1.PersistentVolumeClaim) (*volsyncv1alpha1.ResticReta
 	return policy, nil
 }
 
-// positiveCount parses a retention count, which is at least one.
+// positiveCount parses a retention count from an annotation value. It returns
+// an error unless the value is an integer of at least 1.
 func positiveCount(value string) (int32, error) {
 	n, err := strconv.ParseInt(value, 10, 32)
 	if err != nil || n < 1 {
@@ -151,19 +172,36 @@ func positiveCount(value string) (int32, error) {
 	return int32(n), nil
 }
 
-// ensureSource writes the claim's ReplicationSource with the run's tag, and
-// returns it.
+// ensureSource creates or updates the ReplicationSource that backs up a claim,
+// with the run's tag as its manual trigger. Setting the tag is what starts
+// VolSync's backup.
 //
-// The controller owns every field: the repository, the cache class and the
-// mover's security context come from the claim's VolumeRestore, the retention
-// from the claim's annotations, the prune interval from the namespace's, and
-// the node from the claim's volume. The
-// source is owned by the claim, so a claim deleted for a restore takes its
-// source with it and the next run writes a new one.
+// Parameters:
+//   - c writes the ReplicationSource.
+//   - reader reads the claim's VolumeRestore and PersistentVolume, the
+//     Namespace, and any ReplicationSource that already exists.
+//   - claim is the claim to back up. The ReplicationSource takes its name.
+//   - tag is the run's manual trigger, from TriggerFor. VolSync starts a
+//     backup when spec.trigger.manual holds a value it hasn't completed yet.
 //
-// A source of the same name that this controller did not write is left
-// alone: something else declares it, and writing over it would start a fight
-// that thing wins on its next reconcile.
+// It returns the ReplicationSource as written. While an existing source is
+// still busy with another run's tag, it returns that source and
+// errSourceBusy, and changes nothing. It returns an error, and writes
+// nothing, when a ReplicationSource of the same name exists without the label
+// app.kubernetes.io/managed-by: backup-controller, or when one of the
+// settings below can't be read.
+//
+// The controller writes every field of the spec. The repository, the cache
+// class and the mover's security context come from the claim's VolumeRestore.
+// The retention comes from the claim's annotations, the prune interval from
+// the namespace's annotation, and the mover's node affinity from the claim's
+// volume. The source carries a controller reference to the claim, so a claim
+// deleted for a restore takes its source with it, and the next run writes a
+// new one.
+//
+// A source of the same name that this controller didn't write is left alone.
+// Something else declares it, and writing over it would start a fight that the
+// other writer wins on its next reconcile.
 func ensureSource(ctx context.Context, c client.Client, reader client.Reader, claim *corev1.PersistentVolumeClaim, tag string) (*volsyncv1alpha1.ReplicationSource, error) {
 	vr, err := volumeRestoreFor(ctx, reader, claim)
 	if err != nil {
@@ -210,9 +248,9 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 			Restic: &volsyncv1alpha1.ReplicationSourceResticSpec{
 				ReplicationSourceVolumeOptions: volsyncv1alpha1.ReplicationSourceVolumeOptions{
 					CopyMethod: volsyncv1alpha1.CopyMethodClone,
-					// The clone and the cache are both rebuilt on every run,
-					// so both come from the class the VolumeRestore names for
-					// its cache, which reclaims Delete.
+					// VolSync builds the clone and the cache afresh on every
+					// run, so both come from the class the VolumeRestore names
+					// for its cache, whose reclaim policy is Delete.
 					StorageClassName: vr.Spec.CacheStorageClassName,
 				},
 				Repository:            vr.Spec.Repository,

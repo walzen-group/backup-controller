@@ -16,51 +16,84 @@ import (
 )
 
 const (
-	// WebhookPath is where the admission server serves this handler, and the
-	// path the MutatingWebhookConfiguration in deploy/ points at.
+	// WebhookPath is the URL path the admission server serves Decider on. The
+	// MutatingWebhookConfiguration in deploy/ points at the same path.
 	WebhookPath = "/mutate-postgresql-cnpg-io-v1-cluster"
 
-	// PluginName is the Barman Cloud plugin, named in a Cluster's plugins list
-	// and again in the externalClusters entry this webhook writes.
+	// PluginName is the name of the Barman Cloud plugin. Archiver looks for it
+	// in a Cluster's spec.plugins, and setRecovery writes it into the
+	// externalClusters entry it adds.
 	PluginName = "barman-cloud.cloudnative-pg.io"
 
 	// SkipCheckAnnotation lets a recovered database archive into the prefix it
-	// restored from. CloudNativePG refuses a non-empty archive on a freshly
-	// bootstrapped database, which is every restore.
+	// restored from. CloudNativePG refuses to archive into a non-empty prefix
+	// from a freshly bootstrapped database, and every restore is one.
+	// setRecovery sets it to "enabled".
 	SkipCheckAnnotation = "cnpg.io/skipEmptyWalArchiveCheck"
 
-	// OptOutAnnotation asks for an empty database whatever the object store
-	// holds. Without it there is no way to discard a database, because
-	// deleting the Cluster would restore it again.
+	// OptOutAnnotation, set to OptOutValue on a Cluster, asks for an empty
+	// database whatever the object store holds. Without it there is no way to
+	// discard a database, because deleting the Cluster would restore it again.
 	OptOutAnnotation = "backup.wlz.li/bootstrap"
 
-	// OptOutValue is what OptOutAnnotation is set to. Any other value is
-	// ignored, so a typo does not silently wipe a database.
+	// OptOutValue is the value OptOutAnnotation must have to opt out. The
+	// webhook ignores any other value, so a typo can't silently leave a
+	// database empty.
 	OptOutValue = "initdb"
 
-	// RecoverySource names the externalClusters entry this webhook adds. The
-	// entry's name and bootstrap.recovery.source have to match, and nothing
-	// else reads either, so one constant serves both.
+	// RecoverySource is the name of the externalClusters entry this webhook
+	// adds, and the value it writes to spec.bootstrap.recovery.source. The two
+	// have to match, and no other component uses the name, so one constant
+	// serves both. keepRecovery reads the source back to recognise a
+	// Cluster this webhook recovered.
 	RecoverySource = "backup-controller"
 )
 
-// Decider chooses a Cluster's bootstrap at admission time.
-//
-// Client is a reader rather than a full client because this handler only ever
-// reads, and an uncached reader keeps the controller's Secret grant at get.
-// A cached client would need list and watch on every Secret in the cluster and
-// would hold them all in memory.
+// Decider is the mutating admission webhook for CloudNativePG Clusters. It
+// chooses a new Cluster's bootstrap at admission time, and it keeps a
+// recovered Cluster valid when Flux applies it again.
 type Decider struct {
+	// Client reads ObjectStores, Secrets, Clusters and RestoreRuns. The
+	// handler only ever reads, so a client.Reader is enough.
+	// cmd/backup-controller passes the manager's uncached API reader, which
+	// keeps the controller's Secret grant at get. A cached client would need
+	// list and watch on every Secret in the cluster and would hold them all
+	// in memory.
 	Client client.Reader
+	// Prober asks the object store which base backups exist.
+	// cmd/backup-controller passes S3Prober, and the tests pass a stub.
 	Prober Prober
 }
 
-// Handle reads a Cluster being created and, when its object store already
-// holds a base backup, rewrites it to recover from that backup.
+// Handle answers one admission request for a Cluster. For a new Cluster whose
+// object store already holds a base backup, it rewrites the Cluster to recover
+// from that backup.
 //
-// Every path that is not a clear "recover this" allows the Cluster through
-// unchanged. A webhook that refuses Clusters it does not understand would put
-// this controller in the way of every database on the cluster.
+// The req argument is the admission request. Its Operation, DryRun, Object and
+// OldObject decide what happens:
+//   - An update goes to keepRecovery, on a dry run too.
+//   - Any operation other than create or update is allowed unchanged.
+//   - A dry-run create is allowed unchanged without reading anything.
+//   - A create is allowed unchanged when the Cluster carries OptOutAnnotation
+//     set to OptOutValue, or when it has no archiving plugin (see Archiver).
+//   - A create is refused when the ObjectStore can't be resolved, or when
+//     another Cluster anywhere already archives to the same bucket and prefix.
+//   - A Cluster that declares its own spec.bootstrap.recovery is allowed
+//     unchanged, unless a RestoreRun is waiting for it. Then it's refused.
+//   - A create is refused when a RestoreRun's restoreAsOf or the Cluster's
+//     restore-as-of annotation isn't an RFC 3339 time.
+//   - A create is refused when a RestoreRun or the restore-as-of annotation
+//     asks for a recovery and the store holds no base backup, or no base
+//     backup finished by the requested moment.
+//   - Otherwise, when the store holds a base backup, the response patches the
+//     Cluster to recover from it (see setRecovery). When a RestoreRun waits
+//     for the Cluster, the patch also sets the backup.wlz.li/restore-run
+//     annotation to the run's name. With no base backup and nothing asking
+//     for a recovery, the Cluster is allowed unchanged and starts empty.
+//
+// Failures to read the store, list Clusters or RestoreRuns, or talk to the
+// object store return an HTTP 500 error response, which the API server treats
+// as a refusal. A body that isn't a valid Cluster returns an HTTP 400.
 func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.Response {
 	logger := log.FromContext(ctx).WithValues(
 		"cluster", fmt.Sprintf("%s/%s", req.Namespace, req.Name),
@@ -210,8 +243,14 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
 }
 
-// waitingRun returns the RestoreRun that deleted this Cluster and waits for it
-// to come back, or nil when none does.
+// waitingRun finds the RestoreRun that deleted a Cluster and is waiting for it
+// to be created again, so the webhook can recover the new Cluster for that
+// run.
+//
+// It lists the RestoreRuns in the given namespace and returns the first one
+// that hasn't finished, isn't being deleted, and has an entry in status.items
+// for a Cluster with the given name in phase Deleted. It returns nil when no
+// run matches, and an error when the list fails.
 func waitingRun(ctx context.Context, c client.Reader, namespace, name string) (*backupv1alpha1.RestoreRun, error) {
 	runs := &backupv1alpha1.RestoreRunList{}
 	if err := c.List(ctx, runs, client.InNamespace(namespace)); err != nil {
@@ -231,10 +270,21 @@ func waitingRun(ctx context.Context, c client.Reader, namespace, name string) (*
 	return nil, nil
 }
 
-// restoreTarget returns the moment to recover to and what asked for it: the
-// waiting RestoreRun's syncedTo, else its restoreAsOf, else the Cluster's
-// restore-as-of annotation, else no target, which replays to the end of the
-// archive.
+// restoreTarget works out the moment a new Cluster should recover to, and
+// names what asked for it so refusal messages can point there.
+//
+// Parameters:
+//   - cluster is the Cluster being created. Its backup.wlz.li/restore-as-of
+//     annotation sets the target when no RestoreRun waits for it.
+//   - run is the RestoreRun waiting for the Cluster (see waitingRun), or nil.
+//
+// With a waiting RestoreRun, the target is the run's status.syncedTo, or else
+// its spec.restoreAsOf, or else nil, and the source is "RestoreRun <name>".
+// Without one, the target is the annotation's time and the source is
+// "annotation backup.wlz.li/restore-as-of". With neither, the target is nil and
+// the source is "the webhook". A nil target means the recovery replays to the
+// end of the archive. It returns an error when restoreAsOf or the annotation
+// isn't an RFC 3339 time.
 func restoreTarget(cluster *unstructured.Unstructured, run *backupv1alpha1.RestoreRun) (*time.Time, string, error) {
 	if run != nil {
 		source := "RestoreRun " + run.Name
@@ -264,7 +314,9 @@ func restoreTarget(cluster *unstructured.Unstructured, run *backupv1alpha1.Resto
 	return &t, source, nil
 }
 
-// oldest names the oldest base backup for a refusal message.
+// oldest returns the end of a refusal message that names the oldest base
+// backup and when it finished, or says there is none. It expects the list
+// oldest first, as BaseBackups returns it.
 func oldest(backups []BaseBackup) string {
 	if len(backups) == 0 {
 		return "; it holds no completed base backup"
@@ -272,14 +324,18 @@ func oldest(backups []BaseBackup) string {
 	return fmt.Sprintf("; the oldest, %s, finished at %s", backups[0].ID, backups[0].End.UTC().Format(time.RFC3339))
 }
 
-// keepRecovery drops initdb from an update of a Cluster this webhook recovered.
+// keepRecovery answers an update of a Cluster. When the old Cluster was
+// recovered by this webhook (its spec.bootstrap.recovery.source is
+// RecoverySource) and the new one carries spec.bootstrap.initdb, it returns a
+// patch that removes initdb. Every other update is allowed unchanged.
 //
 // Flux applies the Cluster from git on every reconcile, and git holds initdb.
-// Server-side apply keeps the recovery written at creation and adds initdb back,
-// and CloudNativePG refuses a Cluster with two bootstrap methods. That refusal
-// fails the dry-run Flux runs first, so this runs on dry-runs too. It reads
-// nothing, and CloudNativePG ignores spec.bootstrap once a Cluster exists, so
-// dropping initdb changes nothing about the database.
+// Server-side apply keeps the recovery written at creation and adds initdb
+// back, and CloudNativePG refuses a Cluster with two bootstrap methods. That
+// refusal fails the dry run Flux runs first, so keepRecovery runs on dry runs
+// too. It reads nothing from the cluster, and CloudNativePG ignores
+// spec.bootstrap once a Cluster exists, so dropping initdb changes nothing
+// about the database.
 func keepRecovery(req admission.Request) admission.Response {
 	old := &unstructured.Unstructured{}
 	if err := json.Unmarshal(req.OldObject.Raw, old); err != nil {
@@ -306,17 +362,26 @@ func keepRecovery(req admission.Request) admission.Response {
 	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
 }
 
-// archiveHolder returns the name of an existing Cluster that already archives
-// to the same bucket and prefix, or an empty string when none does.
+// archiveHolder finds an existing Cluster that already archives to the same
+// bucket and prefix as the Cluster being admitted. Two databases archiving to
+// one prefix interleave their WAL and leave the archive unrestorable.
 //
-// It compares resolved destinations rather than names, because two Clusters
-// can reach one prefix through differently named ObjectStores. The Cluster
-// being admitted is skipped by namespace and name, so a recreate of the same
-// database does not collide with the record of itself.
+// Parameters:
+//   - namespace and name identify the Cluster being admitted. A Cluster with
+//     the same namespace and name is skipped, so a recreate of the same
+//     database doesn't collide with its own record.
+//   - at is where the admitted Cluster would archive, from ResolveLocation.
 //
-// A Cluster whose own store cannot be read is skipped rather than treated as a
-// collision. Refusing a new database because an unrelated one is misconfigured
-// would put this check in the way of work it has no business blocking.
+// It returns the holder as "namespace/name", or an empty string when no
+// Cluster archives there. It returns an error only when the Cluster list
+// fails.
+//
+// It lists every Cluster in every namespace and resolves each one's location
+// with ResolveLocation, then compares bucket and prefix. Two Clusters can reach
+// one prefix through differently named ObjectStores, so comparing store names
+// would miss them. A Cluster whose own store can't be resolved is skipped.
+// Refusing a new database because an unrelated one is misconfigured would
+// block work this check has no reason to block.
 func archiveHolder(
 	ctx context.Context,
 	c client.Reader,
@@ -349,9 +414,15 @@ func archiveHolder(
 	return "", nil
 }
 
-// Archiver finds the Cluster's WAL archiving plugin and the server name it
-// writes under. A Cluster with no such plugin backs nothing up and has nothing
-// to recover from.
+// Archiver finds where a Cluster archives its WAL. It looks in spec.plugins for
+// the first entry named PluginName with isWALArchiver set to true and a
+// non-empty barmanObjectName parameter.
+//
+// It returns that entry's barmanObjectName as the store and its serverName
+// parameter as the server name, with found set to true. When serverName is
+// unset, the server name is the Cluster's own name. It returns found as false
+// when no entry matches. Such a Cluster backs nothing up and has nothing to
+// recover from.
 func Archiver(cluster *unstructured.Unstructured) (store, serverName string, found bool) {
 	plugins, ok, err := unstructured.NestedSlice(cluster.Object, "spec", "plugins")
 	if err != nil || !ok {
@@ -384,10 +455,23 @@ func Archiver(cluster *unstructured.Unstructured) (store, serverName string, fou
 	return "", "", false
 }
 
-// setRecovery rewrites the Cluster to restore from its own archive: the
-// bootstrap, the external cluster it reads through, and the annotation that
-// lets it archive into the prefix it restored from. A nil target replays to
-// the end of the archive.
+// setRecovery rewrites a Cluster, in place, to recover from its own archive.
+//
+// Parameters:
+//   - cluster is the Cluster being created. It's modified directly.
+//   - store and serverName say where the Cluster archives, as Archiver
+//     returns them. The recovery reads from the same place.
+//   - target is the moment to recover to, written as
+//     recoveryTarget.targetTime. A nil target replays to the end of the
+//     archive.
+//
+// It replaces spec.bootstrap.initdb with spec.bootstrap.recovery, carrying
+// over initdb's database, owner and secret. It adds an externalClusters entry
+// named RecoverySource that reads through the Barman Cloud plugin, or replaces
+// an entry of that name if one is there. It sets SkipCheckAnnotation to
+// "enabled" so the recovered database can archive into the prefix it restored
+// from. It returns an error only when the unstructured object can't be read or
+// written at those paths.
 func setRecovery(cluster *unstructured.Unstructured, store, serverName string, target *time.Time) error {
 	recovery := map[string]any{"source": RecoverySource}
 	if target != nil {
@@ -397,11 +481,12 @@ func setRecovery(cluster *unstructured.Unstructured, store, serverName string, t
 	// The application database, its owning role and the Secret holding that
 	// role's password carry over from initdb.
 	//
-	// Dropping them is not harmless. CloudNativePG defaults a recovery's
+	// Dropping them breaks the app. CloudNativePG defaults a recovery's
 	// database and owner to "app", so a Cluster that was created with
 	// database "canary" comes back with its data in "canary" and an empty
 	// "app" beside it, and the <cluster>-app Secret the workload reads points
-	// at the empty one. The restore looks like data loss and is not.
+	// at the empty one. The restore then looks like data loss, though the
+	// data is all there.
 	for _, field := range []string{"database", "owner"} {
 		value, found, err := unstructured.NestedString(cluster.Object, "spec", "bootstrap", "initdb", field)
 		if err == nil && found && value != "" {

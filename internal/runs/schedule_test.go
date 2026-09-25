@@ -14,6 +14,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// scheduledNamespace returns the test namespace with the cron schedule given
+// in schedule and the creation time given in created.
 func scheduledNamespace(schedule string, created time.Time) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 		Name:              ns,
@@ -22,6 +24,9 @@ func scheduledNamespace(schedule string, created time.Time) *corev1.Namespace {
 	}}
 }
 
+// scheduler builds a Scheduler over a fake client that holds the given
+// objects, with its clock stopped at now. It also returns the client and the
+// fake event recorder.
 func scheduler(t *testing.T, now time.Time, objects ...client.Object) (*Scheduler, client.Client, *events.FakeRecorder) {
 	t.Helper()
 	c := newClient(t, objects...)
@@ -29,6 +34,7 @@ func scheduler(t *testing.T, now time.Time, objects ...client.Object) (*Schedule
 	return &Scheduler{Client: c, Reader: c, Recorder: recorder, Now: func() time.Time { return now }}, c, recorder
 }
 
+// tick reconciles the test namespace once and fails the test on an error.
 func tick(t *testing.T, s *Scheduler) ctrl.Result {
 	t.Helper()
 	result, err := s.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: ns}})
@@ -38,12 +44,16 @@ func tick(t *testing.T, s *Scheduler) ctrl.Result {
 	return result
 }
 
+// schedule builds a Scheduler with scheduler and reconciles the test
+// namespace once.
 func schedule(t *testing.T, now time.Time, objects ...client.Object) (ctrl.Result, client.Client) {
 	t.Helper()
 	s, c, _ := scheduler(t, now, objects...)
 	return tick(t, s), c
 }
 
+// scheduledRuns lists the BackupRuns in the test namespace that carry the
+// backup.wlz.li/scheduled-for label.
 func scheduledRuns(t *testing.T, c client.Client) []backupv1alpha1.BackupRun {
 	t.Helper()
 	runs := &backupv1alpha1.BackupRunList{}
@@ -53,6 +63,9 @@ func scheduledRuns(t *testing.T, c client.Client) []backupv1alpha1.BackupRun {
 	return runs.Items
 }
 
+// TestADueTickCreatesARunOfTheWholeNamespace checks that a due tick creates
+// one BackupRun with spec.all set, named and labelled after the tick. With
+// the next tick a day away, the scheduler requeues after refresh.
 func TestADueTickCreatesARunOfTheWholeNamespace(t *testing.T) {
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
@@ -72,8 +85,9 @@ func TestADueTickCreatesARunOfTheWholeNamespace(t *testing.T) {
 	}
 }
 
-// A CRON_TZ prefix puts the schedule on that zone's clock: 04:00 in Berlin is
-// 02:00 UTC in September.
+// TestAScheduleWithAZoneTicksOnThatZonesClock checks that a CRON_TZ prefix
+// puts the schedule on that zone's clock. 04:00 in Berlin is 02:00 UTC in
+// September.
 func TestAScheduleWithAZoneTicksOnThatZonesClock(t *testing.T) {
 	created := time.Date(2026, 9, 24, 1, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 2, 0, 30, 0, time.UTC)
@@ -86,6 +100,8 @@ func TestAScheduleWithAZoneTicksOnThatZonesClock(t *testing.T) {
 	}
 }
 
+// TestATickNotYetDueCreatesNothing checks that a tick two minutes away creates
+// no run, and that the scheduler requeues for the moment the tick is due.
 func TestATickNotYetDueCreatesNothing(t *testing.T) {
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 4, 58, 0, 0, time.UTC)
@@ -100,7 +116,8 @@ func TestATickNotYetDueCreatesNothing(t *testing.T) {
 	}
 }
 
-// Ticks missed while the controller was down run once, for the newest.
+// TestMissedTicksRunOnceForTheNewest checks that the ticks missed while the
+// controller was down produce one run, for the newest of them.
 func TestMissedTicksRunOnceForTheNewest(t *testing.T) {
 	created := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 30, 0, 0, time.UTC)
@@ -113,7 +130,10 @@ func TestMissedTicksRunOnceForTheNewest(t *testing.T) {
 	}
 }
 
-// One namespace backup at a time: a second would find every source busy.
+// TestAnUnfinishedNamespaceRunHoldsTheTick checks that a due tick creates no
+// run while another BackupRun with spec.all set is still running. Only one
+// namespace backup runs at a time, because a second would find every source
+// busy.
 func TestAnUnfinishedNamespaceRunHoldsTheTick(t *testing.T) {
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
@@ -130,9 +150,11 @@ func TestAnUnfinishedNamespaceRunHoldsTheTick(t *testing.T) {
 	}
 }
 
-// Flux writes a Namespace before the claims in it. A tick already due when the
-// schedule arrives waits for a claim marked enabled, because a run created
-// first finds nothing to back up and fails.
+// TestADueTickWaitsForSomethingMarkedEnabled checks that a due tick waits,
+// with a Warning event on the Namespace, until a claim is marked enabled, and
+// then creates its run. Flux creates a Namespace before the claims in it, so a
+// tick can be due before anything is marked, and a run created then would
+// find nothing to back up and fail.
 func TestADueTickWaitsForSomethingMarkedEnabled(t *testing.T) {
 	created := time.Date(2026, 9, 22, 16, 25, 56, 0, time.UTC)
 	now := time.Date(2026, 9, 25, 9, 37, 16, 0, time.UTC)
@@ -167,7 +189,8 @@ func TestADueTickWaitsForSomethingMarkedEnabled(t *testing.T) {
 	}
 }
 
-// A namespace whose only backup is a database has something to back up.
+// TestAnEnabledClusterAloneLetsTheTickRun checks that a namespace whose only
+// marked object is a Cluster gets its scheduled run.
 func TestAnEnabledClusterAloneLetsTheTickRun(t *testing.T) {
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
@@ -179,6 +202,8 @@ func TestAnEnabledClusterAloneLetsTheTickRun(t *testing.T) {
 	}
 }
 
+// TestANamespaceWithoutAScheduleIsLeftAlone checks that a namespace without
+// backup.wlz.li/schedule gets no run.
 func TestANamespaceWithoutAScheduleIsLeftAlone(t *testing.T) {
 	plain := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 	_, c := schedule(t, frozen, plain)

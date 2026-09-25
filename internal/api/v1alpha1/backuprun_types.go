@@ -4,43 +4,47 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// BackupRunSpec asks for one backup now: of one volume, of one database, or of
-// everything the namespace marks backup.wlz.li/enabled.
+// BackupRunSpec asks for one backup now. It names one volume, one database, or
+// everything in the namespace marked backup.wlz.li/enabled.
 //
-// The controller writes and triggers each volume's ReplicationSource itself,
-// named after the claim, and asks CloudNativePG for a base backup of each
-// database. A run with all set is admitted by the namespace's Kueue queue as
-// one unit and stops the workloads marked backup.wlz.li/quiesce until every
-// volume's clone is cut.
+// For each volume, the controller writes the ReplicationSource itself, names it
+// after the claim, and triggers it. For each database, it asks CloudNativePG
+// for a base backup. When the namespace has a Kueue LocalQueue, the run waits
+// for the queue to admit it as one Workload. A run with all set also scales the
+// workloads marked backup.wlz.li/quiesce to zero until every volume's clone is
+// cut.
 // +kubebuilder:validation:XValidation:rule="(has(self.source) ? 1 : 0) + (has(self.database) ? 1 : 0) + ((has(self.all) && self.all) ? 1 : 0) == 1",message="set exactly one of source, database and all"
 type BackupRunSpec struct {
-	// Source is the claim to back up. Its ReplicationSource carries the same
-	// name, and the claim has to be marked backup.wlz.li/enabled.
+	// Source is the name of the claim to back up. The claim has to be marked
+	// backup.wlz.li/enabled, and its ReplicationSource carries the same name.
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
 	Source string `json:"source,omitempty"`
 
-	// Database is the CloudNativePG Cluster in this namespace to take a base
-	// backup of.
+	// Database is the name of the CloudNativePG Cluster in this namespace to
+	// take a base backup of. The Cluster has to be marked
+	// backup.wlz.li/enabled.
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
 	Database string `json:"database,omitempty"`
 
 	// All backs up every claim and every Cluster in this namespace marked
-	// backup.wlz.li/enabled, and stops the workloads marked
-	// backup.wlz.li/quiesce while the clones are cut.
+	// backup.wlz.li/enabled. It also stops the workloads marked
+	// backup.wlz.li/quiesce while the volumes' clones are cut.
 	// +optional
 	All bool `json:"all,omitempty"`
 
-	// Timeout is how long the run waits for its movers and base backups
-	// before it gives up. Admission by the queue does not count toward it.
-	// Omitted, the namespace's backup.wlz.li/timeout annotation applies, and
-	// six hours without one.
+	// Timeout is how long the run may work on its movers and base backups
+	// before it gives up. The clock starts when the queue admits the run, so
+	// time spent queued does not count. When omitted, the namespace's
+	// backup.wlz.li/timeout annotation applies, and six hours applies when the
+	// namespace has none.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
-	// TTLSecondsAfterFinished deletes this object that long after it reaches a
-	// terminal phase. Omitted, it is kept as the record of what was backed up.
+	// TTLSecondsAfterFinished is how many seconds after the run finishes the
+	// controller deletes it. When omitted, the run is kept as the record of
+	// what was backed up.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
@@ -48,11 +52,12 @@ type BackupRunSpec struct {
 
 // BackupRunStatus reports how far the run got.
 type BackupRunStatus struct {
-	// Phase is the run's state, and the column `kubectl get` prints.
+	// Phase is the run's state. It is the Phase column `kubectl get` prints.
 	// +optional
 	Phase RunPhase `json:"phase,omitempty"`
 
-	// Workload is the Kueue Workload that admits the run, while it exists.
+	// Workload is the name of the Kueue Workload that admits the run. It is
+	// cleared when the run finishes and the Workload is deleted.
 	// +optional
 	Workload string `json:"workload,omitempty"`
 
@@ -65,7 +70,7 @@ type BackupRunStatus struct {
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 
 	// QuiescedAt is when the run stopped the workloads marked
-	// backup.wlz.li/quiesce, or found none to stop.
+	// backup.wlz.li/quiesce, or found that none were marked.
 	// +optional
 	QuiescedAt *metav1.Time `json:"quiescedAt,omitempty"`
 
@@ -73,33 +78,34 @@ type BackupRunStatus struct {
 	// +optional
 	RestartedAt *metav1.Time `json:"restartedAt,omitempty"`
 
-	// Quiesced lists the workloads this run scaled to zero, with the replicas
-	// it gives each back.
+	// Quiesced lists the workloads this run scaled to zero, each with the
+	// replica count the run restores when it starts them again.
 	// +optional
 	Quiesced []QuiescedWorkload `json:"quiesced,omitempty"`
 
 	// SuspendedKustomizations lists the Flux Kustomizations this run
-	// suspended, as namespace/name. The run resumes exactly these.
+	// suspended, as namespace/name. The run resumes these and no others.
 	// +optional
 	SuspendedKustomizations []string `json:"suspendedKustomizations,omitempty"`
 
-	// Items has one entry per volume and database the run backs up.
+	// Items has one entry for each volume and each database the run backs up.
 	// +optional
 	Items []BackupItem `json:"items,omitempty"`
 
-	// Conditions carry the kstatus-compatible state, so a Flux Kustomization
-	// with wait: true can gate on this object.
+	// Conditions holds the kstatus-compatible state, so a Flux Kustomization
+	// with wait: true can wait for this object.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// QuiescedWorkload is one workload a run stopped.
+// QuiescedWorkload is one workload a run scaled to zero.
 type QuiescedWorkload struct {
 	// Kind is Deployment or StatefulSet.
 	Kind string `json:"kind"`
 	// Name is the workload's name in the run's namespace.
 	Name string `json:"name"`
-	// Replicas is what the workload ran with before the run stopped it.
+	// Replicas is the replica count the workload had before the run stopped
+	// it.
 	Replicas int32 `json:"replicas"`
 }
 
@@ -107,30 +113,34 @@ type QuiescedWorkload struct {
 type BackupItem struct {
 	// Kind is ReplicationSource for a volume and Cluster for a database.
 	Kind string `json:"kind"`
-	// Name is the object's name, which for a volume is also the claim's.
+	// Name is the object's name. For a volume, it is also the claim's name.
 	Name string `json:"name"`
 	// Phase is how far this item got.
 	Phase ItemPhase `json:"phase"`
-	// Message says why an item failed or was skipped.
+	// Message says why the item failed or was skipped, or what it is waiting
+	// for.
 	// +optional
 	Message string `json:"message,omitempty"`
-	// Trigger is the manual tag the run wrote onto a ReplicationSource.
+	// Trigger is the manual trigger value the run wrote onto the
+	// ReplicationSource.
 	// +optional
 	Trigger string `json:"trigger,omitempty"`
-	// Snapshot is the restic snapshot the mover wrote, as its short ID.
+	// Snapshot is the short ID of the restic snapshot the mover wrote.
 	// +optional
 	Snapshot string `json:"snapshot,omitempty"`
-	// SnapshotTime is the time on that snapshot. restic stamps the moment the
-	// backup of the volume's clone started; a run that stopped workloads then
-	// moves the snapshot to its restartedAt and tags it quiesced, so a restore
-	// can recover the databases to the same moment.
+	// SnapshotTime is the time recorded on that snapshot. restic records the
+	// moment the backup of the volume's clone started. When the run stopped
+	// workloads, it then rewrites the snapshot to carry the run's restartedAt
+	// and tags it quiesced, so that a restore can recover the databases to the
+	// same moment.
 	// +optional
 	SnapshotTime *metav1.Time `json:"snapshotTime,omitempty"`
-	// Empty reports a volume VolSync did not back up because it held no
-	// files. The repository gains no snapshot for such a run.
+	// Empty is true when VolSync took no backup of the volume because it held
+	// no files. The repository gains no snapshot from such a run.
 	// +optional
 	Empty bool `json:"empty,omitempty"`
-	// Backup is the CloudNativePG Backup the run created for a database.
+	// Backup is the name of the CloudNativePG Backup the run created for a
+	// database.
 	// +optional
 	Backup string `json:"backup,omitempty"`
 }
@@ -145,20 +155,21 @@ const (
 	ItemRunning ItemPhase = "Running"
 	// ItemSucceeded is an item that finished.
 	ItemSucceeded ItemPhase = "Succeeded"
-	// ItemFailed is an item that gave up, with the reason in its message.
+	// ItemFailed is an item that gave up. Its message gives the reason.
 	ItemFailed ItemPhase = "Failed"
-	// ItemSkipped is an item the run left alone, with the reason in its
-	// message.
+	// ItemSkipped is an item the run left alone. Its message gives the
+	// reason.
 	ItemSkipped ItemPhase = "Skipped"
-	// ItemDeleted is a database a RestoreRun deleted, waiting for its Cluster
-	// to be created again.
+	// ItemDeleted is a database whose Cluster a RestoreRun deleted, waiting
+	// for the Cluster to be created again.
 	ItemDeleted ItemPhase = "Deleted"
-	// ItemRecovering is a recreated database replaying WAL to the run's time.
+	// ItemRecovering is a recreated database replaying WAL up to the run's
+	// moment.
 	ItemRecovering ItemPhase = "Recovering"
 )
 
-// RunPhase is the state of a one-shot run. Both BackupRun and RestoreRun use
-// it, so the column reads the same for either.
+// RunPhase is the state of a one-shot run. BackupRun and RestoreRun both use
+// it, so the Phase column reads the same for either kind.
 type RunPhase string
 
 const (
@@ -168,19 +179,20 @@ const (
 	// RunPhaseRunning is a run whose work is under way.
 	RunPhaseRunning RunPhase = "Running"
 
-	// RunPhaseWaiting is a run held up by something outside its control, with
-	// the Ready condition's message naming what.
+	// RunPhaseWaiting is a run held up by something outside its control. The
+	// Ready condition's message names what it is waiting for.
 	RunPhaseWaiting RunPhase = "Waiting"
 
 	// RunPhaseSucceeded is a run whose work finished.
 	RunPhaseSucceeded RunPhase = "Succeeded"
 
-	// RunPhaseFailed is a run that gave up. Anything it created is cleaned up
-	// before it reports this.
+	// RunPhaseFailed is a run that gave up. The run cleans up what it created
+	// before it reports this phase.
 	RunPhaseFailed RunPhase = "Failed"
 )
 
-// Finished reports whether a phase is terminal.
+// Finished reports whether the phase is terminal, meaning Succeeded or
+// Failed.
 func (p RunPhase) Finished() bool {
 	return p == RunPhaseSucceeded || p == RunPhaseFailed
 }
@@ -194,9 +206,9 @@ func (p RunPhase) Finished() bool {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// BackupRun takes one backup on demand, and is also the record the scheduler
-// leaves for every scheduled backup. Submit it and watch it the way you would
-// a Job.
+// BackupRun takes one backup on demand. The scheduler also creates one for
+// every scheduled backup, and the object stays as the record of it. Create a
+// BackupRun and watch it the way you would a Job.
 type BackupRun struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

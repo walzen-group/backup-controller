@@ -6,10 +6,12 @@ import (
 	"testing"
 )
 
-// The image is FROM scratch and holds no /usr/share/zoneinfo, so a schedule
-// with a CRON_TZ prefix loads its zone only if the binary carries the zone
-// database. Every developer machine has the files, which is why this reads the
-// build's dependencies and does not parse a schedule.
+// TestTheBinaryCarriesTheZoneDatabase checks that time/tzdata is among the
+// binary's dependencies. The image is FROM scratch and has no
+// /usr/share/zoneinfo, so a schedule with a CRON_TZ prefix can load its zone
+// only when the binary carries the zone database. Every developer machine has
+// the zone files, so parsing a schedule here would pass either way. The test
+// reads the build's package list for that reason.
 func TestTheBinaryCarriesTheZoneDatabase(t *testing.T) {
 	out, err := exec.Command("go", "list", "-deps", ".").Output()
 	if err != nil {

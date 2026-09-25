@@ -5,8 +5,9 @@ import (
 	"time"
 )
 
-// The fields barman-cloud writes into base/<id>/backup.info, trimmed to the
-// ones read here and one neighbour of each kind.
+// doneInfo is a backup.info as barman-cloud writes it into base/<id>/, for a
+// completed backup. It keeps the fields this package reads and one neighbour
+// of each kind.
 const doneInfo = `backup_id=20260915T073203
 begin_time=2026-09-15 07:32:03.851231+00:00
 end_time=2026-09-15 07:32:19.219011+00:00
@@ -14,6 +15,8 @@ status=DONE
 systemid=7685661356187803671
 `
 
+// TestParseBackupInfoReadsTheEndToTheMicrosecond checks that a DONE backup is
+// reported as complete, with its ID and its end_time kept to the microsecond.
 func TestParseBackupInfoReadsTheEndToTheMicrosecond(t *testing.T) {
 	backup, done, err := ParseBackupInfo([]byte(doneInfo))
 	if err != nil {
@@ -31,7 +34,9 @@ func TestParseBackupInfoReadsTheEndToTheMicrosecond(t *testing.T) {
 	}
 }
 
-// barman-cloud writes no backup_id into backup.info; the ID is the directory.
+// TestABaseBackupIsNamedByItsDirectory checks that a backup.info with no
+// backup_id takes its ID from the directory that holds it. barman-cloud writes
+// no backup_id into backup.info.
 func TestABaseBackupIsNamedByItsDirectory(t *testing.T) {
 	// The ID format is barman's, as CloudNativePG reported it for the prod
 	// canary's Backup canary-namespace-backup-pg-a9158795: 20260924T224544.
@@ -45,6 +50,8 @@ func TestABaseBackupIsNamedByItsDirectory(t *testing.T) {
 	}
 }
 
+// TestParseBackupInfoSkipsABackupThatDidNotFinish checks that a FAILED backup
+// is reported as incomplete, without an error.
 func TestParseBackupInfoSkipsABackupThatDidNotFinish(t *testing.T) {
 	_, done, err := ParseBackupInfo([]byte("backup_id=x\nstatus=FAILED\n"))
 	if err != nil {
@@ -55,6 +62,8 @@ func TestParseBackupInfoSkipsABackupThatDidNotFinish(t *testing.T) {
 	}
 }
 
+// TestParseBackupInfoReadsAnEndWithoutMicroseconds checks that an end_time
+// written without a fraction of a second parses.
 func TestParseBackupInfoReadsAnEndWithoutMicroseconds(t *testing.T) {
 	backup, _, err := ParseBackupInfo([]byte("status=DONE\nend_time=2026-09-15 07:32:19+00:00\n"))
 	if err != nil {
@@ -65,6 +74,9 @@ func TestParseBackupInfoReadsAnEndWithoutMicroseconds(t *testing.T) {
 	}
 }
 
+// TestBaseBackupAtOrBefore checks that AtOrBefore picks the newest backup
+// finished by the given moment, and finds none for a moment before the first
+// backup finished.
 func TestBaseBackupAtOrBefore(t *testing.T) {
 	backups := []BaseBackup{
 		{ID: "a", End: time.Date(2026, 9, 13, 3, 0, 20, 0, time.UTC)},

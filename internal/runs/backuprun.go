@@ -19,34 +19,41 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// backupRunKind is the kind the Workload's owner reference names.
+// backupRunKind is the group, version and kind that the owner reference on a
+// BackupRun's Kueue Workload names.
 var backupRunKind = backupv1alpha1.GroupVersion.WithKind("BackupRun")
 
-// BackupRunReconciler runs one backup: of a volume, of a database, or of a
-// whole namespace.
+// BackupRunReconciler runs BackupRuns. A BackupRun backs up one volume, one
+// database, or every volume and database in its namespace that is marked
+// backup.wlz.li/enabled.
 type BackupRunReconciler struct {
 	client.Client
 
-	// Reader reads without the informer cache: Secrets, Workloads, LocalQueues
-	// and Kustomizations, which the controller has no reason to watch.
+	// Reader reads straight from the API server, without the informer cache.
+	// The run reads claims, ReplicationSources, Clusters, Secrets, pods,
+	// LocalQueues and Kustomizations through it. The controller has no reason
+	// to watch any of these kinds.
 	Reader client.Reader
 
-	// Snapshots lists a repository's snapshots, for the time restic stamped on
-	// the one a mover saved.
+	// Snapshots lists the snapshots in a restic repository. The run uses it to
+	// read the time restic stamped on the snapshot a mover saved.
 	Snapshots restic.Lister
 
-	// Retimer moves a quiesced run's snapshots to the moment it restarted the
-	// workloads and tags them quiesced.
+	// Retimer rewrites a snapshot with a new time and a tag. A quiesced run
+	// uses it to move each volume's snapshot to the moment the run started the
+	// workloads again, and to tag it quiesced.
 	Retimer restic.Retimer
 
 	// Recorder writes an event on the run each time its Ready reason changes.
 	Recorder events.EventRecorder
 
-	// Now is the clock, injected so tests can move time without sleeping.
+	// Now returns the current time. Tests replace it so they can move time
+	// forward without sleeping.
 	Now func() time.Time
 }
 
-// SetupWithManager registers the reconciler.
+// SetupWithManager registers the reconciler with mgr so it runs for every
+// BackupRun. It sets Now to time.Now when the caller left it unset.
 func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Now == nil {
 		r.Now = time.Now
@@ -57,12 +64,21 @@ func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// Reconcile drives one BackupRun from submitted to finished.
+// Reconcile moves the BackupRun that req names one step further, and requeues
+// until the run has finished.
 //
-// The run moves through four steps: it lists its items, waits for the queue to
-// admit it, stops the workloads marked for quiesce while it starts every
-// item, and collects each item's result. Each step reads the state the last
-// one recorded, so a reconcile that runs twice does the same thing twice.
+// A run goes through three stages, chosen by status.phase. With no phase, plan
+// lists the items to back up. In Queued, admit waits for the namespace's
+// LocalQueue to admit the run. From then on, work stops the workloads marked
+// for quiesce (on a run with spec.all set), starts every item, starts the
+// workloads again once the clones are cut, and collects each item's result.
+// Each stage acts only on what the last one wrote to the status, so a
+// reconcile that runs twice from the same status does the same thing twice.
+//
+// Before any stage, Reconcile adds the run's finalizer. A run being deleted
+// gets its changes put back by finalize, and a finished run is deleted once
+// spec.ttlSecondsAfterFinished has passed. Whenever the Ready reason changes
+// during a reconcile, Reconcile records an event on the run.
 func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.BackupRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -93,7 +109,9 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 }
 
-// plan resolves what the run backs up and records one item for each.
+// plan records one Pending item for each thing the run backs up and moves the
+// run to Queued. When items returns an error, plan ends the run as Failed with
+// reason Invalid and the error as the message.
 func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
 	items, err := r.items(ctx, run)
 	if err != nil {
@@ -106,8 +124,15 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 	return after(time.Second, r.writeStatus(ctx, run))
 }
 
-// items lists what the run's spec names. Everything it backs up has to be
-// marked backup.wlz.li/enabled, so a run and a schedule cover the same set.
+// items returns one Pending item for each thing the run's spec names.
+// spec.source names one claim, spec.database names one Cluster, and a run
+// with neither takes every claim and Cluster in the namespace. A claim's item
+// has kind ReplicationSource, after the VolSync object that backs it up.
+//
+// Everything the run backs up has to be marked backup.wlz.li/enabled: "true",
+// so a run and a schedule cover the same set. items returns an error when a
+// named claim or Cluster is missing or not marked, and when nothing in the
+// namespace is marked.
 func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.BackupRun) ([]backupv1alpha1.BackupItem, error) {
 	pending := func(kind, name string) backupv1alpha1.BackupItem {
 		return backupv1alpha1.BackupItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
@@ -163,8 +188,14 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 	}
 }
 
-// admit waits for the namespace's queue to admit the run as one Workload. A
-// namespace with no LocalQueue starts at once.
+// admit waits for the namespace's LocalQueue to admit the run, then moves the
+// run to Running and records status.startedAt. A namespace with no LocalQueue
+// starts the run at once.
+//
+// The run goes through Kueue as one Workload, which counts as one pod against
+// the queue's quota. Once Kueue admits it, admit marks the Workload PodsReady,
+// so that Kueue's waitForPodsReady does not evict it. While the Workload
+// waits, admit requeues after pollInterval.
 func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
 	queue, err := localQueue(ctx, r.Reader, run.Namespace)
 	if err != nil {
@@ -189,8 +220,9 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 		}
 	}
 
-	// A namespace timeout that does not parse fails the run before it starts
-	// anything, since no deadline could be kept.
+	// A backup.wlz.li/timeout on the namespace that does not parse fails the
+	// run here, before it stops or starts anything, because the run would
+	// have no deadline to keep.
 	if _, err := timeoutFor(ctx, r.Reader, run); err != nil {
 		var bad invalidSetting
 		if errors.As(err, &bad) {
@@ -205,8 +237,21 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 	return after(time.Second, r.writeStatus(ctx, run))
 }
 
-// work stops the quiesced workloads, starts every item, restarts the
-// workloads once every clone is cut, and collects the results.
+// work makes one pass over a run that the queue has admitted, and returns when
+// to look again.
+//
+// On a run with spec.all set, the first pass calls quiesce to stop the
+// workloads marked backup.wlz.li/quiesce and does nothing else. Later passes
+// start no item until every pod of those workloads is gone. work then starts
+// every Pending item. Once every volume's clone is cut, it scales the
+// workloads back up, resumes the Kustomizations it suspended, and records
+// status.restartedAt. Last, it collects the result of every Running item.
+//
+// The run finishes once every item is done and, on a run with spec.all set,
+// the workloads are running again. It finishes Succeeded when no item failed
+// and Failed otherwise. A run past its timeout is aborted. While the
+// workloads are stopped, work looks again every two seconds; otherwise it
+// waits pollInterval.
 func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
 	now := metav1.NewTime(r.Now())
 	deadline, over, err := r.overdue(ctx, run)
@@ -276,20 +321,28 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "backing up")
 	interval := pollInterval
 	if run.Spec.All && run.Status.RestartedAt == nil {
-		// The workloads are down until every clone is cut, so this wait
-		// looks more often than the others.
+		// The app stays down until every clone is cut, so the run looks
+		// more often here than in its other waits.
 		interval = 2 * time.Second
 	}
 	return after(interval, r.writeStatus(ctx, run))
 }
 
-// quiesce stops the marked workloads and records what it changed before
-// anything else happens, so a failure halfway is still undone by the
-// finalizer.
+// quiesce stops the workloads in the run's namespace that are marked
+// backup.wlz.li/quiesce: "true", and records in the status what it changed
+// before the run does anything else. It stores its now argument, the time of
+// this pass, in status.quiescedAt.
+//
+// stopWorkloads suspends the Flux Kustomizations that apply the workloads,
+// then scales each workload to zero. quiesce writes status.quiesced and
+// status.suspendedKustomizations even when stopping fails partway, so release
+// can still put back what was changed, and a failure then aborts the run.
+// When no workload is marked, quiesce sets status.restartedAt to the same
+// moment, because there is nothing to start again.
 func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (ctrl.Result, error) {
 	// A volume still busy with another run's backup would keep the stopped
-	// workloads down for as long as that backup takes, so the run waits with
-	// the workloads running.
+	// workloads down for as long as that backup takes. The run waits with the
+	// workloads still running.
 	for _, item := range run.Status.Items {
 		if item.Kind != "ReplicationSource" {
 			continue
@@ -322,8 +375,18 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 	return ctrl.Result{RequeueAfter: time.Second}, nil
 }
 
-// startItem triggers one item and returns a waiting message when the item has
-// to wait for another run.
+// startItem starts the backup of one Pending item and sets the item's phase.
+//
+// For a volume, it writes the claim's ReplicationSource with the run's manual
+// trigger tag and moves the item to Running. For a database, it creates a
+// CloudNativePG Backup and moves the item to Running, or skips the item when
+// the Cluster is hibernated. When something goes wrong, startItem marks the
+// item Failed with the reason in its message.
+//
+// It returns a message for the run's Ready condition when the item has to
+// wait, which happens when the volume's ReplicationSource is still completing
+// another run's backup. The item then stays Pending. Otherwise it returns an
+// empty string.
 func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) string {
 	switch item.Kind {
 	case "ReplicationSource":
@@ -364,10 +427,15 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 	return ""
 }
 
-// clonesCut reports whether every volume's clone exists, which is the moment
-// the stopped workloads can start again: VolSync uploads from the clone. A
-// source that already completed the tag has cut its clone too, which covers a
-// clone that came and went between two looks.
+// clonesCut reports whether VolSync has cut the clone of every volume the run
+// backs up. That is the moment the stopped workloads can start again, because
+// VolSync uploads from the clone and no longer reads the app's volume.
+//
+// A clone counts as cut when the claim volsync-<claim>-src is Bound. A
+// ReplicationSource that has already completed the run's trigger tag has cut
+// its clone too. That check catches a clone VolSync created and deleted
+// between two passes. A Pending volume item means no clone yet, and items
+// that failed or were skipped are left out.
 func (r *BackupRunReconciler) clonesCut(ctx context.Context, run *backupv1alpha1.BackupRun) bool {
 	for _, item := range run.Status.Items {
 		if item.Kind != "ReplicationSource" {
@@ -393,7 +461,18 @@ func (r *BackupRunReconciler) clonesCut(ctx context.Context, run *backupv1alpha1
 	return true
 }
 
-// collectItem records a started item's result once it has one.
+// collectItem records the result of a Running item once it has one, and
+// leaves the item Running until then.
+//
+// A volume item is done when its ReplicationSource has completed the run's
+// trigger tag. A failed mover fails the item with the mover's logs. A volume
+// with no files succeeds with Empty set, since VolSync takes no snapshot of
+// it. Otherwise the item records the snapshot ID the mover logged and the
+// time restic stamped on it. On a quiesced run, the snapshot is first moved to
+// status.restartedAt and tagged quiesced, and the item stays Running until
+// that rewrite succeeds.
+//
+// A database item follows the phase of its CloudNativePG Backup.
 func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) {
 	switch item.Kind {
 	case "ReplicationSource":
@@ -415,8 +494,9 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 			return
 		}
 		if quiesced(run) {
-			// The item stays Running until the rewrite goes through, so the run
-			// never reports success for a snapshot a synced restore cannot use.
+			// The item stays Running until the rewrite goes through. That way
+			// the run never reports success for a snapshot that a synced
+			// restore cannot use.
 			moved, err := r.retime(ctx, run.Namespace, item.Name, snapshot, run.Status.RestartedAt.Time)
 			if err != nil {
 				item.Message = fmt.Sprintf("snapshot %s is saved and waits to be moved to %s and tagged %s: %v",
@@ -446,13 +526,29 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 	}
 }
 
-// quiesced reports whether the run stopped workloads and started them again,
-// which is what gives its snapshots a moment nothing was written.
+// quiesced reports whether the run stopped at least one workload and has
+// started the workloads again. Only such a run has a moment when nothing wrote
+// to the volumes or the databases, which is what its snapshots are moved to.
 func quiesced(run *backupv1alpha1.BackupRun) bool {
 	return run.Spec.All && len(run.Status.Quiesced) > 0 && run.Status.RestartedAt != nil
 }
 
-// retime moves the snapshot a mover saved to at and tags it quiesced.
+// retime moves the snapshot a mover saved to a new time and tags it quiesced,
+// so a RestoreRun with syncDatabaseToVolume can find it.
+//
+// Parameters:
+//   - namespace and claimName name the claim that was backed up. retime reads
+//     the repository Secret through the claim's VolumeRestore.
+//   - short is the snapshot ID the mover logged, eight hex characters or
+//     more. It is empty when the mover logged no snapshot.
+//   - at is the time the snapshot should carry. collectItem passes the run's
+//     status.restartedAt.
+//
+// It returns the rewritten snapshot, which has a new ID. It returns an error
+// when the mover logged no snapshot, when the reconciler has no Retimer, when
+// the Secret can't be read, and when the rewrite fails. A *restic.LockedError
+// means another process holds a lock on the repository, and the caller tries
+// again on its next pass.
 func (r *BackupRunReconciler) retime(ctx context.Context, namespace, claimName, short string, at time.Time) (restic.Snapshot, error) {
 	if short == "" || r.Retimer == nil {
 		return restic.Snapshot{}, fmt.Errorf("the mover logged no snapshot")
@@ -464,7 +560,9 @@ func (r *BackupRunReconciler) retime(ctx context.Context, namespace, claimName, 
 	return r.Retimer.Retime(ctx, secret, short, at, restic.QuiescedTag)
 }
 
-// repositorySecret reads the restic Secret the claim's VolumeRestore names.
+// repositorySecret reads the Secret holding the restic repository settings
+// for the claim named claimName. It finds the Secret's name in
+// spec.repository of the claim's VolumeRestore.
 func (r *BackupRunReconciler) repositorySecret(ctx context.Context, namespace, claimName string) (*corev1.Secret, error) {
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: claimName}, claim); err != nil {
@@ -481,7 +579,11 @@ func (r *BackupRunReconciler) repositorySecret(ctx context.Context, namespace, c
 	return secret, nil
 }
 
-// snapshotTime reads the time restic stamped on the snapshot a mover saved.
+// snapshotTime reads the time restic stamped on a snapshot a mover saved. It
+// lists the repository of the claim named claimName and looks for the
+// snapshot whose ID starts with the prefix in short. It returns an error when
+// that prefix is empty, when the reconciler has no Snapshots lister, and when
+// the repository holds no such snapshot.
 func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claimName, short string) (*metav1.Time, error) {
 	if short == "" || r.Snapshots == nil {
 		return nil, fmt.Errorf("the mover logged no snapshot")
@@ -501,8 +603,10 @@ func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claim
 	return newTime(metav1.NewTime(found.Time)), nil
 }
 
-// abort ends a run early: it restarts what it stopped, marks every unfinished
-// item failed, and gives the queue its slot back.
+// abort ends a run early as Failed. It marks every Pending or Running item as
+// Failed with the given message, then calls finish, which starts the stopped
+// workloads again and deletes the run's Workload so the queue gets its slot
+// back.
 func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, message string) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
@@ -513,8 +617,11 @@ func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Bac
 	return r.finish(ctx, run, backupv1alpha1.ReasonFailed, message)
 }
 
-// finish restarts any workload still stopped, removes the Workload, and
-// records the terminal phase.
+// finish ends the run. It starts any workload the run still holds stopped,
+// deletes the run's Workload, and records the terminal phase: Succeeded when
+// reason is ReasonSucceeded and Failed for any other reason. It sets the
+// Ready condition to reason and message, records status.completedAt, and
+// removes the finalizer.
 func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
 	if err := r.release(ctx, run); err != nil {
 		return err
@@ -533,7 +640,10 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 	return dropFinalizer(ctx, r.Client, run)
 }
 
-// release puts back what the run changed on the cluster.
+// release puts back what the run changed in the cluster. When the run stopped
+// workloads and has not started them again, release scales them back up,
+// resumes the Kustomizations it suspended, and records status.restartedAt. It
+// then deletes the run's Workload.
 func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.BackupRun) error {
 	if run.Status.QuiescedAt != nil && run.Status.RestartedAt == nil {
 		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
@@ -544,7 +654,8 @@ func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.B
 	return deleteWorkload(ctx, r.Client, run.Namespace, run.UID)
 }
 
-// finalize puts back what a run deleted mid-flight changed.
+// finalize puts back what a run changed when the run is deleted before it
+// finished, then removes the finalizer so the deletion can complete.
 func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.BackupRun) error {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return nil
@@ -555,9 +666,12 @@ func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.
 	return dropFinalizer(ctx, r.Client, run)
 }
 
-// overdue reports whether the run has worked past its timeout, which
-// timeoutFor resolves on every check, so a namespace annotation changed during
-// a run moves its deadline.
+// overdue returns the run's deadline and reports whether the run has worked
+// past it. The deadline is status.startedAt plus the timeout, and a run that
+// has not started is never overdue.
+//
+// timeoutFor resolves the timeout again on every check, so a change to the
+// namespace's backup.wlz.li/timeout during a run moves the run's deadline.
 func (r *BackupRunReconciler) overdue(ctx context.Context, run *backupv1alpha1.BackupRun) (time.Time, bool, error) {
 	if run.Status.StartedAt == nil {
 		return time.Time{}, false, nil
@@ -570,12 +684,15 @@ func (r *BackupRunReconciler) overdue(ctx context.Context, run *backupv1alpha1.B
 	return deadline, !r.Now().Before(deadline), nil
 }
 
+// waitFor moves the run to Waiting, sets its Ready condition to False with
+// reason and message, and writes the status.
 func (r *BackupRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
 	run.Status.Phase = backupv1alpha1.RunPhaseWaiting
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
 	return r.writeStatus(ctx, run)
 }
 
+// writeStatus writes the run's status subresource.
 func (r *BackupRunReconciler) writeStatus(ctx context.Context, run *backupv1alpha1.BackupRun) error {
 	if err := r.Status().Update(ctx, run); err != nil {
 		return fmt.Errorf("set BackupRun %s/%s status: %w", run.Namespace, run.Name, err)
@@ -583,7 +700,8 @@ func (r *BackupRunReconciler) writeStatus(ctx context.Context, run *backupv1alph
 	return nil
 }
 
-// anyPending reports whether an item has not been started.
+// anyPending reports whether any item is still Pending, which means the run
+// has not started it yet.
 func anyPending(items []backupv1alpha1.BackupItem) bool {
 	for _, item := range items {
 		if item.Phase == backupv1alpha1.ItemPending {
@@ -593,7 +711,8 @@ func anyPending(items []backupv1alpha1.BackupItem) bool {
 	return false
 }
 
-// allDone reports whether every item reached a terminal phase.
+// allDone reports whether every item has left Pending and Running, so none
+// has anything more to do.
 func allDone(items []backupv1alpha1.BackupItem) bool {
 	for _, item := range items {
 		if item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning {
@@ -603,7 +722,9 @@ func allDone(items []backupv1alpha1.BackupItem) bool {
 	return true
 }
 
-// failures names the failed items, empty when none failed.
+// failures returns one line per failed item, naming its kind, its name and
+// its message, joined with "; ". It returns an empty string when no item
+// failed.
 func failures(items []backupv1alpha1.BackupItem) string {
 	message := ""
 	for _, item := range items {
@@ -617,7 +738,9 @@ func failures(items []backupv1alpha1.BackupItem) string {
 	return message
 }
 
-// summary says what a successful run captured.
+// summary returns the Ready message for a run that succeeded. It says for
+// each item what it captured: the snapshot a volume saved, the Backup a
+// database completed, or why the item was skipped or had nothing to save.
 func summary(items []backupv1alpha1.BackupItem) string {
 	message := ""
 	for _, item := range items {
@@ -640,7 +763,9 @@ func summary(items []backupv1alpha1.BackupItem) string {
 	return message
 }
 
-// dropFinalizer removes the run's finalizer once nothing of it is left.
+// dropFinalizer removes the run's finalizer, if it still has one. Callers
+// call it last, once the run has put back everything it changed. Both
+// BackupRuns and RestoreRuns use it.
 func dropFinalizer(ctx context.Context, c client.Client, run client.Object) error {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return nil
@@ -652,8 +777,19 @@ func dropFinalizer(ctx context.Context, c client.Client, run client.Object) erro
 	return nil
 }
 
-// expire deletes a finished run once its TTL has passed, and requeues until
-// then. A run with no TTL is kept.
+// expire deletes a finished run once its time to live has passed, and
+// requeues the run for that moment until then. Both BackupRuns and
+// RestoreRuns use it.
+//
+// Parameters:
+//   - run is the finished BackupRun or RestoreRun.
+//   - ttl is the run's spec.ttlSecondsAfterFinished. When it is nil, the run
+//     is kept for good.
+//   - completed is the run's status.completedAt, which the time to live
+//     counts from.
+//   - now is the reconciler's current time.
+//
+// A run that is already gone when expire deletes it is not an error.
 func expire(ctx context.Context, c client.Client, run client.Object, ttl *int32, completed *metav1.Time, now time.Time) (ctrl.Result, error) {
 	if ttl == nil || completed == nil {
 		return ctrl.Result{}, nil

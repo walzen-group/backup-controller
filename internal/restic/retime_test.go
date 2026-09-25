@@ -15,17 +15,20 @@ import (
 	"time"
 )
 
+// sundayID and mondayID are the full IDs of the fixture's two snapshots, taken
+// on Sunday 20 and Monday 21 September 2026.
 const (
 	sundayID = "49319ee865f4a00a86a35af5edf18730836cb27e770aba03ceca2de36a37be0f"
 	mondayID = "88dc3648f06c94f727f601cb69653191e7e79602d36965a8e7892388d7875b81"
 )
 
-// quiescedAt is a moment inside a quiesce window, a few seconds before the
-// time restic stamped on the monday snapshot.
+// quiescedAt is a moment inside a quiesce window, three seconds before the time
+// restic stamped on the Monday snapshot.
 var quiescedAt = time.Date(2026, 9, 21, 4, 59, 57, 0, time.UTC)
 
-// writableFixture copies the fixture repository into a temporary directory the
-// test may write to, and opens it.
+// writableFixture copies the fixture repository into a temporary directory that
+// the test may write to, opens it, and turns off the lock protocol's pause for
+// the test.
 func writableFixture(t *testing.T) (DirStore, *Repository) {
 	t.Helper()
 	dir := t.TempDir()
@@ -47,6 +50,7 @@ func writableFixture(t *testing.T) (DirStore, *Repository) {
 		t.Fatalf("copy the fixture: %v", err)
 	}
 	// A fresh clone has no locks/, because git keeps no empty directory.
+	// Removing it here makes every run start the way a fresh clone does.
 	if err := os.RemoveAll(filepath.Join(dir, "locks")); err != nil {
 		t.Fatal(err)
 	}
@@ -60,8 +64,9 @@ func writableFixture(t *testing.T) (DirStore, *Repository) {
 	return store, repo
 }
 
-// withoutLockWait drops the pause restic makes between writing its lock and
-// checking for others, so the tests do not sleep.
+// withoutLockWait sets lockCheckDelay to zero for the length of the test, so
+// the tests don't sleep through restic's pause between writing a lock and
+// checking for others.
 func withoutLockWait(t *testing.T) {
 	t.Helper()
 	saved := lockCheckDelay
@@ -69,7 +74,7 @@ func withoutLockWait(t *testing.T) {
 	t.Cleanup(func() { lockCheckDelay = saved })
 }
 
-// document decrypts one file of the repository into its JSON fields.
+// document decrypts one file of the repository and returns its JSON fields.
 func document(t *testing.T, store DirStore, repo *Repository, name string) map[string]json.RawMessage {
 	t.Helper()
 	sealed, err := store.Get(context.Background(), name)
@@ -94,8 +99,8 @@ func document(t *testing.T, store DirStore, repo *Repository, name string) map[s
 // moverHost is the hostname a VolSync mover pod writes into its locks.
 const moverHost = "volsync-src-notes-data-abcde"
 
-// placeLock writes a lock file the way restic does, for the host and process
-// given.
+// placeLock writes a lock file the way restic does, with the time, kind, host
+// and PID given.
 func placeLock(t *testing.T, store DirStore, repo *Repository, at time.Time, exclusive bool, host string, pid int) {
 	t.Helper()
 	plain, err := json.Marshal(map[string]any{"time": at, "exclusive": exclusive, "hostname": host, "pid": pid})
@@ -112,6 +117,7 @@ func placeLock(t *testing.T, store DirStore, repo *Repository, at time.Time, exc
 	}
 }
 
+// lockFiles returns the names of the lock files in the repository.
 func lockFiles(t *testing.T, store DirStore) []string {
 	t.Helper()
 	names, err := store.List(context.Background(), "locks")
@@ -121,10 +127,11 @@ func lockFiles(t *testing.T, store DirStore) []string {
 	return names
 }
 
-// A quiesced backup's snapshot is written again with the quiesce moment as its
-// time and the quiesced tag, the way restic rewrite --forget --new-time does:
-// a new snapshot file replaces the old one, which the new one names as its
-// original.
+// TestRetimeReplacesTheSnapshotWithOneAtTheNewTime checks that Retime replaces
+// a quiesced backup's snapshot with a new snapshot file. The new file carries
+// the quiesce moment as its time, the quiesced tag, and the old ID in its
+// original field, as restic rewrite --forget --new-time would write it. The
+// other snapshot stays as it was, and no lock is left behind.
 func TestRetimeReplacesTheSnapshotWithOneAtTheNewTime(t *testing.T) {
 	store, repo := writableFixture(t)
 
@@ -155,9 +162,10 @@ func TestRetimeReplacesTheSnapshotWithOneAtTheNewTime(t *testing.T) {
 	}
 }
 
-// The rewrite changes the time, the tags and the original and carries every
-// other field over, so restic still finds the tree and groups the snapshot with
-// the others for forget.
+// TestRetimeKeepsTheSnapshotsOtherFields checks that the rewrite changes only
+// the time, the tags and the original field, and copies every other field
+// unchanged. Those fields let restic find the snapshot's tree and group the
+// snapshot with the others for forget.
 func TestRetimeKeepsTheSnapshotsOtherFields(t *testing.T) {
 	store, repo := writableFixture(t)
 	before := document(t, store, repo, path.Join("snapshots", mondayID))
@@ -179,8 +187,10 @@ func TestRetimeKeepsTheSnapshotsOtherFields(t *testing.T) {
 	}
 }
 
-// A controller that restarts after writing the new snapshot and before
-// recording it asks again with the old ID, and gets the snapshot it wrote.
+// TestRetimeAgainReturnsTheFirstRewrite checks that a second Retime with the
+// old ID returns the snapshot the first one wrote, and writes nothing more. A
+// controller that restarts after the rewrite and before it records the new ID
+// makes exactly that second call.
 func TestRetimeAgainReturnsTheFirstRewrite(t *testing.T) {
 	_, repo := writableFixture(t)
 
@@ -204,9 +214,10 @@ func TestRetimeAgainReturnsTheFirstRewrite(t *testing.T) {
 	}
 }
 
-// A lock another process holds, even a shared one a backup takes, keeps the
-// exclusive lock the rewrite needs. The rewrite writes nothing and takes its
-// own lock back out.
+// TestRetimeBacksOffFromAnotherLock checks that Retime returns a *LockedError
+// and writes nothing while another process holds a lock, even a shared one
+// such as a backup takes. The rewrite needs the exclusive lock, which no other
+// lock may share. Retime also removes its own lock before it returns.
 func TestRetimeBacksOffFromAnotherLock(t *testing.T) {
 	store, repo := writableFixture(t)
 	placeLock(t, store, repo, time.Now().Add(-time.Minute), false, moverHost, 12)
@@ -231,8 +242,10 @@ func TestRetimeBacksOffFromAnotherLock(t *testing.T) {
 	}
 }
 
-// restic refreshes a live lock every five minutes and calls one older than
-// thirty minutes stale, so a lock that old belongs to a process that is gone.
+// TestRetimeIgnoresAStaleLock checks that Retime goes ahead past a lock older
+// than thirty minutes. restic refreshes a live lock every five minutes and
+// calls a lock older than thirty minutes stale, so a lock that old belongs to
+// a process that is gone.
 func TestRetimeIgnoresAStaleLock(t *testing.T) {
 	store, repo := writableFixture(t)
 	placeLock(t, store, repo, time.Now().Add(-31*time.Minute), true, moverHost, 12)
@@ -242,10 +255,11 @@ func TestRetimeIgnoresAStaleLock(t *testing.T) {
 	}
 }
 
-// restic's prune checks for other locks without skipping stale ones, so a lock
-// the controller failed to remove would stop every prune until someone runs
-// restic unlock. A lock carrying this process's host and PID is one it wrote
-// itself, and the next retime removes it.
+// TestRetimeRemovesALockThisProcessLeftBehind checks that Retime removes a lock
+// that carries this process's host and PID, which this process wrote and
+// failed to remove. restic's prune checks for other locks without skipping
+// stale ones, so a lock like that would stop every prune until someone ran
+// restic unlock.
 func TestRetimeRemovesALockThisProcessLeftBehind(t *testing.T) {
 	store, repo := writableFixture(t)
 	host, err := os.Hostname()
@@ -262,6 +276,8 @@ func TestRetimeRemovesALockThisProcessLeftBehind(t *testing.T) {
 	}
 }
 
+// TestRetimeOfAnUnknownSnapshotSaysSo checks that Retime returns an error for
+// an ID the repository doesn't hold.
 func TestRetimeOfAnUnknownSnapshotSaysSo(t *testing.T) {
 	_, repo := writableFixture(t)
 	if _, err := repo.Retime(context.Background(), "ffffffff", quiescedAt, QuiescedTag); err == nil {

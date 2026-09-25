@@ -2,17 +2,19 @@ package main
 
 import "flag"
 
-// kubeconfigFlag returns a reader for the --kubeconfig flag, registering it
-// only if nothing already has.
+// kubeconfigFlag returns a function that reads the --kubeconfig flag from fs.
+// It registers the flag only when fs doesn't already have one, and otherwise
+// reads the existing flag. main passes flag.CommandLine.
 //
-// controller-runtime's pkg/client/config registers a --kubeconfig flag in its
-// init, so importing controller-runtime at all puts one on the default FlagSet
-// before main runs. Declaring a second panics the process at startup with
-// "flag redefined: kubeconfig", which no unit test catches because none of them
-// calls main: v0.2.0 shipped that way and crashlooped on the cluster.
+// controller-runtime's pkg/client/config registers a --kubeconfig flag on the
+// default FlagSet in its init function, so any binary that imports
+// controller-runtime has one before main runs. Registering a second one panics
+// at startup with "flag redefined: kubeconfig". No unit test catches that,
+// because none of them calls main, and v0.2.0 shipped that way and crashlooped
+// on the cluster.
 //
-// Reusing whichever flag exists keeps the binary's interface the same whoever
-// registered it, and keeps working if that dependency stops registering one.
+// Reading whichever flag exists keeps the command line the same no matter who
+// registered it, and keeps working if the dependency stops registering one.
 func kubeconfigFlag(fs *flag.FlagSet) func() string {
 	const name = "kubeconfig"
 	if existing := fs.Lookup(name); existing != nil {

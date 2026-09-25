@@ -11,7 +11,9 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// grant is one thing the controller does and the rule that has to allow it.
+// grant is one permission the controller needs: the API group, the resource
+// and the verbs a ClusterRole rule has to allow, and why the controller needs
+// them.
 type grant struct {
 	group    string
 	resource string
@@ -19,14 +21,15 @@ type grant struct {
 	why      string
 }
 
-// grants is every permission this controller needs, and where each comes from.
+// grants lists every permission this controller needs, each with the reason
+// it needs it.
 //
-// The first block is not ours. lib-volume-populator builds an informer per
-// resource and waits for all of them to sync before the controller runs at all
-// (populator-machinery/controller.go:287-291 and :542), so a missing read there
-// stops everything while the Deployment still reports Available. That is how
-// v0.1.1 shipped without pods: the RBAC had been written from what the
-// callbacks call, and the informers call nothing.
+// The first block is for lib-volume-populator's informers. The library builds
+// an informer per resource and waits for all of them to sync before the
+// controller runs at all (populator-machinery/controller.go:287-291 and
+// :542). A missing read there stops everything while the Deployment still
+// reports Available. That is how v0.1.1 shipped without pods: its RBAC listed
+// the calls the callbacks make, and the informers' reads are not among them.
 var grants = []grant{
 	{"", "persistentvolumeclaims", []string{"get", "list", "watch"}, "the library's claim informer"},
 	{"", "persistentvolumes", []string{"get", "list", "watch"}, "the library's volume informer"},
@@ -60,10 +63,13 @@ var grants = []grant{
 	{"kueue.x-k8s.io", "localqueues", []string{"list"}, "the queue a namespace's runs are admitted through"},
 }
 
-// v0.1.1 installed cleanly, reported Running and Available, and filled nothing,
-// because its ClusterRole could not list pods. Nothing caught it: the offline
-// check compared deploy/rbac.yaml against a table in the docs, and both had
-// been written from the same wrong premise.
+// TestTheClusterRoleCoversEverythingTheControllerDoes checks that the
+// ClusterRole in deploy/rbac.yaml allows every verb in grants.
+//
+// v0.1.1 installed cleanly, reported Running and Available, and filled
+// nothing, because its ClusterRole could not list pods. Nothing caught it. The
+// offline check compared deploy/rbac.yaml against a table in the docs, and
+// both had been written from the same wrong premise.
 func TestTheClusterRoleCoversEverythingTheControllerDoes(t *testing.T) {
 	role := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
 
@@ -77,8 +83,10 @@ func TestTheClusterRoleCoversEverythingTheControllerDoes(t *testing.T) {
 	}
 }
 
-// The chart and deploy/ install the same controller, so a permission added to
-// one and forgotten in the other is an install that works only one way.
+// TestTheChartGrantsTheSameRulesAsDeploy checks that the chart's
+// templates/rbac.yaml names a rule for every resource in grants. The chart and
+// deploy/ install the same controller, so a permission added to one and
+// forgotten in the other gives an install that works only one way.
 func TestTheChartGrantsTheSameRulesAsDeploy(t *testing.T) {
 	chart, err := os.ReadFile(filepath.Join("..", "..", "chart", "templates", "rbac.yaml"))
 	if err != nil {
@@ -95,6 +103,8 @@ func TestTheChartGrantsTheSameRulesAsDeploy(t *testing.T) {
 	}
 }
 
+// allows reports whether any rule in the role grants the verb, or the "*"
+// wildcard, on the resource in the API group.
 func allows(role *rbacv1.ClusterRole, group, resource, verb string) bool {
 	for _, rule := range role.Rules {
 		if !contains(rule.APIGroups, group) || !contains(rule.Resources, resource) {
@@ -107,6 +117,7 @@ func allows(role *rbacv1.ClusterRole, group, resource, verb string) bool {
 	return false
 }
 
+// contains reports whether haystack holds needle.
 func contains(haystack []string, needle string) bool {
 	for _, item := range haystack {
 		if item == needle {
@@ -116,6 +127,8 @@ func contains(haystack []string, needle string) bool {
 	return false
 }
 
+// resourceName returns the resource qualified by its API group, such as
+// clusters.postgresql.cnpg.io, or the bare resource for the core group.
 func resourceName(group, resource string) string {
 	if group == "" {
 		return resource
@@ -123,6 +136,8 @@ func resourceName(group, resource string) string {
 	return resource + "." + group
 }
 
+// readClusterRole returns the first ClusterRole in the multi-document YAML
+// file at path, and fails the test when the file holds none.
 func readClusterRole(t *testing.T, path string) *rbacv1.ClusterRole {
 	t.Helper()
 	content, err := os.ReadFile(path)
