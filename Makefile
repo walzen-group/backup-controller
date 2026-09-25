@@ -14,7 +14,7 @@ FIXTURES := nix develop .\#fixtures -c
 # copy, because kustomize and helm both read a directory of their own. Every
 # generated file is copied, so a new kind needs no edit here.
 
-.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic
+.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic fixtures-barman
 
 ## build: compile every package.
 build:
@@ -40,11 +40,15 @@ envtest:
 	$(ENVTEST) go test -tags envtest ./...
 
 ## fixtures: re-record every checked-in fixture that real programs produce. Run it after a pin in versions.json moves; check fails until it has.
-fixtures: fixtures-restic
+fixtures: fixtures-restic fixtures-barman
 
 ## fixtures-restic: re-record the restic repositories and restic's verdicts under internal/restic/testdata/recorded.
 fixtures-restic:
-	$(FIXTURES) hack/testdata/restic-fixtures.sh
+	$(FIXTURES) hack/fixtures/restic.sh
+
+## fixtures-barman: re-record the barman stores, barman's verdicts and RustFS's answers under internal/testinfra/barmanstore/recorded.
+fixtures-barman:
+	$(FIXTURES) hack/fixtures/barman-stores.sh
 
 ## generate: regenerate deepcopy functions into the API package.
 generate:
