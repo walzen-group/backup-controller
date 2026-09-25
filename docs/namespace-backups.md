@@ -130,7 +130,9 @@ seconds; lines repeating the one before are left out:
 22:16:00 phase=Succeeded replicas=1/1 clone=
 ```
 
-Its status afterwards, trimmed to the fields this page discusses:
+Its status afterwards, on v0.5.4, trimmed to the fields this page discusses. A
+run on v0.6.0 or later also moves the snapshot to `restartedAt`, as
+[Quiesced snapshots](#quiesced-snapshots) shows:
 
 ```yaml
 items:
@@ -170,13 +172,75 @@ restartedAt: "2026-09-24T22:15:45Z"
    its replicas back and resumes only the Kustomizations it suspended. The
    upload continues from the clone.
 5. It reads the snapshot each mover logged, `snapshot d1cb7739 saved`, and the
-   time restic stamped on it from the repository itself, then deletes the
-   Workload.
+   time restic stamped on it from the repository itself. When step 2 stopped a
+   workload, it writes the snapshot again at `restartedAt`, as the next section
+   describes. Then it deletes the Workload.
 
 A finalizer performs step 4 and deletes the Workload on failure, on timeout and
 when the run is deleted. The canary's writer was down 34 seconds, most of it the
 pod's 30-second termination grace, because its shell loop does not handle
 SIGTERM.
+
+### Quiesced snapshots
+
+restic stamps a snapshot with the moment `restic backup` starts. The mover
+starts it once the clone is Bound, which is when step 4 gives the app its
+replicas back, so the stamp can fall after the app has written again, and a
+database recovered to it would hold rows the volume lacks.
+
+A run that stopped workloads therefore writes each volume's snapshot again once
+the mover is done. The new snapshot carries the run's `restartedAt` as its time
+and the tag `quiesced`, and names the snapshot the mover wrote as its
+`original`; the controller then deletes that one. `restic rewrite --forget
+--new-time` makes the same change, and `restic tag --add` the tag. Nothing
+wrote between the last pod stopping and `restartedAt`: the controller reads the
+clock at the start of the reconcile that gives the replicas back, and that
+reconcile runs after the one that found the pods gone.
+
+The 11:45 scheduled run on the prod canary, on v0.6.0. Its mover logged, in the
+ReplicationSource's `status.latestMoverStatus.logs`:
+
+```text
+using parent snapshot 2193fdf9
+Added to the repository: 13.948 KiB (1.560 KiB stored)
+processed 1 files, 13.494 KiB in 0:00
+snapshot da4d7eb4 saved
+Restic completed in 2s
+```
+
+The run recorded the rewritten snapshot, at `restartedAt`:
+
+```yaml
+items:
+  - kind: ReplicationSource
+    name: canary-namespace-backup-data
+    phase: Succeeded
+    snapshot: 04833d50
+    snapshotTime: "2026-09-25T11:45:48Z"
+quiesced:
+  - kind: Deployment
+    name: canary-namespace-backup
+    replicas: 1
+quiescedAt: "2026-09-25T11:45:10Z"
+restartedAt: "2026-09-25T11:45:48Z"
+```
+
+The 12:00 run's mover, restic 0.18.1, took the rewritten snapshot as its parent:
+
+```text
+using parent snapshot 04833d50
+Added to the repository: 14.256 KiB (1.582 KiB stored)
+processed 1 files, 13.802 KiB in 0:00
+snapshot 563cd92c saved
+Restic completed in 3s
+```
+
+The controller holds restic's exclusive lock while it writes, and restic's own
+`prune` holds the same one. Any other lock in locks/ keeps the rewrite waiting,
+shared ones included, apart from a lock older than restic's 30-minute stale
+limit. While one is held, the volume's item stays Running with a message naming
+the lock's host, and the run tries again at its next poll, so it never reports
+Succeeded for a snapshot left untagged.
 
 ### Sources the controller writes
 
@@ -257,6 +321,13 @@ Each accepts `restoreAsOf`. A volume restores the newest snapshot taken at or
 before it, and a database replays WAL to it exactly. Left out, a volume restores
 its newest snapshot and a database the end of its WAL archive.
 
+A run with `all: true` also accepts `syncDatabaseToVolume`, which recovers the
+databases to the moment the volumes' snapshot holds. Every run except an `into`
+restore accepts `quiesce`, a list of workloads the run stops while it restores.
+The `backup.wlz.li/quiesce` annotation plays no part in a restore. [Restore a
+whole namespace to one moment](#restore-a-whole-namespace-to-one-moment) uses
+both.
+
 ### Checks before anything is touched
 
 The run lists each claim's snapshots and each Cluster's base backups first. An
@@ -328,6 +399,69 @@ database holds every row to 22:16:30. The row at 22:15:47 is in the database
 and not on the volume: each side goes to its own newest point at or before the
 moment, by design.
 
+### Restore a whole namespace to one moment
+
+Add `syncDatabaseToVolume: true` to a run with `all: true`, and the databases
+recover to the time on the volumes' snapshot. Add the app's workloads under
+`quiesce`, and the run stops them and gives them back itself. The run used on
+the prod canary on v0.7.0:
+
+```yaml
+apiVersion: backup.wlz.li/v1alpha1
+kind: RestoreRun
+metadata:
+  name: synced
+  namespace: canary-namespace-backup
+spec:
+  all: true
+  syncDatabaseToVolume: true
+  quiesce:
+    - kind: Deployment
+      name: canary-namespace-backup
+```
+
+1. At its checks the run keeps only the snapshots tagged `quiesced`, selects the
+   newest at or before `restoreAsOf` (the newest of all without one), and
+   records its time as `status.syncedTo`. A claim with no such snapshot fails
+   the run with `the repository holds no snapshot tagged quiesced; only a
+   BackupRun that stopped the workloads writes one`, and so do two claims whose
+   snapshots carry different times. A listed workload the namespace does not
+   hold fails it too.
+2. It suspends each listed workload's Flux Kustomization, scales the workload to
+   zero, and waits until no pod of it is left.
+3. It restores each volume with `restoreAsOf` set to `syncedTo`. The quiesced
+   snapshot carries exactly that time, so the mover selects it.
+4. It deletes each Cluster, then gives the workloads their replicas back and
+   resumes the Kustomizations it suspended. A suspended Kustomization would never
+   create the Cluster again, and resuming it reapplies the replicas as well.
+5. When the Cluster is created again, the webhook sets its `targetTime` to
+   `syncedTo`.
+
+The run's status while it waited for the canary's apply, printed by `kubectl
+get restorerun synced -o jsonpath=...` with each field labelled:
+
+```text
+Waiting syncedTo=2026-09-25T12:30:46Z quiescedAt=2026-09-25T12:31:22Z restartedAt=2026-09-25T12:32:14Z
+WaitingForRecreate: recreate canary-namespace-backup-pg to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it
+PersistentVolumeClaim canary-namespace-backup-data Succeeded e36a856c
+Cluster canary-namespace-backup-pg Deleted  20260925T123045
+```
+
+`syncedTo` is the 12:30 scheduled run's `restartedAt`. The writer's last report
+before the restore, and its first after it:
+
+```text
+2026-09-25T12:30:48Z db=[718 2026-09-25T12:28:52Z,2026-09-25T12:29:52Z,2026-09-25T12:30:48Z] file=[704 2026-09-25T12:28:52Z,2026-09-25T12:29:52Z,2026-09-25T12:30:48Z]
+start db=[717 2026-09-25T12:27:52Z,2026-09-25T12:28:52Z,2026-09-25T12:29:52Z] file=[703 2026-09-25T12:27:52Z,2026-09-25T12:28:52Z,2026-09-25T12:29:52Z]
+```
+
+Both sides end at 12:29:52, the last tick before the 12:30 run stopped the
+writer, and the 12:30:48 tick is gone from both. The counts stay 14 apart
+because an earlier automatic restore, which aligns nothing, brought this
+database back 14 ticks ahead of the volume. The writer got its replica back
+while the Cluster was still recovering, and its log shows connection errors
+until CloudNativePG reported the Cluster healthy.
+
 ## Automatic restore
 
 A claim filled by its VolumeRestore and a Cluster created by Flux or tofu
@@ -384,6 +518,16 @@ PodMonitor sets honorLabels for that reason.
 The restore checks and each BackupRun's snapshot time read the repository's own
 files through the S3 client, in internal/restic: the key file opened with scrypt
 and the repository password, snapshots decrypted with AES-256-CTR and checked
-with Poly1305-AES, and repository version 2's zstd header handled. Its tests read
-a fixture restic 0.19.1 wrote. The controller runs no restic binary and pins no
-image beside VolSync's.
+with Poly1305-AES, and repository version 2's zstd header handled.
+
+A quiesced snapshot is written the same way in reverse: its JSON goes in
+uncompressed, which restic reads in repository versions 1 and 2, encrypted under
+a random IV and stored under the SHA-256 of the encrypted file. The lock follows
+restic 0.18.1's internal/restic/lock.go: check locks/ for other locks, write
+its own, wait 200 ms, check again, and remove its own on a conflict. A lock
+carrying the controller's own hostname and PID is one it failed to remove
+earlier, and the next rewrite deletes it, because restic's `prune` never skips
+a stale lock.
+
+The tests read, and rewrite a copy of, a fixture restic 0.19.1 wrote. The
+controller runs no restic binary and pins no image beside VolSync's.

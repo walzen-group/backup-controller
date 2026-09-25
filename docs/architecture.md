@@ -10,7 +10,8 @@
 
 internal/volsync builds the ReplicationDestinations both the populator and a
 RestoreRun create, and internal/restic reads a repository's snapshots for the
-restore checks and each BackupRun's `snapshotTime`. Databases below covers the
+restore checks and each BackupRun's `snapshotTime`, and rewrites a quiesced
+run's snapshots. Databases below covers the
 database side of all three parts; the sections after it are about the
 populator, and the volume runs are in [namespace-backups.md](namespace-backups.md).
 
@@ -35,8 +36,10 @@ On objects the controller does not own:
 
 | Object | Write | When |
 | --- | --- | --- |
-| Deployment or StatefulSet marked `backup.wlz.li/quiesce` | `spec.replicas` to 0, then back to the recorded value | during a run with `all: true` |
-| the workload's Flux Kustomization | `spec.suspend` on, then off, only when the run found it running | the same |
+| Deployment or StatefulSet marked `backup.wlz.li/quiesce` | `spec.replicas` to 0, then back to the recorded value | during a BackupRun with `all: true` |
+| Deployment or StatefulSet a RestoreRun's `quiesce` lists | the same | from the RestoreRun's start until its volumes are restored and its databases deleted |
+| the workload's Flux Kustomization | `spec.suspend` on, then off, only when the run found it running | the same as its workload |
+| a snapshot in the volume's restic repository | a new snapshot file at the run's `restartedAt`, tagged `quiesced`, replacing the one the mover wrote, under a lock file in locks/ | after the mover of a BackupRun that stopped workloads |
 | a new CloudNativePG Cluster | `bootstrap` swapped for `recovery`, an `externalClusters` entry, the `cnpg.io/skipEmptyWalArchiveCheck` annotation, and `backup.wlz.li/restore-run` when a run waits for it | on CREATE, in the webhook |
 | a recovered Cluster | the `initdb` a GitOps tool applies again, dropped | on UPDATE, in the webhook |
 | a Cluster in a database RestoreRun | deleted, so it is created again and recovered | when the restore starts |

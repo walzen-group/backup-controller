@@ -192,11 +192,13 @@ PersistentVolume per restore. It runs no mover and mounts no volume. If a
 restore fails, the failure is VolSync's and is reported in VolSync's objects and
 events.
 
-It does read repositories. The restore checks and each BackupRun's
-`snapshotTime` read the restic repository's own files through the S3 client in
-internal/restic, with the password and keys from the repository Secret, and
-copying that Secret for a fill is why the ClusterRole can read Secrets.
-[decisions.md](decisions.md) records that choice.
+It does read repositories, and writes one kind of file in them. The restore
+checks and each BackupRun's `snapshotTime` read the restic repository's own
+files through the S3 client in internal/restic, with the password and keys from
+the repository Secret, and a BackupRun that stopped workloads writes each of its
+snapshots again at the moment it restarted them. Copying that Secret for a fill
+is why the ClusterRole can read Secrets. [decisions.md](decisions.md) records
+both choices.
 
 For a database, the controller creates CloudNativePG Backup objects, deletes a
 Cluster for a restore, and patches a Cluster's bootstrap as it is created. It

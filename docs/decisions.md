@@ -109,6 +109,44 @@ backup and a namespace's volumes are cut together. The infrastructure
 repository's docs/agent/specs/namespace-backups.md holds the full decision
 record, with the per-namespace admission the admin chose on 2026-09-24.
 
+## Move a quiesced snapshot's time by writing the repository in Go
+
+From v0.6.0 a BackupRun that stopped workloads writes each volume's snapshot
+again with the run's `restartedAt` as its time and the tag `quiesced`, so a
+restore can recover a database to the moment the volume holds. restic stamps a
+snapshot when `restic backup` starts, after the run has given the app back, and
+VolSync's mover passes no `--time`.
+
+Keeping the app down until restic has stamped its time would move nothing, but
+nothing tells the controller when that is. VolSync's entry.sh runs `restic cat
+config` before `restic backup`, and both write a lock with the mover pod's
+hostname, so a lock under locks/ does not say which command wrote it. The
+mover's log does say it, and reading it would give the controller access to
+pods/log and make it parse restic's output. A Job running `restic rewrite` needs a pod per volume per run
+and a restic image to pin or to discover from VolSync. A file pairing each
+snapshot with a moment, stored next to the repository, needs retention of its
+own that follows restic's `forget`. A BackupRun already records the pairing,
+and a rebuilt cluster has none of them.
+
+The controller already opens the master key to list snapshots. Writing a
+snapshot is the same format in reverse, plus restic's lock protocol, so it
+needs no pod, no image and no second object. The admin chose this on
+2026-09-25. [namespace-backups.md](namespace-backups.md#quiesced-snapshots)
+shows a rewrite on the prod canary.
+
+## Let a RestoreRun list the workloads it stops
+
+From v0.7.0 a RestoreRun stops the Deployments and StatefulSets its `quiesce`
+list names. The `backup.wlz.li/quiesce` annotation stays the BackupRun's: a
+workload stopped for a backup is not always one to stop for a restore, and the
+admin decided on 2026-09-25 that a restore reads its own definition.
+
+The run gives the workloads back once the volumes are restored and the
+databases deleted. It cannot wait for the databases to recover: a deleted
+Cluster comes back only when Flux or tofu creates it again, a Kustomization the
+run suspended creates nothing, and resuming it reapplies the workload's
+replicas along with the Cluster.
+
 ## Read namespace settings from annotations, and treat an empty one as absent
 
 The timeout and the prune interval live beside the schedule, as

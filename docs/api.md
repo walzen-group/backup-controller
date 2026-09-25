@@ -139,6 +139,13 @@ scheduled run is an ordinary BackupRun named `scheduled-<yyyymmdd-hhmm>` with
 | `items[]` | one per volume and database: kind, name, phase, message, the manual `trigger`, the restic `snapshot` and its `snapshotTime`, `empty` for a volume with no files, and the CloudNativePG `backup` |
 | `conditions[type=Ready]` | the reason and message, kstatus-compatible, so a Flux Kustomization with `wait: true` can gate on the run |
 
+A run that stopped workloads rewrites each volume's snapshot to its
+`restartedAt` and tags it `quiesced`, so `items[].snapshot` is the rewritten
+ID and `snapshotTime` equals `restartedAt`. Without stopped workloads,
+`snapshotTime` is the time restic stamped when it started reading the clone.
+[namespace-backups.md](namespace-backups.md#quiesced-snapshots) shows a run
+doing it.
+
 Whenever a run's Ready condition moves to a new reason, the controller records
 an event on the run with that reason, and the condition's message as its note.
 A run that finishes with any reason but Succeeded, such as Invalid or Failed,
@@ -170,6 +177,8 @@ spec:
 | `all` | one of the three | every enabled claim in place, then every enabled Cluster |
 | `restoreAsOf` | no | the moment to restore to. A volume restores the newest snapshot at or before it, a database replays WAL to it exactly. Omitted, the newest snapshot and the end of the archive |
 | `previous` | no | how many snapshots further back than the selected one; one volume only |
+| `syncDatabaseToVolume` | no | with `all` only: recover the databases to the moment of the volumes' newest `quiesced` snapshot at or before `restoreAsOf`, so the files and the rows agree. Refused when a volume has no such snapshot, or two volumes' snapshots are from different moments |
+| `quiesce` | no | Deployments and StatefulSets, as `{kind, name}`, to stop while the run restores; not with `into`. The run gives them back once the volumes are restored and the databases deleted |
 | `timeout` | no | how long to wait for the movers and the recovered databases; defaults to `4h` |
 | `moverSecurityContext` | no | passed to the restore's ReplicationDestination; omitted, the source claim's VolumeRestore supplies it |
 | `ttlSecondsAfterFinished` | no | delete the run that long after it finishes; an `into` claim and its VolumeRestore go with it |
@@ -179,12 +188,14 @@ spec:
 | `phase` | Queued, Running, Waiting, Succeeded or Failed; the column `kubectl get rrun` prints |
 | `target` | the claim an `into` restore creates and fills |
 | `startedAt`, `completedAt` | when the run passed its checks and began, and when it finished |
+| `syncedTo` | the moment a `syncDatabaseToVolume` run restores the volumes and recovers the databases to |
+| `quiescedAt`, `restartedAt`, `quiesced[]`, `suspendedKustomizations[]` | when the run stopped and gave back the workloads `quiesce` lists, the replicas it gave each back, and the Flux Kustomizations it suspended and resumed |
 | `items[]` | one per volume restored in place and per database: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message, the `destination` while it exists, the `snapshot` and the `baseBackup` a recovery starts from |
 | `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, ClaimInUse, or `recreate <cluster> to finish the restore` |
 
 A RestoreRun records an event at each new Ready reason, the same way a
 [BackupRun](#backuprun) does.
 
-Three CEL rules on the CRD: exactly one of `claim` or `repository`, `database`
+Five CEL rules on the CRD: exactly one of `claim` or `repository`, `database`
 and `all`; `previous` only with one volume; `into` only with `claim` or
-`repository`.
+`repository`; `syncDatabaseToVolume` only with `all`; `quiesce` not with `into`.

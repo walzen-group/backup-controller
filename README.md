@@ -17,14 +17,20 @@ Cluster opts in with `backup.wlz.li/enabled`. At every tick the controller
 creates a BackupRun that Kueue admits as one unit. The run stops the workloads
 marked `backup.wlz.li/quiesce` while the volumes' clones are cut, writes each
 claim's ReplicationSource, and asks CloudNativePG for a base backup of each
-database. A RestoreRun restores one volume, one database or the whole namespace
-to the newest backup or a chosen moment.
+database. A run that stopped workloads moves each volume's snapshot to the
+moment it started them again and tags it `quiesced`. A RestoreRun restores one
+volume, one database or the whole namespace to the newest backup or a chosen
+moment, can stop the workloads it lists while it does, and with
+`syncDatabaseToVolume` recovers the databases to the moment the volumes'
+quiesced snapshot holds.
 
-Status, 2026-09-25: released at v0.5.6. v0.5.4 runs on the walzen prod cluster,
-where the canary at the infrastructure repository's
+Status, 2026-09-25: released at v0.7.0, which runs on the walzen prod cluster.
+The canary at the infrastructure repository's
 modules/testing/canary-namespace-backup ran every mode on 2026-09-24: a
 scheduled run, each form of BackupRun and RestoreRun, and automatic restore of
-the volume and the database after the namespace was destroyed.
+the volume and the database after the namespace was destroyed. On 2026-09-25 it
+ran the quiesced snapshot rewrite and a synced, quiesced RestoreRun that brought
+the volume and the database back ending on the same tick.
 [docs/namespace-backups.md](docs/namespace-backups.md) quotes those runs.
 
 ## Releases
@@ -51,6 +57,10 @@ the volume and the database after the namespace was destroyed.
 | v0.5.2 | retention tiers from the `retain-` annotations |
 | v0.5.3 | the zone database compiled in, so a `CRON_TZ=` schedule loads its zone |
 | v0.5.4 | `backup.wlz.li/timeout` and `backup.wlz.li/prune-interval-days` per namespace, and a six-hour default timeout |
+| v0.5.5 | an event on a run at each new Ready reason, a Warning when it fails |
+| v0.5.6 | a due tick waits until something in the namespace is marked enabled |
+| v0.6.0 | quiesced snapshots moved to the run's `restartedAt` and tagged `quiesced`, and `syncDatabaseToVolume` on a RestoreRun |
+| v0.7.0 | `quiesce` on a RestoreRun: the workloads it lists are stopped while it restores |
 
 The early fixes below explain behaviour that is still in the code.
 
