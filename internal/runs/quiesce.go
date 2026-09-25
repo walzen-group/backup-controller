@@ -330,7 +330,9 @@ func workloadObject(namespace string, w backupv1alpha1.QuiescedWorkload) client.
 
 // podsGone reports whether every pod of the target workloads has gone. A
 // terminating pod still counts, because a pod that is shutting down can still
-// write to the volume.
+// write to the volume. A pod in phase Succeeded or Failed doesn't count: its
+// containers have ended, and an evicted pod stays in that phase until
+// something deletes it.
 //
 // While a pod is left, it returns false and that pod's name, which the caller
 // puts in the message it waits with. It returns an error when a target's
@@ -345,8 +347,10 @@ func podsGone(ctx context.Context, c client.Reader, namespace string, targets []
 		if err := c.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
 			return false, "", fmt.Errorf("list the pods of %s %s: %w", t.kind, t.object.GetName(), err)
 		}
-		if len(pods.Items) > 0 {
-			return false, pods.Items[0].Name, nil
+		for _, pod := range pods.Items {
+			if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+				return false, pod.Name, nil
+			}
 		}
 	}
 	return true, "", nil

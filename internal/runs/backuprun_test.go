@@ -779,3 +779,23 @@ func TestAFailedResultFromAnEarlierSyncIsIgnored(t *testing.T) {
 		t.Errorf("item = %+v, want it still Running", item)
 	}
 }
+
+// An evicted pod of a stopped workload does not hold the run. The kubelet
+// has killed its containers, so it writes nothing, but it stays in the API
+// in phase Failed until something deletes it.
+func TestAnEvictedPodDoesNotHoldTheRun(t *testing.T) {
+	evicted := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "notes-7c4d", Namespace: ns, Labels: map[string]string{"app": appN}},
+		Status:     corev1.PodStatus{Phase: corev1.PodFailed, Reason: "Evicted"},
+	}
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false), evicted)
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // start
+
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
+		t.Errorf("item = %+v, want it Running once every live pod is gone", item)
+	}
+}
