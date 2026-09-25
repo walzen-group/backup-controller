@@ -27,8 +27,8 @@ const (
 var quiescedAt = time.Date(2026, 9, 21, 4, 59, 57, 0, time.UTC)
 
 // writableFixture copies the fixture repository into a temporary directory that
-// the test may write to, opens it, and turns off the lock protocol's pause for
-// the test.
+// the test may write to, opens it with the fixture's cached master key, and
+// turns off the lock protocol's pause for the test.
 func writableFixture(t *testing.T) (DirStore, *Repository) {
 	t.Helper()
 	dir := t.TempDir()
@@ -56,10 +56,7 @@ func writableFixture(t *testing.T) (DirStore, *Repository) {
 	}
 
 	store := DirStore(dir)
-	repo, err := Open(context.Background(), store, "backup")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	repo := openCached(t, string(fixture), store)
 	withoutLockWait(t)
 	return store, repo
 }
@@ -350,10 +347,7 @@ func (s *failLockRemove) Remove(ctx context.Context, name string) error {
 func TestRetimeRetriesTheRemovalOfItsLock(t *testing.T) {
 	dir, _ := writableFixture(t)
 	store := &failLockRemove{DirStore: dir}
-	repo, err := Open(context.Background(), store, "backup")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	repo := openCached(t, string(fixture), store)
 
 	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err != nil {
 		t.Fatalf("retime: %v", err)
@@ -395,10 +389,7 @@ func (s *failFirstRemove) Remove(ctx context.Context, name string) error {
 func TestRetimeAfterAFailedRemoveWritesNoSecondCopy(t *testing.T) {
 	dir, _ := writableFixture(t)
 	store := &failFirstRemove{DirStore: dir, name: path.Join("snapshots", mondayID)}
-	repo, err := Open(context.Background(), store, "backup")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	repo := openCached(t, string(fixture), store)
 
 	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err == nil {
 		t.Fatal("first retime succeeded, want the refused delete")
@@ -436,10 +427,7 @@ func TestRetimeAfterAFailedRemoveWritesNoSecondCopy(t *testing.T) {
 func TestRetimeStampsWholeSeconds(t *testing.T) {
 	dir, _ := writableFixture(t)
 	store := &failFirstRemove{DirStore: dir, name: path.Join("snapshots", mondayID)}
-	repo, err := Open(context.Background(), store, "backup")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	repo := openCached(t, string(fixture), store)
 
 	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt.Add(123456789), QuiescedTag); err == nil {
 		t.Fatal("first retime succeeded, want the refused delete")

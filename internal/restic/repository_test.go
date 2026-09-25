@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,13 +25,42 @@ import (
 // restic snapshots listed them as 49319ee8 and 88dc3648.
 const fixture = DirStore("testdata/repo")
 
+// masterKeys caches the master key of each test repository, keyed by the
+// directory the repository's key files come from. Open derives the key from
+// the password with restic's scrypt parameters, which takes seconds under the
+// race detector, and every test of one repository needs the same key.
+var masterKeys sync.Map
+
+// openCached opens the repository in a store with the password "backup".
+//
+// Parameters:
+//   - source names the repository the store's key files come from, such as
+//     the fixture directory that a temporary copy was made from. Stores with
+//     the same source share one master key.
+//   - store is the store the returned Repository reads and writes. It may be
+//     a copy of source, or a wrapper around such a copy.
+//
+// It returns the opened repository, and fails the test when Open fails.
+//
+// The first call for a source goes through Open, so Open's key path runs once
+// per test repository. Later calls pair the cached master key with the store.
+func openCached(t *testing.T, source string, store Store) *Repository {
+	t.Helper()
+	if master, ok := masterKeys.Load(source); ok {
+		return &Repository{store: store, master: master.(key)}
+	}
+	repo, err := Open(context.Background(), store, "backup")
+	if err != nil {
+		t.Fatalf("open %s: %v", source, err)
+	}
+	masterKeys.Store(source, repo.master)
+	return repo
+}
+
 // TestTheFixtureListsBothSnapshotsWithResticsTimes checks that Snapshots reads
 // both fixture snapshots with the IDs and times restic gave them, oldest first.
 func TestTheFixtureListsBothSnapshotsWithResticsTimes(t *testing.T) {
-	repo, err := Open(context.Background(), fixture, "backup")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	repo := openCached(t, string(fixture), fixture)
 	snapshots, err := repo.Snapshots(context.Background())
 	if err != nil {
 		t.Fatalf("snapshots: %v", err)

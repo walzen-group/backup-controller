@@ -9,7 +9,6 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
-	"sync"
 	"testing"
 	"time"
 
@@ -74,26 +73,11 @@ func (f recordedFixture) snapshots(t *testing.T) []recordedSnapshot {
 	return s
 }
 
-// masterKeys caches the master key of each recorded repository by its
-// directory. Open derives it from the password with restic's scrypt
-// parameters, which takes about half a second, and every test of a fixture
-// needs the same key.
-var masterKeys sync.Map
-
 // open opens the fixture's repository where it lies, read only. The first
 // call per fixture goes through Open; later ones reuse its master key.
 func (f recordedFixture) open(t *testing.T) *Repository {
 	t.Helper()
-	store := DirStore(filepath.Join(f.dir, "repo"))
-	if master, ok := masterKeys.Load(f.dir); ok {
-		return &Repository{store: store, master: master.(key)}
-	}
-	repo, err := Open(context.Background(), store, "backup")
-	if err != nil {
-		t.Fatalf("open %s: %v", f.name, err)
-	}
-	masterKeys.Store(f.dir, repo.master)
-	return repo
+	return openCached(t, f.dir, DirStore(filepath.Join(f.dir, "repo")))
 }
 
 // writable copies the fixture's repository into a temporary directory the
@@ -175,11 +159,14 @@ func TestTheRecordingsCameFromThePinnedTools(t *testing.T) {
 // TestSnapshotsReadsWhatResticLists checks that Snapshots reads every
 // recorded repository the way restic snapshots --json lists it: the same
 // snapshots, oldest first, with the same full IDs, the same times to the
-// nanosecond, paths, tags and original.
+// nanosecond, paths, tags and original. The subtests run in parallel, so
+// the first Open of each fixture, which derives its key with scrypt, runs on
+// its own core.
 func TestSnapshotsReadsWhatResticLists(t *testing.T) {
 	for _, kind := range []string{"timed", "same-second", "killed-mover"} {
 		for _, f := range fixtures(t, kind) {
 			t.Run(f.name, func(t *testing.T) {
+				t.Parallel()
 				want := f.snapshots(t)
 				got, err := f.open(t).Snapshots(context.Background())
 				if err != nil {
