@@ -11,6 +11,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -233,6 +234,9 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 			var snapshot restic.Snapshot
 			snapshot, reason, err = r.checkVolume(ctx, run, item.Name, at, sync)
 			item.Snapshot = snapshot.ShortID()
+			if !snapshot.Time.IsZero() {
+				item.SnapshotTime = &metav1.Time{Time: snapshot.Time}
+			}
 			if sync && reason == "" && err == nil {
 				switch {
 				case synced == nil:
@@ -664,7 +668,7 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			return "", "", nil
 		}
 		name := destinationName(run.UID, index)
-		if err := r.Create(ctx, directDestination(run, item.Name, settings, name)); err != nil && !apierrors.IsAlreadyExists(err) {
+		if err := r.Create(ctx, directDestination(run, *item, settings, name)); err != nil && !apierrors.IsAlreadyExists(err) {
 			return "", "", fmt.Errorf("create ReplicationDestination %s: %w", name, err)
 		}
 		item.Phase, item.Destination = backupv1alpha1.ItemRunning, name
@@ -820,7 +824,8 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	run.Status.StartedAt = &now
 	run.Status.Items = []backupv1alpha1.RestoreItem{{
-		Kind: "PersistentVolumeClaim", Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning, Snapshot: snapshot.ShortID(),
+		Kind: "PersistentVolumeClaim", Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning,
+		Snapshot: snapshot.ShortID(), SnapshotTime: &metav1.Time{Time: snapshot.Time},
 	}}
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning,
 		fmt.Sprintf("restoring into claim %s", run.Spec.Into))
@@ -831,8 +836,8 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 // names, and leaves the app's claim alone. planIntoNewClaim has checked the
 // run before this runs.
 //
-// It creates a VolumeRestore carrying spec.restoreAsOf and a claim whose data
-// source names it, so the ordinary populator path does the work. The run
+// It creates a VolumeRestore carrying the time of the snapshot the checks
+// selected (see pointInTimeRestore) and a claim whose data source names it, so the ordinary populator path does the work. The run
 // succeeds once the new claim is Bound, and is aborted when the claim has not
 // bound by spec.timeout.
 func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
@@ -844,7 +849,7 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 
-	vr := pointInTimeRestore(run, settings)
+	vr := pointInTimeRestore(run, run.Status.Items[0], settings)
 	if err := r.Create(ctx, vr); err != nil && !apierrors.IsAlreadyExists(err) {
 		return ctrl.Result{}, fmt.Errorf("create VolumeRestore %s/%s: %w", vr.Namespace, vr.Name, err)
 	}
@@ -974,8 +979,15 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // created, starts any workload it still holds stopped, and records the
 // terminal phase: Succeeded when reason is ReasonSucceeded and Failed for any
 // other reason. It sets the Ready condition to reason and message, records
-// status.completedAt, and removes the finalizer.
+// status.completedAt, and removes the finalizer. For an into restore that
+// did not succeed, it first releases the VolumeRestore with
+// releaseVolumeRestore.
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
+	if reason != backupv1alpha1.ReasonSucceeded {
+		if err := r.releaseVolumeRestore(ctx, run); err != nil {
+			return err
+		}
+	}
 	if err := r.removeDestinations(ctx, run, anyItem); err != nil {
 		return err
 	}
@@ -999,14 +1011,18 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 
 // finalize runs when the run is deleted before it finished. It deletes the
 // run's ReplicationDestinations, starts any workload the run still holds
-// stopped, and removes the finalizer so the deletion can complete. Without
-// it, a run deleted while its mover writes would leave a restore running
-// against a claim with nothing tracking it.
+// stopped, releases an into restore's VolumeRestore with
+// releaseVolumeRestore, and removes the finalizer so the deletion can
+// complete. Without it, a run deleted while its mover writes would leave a
+// restore running against a claim with nothing tracking it.
 func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return nil
 	}
 	if err := r.removeDestinations(ctx, run, anyItem); err != nil {
+		return err
+	}
+	if err := r.releaseVolumeRestore(ctx, run); err != nil {
 		return err
 	}
 	if stopped(run) {
@@ -1172,4 +1188,53 @@ func finishedWithDestination(items []backupv1alpha1.RestoreItem) bool {
 		}
 	}
 	return false
+}
+
+// populatorClaimFinalizer is the end of the finalizer name the volume populator
+// library puts on a claim while it fills it. The name starts with the
+// populator's prefix, which the binary sets.
+const populatorClaimFinalizer = "/populate-target-protection"
+
+// releaseVolumeRestore takes populator.Finalizer off the VolumeRestore an into
+// restore created, when the populator never took that VolumeRestore on. finish
+// calls it for an into restore that did not succeed, and finalize for one
+// deleted before it finished.
+//
+// pointInTimeRestore creates the VolumeRestore with the finalizer, and the
+// populator's Cleanup removes it once the claim is filled or deleted. The
+// library calls Cleanup only for a claim it has started on, so a claim it
+// never reached, such as one still waiting for a node, would leave the
+// VolumeRestore hanging in deletion after the run is gone.
+//
+// It leaves the finalizer while the VolumeRestore's status lists a claim, or
+// while the scratch claim carries the library's finalizer, because the
+// populator is then at work and its Cleanup will remove it. If the populator
+// starts after the release, its Populate adds the finalizer again. A
+// VolumeRestore the run does not control is left alone. It returns an error
+// when a read or the write fails.
+func (r *RestoreRunReconciler) releaseVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+	if run.Spec.Into == "" {
+		return nil
+	}
+	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
+	vr := &backupv1alpha1.VolumeRestore{}
+	if err := r.Reader.Get(ctx, key, vr); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(vr, run) || !controllerutil.ContainsFinalizer(vr, populator.Finalizer) || len(vr.Status.Claims) > 0 {
+		return nil
+	}
+	claim := &corev1.PersistentVolumeClaim{}
+	err := r.Reader.Get(ctx, key, claim)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
+	}
+	if err == nil && slices.ContainsFunc(claim.Finalizers, func(f string) bool { return strings.HasSuffix(f, populatorClaimFinalizer) }) {
+		return nil
+	}
+	controllerutil.RemoveFinalizer(vr, populator.Finalizer)
+	if err := r.Update(ctx, vr); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("remove finalizer %s from VolumeRestore %s: %w", populator.Finalizer, key, err)
+	}
+	return nil
 }

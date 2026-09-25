@@ -215,6 +215,12 @@ type RestoreItem struct {
 	// Snapshot is the short ID of the restic snapshot a volume restores.
 	// +optional
 	Snapshot string `json:"snapshot,omitempty"`
+	// SnapshotTime is the time of that snapshot. The run hands it to the mover
+	// as restoreAsOf, in whole seconds and with no previous, so the mover
+	// restores the snapshot the run's checks selected even when a backup lands
+	// in between.
+	// +optional
+	SnapshotTime *metav1.Time `json:"snapshotTime,omitempty"`
 	// BaseBackup is the ID of the barman base backup a database's recovery
 	// starts from.
 	// +optional

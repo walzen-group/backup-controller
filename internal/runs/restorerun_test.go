@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -103,8 +105,8 @@ func TestARestoreBeforeEverySnapshotFailsBeforeTouchingAnything(t *testing.T) {
 }
 
 // A claim restore to a time between two snapshots selects the earlier one,
-// hands the time to its ReplicationDestination, and deletes the destination
-// once the restore succeeds.
+// hands that snapshot's time to its ReplicationDestination, and deletes the
+// destination once the restore succeeds.
 func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
@@ -120,7 +122,7 @@ func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 	}
 	rd := &volsyncv1alpha1.ReplicationDestination{}
 	get(t, c, ns, item.Destination, rd)
-	if *rd.Spec.Restic.DestinationPVC != claimN || *rd.Spec.Restic.RestoreAsOf != "2026-09-21T04:00:00Z" {
+	if *rd.Spec.Restic.DestinationPVC != claimN || *rd.Spec.Restic.RestoreAsOf != "2026-09-20T05:00:02Z" {
 		t.Errorf("destination = %+v", rd.Spec.Restic)
 	}
 
@@ -1070,5 +1072,85 @@ func TestAVolumeRestoreWhoseSuccessWasNotRecordedFinishes(t *testing.T) {
 	rd := &volsyncv1alpha1.ReplicationDestination{}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: destination}, rd); err == nil {
 		t.Error("the destination outlived the run")
+	}
+}
+
+// previousOne is a mutate function for restoreRun that sets spec.previous to
+// 1.
+func previousOne(r *backupv1alpha1.RestoreRun) {
+	one := int32(1)
+	r.Spec.Previous = &one
+}
+
+// An into restore with spec.previous fills its claim from the snapshot it
+// recorded. The VolumeRestore has no previous of its own, so it carries that
+// snapshot's time as restoreAsOf. It also carries the populator's finalizer
+// from the start, so it can't be deleted before the populator has cleaned up
+// after its claim.
+func TestAnIntoRestoreWithPreviousRestoresTheSnapshotItRecorded(t *testing.T) {
+	r, c := restoreReconciler(t, nil,
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "notes-data-monday" }, previousOne),
+		claim(), volumeRestore(), repository())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // create
+
+	run := readRestoreRun(t, c)
+	if run.Status.Items[0].Snapshot != sunday.ShortID() {
+		t.Fatalf("snapshot = %q, want %s, one before the newest", run.Status.Items[0].Snapshot, sunday.ShortID())
+	}
+	vr := &backupv1alpha1.VolumeRestore{}
+	get(t, c, ns, "notes-data-monday", vr)
+	if vr.Spec.RestoreAsOf == nil || *vr.Spec.RestoreAsOf != "2026-09-20T05:00:02Z" {
+		t.Errorf("VolumeRestore restoreAsOf = %v, want 2026-09-20T05:00:02Z, the time of the snapshot the run recorded", vr.Spec.RestoreAsOf)
+	}
+	if !slices.Contains(vr.Finalizers, populator.Finalizer) {
+		t.Errorf("VolumeRestore finalizers = %v, want %s", vr.Finalizers, populator.Finalizer)
+	}
+}
+
+// An in-place restore hands the mover the time of the snapshot its checks
+// selected, in whole seconds, and no previous. The mover's own rule would pick
+// again when it starts, and a backup taken between the checks and the start
+// would shift what "newest" or previous means.
+func TestAClaimRestoreHandsTheMoverTheSnapshotItSelected(t *testing.T) {
+	early := sunday
+	early.Time = sunday.Time.Add(700 * time.Millisecond)
+	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, previousOne),
+		claim(), volumeRestore(), repository())
+	r.Snapshots = snapshots{early, monday}
+	restoreStep(t, r) // plan
+
+	tuesday := restic.Snapshot{ID: "7a11ce00" + "00000000", Time: monday.Time.Add(24 * time.Hour)}
+	r.Snapshots = snapshots{early, monday, tuesday}
+	restoreStep(t, r) // restore
+
+	run := readRestoreRun(t, c)
+	rd := &volsyncv1alpha1.ReplicationDestination{}
+	get(t, c, ns, run.Status.Items[0].Destination, rd)
+	if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-20T05:00:02Z" || rd.Spec.Restic.Previous != nil {
+		t.Errorf("destination restoreAsOf = %v, previous = %v; want 2026-09-20T05:00:02Z and none", rd.Spec.Restic.RestoreAsOf, rd.Spec.Restic.Previous)
+	}
+}
+
+// An into restore deleted before the populator started on its claim takes the
+// populator's finalizer off its VolumeRestore. The populator never took the
+// VolumeRestore on, so its Cleanup would never run, and the VolumeRestore
+// would hang in deletion once the run is gone.
+func TestAnIntoRestoreDeletedBeforeThePopulatorStartedReleasesItsVolumeRestore(t *testing.T) {
+	r, c := restoreReconciler(t, nil,
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "notes-data-monday" }),
+		claim(), volumeRestore(), repository())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // create
+
+	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	vr := &backupv1alpha1.VolumeRestore{}
+	get(t, c, ns, "notes-data-monday", vr)
+	if slices.Contains(vr.Finalizers, populator.Finalizer) {
+		t.Errorf("VolumeRestore finalizers = %v, want %s released", vr.Finalizers, populator.Finalizer)
 	}
 }

@@ -7,6 +7,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/populator"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -129,14 +130,28 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 	return settings, nil
 }
 
+// selectedMoment returns the restoreAsOf that makes a mover restore the
+// snapshot a run's checks selected for an item: the snapshot's time in whole
+// seconds, as RFC 3339. The mover takes the newest snapshot at or before
+// restoreAsOf, comparing whole seconds, and every newer snapshot is later than
+// that, so it takes the selected one. It returns nil for an item with no
+// recorded snapshot time, which a run planned by an older controller has.
+func selectedMoment(item backupv1alpha1.RestoreItem) *string {
+	if item.SnapshotTime == nil {
+		return nil
+	}
+	moment := item.SnapshotTime.UTC().Format(time.RFC3339)
+	return &moment
+}
+
 // directDestination builds the ReplicationDestination for an in-place
 // restore. Its mover mounts the claim the app uses and writes the chosen
 // snapshot into it.
 //
 // Parameters:
-//   - run is the RestoreRun. Its spec.restoreAsOf and spec.previous choose
-//     the snapshot, and its UID becomes the manual trigger.
-//   - claim is the name of the claim to write into.
+//   - run is the RestoreRun. Its UID becomes the manual trigger.
+//   - item is the volume item. The destination writes into the claim it
+//     names, and restores the snapshot the run's checks selected for it.
 //   - settings are the repository and mover settings from repositoryFor.
 //   - name is the name to give the ReplicationDestination.
 //
@@ -145,13 +160,20 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 // mover's cache claim when the run ends. The manual trigger is the run's UID,
 // so a controller that restarts mid-restore recognises its own work.
 //
-// For a synced run, one whose status.syncedTo is set, the mover gets that
-// time as restoreAsOf and gets no previous. The quiesced snapshot carries
-// exactly that time, and the mover picks the newest snapshot at or before
-// restoreAsOf, so it picks the quiesced one.
-func directDestination(run *backupv1alpha1.RestoreRun, claim string, settings restoreSettings, name string) *volsyncv1alpha1.ReplicationDestination {
+// The mover gets the selected snapshot's time as restoreAsOf and gets no
+// previous (see selectedMoment). Handing it spec.restoreAsOf and
+// spec.previous would make it choose again when it starts, and a backup taken
+// since the checks would shift what the newest snapshot, or the one before
+// it, is. An item with no recorded time, from a run an older controller
+// planned, falls back to status.syncedTo for a synced run and to the run's
+// spec otherwise.
+func directDestination(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem, settings restoreSettings, name string) *volsyncv1alpha1.ReplicationDestination {
+	claim := item.Name
 	restoreAsOf, previous := run.Spec.RestoreAsOf, run.Spec.Previous
-	if run.Status.SyncedTo != nil {
+	switch {
+	case item.SnapshotTime != nil:
+		restoreAsOf, previous = selectedMoment(item), nil
+	case run.Status.SyncedTo != nil:
 		moment := run.Status.SyncedTo.UTC().Format(time.RFC3339)
 		restoreAsOf, previous = &moment, nil
 	}
@@ -180,11 +202,28 @@ func directDestination(run *backupv1alpha1.RestoreRun, claim string, settings re
 }
 
 // pointInTimeRestore builds the VolumeRestore that an Into restore fills its
-// scratch claim from. It is named after the run's spec.into and carries the
-// run's spec.restoreAsOf. Because it is an ordinary VolumeRestore, the volume
+// scratch claim from. Because it is an ordinary VolumeRestore, the volume
 // populator does the restore, and none of that work is repeated here. The run
 // is its controller owner.
-func pointInTimeRestore(run *backupv1alpha1.RestoreRun, settings restoreSettings) *backupv1alpha1.VolumeRestore {
+//
+// Parameters:
+//   - run is the RestoreRun. The VolumeRestore is named after its spec.into.
+//   - item is the run's single item, which records the snapshot the run's
+//     checks selected.
+//   - settings are the repository and mover settings from repositoryFor.
+//
+// The VolumeRestore carries the selected snapshot's time as restoreAsOf (see
+// selectedMoment). A VolumeRestore has no previous, so a run with
+// spec.previous gets the snapshot it recorded only this way. An item with no
+// recorded time, from a run an older controller planned, falls back to the
+// run's spec.restoreAsOf.
+//
+// It also carries populator.Finalizer from the start. The populator adds that
+// finalizer only when it first fills a claim, and a VolumeRestore deleted
+// before then would leave the library's finalizer on the claim with nothing
+// to remove it. The populator's Cleanup removes it once no claim is being
+// filled.
+func pointInTimeRestore(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem, settings restoreSettings) *backupv1alpha1.VolumeRestore {
 	labels := map[string]backupv1alpha1.MoverPodLabelValue{}
 	for key, value := range settings.MoverPodLabels {
 		labels[key] = backupv1alpha1.MoverPodLabelValue(value)
@@ -192,18 +231,23 @@ func pointInTimeRestore(run *backupv1alpha1.RestoreRun, settings restoreSettings
 	if len(labels) == 0 {
 		labels = nil
 	}
+	restoreAsOf := selectedMoment(item)
+	if restoreAsOf == nil {
+		restoreAsOf = run.Spec.RestoreAsOf
+	}
 
 	return &backupv1alpha1.VolumeRestore{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      run.Spec.Into,
-			Namespace: run.Namespace,
+			Name:       run.Spec.Into,
+			Namespace:  run.Namespace,
+			Finalizers: []string{populator.Finalizer},
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(run, backupv1alpha1.GroupVersion.WithKind("RestoreRun")),
 			},
 		},
 		Spec: backupv1alpha1.VolumeRestoreSpec{
 			Repository:            settings.Secret,
-			RestoreAsOf:           run.Spec.RestoreAsOf,
+			RestoreAsOf:           restoreAsOf,
 			CacheStorageClassName: settings.CacheStorageClassName,
 			MoverPodLabels:        labels,
 			MoverSecurityContext:  settings.MoverSecurityContext,
