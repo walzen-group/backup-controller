@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -41,6 +42,9 @@ type RestoreRunReconciler struct {
 	// Prober lists a database's base backups, for the same check.
 	Prober bootstrap.Prober
 
+	// Recorder writes an event on the run each time its Ready reason changes.
+	Recorder events.EventRecorder
+
 	// Now is the clock, injected so tests can move time without sleeping.
 	Now func() time.Time
 }
@@ -62,6 +66,8 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	before := readyReason(run.Status.Conditions)
+	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Restore") }()
 	if !run.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, r.finalize(ctx, run)
 	}

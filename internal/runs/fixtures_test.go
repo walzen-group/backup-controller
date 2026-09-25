@@ -243,12 +243,3 @@ func getUnstructured(t *testing.T, c client.Client, gvk schema.GroupVersionKind,
 	err := c.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: name}, u)
 	return u, err == nil
 }
-
-func readyReason(conditions []metav1.Condition) string {
-	for _, c := range conditions {
-		if c.Type == backupv1alpha1.ConditionReady {
-			return c.Reason
-		}
-	}
-	return ""
-}

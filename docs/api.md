@@ -139,6 +139,14 @@ scheduled run is an ordinary BackupRun named `scheduled-<yyyymmdd-hhmm>` with
 | `items[]` | one per volume and database: kind, name, phase, message, the manual `trigger`, the restic `snapshot` and its `snapshotTime`, `empty` for a volume with no files, and the CloudNativePG `backup` |
 | `conditions[type=Ready]` | the reason and message, kstatus-compatible, so a Flux Kustomization with `wait: true` can gate on the run |
 
+Whenever a run's Ready condition moves to a new reason, the controller records
+an event on the run with that reason, and the condition's message as its note.
+A run that finishes with any reason but Succeeded, such as Invalid or Failed,
+records a Warning; Queued, Running, SourceBusy and Succeeded record Normal
+events. `kubectl describe brun <name>` lists them under Events. Because
+events.k8s.io/v1 rejects a note over 1024 bytes, the controller cuts a longer
+message at that length, and the full text stays on the condition.
+
 ## RestoreRun
 
 ```yaml
@@ -173,6 +181,9 @@ spec:
 | `startedAt`, `completedAt` | when the run passed its checks and began, and when it finished |
 | `items[]` | one per volume restored in place and per database: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message, the `destination` while it exists, the `snapshot` and the `baseBackup` a recovery starts from |
 | `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, ClaimInUse, or `recreate <cluster> to finish the restore` |
+
+A RestoreRun records an event at each new Ready reason, the same way a
+[BackupRun](#backuprun) does.
 
 Three CEL rules on the CRD: exactly one of `claim` or `repository`, `database`
 and `all`; `previous` only with one volume; `into` only with `claim` or

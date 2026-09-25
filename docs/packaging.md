@@ -138,6 +138,7 @@ caller in the controller:
 | `localqueues.kueue.x-k8s.io` | list | finding the namespace's queue |
 | `secrets` | get, create, delete | copying the repository Secret for a fill, and the restic and object store reads |
 | `events` | create, patch | the recorder the library uses |
+| `events.events.k8s.io` | create, patch | an event on a BackupRun or RestoreRun at each new Ready reason |
 
 Narrow `secrets` if it can be narrowed. A ClusterRole that can read every Secret
 in the cluster is the one line in this install worth arguing about, and
