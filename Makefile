@@ -14,7 +14,7 @@ FIXTURES := nix develop .\#fixtures -c
 # copy, because kustomize and helm both read a directory of their own. Every
 # generated file is copied, so a new kind needs no edit here.
 
-.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic fixtures-barman
+.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic fixtures-barman fixtures-crds
 
 ## build: compile every package.
 build:
@@ -40,7 +40,7 @@ envtest:
 	$(ENVTEST) go test -tags envtest ./...
 
 ## fixtures: re-record every checked-in fixture that real programs produce. Run it after a pin in versions.json moves; check fails until it has.
-fixtures: fixtures-restic fixtures-barman
+fixtures: fixtures-restic fixtures-barman fixtures-crds
 
 ## fixtures-restic: re-record the restic repositories and restic's verdicts under internal/restic/testdata/recorded.
 fixtures-restic:
@@ -49,6 +49,10 @@ fixtures-restic:
 ## fixtures-barman: re-record the barman stores, barman's verdicts and RustFS's answers under internal/testinfra/barmanstore/recorded.
 fixtures-barman:
 	$(FIXTURES) hack/fixtures/barman-stores.sh
+
+## fixtures-crds: copy the pinned third-party CRDs, and our CRDs at old tags, under internal/testinfra/crds.
+fixtures-crds:
+	$(FIXTURES) hack/fixtures/crds.sh
 
 ## generate: regenerate deepcopy functions into the API package.
 generate:

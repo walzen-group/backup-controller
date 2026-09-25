@@ -1,0 +1,124 @@
+{
+  "generator": "hack/fixtures/crds.sh",
+  "files": [
+    {
+      "path": "cloudnative-pg/postgresql.cnpg.io_clusters.yaml",
+      "component": "cloudnative-pg",
+      "version": "1.30.0",
+      "source": "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml",
+      "sha256": "ae47f4a00f6e998faef57e480f9a3960cd48ea16a79270861fc7442601507472"
+    },
+    {
+      "path": "cloudnative-pg/postgresql.cnpg.io_backups.yaml",
+      "component": "cloudnative-pg",
+      "version": "1.30.0",
+      "source": "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_backups.yaml",
+      "sha256": "694bafce2eda4603629657c2141a89189c15250c74215002a6987538d3d78ff5"
+    },
+    {
+      "path": "plugin-barman-cloud/barmancloud.cnpg.io_objectstores.yaml",
+      "component": "plugin-barman-cloud",
+      "version": "0.15.0",
+      "source": "https://raw.githubusercontent.com/cloudnative-pg/plugin-barman-cloud/v0.15.0/config/crd/bases/barmancloud.cnpg.io_objectstores.yaml",
+      "sha256": "2d8be9265b99571a560e80f2a54dbbcc19cbfb2254575ff2e7bba9dc4429e99e"
+    },
+    {
+      "path": "flux/kustomize-controller.crds.yaml",
+      "component": "flux",
+      "version": "2.9.5",
+      "source": "https://github.com/fluxcd/kustomize-controller/releases/download/v1.9.5/kustomize-controller.crds.yaml (named by https://raw.githubusercontent.com/fluxcd/flux2/v2.9.5/manifests/bases/kustomize-controller/kustomization.yaml)",
+      "sha256": "b9e74622f9f3d87950f59641651fe0ea0220367c1d6f34a72c9591552afda292"
+    },
+    {
+      "path": "kueue/kueue.x-k8s.io_workloads.yaml",
+      "component": "kueue",
+      "version": "0.19.5",
+      "source": "https://raw.githubusercontent.com/kubernetes-sigs/kueue/v0.19.5/config/components/crd/bases/kueue.x-k8s.io_workloads.yaml",
+      "sha256": "1970ff6fcc5dc1a29e3f290ed736032c5d4509c94efe2c642d64a244ad1b8aa5"
+    },
+    {
+      "path": "kueue/kueue.x-k8s.io_localqueues.yaml",
+      "component": "kueue",
+      "version": "0.19.5",
+      "source": "https://raw.githubusercontent.com/kubernetes-sigs/kueue/v0.19.5/config/components/crd/bases/kueue.x-k8s.io_localqueues.yaml",
+      "sha256": "dd10ef8d3578e7212fa52763549e7b6be0949793a5b924495fcd293330109fed"
+    },
+    {
+      "path": "volsync/volsync.backube_replicationdestinations.yaml",
+      "component": "volsync",
+      "version": "0.16.0",
+      "source": "go module github.com/backube/volsync@v0.16.0 config/crd/bases/volsync.backube_replicationdestinations.yaml",
+      "sha256": "503cb28f7eafc73b9c3332cdc084aca3149f8520e3b265769caf02a47f51251d"
+    },
+    {
+      "path": "volsync/volsync.backube_replicationsources.yaml",
+      "component": "volsync",
+      "version": "0.16.0",
+      "source": "go module github.com/backube/volsync@v0.16.0 config/crd/bases/volsync.backube_replicationsources.yaml",
+      "sha256": "597e68a855277fe5bfb86f1239ab472dda1fe4660fca22fa932ff2f13b72d29b"
+    },
+    {
+      "path": "volsync/snapshot.storage.k8s.io_volumesnapshotclasses.yaml",
+      "component": "volsync",
+      "version": "0.16.0",
+      "source": "go module github.com/backube/volsync@v0.16.0 hack/crds/snapshot.storage.k8s.io_volumesnapshotclasses.yaml",
+      "sha256": "56e321bf3eb6bdb100fca5eb3a73a79ca44fe1ce247a71ec91a90269ae675f91"
+    },
+    {
+      "path": "volsync/snapshot.storage.k8s.io_volumesnapshotcontents.yaml",
+      "component": "volsync",
+      "version": "0.16.0",
+      "source": "go module github.com/backube/volsync@v0.16.0 hack/crds/snapshot.storage.k8s.io_volumesnapshotcontents.yaml",
+      "sha256": "a7b1c356e172a75b692e7345254c4200402684c059817060c513c1fba3472c09"
+    },
+    {
+      "path": "volsync/snapshot.storage.k8s.io_volumesnapshots.yaml",
+      "component": "volsync",
+      "version": "0.16.0",
+      "source": "go module github.com/backube/volsync@v0.16.0 hack/crds/snapshot.storage.k8s.io_volumesnapshots.yaml",
+      "sha256": "1d5167d45fb778acadf20dfa5fa77a4faa70e02f7f335039e3e1a3a61c7f28c5"
+    },
+    {
+      "path": "backup-controller/v0.7.2/backup.wlz.li_backupruns.yaml",
+      "component": "backup-controller",
+      "version": "0.7.2",
+      "source": "git show v0.7.2:config/crd/backup.wlz.li_backupruns.yaml",
+      "sha256": "56af7bd3644c2477a9bf21dc9987a67011ed6dd5840fe2546c8f71aaa1d9c917"
+    },
+    {
+      "path": "backup-controller/v0.7.2/backup.wlz.li_restoreruns.yaml",
+      "component": "backup-controller",
+      "version": "0.7.2",
+      "source": "git show v0.7.2:config/crd/backup.wlz.li_restoreruns.yaml",
+      "sha256": "3c690eb0c5410bc5cc4bc197d1484afecb0af3f068292b9f615149e3d1f8b34f"
+    },
+    {
+      "path": "backup-controller/v0.7.2/backup.wlz.li_volumerestores.yaml",
+      "component": "backup-controller",
+      "version": "0.7.2",
+      "source": "git show v0.7.2:config/crd/backup.wlz.li_volumerestores.yaml",
+      "sha256": "e010a1d2ccff4384b088e0298baea12045364e191177c814c0b14ea1518633ea"
+    },
+    {
+      "path": "backup-controller/v0.8.1/backup.wlz.li_backupruns.yaml",
+      "component": "backup-controller",
+      "version": "0.8.1",
+      "source": "git show v0.8.1:config/crd/backup.wlz.li_backupruns.yaml",
+      "sha256": "5071a443f0bcd22427807a83fd19c8fa9ace061402347ca4c022c9744cf12529"
+    },
+    {
+      "path": "backup-controller/v0.8.1/backup.wlz.li_restoreruns.yaml",
+      "component": "backup-controller",
+      "version": "0.8.1",
+      "source": "git show v0.8.1:config/crd/backup.wlz.li_restoreruns.yaml",
+      "sha256": "cba888a41363bf968b80748be370a052db8326e7f153b9b699b3e4bb1a99d630"
+    },
+    {
+      "path": "backup-controller/v0.8.1/backup.wlz.li_volumerestores.yaml",
+      "component": "backup-controller",
+      "version": "0.8.1",
+      "source": "git show v0.8.1:config/crd/backup.wlz.li_volumerestores.yaml",
+      "sha256": "e010a1d2ccff4384b088e0298baea12045364e191177c814c0b14ea1518633ea"
+    }
+  ]
+}

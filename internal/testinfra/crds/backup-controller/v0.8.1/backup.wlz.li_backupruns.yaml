@@ -1,0 +1,305 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: backupruns.backup.wlz.li
+spec:
+  group: backup.wlz.li
+  names:
+    kind: BackupRun
+    listKind: BackupRunList
+    plural: backupruns
+    shortNames:
+    - brun
+    singular: backuprun
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.source
+      name: Source
+      type: string
+    - jsonPath: .spec.database
+      name: Database
+      type: string
+    - jsonPath: .spec.all
+      name: All
+      type: boolean
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          BackupRun takes one backup on demand. The scheduler also creates one for
+          every scheduled backup, and the object stays as the record of it. Create a
+          BackupRun and watch it the way you would a Job.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BackupRunSpec asks for one backup now. It names one volume, one database, or
+              everything in the namespace marked backup.wlz.li/enabled.
+
+              For each volume, the controller writes the ReplicationSource itself, names it
+              after the claim, and triggers it. For each database, it asks CloudNativePG
+              for a base backup. When the namespace has a Kueue LocalQueue, the run waits
+              for the queue to admit it as one Workload. A run with all set also scales the
+              workloads marked backup.wlz.li/quiesce to zero until every volume's clone is
+              cut.
+            properties:
+              all:
+                description: |-
+                  All backs up every claim and every Cluster in this namespace marked
+                  backup.wlz.li/enabled. It also stops the workloads marked
+                  backup.wlz.li/quiesce while the volumes' clones are cut.
+                type: boolean
+              database:
+                description: |-
+                  Database is the name of the CloudNativePG Cluster in this namespace to
+                  take a base backup of. The Cluster has to be marked
+                  backup.wlz.li/enabled.
+                maxLength: 253
+                type: string
+              source:
+                description: |-
+                  Source is the name of the claim to back up. The claim has to be marked
+                  backup.wlz.li/enabled, and its ReplicationSource carries the same name.
+                maxLength: 253
+                type: string
+              timeout:
+                description: |-
+                  Timeout is how long the run may work on its movers and base backups
+                  before it gives up. The clock starts when the queue admits the run, so
+                  time spent queued does not count. When omitted, the namespace's
+                  backup.wlz.li/timeout annotation applies, and six hours applies when the
+                  namespace has none.
+                type: string
+              ttlSecondsAfterFinished:
+                description: |-
+                  TTLSecondsAfterFinished is how many seconds after the run finishes the
+                  controller deletes it. When omitted, the run is kept as the record of
+                  what was backed up.
+                format: int32
+                minimum: 0
+                type: integer
+            type: object
+            x-kubernetes-validations:
+            - message: set exactly one of source, database and all
+              rule: '(has(self.source) ? 1 : 0) + (has(self.database) ? 1 : 0) + ((has(self.all)
+                && self.all) ? 1 : 0) == 1'
+          status:
+            description: BackupRunStatus reports how far the run got.
+            properties:
+              completedAt:
+                description: CompletedAt is when the run reached a terminal phase.
+                format: date-time
+                type: string
+              conditions:
+                description: |-
+                  Conditions holds the kstatus-compatible state, so a Flux Kustomization
+                  with wait: true can wait for this object.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              items:
+                description: Items has one entry for each volume and each database
+                  the run backs up.
+                items:
+                  description: BackupItem is one volume or database a BackupRun backs
+                    up.
+                  properties:
+                    backup:
+                      description: |-
+                        Backup is the name of the CloudNativePG Backup the run created for a
+                        database.
+                      type: string
+                    empty:
+                      description: |-
+                        Empty is true when VolSync took no backup of the volume because it held
+                        no files. The repository gains no snapshot from such a run.
+                      type: boolean
+                    kind:
+                      description: Kind is ReplicationSource for a volume and Cluster
+                        for a database.
+                      type: string
+                    message:
+                      description: |-
+                        Message says why the item failed or was skipped, or what it is waiting
+                        for.
+                      type: string
+                    name:
+                      description: Name is the object's name. For a volume, it is
+                        also the claim's name.
+                      type: string
+                    phase:
+                      description: Phase is how far this item got.
+                      type: string
+                    snapshot:
+                      description: Snapshot is the short ID of the restic snapshot
+                        the mover wrote.
+                      type: string
+                    snapshotTime:
+                      description: |-
+                        SnapshotTime is the time recorded on that snapshot. restic records the
+                        moment the backup of the volume's clone started. When the run stopped
+                        workloads, it then rewrites the snapshot to carry the run's restartedAt
+                        and tags it quiesced, so that a restore can recover the databases to the
+                        same moment.
+                      format: date-time
+                      type: string
+                    trigger:
+                      description: |-
+                        Trigger is the manual trigger value the run wrote onto the
+                        ReplicationSource.
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  - phase
+                  type: object
+                type: array
+              phase:
+                description: Phase is the run's state. It is the Phase column `kubectl
+                  get` prints.
+                type: string
+              quiesced:
+                description: |-
+                  Quiesced lists the workloads this run scaled to zero, each with the
+                  replica count the run restores when it starts them again.
+                items:
+                  description: QuiescedWorkload is one workload a run scaled to zero.
+                  properties:
+                    kind:
+                      description: Kind is Deployment or StatefulSet.
+                      type: string
+                    name:
+                      description: Name is the workload's name in the run's namespace.
+                      type: string
+                    replicas:
+                      description: |-
+                        Replicas is the replica count the workload had before the run stopped
+                        it.
+                      format: int32
+                      type: integer
+                  required:
+                  - kind
+                  - name
+                  - replicas
+                  type: object
+                type: array
+              quiescedAt:
+                description: |-
+                  QuiescedAt is when the run stopped the workloads marked
+                  backup.wlz.li/quiesce, or found that none were marked.
+                format: date-time
+                type: string
+              restartPending:
+                description: |-
+                  RestartPending is true from the moment the run records restartedAt
+                  until it has given every stopped workload its replicas back and resumed
+                  every Kustomization it suspended. The run records the moment first, so
+                  a pass that starts the workloads and then loses its status write is
+                  retried with the same restartedAt.
+                type: boolean
+              restartedAt:
+                description: RestartedAt is when the run gave those workloads their
+                  replicas back.
+                format: date-time
+                type: string
+              startedAt:
+                description: StartedAt is when the run was admitted and began backing
+                  up.
+                format: date-time
+                type: string
+              suspendedKustomizations:
+                description: |-
+                  SuspendedKustomizations lists the Flux Kustomizations this run
+                  suspended, as namespace/name. The run resumes these and no others.
+                items:
+                  type: string
+                type: array
+              workload:
+                description: |-
+                  Workload is the name of the Kueue Workload that admits the run. It is
+                  cleared when the run finishes and the Workload is deleted.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

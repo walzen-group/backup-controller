@@ -1,0 +1,623 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: restoreruns.backup.wlz.li
+spec:
+  group: backup.wlz.li
+  names:
+    kind: RestoreRun
+    listKind: RestoreRunList
+    plural: restoreruns
+    shortNames:
+    - rrun
+    singular: restorerun
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.claim
+      name: Claim
+      type: string
+    - jsonPath: .spec.database
+      name: Database
+      type: string
+    - jsonPath: .spec.all
+      name: All
+      type: boolean
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          RestoreRun restores volumes and databases to a chosen point in time. Create
+          a RestoreRun and watch it the way you would a Job.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              RestoreRunSpec asks for one restore. It names one volume, one database, or
+              everything in the namespace marked backup.wlz.li/enabled, and restores it to
+              the newest backup or to a chosen moment.
+
+              A volume is restored in place, or into a new claim when Into is set. A
+              database is restored by creating it again. The run deletes its Cluster, and
+              when Flux or tofu creates the Cluster again, the bootstrap webhook sets it up
+              to recover to RestoreAsOf.
+            properties:
+              all:
+                description: |-
+                  All restores every claim and every Cluster in this namespace marked
+                  backup.wlz.li/enabled. The volumes are restored in place first, and the
+                  databases after them.
+                type: boolean
+              claim:
+                description: |-
+                  Claim is the name of a claim in this namespace. The restore reads from
+                  that claim's repository, and writes into the claim itself unless Into
+                  names a new one.
+
+                  The claim's VolumeRestore supplies the repository Secret, the cache
+                  storage class and the mover's pod labels, so none of them is repeated
+                  here. That is the VolumeRestore the claim's dataSourceRef names, or the
+                  one with the claim's own name. To restore from a repository that no
+                  claim in this namespace uses, set Repository instead.
+                maxLength: 253
+                type: string
+              database:
+                description: |-
+                  Database is the name of the CloudNativePG Cluster in this namespace to
+                  restore. The run deletes the Cluster, and the Cluster is recovered when
+                  it is created again.
+                maxLength: 253
+                type: string
+              into:
+                description: |-
+                  Into is the name of a new claim to create and fill. The source claim
+                  stays untouched. When omitted, the restore overwrites Claim in place,
+                  and the workload that mounts it has to stop first.
+                maxLength: 253
+                type: string
+              intoSize:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  IntoSize is the storage request of the claim that Into creates. When
+                  omitted, the new claim requests the same size as the source claim. A
+                  restore from Repository has no source claim to copy a size from, so
+                  set it there.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+              moverSecurityContext:
+                description: |-
+                  MoverSecurityContext is copied onto the ReplicationDestination. Set it
+                  for an app whose files belong to a user the mover has to run as. When
+                  omitted, the one on the claim's VolumeRestore applies.
+                properties:
+                  appArmorProfile:
+                    description: |-
+                      appArmorProfile is the AppArmor options to use by the containers in this pod.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    properties:
+                      localhostProfile:
+                        description: |-
+                          localhostProfile indicates a profile loaded on the node that should be used.
+                          The profile must be preconfigured on the node to work.
+                          Must match the loaded name of the profile.
+                          Must be set if and only if type is "Localhost".
+                        type: string
+                      type:
+                        description: |-
+                          type indicates which kind of AppArmor profile will be applied.
+                          Valid options are:
+                            Localhost - a profile pre-loaded on the node.
+                            RuntimeDefault - the container runtime's default profile.
+                            Unconfined - no AppArmor enforcement.
+                        type: string
+                    required:
+                    - type
+                    type: object
+                  fsGroup:
+                    description: |-
+                      A special supplemental group that applies to all containers in a pod.
+                      Some volume types allow the Kubelet to change the ownership of that volume
+                      to be owned by the pod:
+
+                      1. The owning GID will be the FSGroup
+                      2. The setgid bit is set (new files created in the volume will be owned by FSGroup)
+                      3. The permission bits are OR'd with rw-rw----
+
+                      If unset, the Kubelet will not modify the ownership and permissions of any volume.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    format: int64
+                    type: integer
+                  fsGroupChangePolicy:
+                    description: |-
+                      fsGroupChangePolicy defines behavior of changing ownership and permission of the volume
+                      before being exposed inside Pod. This field will only apply to
+                      volume types which support fsGroup based ownership(and permissions).
+                      It will have no effect on ephemeral volume types such as: secret, configmaps
+                      and emptydir.
+                      Valid values are "OnRootMismatch" and "Always". If not specified, "Always" is used.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    type: string
+                  runAsGroup:
+                    description: |-
+                      The GID to run the entrypoint of the container process.
+                      Uses runtime default if unset.
+                      May also be set in SecurityContext.  If set in both SecurityContext and
+                      PodSecurityContext, the value specified in SecurityContext takes precedence
+                      for that container.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    format: int64
+                    type: integer
+                  runAsNonRoot:
+                    description: |-
+                      Indicates that the container must run as a non-root user.
+                      If true, the Kubelet will validate the image at runtime to ensure that it
+                      does not run as UID 0 (root) and fail to start the container if it does.
+                      If unset or false, no such validation will be performed.
+                      May also be set in SecurityContext.  If set in both SecurityContext and
+                      PodSecurityContext, the value specified in SecurityContext takes precedence.
+                    type: boolean
+                  runAsUser:
+                    description: |-
+                      The UID to run the entrypoint of the container process.
+                      Defaults to user specified in image metadata if unspecified.
+                      May also be set in SecurityContext.  If set in both SecurityContext and
+                      PodSecurityContext, the value specified in SecurityContext takes precedence
+                      for that container.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    format: int64
+                    type: integer
+                  seLinuxChangePolicy:
+                    description: |-
+                      seLinuxChangePolicy defines how the container's SELinux label is applied to all volumes used by the Pod.
+                      It has no effect on nodes that do not support SELinux or to volumes does not support SELinux.
+                      Valid values are "MountOption" and "Recursive".
+
+                      "Recursive" means relabeling of all files on all Pod volumes by the container runtime.
+                      This may be slow for large volumes, but allows mixing privileged and unprivileged Pods sharing the same volume on the same node.
+
+                      "MountOption" mounts all eligible Pod volumes with `-o context` mount option.
+                      This requires all Pods that share the same volume to use the same SELinux label.
+                      It is not possible to share the same volume among privileged and unprivileged Pods.
+                      Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes
+                      whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their
+                      CSIDriver instance. Other volumes are always re-labelled recursively.
+                      "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
+
+                      If not specified and SELinuxMount feature gate is enabled, "MountOption" is used.
+                      If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes
+                      and "Recursive" for all other volumes.
+
+                      This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
+
+                      All Pods that use the same volume should use the same seLinuxChangePolicy, otherwise some pods can get stuck in ContainerCreating state.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    type: string
+                  seLinuxOptions:
+                    description: |-
+                      The SELinux context to be applied to all containers.
+                      If unspecified, the container runtime will allocate a random SELinux context for each
+                      container.  May also be set in SecurityContext.  If set in
+                      both SecurityContext and PodSecurityContext, the value specified in SecurityContext
+                      takes precedence for that container.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    properties:
+                      level:
+                        description: Level is SELinux level label that applies to
+                          the container.
+                        type: string
+                      role:
+                        description: Role is a SELinux role label that applies to
+                          the container.
+                        type: string
+                      type:
+                        description: Type is a SELinux type label that applies to
+                          the container.
+                        type: string
+                      user:
+                        description: User is a SELinux user label that applies to
+                          the container.
+                        type: string
+                    type: object
+                  seccompProfile:
+                    description: |-
+                      The seccomp options to use by the containers in this pod.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    properties:
+                      localhostProfile:
+                        description: |-
+                          localhostProfile indicates a profile defined in a file on the node should be used.
+                          The profile must be preconfigured on the node to work.
+                          Must be a descending path, relative to the kubelet's configured seccomp profile location.
+                          Must be set if type is "Localhost". Must NOT be set for any other type.
+                        type: string
+                      type:
+                        description: |-
+                          type indicates which kind of seccomp profile will be applied.
+                          Valid options are:
+
+                          Localhost - a profile defined in a file on the node should be used.
+                          RuntimeDefault - the container runtime default profile should be used.
+                          Unconfined - no profile should be applied.
+                        type: string
+                    required:
+                    - type
+                    type: object
+                  supplementalGroups:
+                    description: |-
+                      A list of groups applied to the first process run in each container, in
+                      addition to the container's primary GID and fsGroup (if specified).  If
+                      the SupplementalGroupsPolicy feature is enabled, the
+                      supplementalGroupsPolicy field determines whether these are in addition
+                      to or instead of any group memberships defined in the container image.
+                      If unspecified, no additional groups are added, though group memberships
+                      defined in the container image may still be used, depending on the
+                      supplementalGroupsPolicy field.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    items:
+                      format: int64
+                      type: integer
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  supplementalGroupsPolicy:
+                    description: |-
+                      Defines how supplemental groups of the first container processes are calculated.
+                      Valid values are "Merge" and "Strict". If not specified, "Merge" is used.
+                      (Alpha) Using the field requires the SupplementalGroupsPolicy feature gate to be enabled
+                      and the container runtime must implement support for this feature.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    type: string
+                  sysctls:
+                    description: |-
+                      Sysctls hold a list of namespaced sysctls used for the pod. Pods with unsupported
+                      sysctls (by the container runtime) might fail to launch.
+                      Note that this field cannot be set when spec.os.name is windows.
+                    items:
+                      description: Sysctl defines a kernel parameter to be set
+                      properties:
+                        name:
+                          description: Name of a property to set
+                          type: string
+                        value:
+                          description: Value of a property to set
+                          type: string
+                      required:
+                      - name
+                      - value
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  windowsOptions:
+                    description: |-
+                      The Windows specific settings applied to all containers.
+                      If unspecified, the options within a container's SecurityContext will be used.
+                      If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence.
+                      Note that this field cannot be set when spec.os.name is linux.
+                    properties:
+                      gmsaCredentialSpec:
+                        description: |-
+                          GMSACredentialSpec is where the GMSA admission webhook
+                          (https://github.com/kubernetes-sigs/windows-gmsa) inlines the contents of the
+                          GMSA credential spec named by the GMSACredentialSpecName field.
+                        type: string
+                      gmsaCredentialSpecName:
+                        description: GMSACredentialSpecName is the name of the GMSA
+                          credential spec to use.
+                        type: string
+                      hostProcess:
+                        description: |-
+                          HostProcess determines if a container should be run as a 'Host Process' container.
+                          All of a Pod's containers must have the same effective HostProcess value
+                          (it is not allowed to have a mix of HostProcess containers and non-HostProcess containers).
+                          In addition, if HostProcess is true then HostNetwork must also be set to true.
+                        type: boolean
+                      runAsUserName:
+                        description: |-
+                          The UserName in Windows to run the entrypoint of the container process.
+                          Defaults to the user specified in image metadata if unspecified.
+                          May also be set in PodSecurityContext. If set in both SecurityContext and
+                          PodSecurityContext, the value specified in SecurityContext takes precedence.
+                        type: string
+                    type: object
+                type: object
+              previous:
+                description: |-
+                  Previous is the number of snapshots to step back from the one the run
+                  would otherwise select. That is the newest snapshot at or before
+                  RestoreAsOf, or the newest snapshot when RestoreAsOf is omitted. It
+                  applies to a single volume only.
+                format: int32
+                minimum: 0
+                type: integer
+              quiesce:
+                description: |-
+                  Quiesce lists the workloads in this namespace to stop before anything
+                  is restored. For each one, the run suspends the Flux Kustomization that
+                  applies it and scales it to zero. The run gives the workloads back once
+                  every volume is restored and every database deleted, down to the old
+                  Cluster's last instance pod and PVC. It gives them back at that point
+                  because a database comes back only when its owner creates it again, and
+                  a suspended Kustomization creates nothing. When omitted, the run waits
+                  for whatever mounts a claim to stop on its own.
+                items:
+                  description: WorkloadRef names a Deployment or a StatefulSet in
+                    the run's namespace.
+                  properties:
+                    kind:
+                      description: Kind is Deployment or StatefulSet.
+                      enum:
+                      - Deployment
+                      - StatefulSet
+                      type: string
+                    name:
+                      description: Name is the workload's name.
+                      maxLength: 253
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  type: object
+                maxItems: 32
+                type: array
+              repository:
+                description: |-
+                  Repository is the name of a restic repository Secret in this namespace
+                  to restore from. Use it when the backup belongs to no claim in this
+                  namespace. It needs Into.
+
+                  The Secret has to be in this namespace. If a RestoreRun could name a
+                  Secret in any namespace, anyone allowed to create one here could read
+                  every backup in the cluster. Copying a Secret into this namespace is
+                  the deliberate step that grants that access.
+                maxLength: 253
+                type: string
+              restoreAsOf:
+                description: |-
+                  RestoreAsOf is the moment to restore to, as an RFC 3339 time. A volume
+                  restores the newest snapshot taken at or before it, and a database
+                  replays WAL up to exactly that moment. When it is omitted and Previous
+                  is unset, a volume restores its newest snapshot and a database replays
+                  to the end of its WAL archive.
+                format: date-time
+                type: string
+              syncDatabaseToVolume:
+                description: |-
+                  SyncDatabaseToVolume recovers the databases to the moment of the
+                  volumes' snapshots, and RestoreAsOf then selects the snapshots only. It
+                  needs All. The run considers only snapshots tagged quiesced, which a
+                  BackupRun writes when it stopped the workloads. Such a snapshot carries
+                  the moment the run gave the workloads back, and neither the volumes nor
+                  the databases were written between the stop and that moment. Every
+                  volume has to select a snapshot of the same moment.
+                type: boolean
+              timeout:
+                default: 4h
+                description: |-
+                  Timeout is how long the run waits for its movers and recovered databases
+                  before it gives up. The clock starts when the run passes its checks.
+                type: string
+              ttlSecondsAfterFinished:
+                description: |-
+                  TTLSecondsAfterFinished is how many seconds after the run finishes the
+                  controller deletes it. When omitted, the run is kept as the record of
+                  what was restored.
+                format: int32
+                minimum: 0
+                type: integer
+            type: object
+            x-kubernetes-validations:
+            - message: set exactly one of claim (or repository), database and all
+              rule: '((has(self.claim) || has(self.repository)) ? 1 : 0) + (has(self.database)
+                ? 1 : 0) + ((has(self.all) && self.all) ? 1 : 0) == 1'
+            - message: previous applies to one volume only
+              rule: '!has(self.previous) || has(self.claim) || has(self.repository)'
+            - message: into needs claim or repository
+              rule: '!has(self.into) || has(self.claim) || has(self.repository)'
+            - message: syncDatabaseToVolume needs all
+              rule: '!has(self.syncDatabaseToVolume) || !self.syncDatabaseToVolume
+                || (has(self.all) && self.all)'
+            - message: quiesce restores in place; an into restore leaves the app alone
+              rule: '!has(self.quiesce) || size(self.quiesce) == 0 || !has(self.into)'
+          status:
+            description: RestoreRunStatus reports how far the restore got.
+            properties:
+              completedAt:
+                description: CompletedAt is when the run reached a terminal phase.
+                format: date-time
+                type: string
+              conditions:
+                description: |-
+                  Conditions holds the kstatus-compatible state, so a Flux Kustomization
+                  with wait: true can wait for this object.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              items:
+                description: |-
+                  Items has one entry for each claim and each database the run restores.
+                  An into restore has a single entry, for the claim it creates.
+                items:
+                  description: RestoreItem is one volume or database a RestoreRun
+                    restores.
+                  properties:
+                    baseBackup:
+                      description: |-
+                        BaseBackup is the ID of the barman base backup a database's recovery
+                        starts from.
+                      type: string
+                    destination:
+                      description: |-
+                        Destination is the name of the ReplicationDestination restoring a
+                        volume. It is cleared once the restore ends and the destination is
+                        deleted.
+                      type: string
+                    kind:
+                      description: Kind is PersistentVolumeClaim for a volume and
+                        Cluster for a database.
+                      type: string
+                    message:
+                      description: Message says why the item failed or was skipped.
+                      type: string
+                    name:
+                      description: Name is the name of the claim or the Cluster.
+                      type: string
+                    phase:
+                      description: Phase is how far this item got.
+                      type: string
+                    snapshot:
+                      description: Snapshot is the short ID of the restic snapshot
+                        a volume restores.
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  - phase
+                  type: object
+                type: array
+              phase:
+                description: Phase is the run's state. It is the Phase column `kubectl
+                  get` prints.
+                type: string
+              quiesced:
+                description: |-
+                  Quiesced lists the workloads this run scaled to zero, each with the
+                  replica count the run restores when it starts them again.
+                items:
+                  description: QuiescedWorkload is one workload a run scaled to zero.
+                  properties:
+                    kind:
+                      description: Kind is Deployment or StatefulSet.
+                      type: string
+                    name:
+                      description: Name is the workload's name in the run's namespace.
+                      type: string
+                    replicas:
+                      description: |-
+                        Replicas is the replica count the workload had before the run stopped
+                        it.
+                      format: int32
+                      type: integer
+                  required:
+                  - kind
+                  - name
+                  - replicas
+                  type: object
+                type: array
+              quiescedAt:
+                description: |-
+                  QuiescedAt is when the run stopped the workloads that spec.quiesce
+                  lists.
+                format: date-time
+                type: string
+              restartedAt:
+                description: RestartedAt is when the run gave those workloads their
+                  replicas back.
+                format: date-time
+                type: string
+              startedAt:
+                description: StartedAt is when the run passed its checks and began
+                  restoring.
+                format: date-time
+                type: string
+              suspendedKustomizations:
+                description: |-
+                  SuspendedKustomizations lists the Flux Kustomizations this run
+                  suspended, as namespace/name. The run resumes these and no others.
+                items:
+                  type: string
+                type: array
+              syncedTo:
+                description: |-
+                  SyncedTo is the moment a syncDatabaseToVolume run restores everything
+                  to. It is the time on the volumes' quiesced snapshots, and the
+                  databases recover to it as well.
+                format: date-time
+                type: string
+              target:
+                description: Target is the name of the claim an into restore creates
+                  and fills.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
