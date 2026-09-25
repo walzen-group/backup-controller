@@ -61,6 +61,8 @@ the volume and the database back ending on the same tick.
 | v0.5.6 | a due tick waits until something in the namespace is marked enabled |
 | v0.6.0 | quiesced snapshots moved to the run's `restartedAt` and tagged `quiesced`, and `syncDatabaseToVolume` on a RestoreRun |
 | v0.7.0 | `quiesce` on a RestoreRun: the workloads it lists are stopped while it restores |
+| v0.7.1 | a database restore gives the app back only once the old Cluster's instance pods and PVCs are gone |
+| v0.7.2 | a RestoreRun that can't stop a workload fails at once with reason `Failed`; a retime whose delete failed reuses its copy; an `endpointURL` of `host:port` reads as HTTPS |
 
 The early fixes below explain behaviour that is still in the code.
 

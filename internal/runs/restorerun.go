@@ -153,6 +153,9 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 	if _, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce); err != nil {
+		if !isQuiesceSpecError(err) {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 
@@ -419,7 +422,7 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // Succeeded, Failed or Skipped. A run past spec.timeout is aborted.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if deadline, over := r.overdue(run); over {
-		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
 	}
 
 	if len(run.Spec.Quiesce) > 0 && run.Status.QuiescedAt == nil {
@@ -428,7 +431,10 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	if stopped(run) && anyRestorePending(run.Status.Items) {
 		targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
 		if err != nil {
-			return ctrl.Result{}, r.abort(ctx, run, err.Error())
+			if !isQuiesceSpecError(err) {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error())
 		}
 		gone, pod, err := podsGone(ctx, r.Reader, run.Namespace, targets)
 		if err != nil {
@@ -706,16 +712,21 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 			fmt.Sprintf("claim %s is bound and holds the restored data", run.Spec.Into))
 	}
 	if deadline, over := r.overdue(run); over {
-		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("claim %s had not bound by %s", run.Spec.Into, deadline.Format(time.RFC3339)))
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, fmt.Sprintf("claim %s had not bound by %s", run.Spec.Into, deadline.Format(time.RFC3339)))
 	}
 	return ctrl.Result{RequeueAfter: pollInterval}, nil
 }
 
-// abort ends a run early as Failed with reason TimedOut. It marks every item
-// that has not finished as Failed with the given message, then calls finish,
-// which deletes the run's ReplicationDestinations and starts any workload the
-// run stopped.
-func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) error {
+// abort ends a run early as Failed. It marks every item that has not finished
+// as Failed with the given message, then calls finish, which deletes the run's
+// ReplicationDestinations and starts any workload the run stopped.
+//
+// Parameters:
+//   - reason is the Ready reason the run ends with: ReasonTimedOut when the
+//     run ran past spec.timeout, ReasonFailed when it hit an error it can't
+//     get past, such as a workload it couldn't stop or one that was deleted.
+//   - message is the Ready message, and each unfinished item's message.
+func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		switch item.Phase {
@@ -723,7 +734,7 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 		}
 	}
-	return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, message)
+	return r.finish(ctx, run, reason, message)
 }
 
 // quiesce stops the workloads spec.quiesce lists, and records in the status
@@ -733,12 +744,17 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 // then scales each workload to zero. quiesce writes status.quiesced,
 // status.suspendedKustomizations and status.quiescedAt even when stopping
 // fails partway, so finish and finalize can still put back what was changed.
-// It then returns the error, and it does not try the stop again on a later
-// pass. A spec.quiesce entry the namespace does not hold ends the run as
-// Failed with reason Invalid before anything is stopped.
+// A failed stop then aborts the run with reason Failed, which starts the
+// workloads it stopped again and resumes the Kustomizations, the same as a
+// BackupRun. A spec.quiesce entry the namespace does not hold ends the run as
+// Failed with reason Invalid before anything is stopped, and a failed read of
+// an entry is returned for a retry.
 func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
 	if err != nil {
+		if !isQuiesceSpecError(err) {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 	halted, suspended, stopErr := stopWorkloads(ctx, r.Client, r.Reader, targets)
@@ -748,7 +764,7 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		return ctrl.Result{}, err
 	}
 	if stopErr != nil {
-		return ctrl.Result{}, stopErr
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, stopErr.Error())
 	}
 	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 }

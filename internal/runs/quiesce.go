@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -95,10 +96,12 @@ func quiesceTargets(ctx context.Context, c client.Reader, namespace string) ([]w
 //   - namespace is the RestoreRun's namespace. Each workload is looked up there.
 //   - refs is the run's spec.quiesce.
 //
-// It returns an error when an entry has a kind other than Deployment or
-// StatefulSet, or names a workload the namespace doesn't hold. The error names
-// the entry. A RestoreRun calls this while it plans, before it stops anything,
-// so a mistake in spec.quiesce fails the run with nothing changed.
+// It returns a *quiesceSpecError when an entry has a kind other than
+// Deployment or StatefulSet, or names a workload the namespace doesn't hold.
+// The error names the entry. Any other failed read comes back wrapped as it
+// is, and the caller retries it. A RestoreRun calls this while it plans,
+// before it stops anything, so a mistake in spec.quiesce fails the run with
+// nothing changed.
 func namedTargets(ctx context.Context, c client.Reader, namespace string, refs []backupv1alpha1.WorkloadRef) ([]workload, error) {
 	replicas := func(r *int32) int32 {
 		if r == nil {
@@ -123,18 +126,34 @@ func namedTargets(ctx context.Context, c client.Reader, namespace string, refs [
 			}
 			targets = append(targets, workload{kind: ref.Kind, object: s, replicas: replicas(s.Spec.Replicas), selector: s.Spec.Selector})
 		default:
-			return nil, fmt.Errorf("spec.quiesce lists %s %s; only a Deployment or a StatefulSet can be stopped", ref.Kind, ref.Name)
+			return nil, &quiesceSpecError{fmt.Sprintf("spec.quiesce lists %s %s; only a Deployment or a StatefulSet can be stopped", ref.Kind, ref.Name)}
 		}
 	}
 	return targets, nil
 }
 
+// quiesceSpecError is an entry in a RestoreRun's spec.quiesce that the run
+// can't act on: a kind it can't stop, or a workload the namespace doesn't
+// hold. Reading again won't change it, so the run ends. A failed read of the
+// API server is returned as a plain error, and the run retries it.
+type quiesceSpecError struct{ message string }
+
+func (e *quiesceSpecError) Error() string { return e.message }
+
+// isQuiesceSpecError reports whether err, or an error it wraps, is a
+// *quiesceSpecError.
+func isQuiesceSpecError(err error) bool {
+	var bad *quiesceSpecError
+	return errors.As(err, &bad)
+}
+
 // missingWorkload turns the error from reading a spec.quiesce entry into the
-// message the RestoreRun reports. A NotFound error becomes a sentence saying
-// the namespace holds no such workload. Any other error is wrapped as it is.
+// error the RestoreRun reports. A NotFound error becomes a *quiesceSpecError
+// saying the namespace holds no such workload. Any other error is wrapped as
+// it is.
 func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 	if apierrors.IsNotFound(err) {
-		return fmt.Errorf("spec.quiesce lists %s %s, which this namespace does not hold", ref.Kind, ref.Name)
+		return &quiesceSpecError{fmt.Sprintf("spec.quiesce lists %s %s, which this namespace does not hold", ref.Kind, ref.Name)}
 	}
 	return fmt.Errorf("get %s %s: %w", ref.Kind, ref.Name, err)
 }

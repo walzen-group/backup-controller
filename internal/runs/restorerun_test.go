@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -11,11 +12,13 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // restoreUID is the UID of the RestoreRun back-to-monday. The run's
@@ -561,5 +564,96 @@ func TestAnIntoRestoreChecksBeforeCreatingAnything(t *testing.T) {
 	scratch := &corev1.PersistentVolumeClaim{}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "notes-data-monday"}, scratch); err == nil {
 		t.Fatal("a scratch claim was created although no snapshot is in reach")
+	}
+}
+
+// refuseDeploymentPatches returns a client over c that refuses every patch to
+// a Deployment, the way the API server does when the controller's
+// ServiceAccount lacks patch on deployments.
+func refuseDeploymentPatches(c client.Client) client.Client {
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok {
+				return apierrors.NewForbidden(appsv1.Resource("deployments"), obj.GetName(), errors.New("patch refused"))
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+}
+
+// A quiesced restore that fails to stop a workload ends at once as Failed,
+// with reason Failed, and resumes the Kustomization it already suspended. A
+// BackupRun does the same. Waiting would leave the app running beside the
+// restore until the timeout.
+func TestAQuiescedRestoreThatCannotStopTheAppFailsAtOnce(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), writerPod())
+	r.Client = refuseDeploymentPatches(c)
+
+	restoreStep(t, r) // plan
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err != nil {
+		t.Fatalf("quiesce returned %v, want the run ended with the error in its status", err)
+	}
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonFailed {
+		t.Fatalf("phase = %q, reason = %q; want Failed with reason Failed", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	if !strings.Contains(readyMessage(run.Status.Conditions), "patch refused") {
+		t.Errorf("ready message = %q, want the scale error", readyMessage(run.Status.Conditions))
+	}
+	if suspended(t, c) {
+		t.Error("the Kustomization the run suspended stayed suspended")
+	}
+}
+
+// A spec.quiesce workload deleted while the run holds it stopped ends the run
+// as Failed, with reason Failed. The run has not timed out, so TimedOut would
+// point at the wrong cause.
+func TestAQuiescedRestoreWhoseWorkloadVanishesFails(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), writerPod())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // quiesce
+
+	if err := c.Delete(context.Background(), deployment()); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonFailed {
+		t.Fatalf("phase = %q, reason = %q; want Failed with reason Failed", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	if !strings.Contains(readyMessage(run.Status.Conditions), appN) {
+		t.Errorf("ready message = %q, want it to name %s", readyMessage(run.Status.Conditions), appN)
+	}
+}
+
+// A failed read of a spec.quiesce workload while the run holds it stopped is
+// returned for a retry, and the run keeps going. Only a workload that is gone
+// ends the run.
+func TestAQuiescedRestoreRetriesAFailedWorkloadRead(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), writerPod())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // quiesce
+
+	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok {
+				return apierrors.NewServiceUnavailable("etcd leader changed")
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+		t.Error("reconcile succeeded, want the read error returned for a retry")
+	}
+	if run := readRestoreRun(t, c); run.Status.Phase.Finished() {
+		t.Errorf("phase = %q after a failed read, want the run still going", run.Status.Phase)
 	}
 }
