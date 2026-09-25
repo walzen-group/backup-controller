@@ -110,13 +110,13 @@ sequenceDiagram
     participant hook as bootstrap webhook
 
     run->>run: checks: BaseBackups at the location,<br/>one finished at or before restoreAsOf
-    Note over run: volumes in the run restore first;<br/>a failed one leaves the databases running
+    Note over run: volumes in the run restore first,<br/>and a failed one leaves the databases running
     run->>run: marks the item Deleted
     run->>cnpg: deletes the Cluster
-    Note over run: Waiting: recreate <cluster><br/>to finish the restore
+    Note over run: phase Waiting, until the Cluster<br/>is created again
     owner->>hook: creates the Cluster again
     hook->>hook: finds this run waiting, item Deleted
-    hook-->>owner: bootstrap.recovery to restoreAsOf,<br/>backup.wlz.li/restore-run: <run>
+    hook-->>owner: bootstrap.recovery to restoreAsOf,<br/>annotation backup.wlz.li/restore-run naming the run
     run->>run: sees the annotation, item Recovering
     cnpg-->>run: phase "Cluster in healthy state"
     run->>run: item Succeeded
