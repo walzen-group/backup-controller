@@ -1,0 +1,48 @@
+{
+  "app-pg": {
+    "backups": [
+      {
+        "backup_label": null,
+        "backup_name": "app-pg-backup-failed",
+        "begin_offset": 40,
+        "begin_time": "Fri Sep 25 21:52:03 2026",
+        "begin_wal": "000000010000000000000004",
+        "begin_xlog": "0/4000028",
+        "children_backup_ids": null,
+        "cluster_size": 24026209,
+        "compression": null,
+        "config_file": "/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.9B84/data/postgresql.conf",
+        "copy_stats": null,
+        "data_checksums": "on",
+        "deduplicated_size": null,
+        "encryption": null,
+        "end_offset": null,
+        "end_time": null,
+        "end_wal": null,
+        "end_xlog": null,
+        "error": "failure uploading data (An error occurred (AccessDenied) when calling the CreateMultipartUpload operation: injected by s3fault)",
+        "hba_file": "/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.9B84/data/pg_hba.conf",
+        "ident_file": "/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.9B84/data/pg_ident.conf",
+        "included_files": null,
+        "mode": null,
+        "parent_backup_id": null,
+        "pgdata": "/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.9B84/data",
+        "server_name": "cloud",
+        "size": null,
+        "status": "FAILED",
+        "summarize_wal": "off",
+        "systemid": "7689593423099612508",
+        "tablespaces": null,
+        "timeline": 1,
+        "version": 180006,
+        "xlog_segment_size": 16777216,
+        "backup_id": "20260925T215203",
+        "begin_time_iso": "2026-09-25T21:52:03.382809+00:00"
+      }
+    ],
+    "checkWalArchive": {
+      "exitCode": 1,
+      "output": "2026-09-25 21:52:05,817 [1483256] ERROR: WAL archive check failed for server app-pg: Expected empty archive\n"
+    }
+  }
+}

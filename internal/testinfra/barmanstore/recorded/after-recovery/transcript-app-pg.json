@@ -1,0 +1,80 @@
+[
+  {
+    "step": "prober-has-base-backup",
+    "method": "GET",
+    "path": "/recorded/",
+    "query": "location=",
+    "status": 200,
+    "headers": {
+      "Content-Length": "136",
+      "Content-Type": "application/xml"
+    },
+    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cLocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003eus-east-1\u003c/LocationConstraint\u003e"
+  },
+  {
+    "step": "prober-has-base-backup",
+    "method": "GET",
+    "path": "/recorded/",
+    "query": "delimiter=\u0026encoding-type=url\u0026fetch-owner=true\u0026list-type=2\u0026prefix=after-recovery%2Fapp-pg%2Fbase%2F",
+    "status": 200,
+    "headers": {
+      "Content-Length": "1022",
+      "Content-Type": "application/xml"
+    },
+    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003e\u003cName\u003erecorded\u003c/Name\u003e\u003cPrefix\u003eafter-recovery/app-pg/base/\u003c/Prefix\u003e\u003cMaxKeys\u003e1000\u003c/MaxKeys\u003e\u003cKeyCount\u003e2\u003c/KeyCount\u003e\u003cIsTruncated\u003efalse\u003c/IsTruncated\u003e\u003cContents\u003e\u003cETag\u003e\"651668f8fec5d885bd0fca674dfaf5bf\"\u003c/ETag\u003e\u003cKey\u003eafter-recovery/app-pg/base/20260925T215238/backup.info\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:52:40.096Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e1402\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cContents\u003e\u003cETag\u003e\"93198f708df120b6282e1f8756effc13-2\"\u003c/ETag\u003e\u003cKey\u003eafter-recovery/app-pg/base/20260925T215238/data.tar\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:52:40.083Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e25303040\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cEncodingType\u003eurl\u003c/EncodingType\u003e\u003c/ListBucketResult\u003e"
+  },
+  {
+    "step": "prober-has-base-backup",
+    "method": "GET",
+    "path": "/recorded/after-recovery/app-pg/base/20260925T215238/backup.info",
+    "query": "",
+    "status": 200,
+    "headers": {
+      "Accept-Ranges": "bytes",
+      "Content-Length": "1402",
+      "Content-Type": "application/octet-stream",
+      "ETag": "\"651668f8fec5d885bd0fca674dfaf5bf\"",
+      "Last-Modified": "Fri, 25 Sep 2026 21:52:40 GMT"
+    },
+    "body": "backup_label='START WAL LOCATION: 0/3000028 (file 000000010000000000000003)\\nCHECKPOINT LOCATION: 0/3000080\\nBACKUP METHOD: streamed\\nBACKUP FROM: primary\\nSTART TIME: 2026-09-25 21:52:38 UTC\\nLABEL: Barman backup cloud 20260925T215238\\nSTART TIMELINE: 1\\n'\nbackup_name=app-pg-backup-1\nbegin_offset=40\nbegin_time=2026-09-25 21:52:38.390384+00:00\nbegin_wal=000000010000000000000003\nbegin_xlog=0/3000028\nchildren_backup_ids=None\ncluster_size=23903329\ncompression=None\nconfig_file=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data/postgresql.conf\ncopy_stats={'total_time': 1.724604, 'number_of_workers': 2, 'analysis_time': 0, 'analysis_time_per_item': {'data': 0}, 'copy_time_per_item': {'data': 1.12988}, 'serialized_copy_time_per_item': {'data': 0.382181}, 'copy_time': 1.12988, 'serialized_copy_time': 0.382181}\ndata_checksums=on\ndeduplicated_size=None\nencryption=None\nend_offset=288\nend_time=2026-09-25 21:52:39.015148+00:00\nend_wal=000000010000000000000003\nend_xlog=0/3000120\nerror=None\nhba_file=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data/pg_hba.conf\nident_file=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data/pg_ident.conf\nincluded_files=None\nmode=None\nparent_backup_id=None\npgdata=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data\nserver_name=cloud\nsize=None\nstatus=DONE\nsummarize_wal=off\nsystemid=7689594153985680743\ntablespaces=None\ntimeline=1\nversion=180006\nxlog_segment_size=16777216\n"
+  },
+  {
+    "step": "prober-base-backups",
+    "method": "GET",
+    "path": "/recorded/",
+    "query": "location=",
+    "status": 200,
+    "headers": {
+      "Content-Length": "136",
+      "Content-Type": "application/xml"
+    },
+    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cLocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003eus-east-1\u003c/LocationConstraint\u003e"
+  },
+  {
+    "step": "prober-base-backups",
+    "method": "GET",
+    "path": "/recorded/",
+    "query": "delimiter=\u0026encoding-type=url\u0026fetch-owner=true\u0026list-type=2\u0026prefix=after-recovery%2Fapp-pg%2Fbase%2F",
+    "status": 200,
+    "headers": {
+      "Content-Length": "1022",
+      "Content-Type": "application/xml"
+    },
+    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003e\u003cName\u003erecorded\u003c/Name\u003e\u003cPrefix\u003eafter-recovery/app-pg/base/\u003c/Prefix\u003e\u003cMaxKeys\u003e1000\u003c/MaxKeys\u003e\u003cKeyCount\u003e2\u003c/KeyCount\u003e\u003cIsTruncated\u003efalse\u003c/IsTruncated\u003e\u003cContents\u003e\u003cETag\u003e\"651668f8fec5d885bd0fca674dfaf5bf\"\u003c/ETag\u003e\u003cKey\u003eafter-recovery/app-pg/base/20260925T215238/backup.info\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:52:40.096Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e1402\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cContents\u003e\u003cETag\u003e\"93198f708df120b6282e1f8756effc13-2\"\u003c/ETag\u003e\u003cKey\u003eafter-recovery/app-pg/base/20260925T215238/data.tar\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:52:40.083Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e25303040\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cEncodingType\u003eurl\u003c/EncodingType\u003e\u003c/ListBucketResult\u003e"
+  },
+  {
+    "step": "prober-base-backups",
+    "method": "GET",
+    "path": "/recorded/after-recovery/app-pg/base/20260925T215238/backup.info",
+    "query": "",
+    "status": 200,
+    "headers": {
+      "Accept-Ranges": "bytes",
+      "Content-Length": "1402",
+      "Content-Type": "application/octet-stream",
+      "ETag": "\"651668f8fec5d885bd0fca674dfaf5bf\"",
+      "Last-Modified": "Fri, 25 Sep 2026 21:52:40 GMT"
+    },
+    "body": "backup_label='START WAL LOCATION: 0/3000028 (file 000000010000000000000003)\\nCHECKPOINT LOCATION: 0/3000080\\nBACKUP METHOD: streamed\\nBACKUP FROM: primary\\nSTART TIME: 2026-09-25 21:52:38 UTC\\nLABEL: Barman backup cloud 20260925T215238\\nSTART TIMELINE: 1\\n'\nbackup_name=app-pg-backup-1\nbegin_offset=40\nbegin_time=2026-09-25 21:52:38.390384+00:00\nbegin_wal=000000010000000000000003\nbegin_xlog=0/3000028\nchildren_backup_ids=None\ncluster_size=23903329\ncompression=None\nconfig_file=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data/postgresql.conf\ncopy_stats={'total_time': 1.724604, 'number_of_workers': 2, 'analysis_time': 0, 'analysis_time_per_item': {'data': 0}, 'copy_time_per_item': {'data': 1.12988}, 'serialized_copy_time_per_item': {'data': 0.382181}, 'copy_time': 1.12988, 'serialized_copy_time': 0.382181}\ndata_checksums=on\ndeduplicated_size=None\nencryption=None\nend_offset=288\nend_time=2026-09-25 21:52:39.015148+00:00\nend_wal=000000010000000000000003\nend_xlog=0/3000120\nerror=None\nhba_file=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data/pg_hba.conf\nident_file=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data/pg_ident.conf\nincluded_files=None\nmode=None\nparent_backup_id=None\npgdata=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data\nserver_name=cloud\nsize=None\nstatus=DONE\nsummarize_wal=off\nsystemid=7689594153985680743\ntablespaces=None\ntimeline=1\nversion=180006\nxlog_segment_size=16777216\n"
+  }
+]

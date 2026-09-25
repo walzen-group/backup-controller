@@ -1,0 +1,85 @@
+{
+  "store": "after-recovery",
+  "objects": [
+    {
+      "key": "app-pg/base/20260925T215238/backup.info",
+      "size": 1402,
+      "lastModified": "2026-09-25T21:52:40.096Z",
+      "etag": "\"651668f8fec5d885bd0fca674dfaf5bf\"",
+      "body": "backup_label='START WAL LOCATION: 0/3000028 (file 000000010000000000000003)\\nCHECKPOINT LOCATION: 0/3000080\\nBACKUP METHOD: streamed\\nBACKUP FROM: primary\\nSTART TIME: 2026-09-25 21:52:38 UTC\\nLABEL: Barman backup cloud 20260925T215238\\nSTART TIMELINE: 1\\n'\nbackup_name=app-pg-backup-1\nbegin_offset=40\nbegin_time=2026-09-25 21:52:38.390384+00:00\nbegin_wal=000000010000000000000003\nbegin_xlog=0/3000028\nchildren_backup_ids=None\ncluster_size=23903329\ncompression=None\nconfig_file=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data/postgresql.conf\ncopy_stats={'total_time': 1.724604, 'number_of_workers': 2, 'analysis_time': 0, 'analysis_time_per_item': {'data': 0}, 'copy_time_per_item': {'data': 1.12988}, 'serialized_copy_time_per_item': {'data': 0.382181}, 'copy_time': 1.12988, 'serialized_copy_time': 0.382181}\ndata_checksums=on\ndeduplicated_size=None\nencryption=None\nend_offset=288\nend_time=2026-09-25 21:52:39.015148+00:00\nend_wal=000000010000000000000003\nend_xlog=0/3000120\nerror=None\nhba_file=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data/pg_hba.conf\nident_file=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data/pg_ident.conf\nincluded_files=None\nmode=None\nparent_backup_id=None\npgdata=/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.PYmI/data\nserver_name=cloud\nsize=None\nstatus=DONE\nsummarize_wal=off\nsystemid=7689594153985680743\ntablespaces=None\ntimeline=1\nversion=180006\nxlog_segment_size=16777216\n"
+    },
+    {
+      "key": "app-pg/base/20260925T215238/data.tar",
+      "size": 25303040,
+      "lastModified": "2026-09-25T21:52:40.083Z",
+      "etag": "\"93198f708df120b6282e1f8756effc13-2\""
+    },
+    {
+      "key": "app-pg/wals/0000000100000000/000000010000000000000001",
+      "size": 16777216,
+      "lastModified": "2026-09-25T21:52:37.294Z",
+      "etag": "\"f82cc8cddec20af51424412d5af9c44f\""
+    },
+    {
+      "key": "app-pg/wals/0000000100000000/000000010000000000000002",
+      "size": 16777216,
+      "lastModified": "2026-09-25T21:52:38.878Z",
+      "etag": "\"ae3bb36722f3fe8d827ba780073a15bc\""
+    },
+    {
+      "key": "app-pg/wals/0000000100000000/000000010000000000000003",
+      "size": 16777216,
+      "lastModified": "2026-09-25T21:52:39.486Z",
+      "etag": "\"aef868e03cfb9d59177161c164b2f82c\""
+    },
+    {
+      "key": "app-pg/wals/0000000100000000/000000010000000000000003.00000028.backup",
+      "size": 348,
+      "lastModified": "2026-09-25T21:52:39.9Z",
+      "etag": "\"483fc5d03ba6e358b2dc7ba162242038\""
+    },
+    {
+      "key": "app-pg/wals/0000000100000000/000000010000000000000004",
+      "size": 16777216,
+      "lastModified": "2026-09-25T21:52:40.642Z",
+      "etag": "\"b3b8a3f678738fbbeea0904d14860876\""
+    },
+    {
+      "key": "app-pg/wals/0000000100000000/000000010000000000000005",
+      "size": 16777216,
+      "lastModified": "2026-09-25T21:52:41.223Z",
+      "etag": "\"c9572061700a8a224918f820a1fc7d5b\""
+    },
+    {
+      "key": "app-pg/wals/0000000100000000/000000010000000000000006",
+      "size": 16777216,
+      "lastModified": "2026-09-25T21:52:41.804Z",
+      "etag": "\"3529e62042f6a77b901babd0eeac1b0e\""
+    },
+    {
+      "key": "app-pg/wals/00000002.history",
+      "size": 32,
+      "lastModified": "2026-09-25T21:52:45.883Z",
+      "etag": "\"29dff04ff9563037dff6d30af9a250bf\"",
+      "body": "1\t0/3000120\treached consistency\n"
+    },
+    {
+      "key": "app-pg/wals/0000000200000000/000000020000000000000003",
+      "size": 16777216,
+      "lastModified": "2026-09-25T21:52:46.379Z",
+      "etag": "\"fb4aad404968d8a78df9818d2af9df8e\""
+    },
+    {
+      "key": "app-pg/wals/0000000200000000/000000020000000000000004",
+      "size": 16777216,
+      "lastModified": "2026-09-25T21:52:46.897Z",
+      "etag": "\"fa02e2fad99ae60ee7dde5b54d1cb4de\""
+    },
+    {
+      "key": "app-pg/wals/0000000200000000/000000020000000000000005",
+      "size": 16777216,
+      "lastModified": "2026-09-25T21:52:47.419Z",
+      "etag": "\"618ba21b86f17c08db7b7dae1684a66a\""
+    }
+  ]
+}

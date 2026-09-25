@@ -1,1 +1,12 @@
-{}
+{
+  "generator": "hack/fixtures/barman-stores.sh",
+  "recorded": "2026-09-25T21:57:55Z",
+  "tools": {
+    "barman": "3.20.0",
+    "rustfs": "1.0.0",
+    "postgresql": "18.6"
+  },
+  "bucket": "recorded",
+  "server": "app-pg",
+  "backupArguments": "barman-cloud-backup --cloud-provider aws-s3 --endpoint-url <rustfs> --user postgres --name <backup> --immediate-checkpoint s3://recorded/<store>/ <server>"
+}

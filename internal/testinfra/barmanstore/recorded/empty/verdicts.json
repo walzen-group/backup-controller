@@ -1,0 +1,9 @@
+{
+  "app-pg": {
+    "backups": [],
+    "checkWalArchive": {
+      "exitCode": 0,
+      "output": ""
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "app-pg": {
+    "backups": [],
+    "checkWalArchive": {
+      "exitCode": 1,
+      "output": "2026-09-25 21:52:35,223 [1484083] ERROR: WAL archive check failed for server app-pg: Expected empty archive\n"
+    }
+  },
+  "other-pg": {
+    "backups": [
+      {
+        "backup_label": "'START WAL LOCATION: 0/2000028 (file 000000010000000000000002)\\nCHECKPOINT LOCATION: 0/2000080\\nBACKUP METHOD: streamed\\nBACKUP FROM: primary\\nSTART TIME: 2026-09-25 21:52:33 UTC\\nLABEL: Barman backup cloud 20260925T215233\\nSTART TIMELINE: 1\\n'",
+        "backup_name": "other-pg-backup-1",
+        "begin_offset": 40,
+        "begin_time": "Fri Sep 25 21:52:33 2026",
+        "begin_wal": "000000010000000000000002",
+        "begin_xlog": "0/2000028",
+        "children_backup_ids": null,
+        "cluster_size": 23837793,
+        "compression": null,
+        "config_file": "/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.HAIC/data/postgresql.conf",
+        "copy_stats": {
+          "total_time": 0.896469,
+          "number_of_workers": 2,
+          "analysis_time": 0,
+          "analysis_time_per_item": {
+            "data": 0
+          },
+          "copy_time_per_item": {
+            "data": 0.3235
+          },
+          "serialized_copy_time_per_item": {
+            "data": 0.516863
+          },
+          "copy_time": 0.3235,
+          "serialized_copy_time": 0.516863
+        },
+        "data_checksums": "on",
+        "deduplicated_size": null,
+        "encryption": null,
+        "end_offset": 288,
+        "end_time": "Fri Sep 25 21:52:33 2026",
+        "end_wal": "000000010000000000000002",
+        "end_xlog": "0/2000120",
+        "error": null,
+        "hba_file": "/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.HAIC/data/pg_hba.conf",
+        "ident_file": "/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.HAIC/data/pg_ident.conf",
+        "included_files": null,
+        "mode": null,
+        "parent_backup_id": null,
+        "pgdata": "/tmp/nix-shell.3HGYr8/tmp.axLxFuikaQ/pg.HAIC/data",
+        "server_name": "cloud",
+        "size": null,
+        "status": "DONE",
+        "summarize_wal": "off",
+        "systemid": "7689594136740861127",
+        "tablespaces": null,
+        "timeline": 1,
+        "version": 180006,
+        "xlog_segment_size": 16777216,
+        "backup_id": "20260925T215233",
+        "begin_time_iso": "2026-09-25T21:52:33.396911+00:00",
+        "end_time_iso": "2026-09-25T21:52:33.998238+00:00"
+      }
+    ],
+    "checkWalArchive": {
+      "exitCode": 0,
+      "output": ""
+    }
+  }
+}

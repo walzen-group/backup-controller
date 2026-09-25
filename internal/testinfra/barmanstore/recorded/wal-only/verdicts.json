@@ -1,0 +1,9 @@
+{
+  "app-pg": {
+    "backups": [],
+    "checkWalArchive": {
+      "exitCode": 1,
+      "output": "2026-09-25 21:49:45,933 [1482053] ERROR: WAL archive check failed for server app-pg: Expected empty archive\n"
+    }
+  }
+}
