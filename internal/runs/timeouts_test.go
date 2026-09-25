@@ -104,7 +104,7 @@ func TestANamespaceTimeoutThatDoesNotParseFailsTheRun(t *testing.T) {
 // scheduled one in the same namespace give up at the same point.
 func TestAScheduledRunLeavesTheTimeoutToItsNamespace(t *testing.T) {
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
-	_, c := schedule(t, time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC), scheduledNamespace("0 5 * * *", created))
+	_, c := schedule(t, time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC), scheduledNamespace("0 5 * * *", created), claim())
 
 	runs := scheduledRuns(t, c)
 	if len(runs) != 1 || runs[0].Spec.Timeout != nil {

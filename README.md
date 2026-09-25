@@ -20,7 +20,7 @@ claim's ReplicationSource, and asks CloudNativePG for a base backup of each
 database. A RestoreRun restores one volume, one database or the whole namespace
 to the newest backup or a chosen moment.
 
-Status, 2026-09-25: released at v0.5.4 and running on the walzen prod cluster,
+Status, 2026-09-25: released at v0.5.6. v0.5.4 runs on the walzen prod cluster,
 where the canary at the infrastructure repository's
 modules/testing/canary-namespace-backup ran every mode on 2026-09-24: a
 scheduled run, each form of BackupRun and RestoreRun, and automatic restore of

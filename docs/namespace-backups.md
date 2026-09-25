@@ -101,6 +101,17 @@ At each tick of a Namespace's schedule the controller creates a BackupRun named
 back. While another run with `all: true` in the namespace is unfinished, the
 tick waits for it.
 
+A due tick also waits while no claim or Cluster in the namespace carries
+`backup.wlz.li/enabled: "true"`, because a run created then fails with Invalid.
+Flux writes a Namespace before the claims in it, so adding a schedule to an
+existing namespace can make a tick due a second before its claims are marked.
+Until one is, the controller records a Warning with reason NothingEnabled on the
+Namespace, noted `the tick at 2026-09-23T05:00:00Z is due, but nothing in this
+namespace is marked backup.wlz.li/enabled: "true"`, and creates no run. The
+controller checks again as soon as a claim changes, and at least every five
+minutes, which is how it finds a marked Cluster. `kubectl describe namespace
+<name>` lists the Warning under Events.
+
 A scheduled run carries no timeout of its own, so it gives up at the same point
 a manual run without one does: `backup.wlz.li/timeout` on the Namespace, or six
 hours after Kueue admits it. The clock starts at admission, so the time a run

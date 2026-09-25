@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -21,15 +22,26 @@ func scheduledNamespace(schedule string, created time.Time) *corev1.Namespace {
 	}}
 }
 
-func schedule(t *testing.T, now time.Time, objects ...client.Object) (ctrl.Result, client.Client) {
+func scheduler(t *testing.T, now time.Time, objects ...client.Object) (*Scheduler, client.Client, *events.FakeRecorder) {
 	t.Helper()
 	c := newClient(t, objects...)
-	s := &Scheduler{Client: c, Reader: c, Now: func() time.Time { return now }}
+	recorder := events.NewFakeRecorder(10)
+	return &Scheduler{Client: c, Reader: c, Recorder: recorder, Now: func() time.Time { return now }}, c, recorder
+}
+
+func tick(t *testing.T, s *Scheduler) ctrl.Result {
+	t.Helper()
 	result, err := s.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: ns}})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	return result, c
+	return result
+}
+
+func schedule(t *testing.T, now time.Time, objects ...client.Object) (ctrl.Result, client.Client) {
+	t.Helper()
+	s, c, _ := scheduler(t, now, objects...)
+	return tick(t, s), c
 }
 
 func scheduledRuns(t *testing.T, c client.Client) []backupv1alpha1.BackupRun {
@@ -45,7 +57,7 @@ func TestADueTickCreatesARunOfTheWholeNamespace(t *testing.T) {
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
 
-	result, c := schedule(t, now, scheduledNamespace("0 5 * * *", created))
+	result, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), claim())
 
 	runs := scheduledRuns(t, c)
 	if len(runs) != 1 {
@@ -66,7 +78,7 @@ func TestAScheduleWithAZoneTicksOnThatZonesClock(t *testing.T) {
 	created := time.Date(2026, 9, 24, 1, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 2, 0, 30, 0, time.UTC)
 
-	_, c := schedule(t, now, scheduledNamespace("CRON_TZ=Europe/Berlin 0 4 * * *", created))
+	_, c := schedule(t, now, scheduledNamespace("CRON_TZ=Europe/Berlin 0 4 * * *", created), claim())
 
 	runs := scheduledRuns(t, c)
 	if len(runs) != 1 || runs[0].Labels[backupv1alpha1.LabelScheduledFor] != "1790215200" {
@@ -78,7 +90,7 @@ func TestATickNotYetDueCreatesNothing(t *testing.T) {
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 4, 58, 0, 0, time.UTC)
 
-	result, c := schedule(t, now, scheduledNamespace("0 5 * * *", created))
+	result, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), claim())
 
 	if runs := scheduledRuns(t, c); len(runs) != 0 {
 		t.Fatalf("runs = %d before the tick, want 0", len(runs))
@@ -93,7 +105,7 @@ func TestMissedTicksRunOnceForTheNewest(t *testing.T) {
 	created := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 30, 0, 0, time.UTC)
 
-	_, c := schedule(t, now, scheduledNamespace("0 5 * * *", created))
+	_, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), claim())
 
 	runs := scheduledRuns(t, c)
 	if len(runs) != 1 || runs[0].Name != "scheduled-20260924-0500" {
@@ -111,10 +123,59 @@ func TestAnUnfinishedNamespaceRunHoldsTheTick(t *testing.T) {
 		Status:     backupv1alpha1.BackupRunStatus{Phase: backupv1alpha1.RunPhaseRunning},
 	}
 
-	_, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), running)
+	_, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), claim(), running)
 
 	if runs := scheduledRuns(t, c); len(runs) != 0 {
 		t.Fatalf("runs = %d while another namespace run works, want 0", len(runs))
+	}
+}
+
+// Flux writes a Namespace before the claims in it. A tick already due when the
+// schedule arrives waits for a claim marked enabled, because a run created
+// first finds nothing to back up and fails.
+func TestADueTickWaitsForSomethingMarkedEnabled(t *testing.T) {
+	created := time.Date(2026, 9, 22, 16, 25, 56, 0, time.UTC)
+	now := time.Date(2026, 9, 25, 9, 37, 16, 0, time.UTC)
+	unmarked := claim()
+	unmarked.Annotations = nil
+	s, c, recorder := scheduler(t, now, scheduledNamespace("0 5 * * 3", created), unmarked)
+
+	result := tick(t, s)
+
+	if runs := scheduledRuns(t, c); len(runs) != 0 {
+		t.Fatalf("runs = %d with nothing marked, want 0", len(runs))
+	}
+	if result.RequeueAfter > refresh {
+		t.Errorf("requeue after = %v, want at most %v", result.RequeueAfter, refresh)
+	}
+	want := `Warning NothingEnabled the tick at 2026-09-23T05:00:00Z is due, but nothing in this namespace is marked backup.wlz.li/enabled: "true"`
+	if got := recorded(recorder); len(got) != 1 || got[0] != want {
+		t.Fatalf("events = %q, want [%q]", got, want)
+	}
+
+	marked := &corev1.PersistentVolumeClaim{}
+	get(t, c, ns, claimN, marked)
+	marked.Annotations = enabled()
+	if err := c.Update(context.Background(), marked); err != nil {
+		t.Fatal(err)
+	}
+	tick(t, s)
+
+	runs := scheduledRuns(t, c)
+	if len(runs) != 1 || runs[0].Name != "scheduled-20260923-0500" {
+		t.Fatalf("runs = %v, want the waiting tick's run", runs)
+	}
+}
+
+// A namespace whose only backup is a database has something to back up.
+func TestAnEnabledClusterAloneLetsTheTickRun(t *testing.T) {
+	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
+
+	_, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), cluster())
+
+	if runs := scheduledRuns(t, c); len(runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(runs))
 	}
 }
 

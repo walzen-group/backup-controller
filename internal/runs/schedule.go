@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -37,12 +38,17 @@ const refresh = 5 * time.Minute
 // newest backup.wlz.li/scheduled-for label among its BackupRuns, so a
 // controller that restarts picks up where the runs say it was. A tick missed
 // while the controller was down runs once when it comes back; several missed
-// ticks run once, for the newest.
+// ticks run once, for the newest. A due tick in a namespace with nothing marked
+// backup.wlz.li/enabled creates no run and records a Warning on the Namespace.
 type Scheduler struct {
 	client.Client
 
 	// Reader lists Clusters without the informer cache.
 	Reader client.Reader
+
+	// Recorder writes a Warning on the Namespace when a tick is due and
+	// nothing in it is marked backup.wlz.li/enabled.
+	Recorder events.EventRecorder
 
 	// Now is the clock, injected so tests can move time without sleeping.
 	Now func() time.Time
@@ -128,14 +134,39 @@ func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 		if unfinished {
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
 		}
-		if err := s.create(ctx, req.Name, due); err != nil {
+		// Flux writes a Namespace before the claims in it, so a tick already
+		// due when the schedule arrives waits here until a claim is marked.
+		// The claim's change requeues this, and a Cluster is seen at the next
+		// refresh.
+		marked, err := s.anythingEnabled(ctx, req.Name)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		logger.Info("created a scheduled backup", "tick", due.UTC().Format(time.RFC3339))
+		if marked {
+			if err := s.create(ctx, req.Name, due); err != nil {
+				return ctrl.Result{}, err
+			}
+			logger.Info("created a scheduled backup", "tick", due.UTC().Format(time.RFC3339))
+		} else if s.Recorder != nil {
+			s.Recorder.Eventf(namespace, nil, corev1.EventTypeWarning, "NothingEnabled", "Schedule",
+				"the tick at %s is due, but nothing in this namespace is marked %s: \"true\"",
+				due.UTC().Format(time.RFC3339), backupv1alpha1.AnnotationEnabled)
+		}
 	}
 
 	wait := min(max(schedule.Next(now).Sub(now), time.Second), refresh)
 	return ctrl.Result{RequeueAfter: wait}, nil
+}
+
+// anythingEnabled reports whether a claim or a Cluster in the namespace is
+// marked backup.wlz.li/enabled, which a namespace run needs to back anything up.
+func (s *Scheduler) anythingEnabled(ctx context.Context, namespace string) (bool, error) {
+	claims, err := enabledClaims(ctx, s.Client, namespace)
+	if err != nil || len(claims) > 0 {
+		return len(claims) > 0, err
+	}
+	clusters, err := enabledClusters(ctx, s.Reader, namespace)
+	return len(clusters) > 0, err
 }
 
 // create writes the BackupRun for one tick. Its name and label both carry the

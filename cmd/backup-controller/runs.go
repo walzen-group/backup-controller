@@ -112,7 +112,7 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 	if err := restores.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the RestoreRun controller: %w", err)
 	}
-	if err := (&runs.Scheduler{Client: manager.GetClient(), Reader: reader}).SetupWithManager(manager); err != nil {
+	if err := (&runs.Scheduler{Client: manager.GetClient(), Reader: reader, Recorder: recorder}).SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the scheduler: %w", err)
 	}
 
