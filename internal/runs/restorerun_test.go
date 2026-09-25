@@ -9,6 +9,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -929,5 +930,100 @@ func TestADatabaseRestoreWhoseDeleteFailedDeletesTheOldClusterAgain(t *testing.T
 	}
 	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); ok {
 		t.Error("the old Cluster is still there; the run took it for its recovery")
+	}
+}
+
+// optedOut is a mutate function for cluster that adds the annotation asking
+// the bootstrap webhook to leave the Cluster empty.
+func optedOut(u *unstructured.Unstructured) {
+	annotations := u.GetAnnotations()
+	annotations[bootstrap.OptOutAnnotation] = bootstrap.OptOutValue
+	u.SetAnnotations(annotations)
+}
+
+// completeVolume marks the ReplicationDestination of the run's first item as
+// having completed the run's trigger.
+func completeVolume(t *testing.T, c client.Client) {
+	t.Helper()
+	rd := &volsyncv1alpha1.ReplicationDestination{}
+	get(t, c, ns, readRestoreRun(t, c).Status.Items[0].Destination, rd)
+	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	if err := c.Status().Update(context.Background(), rd); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A namespace restore skips a Cluster that opts out of the bootstrap webhook
+// with backup.wlz.li/bootstrap: initdb, names the annotation in the item's
+// message, and never deletes it. The webhook would let the Cluster come back
+// empty, and the run would delete it again and again. The volumes restore as
+// usual, with and without syncDatabaseToVolume.
+func TestANamespaceRestoreLeavesAnOptedOutClusterAlone(t *testing.T) {
+	for _, sync := range []bool{false, true} {
+		t.Run(map[bool]string{false: "plain", true: "synced"}[sync], func(t *testing.T) {
+			r, c := restoreReconciler(t, prober{saturday},
+				restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, sync }),
+				claim(), volumeRestore(), repository(), cluster(optedOut), objectStore(), storeSecret())
+			r.Snapshots = snapshots{sunday, quiet, monday}
+
+			restoreStep(t, r) // plan
+			run := readRestoreRun(t, c)
+			if item := run.Status.Items[1]; item.Phase != backupv1alpha1.ItemSkipped || !strings.Contains(item.Message, bootstrap.OptOutAnnotation) {
+				t.Fatalf("database item = %+v (%s), want Skipped naming %s", item, readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation)
+			}
+			restoreStep(t, r) // restore the volume
+			completeVolume(t, c)
+			restoreStep(t, r)
+
+			run = readRestoreRun(t, c)
+			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
+				t.Errorf("phase = %q, items = %+v; want Succeeded with the volume restored", run.Status.Phase, run.Status.Items)
+			}
+			if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+				t.Error("the opted-out Cluster was deleted")
+			}
+		})
+	}
+}
+
+// A restore of one database that opts out of the bootstrap webhook ends as
+// Invalid at its checks, naming the annotation, and leaves the Cluster alone.
+func TestARestoreOfAnOptedOutDatabaseIsInvalid(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday},
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), cluster(optedOut), objectStore(), storeSecret())
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
+		!strings.Contains(readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation) {
+		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, naming %s",
+			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation)
+	}
+	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+		t.Error("the opted-out Cluster was deleted")
+	}
+}
+
+// A Cluster created again with backup.wlz.li/bootstrap: initdb after the run
+// deleted the old one comes back empty by the owner's choice. The run marks
+// the item Skipped and does not delete the new Cluster.
+func TestAClusterCreatedAgainOptedOutIsSkipped(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday},
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), cluster(), objectStore(), storeSecret())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // delete
+
+	recreated := cluster(optedOut, func(u *unstructured.Unstructured) { u.SetUID("new-cluster-uid") })
+	if err := c.Create(context.Background(), recreated); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemSkipped || !strings.Contains(item.Message, bootstrap.OptOutAnnotation) {
+		t.Errorf("item = %+v, want Skipped naming %s", item, bootstrap.OptOutAnnotation)
+	}
+	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+		t.Error("the Cluster created again with the opt-out was deleted")
 	}
 }

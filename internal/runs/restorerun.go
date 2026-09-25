@@ -16,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -293,11 +294,14 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 // spec.claim names one claim and spec.database names one Cluster. A run with
 // neither takes every claim and every Cluster in the namespace marked
 // backup.wlz.li/enabled: "true", claims first. A Cluster that archives nowhere
-// has no backup to restore, so its item starts out Skipped.
+// has no backup to restore, so its item starts out Skipped. So does a Cluster
+// that opts out of the bootstrap webhook (see optsOut).
 //
 // items returns a refusal when spec.repository is set and spec.claim is not,
 // because a restore in place needs a claim to write into, and when nothing in
-// the namespace is marked. A failed list comes back as a plain error.
+// the namespace is marked. It also returns a refusal when spec.database names
+// a Cluster that opts out of the bootstrap webhook. A failed read comes back
+// as a plain error.
 func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	pending := func(kind, name string) backupv1alpha1.RestoreItem {
 		return backupv1alpha1.RestoreItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
@@ -308,6 +312,14 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	case run.Spec.Repository != "":
 		return nil, refuse("spec.into is required when spec.repository names the source, because there is no claim to restore in place")
 	case run.Spec.Database != "":
+		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, run.Spec.Database)
+		if err != nil {
+			return nil, err
+		}
+		if found && optsOut(cluster) {
+			return nil, refuse("the Cluster %s carries %s: %s, which asks for an empty database, so a RestoreRun does not restore it",
+				run.Spec.Database, bootstrap.OptOutAnnotation, bootstrap.OptOutValue)
+		}
 		return []backupv1alpha1.RestoreItem{pending("Cluster", run.Spec.Database)}, nil
 	}
 
@@ -325,7 +337,9 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	}
 	for i := range clusters {
 		item := pending("Cluster", clusters[i].GetName())
-		if _, _, archives := bootstrap.Archiver(&clusters[i]); !archives {
+		if optsOut(&clusters[i]) {
+			item.Phase, item.Message = backupv1alpha1.ItemSkipped, optedOutMessage
+		} else if _, _, archives := bootstrap.Archiver(&clusters[i]); !archives {
 			item.Phase, item.Message = backupv1alpha1.ItemSkipped, "the Cluster archives nowhere, so it has no backup to restore"
 		}
 		items = append(items, item)
@@ -664,6 +678,10 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 // which moves the item to Recovering. A Recovering item succeeds once the
 // Cluster is healthy, and fails if the recovered Cluster is deleted.
 //
+// A Cluster that opts out of the bootstrap webhook (see optsOut) moves the
+// item to Skipped, and the run never deletes it. That holds for the old
+// Cluster before the delete reaches it and for a Cluster created again.
+//
 // The item is marked Deleted, and the status written, before the Cluster is
 // deleted. The bootstrap webhook recovers a Cluster only for a run whose item
 // says Deleted, so the mark has to be in place before anything can create the
@@ -684,6 +702,10 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		if err != nil {
 			return err
 		}
+		if found && optsOut(cluster) {
+			item.Phase, item.Message = backupv1alpha1.ItemSkipped, optedOutMessage
+			return nil
+		}
 		if found {
 			item.ClusterUID = cluster.GetUID()
 		}
@@ -703,6 +725,10 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 			return err
 		case !found || cluster.GetDeletionTimestamp() != nil:
 			return nil
+		case optsOut(cluster):
+			// Created again empty by the owner's choice, or opted out before
+			// the delete reached it. Deleting it again would only loop.
+			item.Phase, item.Message = backupv1alpha1.ItemSkipped, optedOutMessage
 		case item.ClusterUID != "" && cluster.GetUID() == item.ClusterUID:
 			// The old Cluster, which the earlier delete did not reach. Its
 			// annotations say nothing about this run.
@@ -1093,4 +1119,17 @@ func failedMover(destination *volsyncv1alpha1.ReplicationDestination) (string, b
 	}
 	mover := destination.Status.LatestMoverStatus
 	return mover.Logs, mover.Result == volsyncv1alpha1.MoverResultFailed
+}
+
+// optedOutMessage is the item message for a Cluster that optsOut reports on.
+var optedOutMessage = fmt.Sprintf("the Cluster carries %s: %s, which asks for an empty database, so the run leaves it alone",
+	bootstrap.OptOutAnnotation, bootstrap.OptOutValue)
+
+// optsOut reports whether a Cluster opts out of the bootstrap webhook with
+// backup.wlz.li/bootstrap: initdb. The webhook lets such a Cluster through
+// empty and never marks it as a run's recovery. A run that deleted it would
+// see it come back empty and delete it again until the timeout, so a run
+// leaves it alone.
+func optsOut(cluster *unstructured.Unstructured) bool {
+	return cluster.GetAnnotations()[bootstrap.OptOutAnnotation] == bootstrap.OptOutValue
 }
