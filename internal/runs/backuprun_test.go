@@ -11,11 +11,14 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // backupRun returns the BackupRun before-upgrade with a one-hour timeout,
@@ -797,5 +800,98 @@ func TestAnEvictedPodDoesNotHoldTheRun(t *testing.T) {
 
 	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
 		t.Errorf("item = %+v, want it Running once every live pod is gone", item)
+	}
+}
+
+// failOnce returns a reader over c whose first call that fail picks returns
+// a ServiceUnavailable error, the way the API server answers while etcd
+// elects a leader. Every other call goes through.
+func failOnce(c client.Client, fail func(object any) bool) client.Reader {
+	failed := false
+	unavailable := func(object any) error {
+		if !failed && fail(object) {
+			failed = true
+			return apierrors.NewServiceUnavailable("etcd leader changed")
+		}
+		return nil
+	}
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := unavailable(obj); err != nil {
+				return err
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if err := unavailable(list); err != nil {
+				return err
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+}
+
+// A failed list while a run plans is returned for a retry, and the next pass
+// plans the run. Ending the run Invalid would lose a scheduled tick to a
+// moment when the API server was busy.
+func TestAFailedReadWhilePlanningIsRetried(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository())
+	r.Reader = failOnce(c, func(object any) bool { _, ok := object.(*corev1.PersistentVolumeClaimList); return ok })
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err == nil {
+		t.Error("reconcile succeeded, want the read error returned for a retry")
+	}
+	if run := readBackupRun(t, c); run.Status.Phase.Finished() {
+		t.Fatalf("phase = %q (%s) after a failed read, want the run still to plan", run.Status.Phase, readyMessage(run.Status.Conditions))
+	}
+	step(t, r)
+	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseQueued {
+		t.Errorf("phase = %q, want Queued", run.Status.Phase)
+	}
+}
+
+// A failed read while a run starts a volume's backup is returned for a retry,
+// and the item stays Pending until the next pass starts it.
+func TestAFailedReadWhileStartingAnItemIsRetried(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore(), repository())
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	reader := r.Reader
+	r.Reader = failOnce(c, func(object any) bool { _, ok := object.(*corev1.PersistentVolume); return ok })
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err == nil {
+		t.Error("reconcile succeeded, want the read error returned for a retry")
+	}
+	if run := readBackupRun(t, c); run.Status.Phase.Finished() || run.Status.Items[0].Phase != backupv1alpha1.ItemPending {
+		t.Fatalf("run = %q, item = %+v after a failed read, want the item still Pending", run.Status.Phase, run.Status.Items[0])
+	}
+	r.Reader = reader
+	step(t, r)
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
+		t.Errorf("item = %+v, want it Running", item)
+	}
+}
+
+// A namespace run in a cluster without the CloudNativePG CRDs backs up the
+// volumes. The API server answers a list of Clusters there with a no-match
+// error, which means there are no Clusters.
+func TestANamespaceRunWithoutCloudNativePGBacksUpTheVolumes(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository())
+	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind().Group == ClusterGVK.Group {
+				return &meta.NoKindMatchError{GroupKind: ClusterGVK.GroupKind(), SearchedVersions: []string{"v1"}}
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseQueued || len(run.Status.Items) != 1 {
+		t.Fatalf("phase = %q (%s), items = %+v; want Queued with the claim", run.Status.Phase, readyMessage(run.Status.Conditions), run.Status.Items)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -94,11 +95,16 @@ func getCluster(ctx context.Context, c client.Reader, namespace, name string) (*
 
 // enabledClusters lists the Clusters in a namespace that carry the annotation
 // backup.wlz.li/enabled: "true", sorted by name. A Cluster that is being
-// deleted is left out.
+// deleted is left out. A cluster without the CloudNativePG CRDs has no
+// Clusters, so the no-match error the API server answers with there gives an
+// empty list.
 func enabledClusters(ctx context.Context, c client.Reader, namespace string) ([]unstructured.Unstructured, error) {
 	clusters := &unstructured.UnstructuredList{}
 	clusters.SetGroupVersionKind(clusterListGV)
 	if err := c.List(ctx, clusters, client.InNamespace(namespace)); err != nil {
+		if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("list the Clusters in %s: %w", namespace, err)
 	}
 	var enabled []unstructured.Unstructured

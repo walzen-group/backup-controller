@@ -11,6 +11,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -110,11 +111,15 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 // plan records one Pending item for each thing the run backs up and moves the
-// run to Queued. When items returns an error, plan ends the run as Failed with
-// reason Invalid and the error as the message.
+// run to Queued. When items returns a refusal, plan ends the run as Failed
+// with reason Invalid and the refusal as the message. Any other error, such as
+// a timeout from the API server, is returned so the reconcile runs again.
 func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
 	items, err := r.items(ctx, run)
 	if err != nil {
+		if !isRefusal(err) {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 	run.Status.Items = items
@@ -130,9 +135,10 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 // has kind ReplicationSource, after the VolSync object that backs it up.
 //
 // Everything the run backs up has to be marked backup.wlz.li/enabled: "true",
-// so a run and a schedule cover the same set. items returns an error when a
+// so a run and a schedule cover the same set. items returns a refusal when a
 // named claim or Cluster is missing or not marked, and when nothing in the
-// namespace is marked.
+// namespace is marked. A cluster without the CloudNativePG CRDs holds no
+// Cluster. Any other failed read comes back as a plain error.
 func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.BackupRun) ([]backupv1alpha1.BackupItem, error) {
 	pending := func(kind, name string) backupv1alpha1.BackupItem {
 		return backupv1alpha1.BackupItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
@@ -143,25 +149,28 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 		claim := &corev1.PersistentVolumeClaim{}
 		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Source}, claim); err != nil {
 			if apierrors.IsNotFound(err) {
-				return nil, fmt.Errorf("no claim %s in this namespace", run.Spec.Source)
+				return nil, refuse("no claim %s in this namespace", run.Spec.Source)
 			}
 			return nil, fmt.Errorf("get claim %s: %w", run.Spec.Source, err)
 		}
 		if !backupv1alpha1.Enabled(claim.Annotations) {
-			return nil, fmt.Errorf("claim %s is not marked %s: \"true\"", claim.Name, backupv1alpha1.AnnotationEnabled)
+			return nil, refuse("claim %s is not marked %s: \"true\"", claim.Name, backupv1alpha1.AnnotationEnabled)
 		}
 		return []backupv1alpha1.BackupItem{pending("ReplicationSource", claim.Name)}, nil
 
 	case run.Spec.Database != "":
 		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, run.Spec.Database)
 		if err != nil {
+			if meta.IsNoMatchError(err) {
+				return nil, refuse("no Cluster %s in this namespace; the cluster has no CloudNativePG CRDs", run.Spec.Database)
+			}
 			return nil, err
 		}
 		if !found {
-			return nil, fmt.Errorf("no Cluster %s in this namespace", run.Spec.Database)
+			return nil, refuse("no Cluster %s in this namespace", run.Spec.Database)
 		}
 		if !backupv1alpha1.Enabled(cluster.GetAnnotations()) {
-			return nil, fmt.Errorf("the Cluster %s is not marked %s: \"true\"", cluster.GetName(), backupv1alpha1.AnnotationEnabled)
+			return nil, refuse("the Cluster %s is not marked %s: \"true\"", cluster.GetName(), backupv1alpha1.AnnotationEnabled)
 		}
 		return []backupv1alpha1.BackupItem{pending("Cluster", cluster.GetName())}, nil
 
@@ -182,7 +191,7 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 			items = append(items, pending("Cluster", cluster.GetName()))
 		}
 		if len(items) == 0 {
-			return nil, fmt.Errorf("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
+			return nil, refuse("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
 		}
 		return items, nil
 	}
@@ -293,7 +302,11 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		if item.Phase != backupv1alpha1.ItemPending {
 			continue
 		}
-		if message := r.startItem(ctx, run, item); message != "" {
+		message, err := r.startItem(ctx, run, item)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if message != "" {
 			waiting = message
 		}
 	}
@@ -410,29 +423,39 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 // For a volume, it writes the claim's ReplicationSource with the run's manual
 // trigger tag and moves the item to Running. For a database, it creates a
 // CloudNativePG Backup and moves the item to Running, or skips the item when
-// the Cluster is hibernated. When something goes wrong, startItem marks the
-// item Failed with the reason in its message.
+// the Cluster is hibernated. When the claim or the Cluster is gone, or the
+// claim's settings are refused, startItem marks the item Failed with the
+// reason in its message. The same goes for a Backup the API server rejects as
+// invalid.
 //
 // It returns a message for the run's Ready condition when the item has to
 // wait, which happens when the volume's ReplicationSource is still completing
 // another run's backup. The item then stays Pending. Otherwise it returns an
-// empty string.
-func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) string {
+// empty string. Any other failed read or write, such as a timeout from the
+// API server, comes back as an error with the item left Pending, and the
+// caller returns it so the reconcile runs again.
+func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) (string, error) {
 	switch item.Kind {
 	case "ReplicationSource":
 		claim := &corev1.PersistentVolumeClaim{}
 		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, claim); err != nil {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, fmt.Sprintf("get claim %s: %v", item.Name, err)
-			return ""
+			if !apierrors.IsNotFound(err) {
+				return "", fmt.Errorf("get claim %s: %w", item.Name, err)
+			}
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, fmt.Sprintf("the claim %s no longer exists", item.Name)
+			return "", nil
 		}
 		tag := TriggerFor(run.UID)
 		_, err := ensureSource(ctx, r.Client, r.Reader, claim, tag)
 		if errors.Is(err, errSourceBusy) {
-			return fmt.Sprintf("ReplicationSource %s is still completing another run's backup", item.Name)
+			return fmt.Sprintf("ReplicationSource %s is still completing another run's backup", item.Name), nil
 		}
 		if err != nil {
+			if !isRefusal(err) {
+				return "", err
+			}
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
-			return ""
+			return "", nil
 		}
 		item.Phase, item.Trigger = backupv1alpha1.ItemRunning, tag
 
@@ -440,7 +463,7 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
 		switch {
 		case err != nil:
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
+			return "", err
 		case !found:
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, fmt.Sprintf("the Cluster %s no longer exists", item.Name)
 		case hibernated(cluster):
@@ -448,13 +471,16 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 		default:
 			name, err := ensureBackup(ctx, r.Client, run.Namespace, item.Name, run.UID)
 			if err != nil {
+				if !apierrors.IsInvalid(err) {
+					return "", err
+				}
 				item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
-				return ""
+				return "", nil
 			}
 			item.Phase, item.Backup = backupv1alpha1.ItemRunning, name
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // clonesCut reports whether VolSync has cut the clone of every volume the run
