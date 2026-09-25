@@ -22,12 +22,18 @@
 //     (k8s.io/apiextensions-apiserver@v0.36.0/pkg/registry/customresource/strategy.go:145-186).
 //     With a status subresource the fake keeps the stored status on a plain
 //     update, so only spec changes count, as on the real server.
+//   - Delete honours a UID precondition with a Conflict (the fake already
+//     honours a ResourceVersion one). See Client.Delete.
+//   - An update or patch cannot add a finalizer to an object that has a
+//     deletionTimestamp; removing the last one deletes the object and the
+//     write still succeeds. See checkNoNewFinalizers.
+//   - Status subresource writes keep the stored generation, uid and
+//     creationTimestamp. See Client.Status.
 //
 // It leaves out: generation for built-in kinds (each built-in strategy has
 // its own rule; the wrapper keeps the stored value and never bumps it), the
-// server-owned fields on status subresource writes, delete preconditions,
-// finalizers on objects being deleted, schema pruning, garbage collection and
-// blockOwnerDeletion. Those are separate behaviours; each one is added as a
+// finalizer check for server-side apply patches, schema pruning, garbage
+// collection and blockOwnerDeletion. Those are separate behaviours; each one is added as a
 // method or an Options field of Client, the way Create, Update and Patch are
 // here.
 //
@@ -142,11 +148,22 @@ func (c *Client) Update(ctx context.Context, obj client.Object, opts ...client.U
 	if err != nil {
 		return c.WithWatch.Update(ctx, obj, opts...)
 	}
+	if err := c.checkNoNewFinalizers(obj, old); err != nil {
+		return err
+	}
 	keepServerFields(obj, old)
 	if err := c.WithWatch.Update(ctx, obj, opts...); err != nil {
 		return err
 	}
-	return c.settleGeneration(ctx, obj, old, isDryRunUpdate(opts))
+	if err := c.settleGeneration(ctx, obj, old, isDryRunUpdate(opts)); err != nil {
+		// The write removed the last finalizer and the object is gone; the
+		// real server answers with the object it was about to store.
+		if goneAfterLastFinalizer(err, old, obj) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // Patch applies patch through the fake client, then restores the server-owned
@@ -159,10 +176,27 @@ func (c *Client) Patch(ctx context.Context, obj client.Object, patch client.Patc
 	if err != nil {
 		return c.WithWatch.Patch(ctx, obj, patch, opts...)
 	}
-	if err := c.WithWatch.Patch(ctx, obj, patch, opts...); err != nil {
+	result, err := c.patchedObject(obj, old, patch)
+	if err != nil {
 		return err
 	}
-	return c.settleGeneration(ctx, obj, old, isDryRunPatch(opts))
+	if result != nil {
+		if err := c.checkNoNewFinalizers(result, old); err != nil {
+			return err
+		}
+	}
+	err = c.WithWatch.Patch(ctx, obj, patch, opts...)
+	if err == nil {
+		err = c.settleGeneration(ctx, obj, old, isDryRunPatch(opts))
+	}
+	// When the patch removed the last finalizer the object is gone and the
+	// fake, or the read-back after it, fails with NotFound; the real server
+	// answers with the object it was about to store.
+	if err != nil && result != nil && goneAfterLastFinalizer(err, old, result) {
+		keepServerFields(result, old)
+		return decodeFrom(obj, result)
+	}
+	return err
 }
 
 // stored reads the current stored copy of obj.
