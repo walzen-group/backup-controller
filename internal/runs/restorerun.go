@@ -483,7 +483,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 				return ctrl.Result{}, err
 			}
 			if item.Phase == backupv1alpha1.ItemDeleted {
-				left, err := instanceLeft(ctx, r.Client, run.Namespace, item.Name)
+				left, err := instanceLeft(ctx, r.Reader, run.Namespace, item.Name)
 				if err != nil {
 					return ctrl.Result{}, err
 				}
@@ -548,7 +548,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (string, string, error) {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
-		holder, err := claimHolder(ctx, r.Client, run.Namespace, item.Name)
+		holder, err := claimHolder(ctx, r.Reader, run.Namespace, item.Name)
 		if err != nil {
 			return "", "", fmt.Errorf("look for a pod holding claim %s: %w", item.Name, err)
 		}
@@ -913,6 +913,11 @@ func (r *RestoreRunReconciler) writeStatus(ctx context.Context, run *backupv1alp
 // claimHolder returns the name of a pod in the namespace that mounts the
 // claim, or an empty string when none does. Pods that have Succeeded or
 // Failed don't count.
+//
+// The run reads the pods through its uncached Reader. Without spec.quiesce
+// this check is the only thing that keeps a second writer off the volume, and
+// an informer cache that has not yet seen a new pod would report the claim
+// free.
 func claimHolder(ctx context.Context, c client.Reader, namespace, claim string) (string, error) {
 	pods := &corev1.PodList{}
 	if err := c.List(ctx, pods, client.InNamespace(namespace)); err != nil {

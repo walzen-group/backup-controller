@@ -45,7 +45,9 @@ const clusterLabel = "cnpg.io/cluster"
 // restarts the workloads it stopped only after that.
 //
 // Parameters:
-//   - c lists the pods and PVCs.
+//   - c lists the pods and PVCs. A RestoreRun passes its uncached Reader,
+//     because an informer cache that has not caught up would report the
+//     instance gone and let the app back onto the old Postgres.
 //   - namespace is the Cluster's namespace.
 //   - name is the Cluster's name, matched against the cnpg.io/cluster label.
 //

@@ -689,3 +689,65 @@ func TestAQuiescedRestoreRetriedAfterALostStatusWriteGivesTheAppBack(t *testing.
 		t.Error("the Kustomization the run suspended stayed suspended")
 	}
 }
+
+// staleCache returns a client over c whose pod and claim lists come back
+// empty, the way the informer cache answers before it has seen a pod the API
+// server already holds.
+func staleCache(c client.Client) client.Client {
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			switch list.(type) {
+			case *corev1.PodList, *corev1.PersistentVolumeClaimList:
+				return nil
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+}
+
+// A restore in place looks for a pod mounting the claim through the uncached
+// reader. A pod the informer cache has not seen yet still makes the run wait
+// with reason ClaimInUse, because without spec.quiesce that check is the only
+// thing that keeps a second writer off the volume.
+func TestARestoreSeesAPodTheCacheHasNotSeenYet(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
+		claim(), volumeRestore(), repository(), writerPod())
+	r.Client = staleCache(c)
+	restoreStep(t, r) // plan
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if reason := readyReason(run.Status.Conditions); reason != backupv1alpha1.ReasonClaimInUse || run.Status.Items[0].Phase != backupv1alpha1.ItemPending {
+		t.Fatalf("reason = %q, item = %+v; want ClaimInUse with the item Pending", reason, run.Status.Items[0])
+	}
+}
+
+// A database restore looks for the deleted Cluster's instance pods through the
+// uncached reader. An instance pod the informer cache has not seen yet keeps
+// the run waiting with reason WaitingForShutdown and the app stopped.
+func TestADatabaseRestoreSeesAnInstanceTheCacheHasNotSeenYet(t *testing.T) {
+	pod, pvc := oldInstance()
+	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), pod, pvc)
+	r.Client = staleCache(c)
+
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // quiesce
+	restoreStep(t, r) // restore the volume
+	run := readRestoreRun(t, c)
+	rd := &volsyncv1alpha1.ReplicationDestination{}
+	get(t, c, ns, run.Status.Items[0].Destination, rd)
+	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	if err := c.Status().Update(context.Background(), rd); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r) // volume done, database deleted
+
+	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonShutdown {
+		t.Errorf("reason = %q, want WaitingForShutdown while pod %s-1 is still there", reason, pgN)
+	}
+	if got := replicasOf(t, c); got != 0 {
+		t.Errorf("replicas = %d while the old instance was still there, want 0", got)
+	}
+}
