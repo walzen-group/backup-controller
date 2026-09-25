@@ -6,6 +6,11 @@ metadata:
     {{- include "backup-controller.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # The controller runs without leader election, so two pods would run two
+  # schedulers and two sets of reconcilers. Recreate stops the old pod before
+  # the new one starts, where the default RollingUpdate overlaps them.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "backup-controller.selectorLabels" . | nindent 6 }}

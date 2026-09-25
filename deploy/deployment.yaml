@@ -8,6 +8,11 @@ metadata:
     app.kubernetes.io/instance: backup-controller
 spec:
   replicas: 1
+  # The controller runs without leader election, so two pods would run two
+  # schedulers and two sets of reconcilers. Recreate stops the old pod before
+  # the new one starts, where the default RollingUpdate overlaps them.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: backup-controller
