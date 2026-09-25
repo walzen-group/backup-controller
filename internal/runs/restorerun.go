@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -114,6 +115,11 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 
+	// A synced run takes its databases' moment from the volumes' quiesced
+	// snapshots. items lists the claims before the Clusters, so the moment is
+	// known by the time the first Cluster is checked.
+	sync := run.Spec.SyncDatabaseToVolume
+	var synced *time.Time
 	var unreachable []string
 	for i := range items {
 		item := &items[i]
@@ -123,9 +129,29 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 		var reason string
 		switch item.Kind {
 		case "PersistentVolumeClaim":
-			item.Snapshot, reason, err = r.checkVolume(ctx, run, item.Name, at)
+			var snapshot restic.Snapshot
+			snapshot, reason, err = r.checkVolume(ctx, run, item.Name, at, sync)
+			item.Snapshot = snapshot.ShortID()
+			if sync && reason == "" && err == nil {
+				switch {
+				case synced == nil:
+					moment := snapshot.Time.UTC()
+					synced = &moment
+				case !snapshot.Time.Equal(*synced):
+					reason = fmt.Sprintf("its quiesced snapshot %s is from %s and another volume's is from %s; a synced restore needs one moment for every volume",
+						snapshot.ShortID(), snapshot.Time.UTC().Format(time.RFC3339), synced.Format(time.RFC3339))
+				}
+			}
 		case "Cluster":
-			item.BaseBackup, reason, err = r.checkDatabase(ctx, run.Namespace, item.Name, at)
+			moment := at
+			if sync {
+				moment = synced
+			}
+			if sync && synced == nil {
+				reason = "no volume selected a quiesced snapshot, so there is no moment to recover the database to"
+				break
+			}
+			item.BaseBackup, reason, err = r.checkDatabase(ctx, run.Namespace, item.Name, moment)
 		}
 		if err != nil {
 			return ctrl.Result{}, err
@@ -147,6 +173,13 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 			}
 		}
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, strings.Join(unreachable, "; "))
+	}
+	if sync {
+		if synced == nil {
+			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid,
+				fmt.Sprintf("syncDatabaseToVolume needs a claim marked %s: \"true\" in this namespace to take the moment from", backupv1alpha1.AnnotationEnabled))
+		}
+		run.Status.SyncedTo = &metav1.Time{Time: *synced}
 	}
 
 	now := metav1.NewTime(r.Now())
@@ -199,34 +232,41 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 // returns a reason when there is none. VolSync itself restores nothing and
 // reports success when no snapshot matches, so this is the only place the
 // missing snapshot is caught.
-func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string, at *time.Time) (string, string, error) {
+func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
-		return "", err.Error(), nil
+		return restic.Snapshot{}, err.Error(), nil
 	}
-	return r.selectSnapshot(ctx, run, settings.Secret, at)
+	return r.selectSnapshot(ctx, run, settings.Secret, at, quiescedOnly)
 }
 
-// selectSnapshot returns the short ID of the snapshot the run would restore
-// from the repository Secret, or a reason when there is none.
-func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time) (string, string, error) {
+// selectSnapshot returns the snapshot the run would restore from the
+// repository Secret, or a reason when there is none. quiescedOnly passes over
+// every snapshot not tagged quiesced.
+func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
 	secret := &corev1.Secret{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: secretName}, secret); err != nil {
-		return "", fmt.Sprintf("read repository Secret %s: %v", secretName, err), nil
+		return restic.Snapshot{}, fmt.Sprintf("read repository Secret %s: %v", secretName, err), nil
 	}
 	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
 	if err != nil {
-		return "", "", fmt.Errorf("list the snapshots in %s: %w", secretName, err)
+		return restic.Snapshot{}, "", fmt.Errorf("list the snapshots in %s: %w", secretName, err)
+	}
+	if quiescedOnly {
+		snapshots = slices.DeleteFunc(slices.Clone(snapshots), func(s restic.Snapshot) bool { return !slices.Contains(s.Tags, restic.QuiescedTag) })
+		if len(snapshots) == 0 {
+			return restic.Snapshot{}, fmt.Sprintf("the repository holds no snapshot tagged %s; only a BackupRun that stopped the workloads writes one", restic.QuiescedTag), nil
+		}
 	}
 	if len(snapshots) == 0 {
-		return "", "the repository holds no snapshot", nil
+		return restic.Snapshot{}, "the repository holds no snapshot", nil
 	}
 
 	index := len(snapshots) - 1
 	if at != nil {
 		found, ok := restic.AtOrBefore(snapshots, *at)
 		if !ok {
-			return "", fmt.Sprintf("no snapshot at or before %s; the oldest, %s, is from %s",
+			return restic.Snapshot{}, fmt.Sprintf("no snapshot at or before %s; the oldest, %s, is from %s",
 				at.UTC().Format(time.RFC3339), snapshots[0].ShortID(), snapshots[0].Time.UTC().Format(time.RFC3339)), nil
 		}
 		for i, s := range snapshots {
@@ -238,10 +278,10 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 	if run.Spec.Previous != nil {
 		index -= int(*run.Spec.Previous)
 		if index < 0 {
-			return "", fmt.Sprintf("previous %d reaches past the oldest snapshot", *run.Spec.Previous), nil
+			return restic.Snapshot{}, fmt.Sprintf("previous %d reaches past the oldest snapshot", *run.Spec.Previous), nil
 		}
 	}
-	return snapshots[index].ShortID(), "", nil
+	return snapshots[index], "", nil
 }
 
 // checkDatabase finds the base backup a recovery of the Cluster would start
@@ -466,7 +506,7 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 		if err != nil {
 			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 		}
-		snapshot, reason, err := r.selectSnapshot(ctx, run, settings.Secret, at)
+		snapshot, reason, err := r.selectSnapshot(ctx, run, settings.Secret, at, false)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -477,7 +517,7 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 		run.Status.Phase = backupv1alpha1.RunPhaseRunning
 		run.Status.StartedAt = &now
 		run.Status.Items = []backupv1alpha1.RestoreItem{{
-			Kind: "PersistentVolumeClaim", Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning, Snapshot: snapshot,
+			Kind: "PersistentVolumeClaim", Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning, Snapshot: snapshot.ShortID(),
 		}}
 		backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning,
 			fmt.Sprintf("restoring into claim %s", run.Spec.Into))

@@ -409,6 +409,27 @@ func TestARunWaitingForTheClusterSetsItsTarget(t *testing.T) {
 	}
 }
 
+// A run syncing the databases to the volumes recovers to the moment it found
+// on the volumes' quiesced snapshots, which it records in status.syncedTo.
+func TestASyncedRunRecoversToTheVolumesMoment(t *testing.T) {
+	original := cluster(t, nil)
+	prober := stubProber{has: true, backups: []BaseBackup{{ID: "20260920T030000", End: monday.Add(-24 * time.Hour)}}}
+	run := waiting(nil)
+	run.Spec.SyncDatabaseToVolume = true
+	run.Status.SyncedTo = &metav1.Time{Time: time.Date(2026, 9, 21, 3, 0, 5, 0, time.UTC)}
+
+	response := decide(t, original, prober, run)
+	if !response.Allowed {
+		t.Fatalf("the cluster was refused: %v", response.Result)
+	}
+	patched := applied(t, original, response)
+
+	target, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "recoveryTarget", "targetTime")
+	if target != "2026-09-21T03:00:05Z" {
+		t.Errorf("targetTime = %q, want the run's syncedTo 2026-09-21T03:00:05Z", target)
+	}
+}
+
 func TestARunWithoutAMomentRecoversToTheEndOfTheArchive(t *testing.T) {
 	original := cluster(t, nil)
 	response := decide(t, original, stubProber{has: true}, waiting(nil))

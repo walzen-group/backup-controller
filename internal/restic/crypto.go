@@ -3,13 +3,14 @@ package restic
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/klauspost/compress/zstd"
-	//nolint:staticcheck // restic's format is Poly1305-AES; this verifies its MACs and encrypts nothing new.
+	//nolint:staticcheck // restic's format is Poly1305-AES, and a file this package writes has to carry that MAC.
 	"golang.org/x/crypto/poly1305"
 	"golang.org/x/crypto/scrypt"
 )
@@ -125,6 +126,30 @@ func (k key) decrypt(sealed []byte) ([]byte, error) {
 	plain := make([]byte, len(ciphertext))
 	cipher.NewCTR(block, iv).XORKeyStream(plain, ciphertext)
 	return plain, nil
+}
+
+// seal encrypts under a fresh random IV and appends the MAC over the
+// ciphertext, giving the IV || CIPHERTEXT || MAC layout decrypt reads.
+func (k key) seal(plain []byte) ([]byte, error) {
+	iv := make([]byte, ivSize)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, fmt.Errorf("draw an IV: %w", err)
+	}
+	block, err := aes.NewCipher(k.encrypt[:])
+	if err != nil {
+		return nil, fmt.Errorf("build the AES cipher: %w", err)
+	}
+	ciphertext := make([]byte, len(plain))
+	cipher.NewCTR(block, iv).XORKeyStream(ciphertext, plain)
+	mac, err := k.mac(iv, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+
+	sealed := make([]byte, 0, ivSize+len(ciphertext)+macSize)
+	sealed = append(sealed, iv...)
+	sealed = append(sealed, ciphertext...)
+	return append(sealed, mac[:]...), nil
 }
 
 // mac computes Poly1305-AES: the one-time key is r followed by AES_k(IV).

@@ -200,6 +200,8 @@ func TestRunsNameExactlyOneScope(t *testing.T) {
 		{"database and all", RestoreRunSpec{Database: "notes-pg", All: true}, true},
 		{"previous with all", RestoreRunSpec{All: true, Previous: &previous}, true},
 		{"into with database", RestoreRunSpec{Database: "notes-pg", Into: "copy"}, true},
+		{"sync with all", RestoreRunSpec{All: true, SyncDatabaseToVolume: true}, false},
+		{"sync with a database", RestoreRunSpec{Database: "notes-pg", SyncDatabaseToVolume: true}, true},
 	}
 	for i, tc := range restores {
 		t.Run("RestoreRun "+tc.name, func(t *testing.T) {

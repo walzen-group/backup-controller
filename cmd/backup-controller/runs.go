@@ -104,7 +104,7 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 
 	reader := manager.GetAPIReader()
 	recorder := manager.GetEventRecorder("backup-controller")
-	backups := &runs.BackupRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Recorder: recorder}
+	backups := &runs.BackupRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Retimer: restic.S3Lister{}, Recorder: recorder}
 	if err := backups.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the BackupRun controller: %w", err)
 	}

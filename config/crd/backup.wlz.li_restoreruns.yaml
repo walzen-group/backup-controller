@@ -363,6 +363,15 @@ spec:
                   and a database the end of its WAL archive.
                 format: date-time
                 type: string
+              syncDatabaseToVolume:
+                description: |-
+                  SyncDatabaseToVolume recovers the databases to the moment the volumes'
+                  snapshots were taken, instead of to RestoreAsOf. It needs All, and takes
+                  only snapshots a quiesced BackupRun tagged quiesced: those carry the
+                  moment the run stopped the workloads, when neither the volumes nor the
+                  databases were written. Every volume has to select a snapshot of the
+                  same moment.
+                type: boolean
               timeout:
                 default: 4h
                 description: |-
@@ -385,6 +394,9 @@ spec:
               rule: '!has(self.previous) || has(self.claim) || has(self.repository)'
             - message: into needs claim or repository
               rule: '!has(self.into) || has(self.claim) || has(self.repository)'
+            - message: syncDatabaseToVolume needs all
+              rule: '!has(self.syncDatabaseToVolume) || !self.syncDatabaseToVolume
+                || (has(self.all) && self.all)'
           status:
             description: RestoreRunStatus reports how far the restore got.
             properties:
@@ -495,6 +507,13 @@ spec:
               startedAt:
                 description: StartedAt is when the run passed its checks and began
                   restoring.
+                format: date-time
+                type: string
+              syncedTo:
+                description: |-
+                  SyncedTo is the moment a SyncDatabaseToVolume run restores everything
+                  to: the time on the volumes' quiesced snapshots, which the databases
+                  recover to as well.
                 format: date-time
                 type: string
               target:

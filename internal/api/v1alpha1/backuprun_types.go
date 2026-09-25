@@ -120,8 +120,10 @@ type BackupItem struct {
 	// Snapshot is the restic snapshot the mover wrote, as its short ID.
 	// +optional
 	Snapshot string `json:"snapshot,omitempty"`
-	// SnapshotTime is the time restic stamped on that snapshot, which is when
-	// the backup of the volume's clone started.
+	// SnapshotTime is the time on that snapshot. restic stamps the moment the
+	// backup of the volume's clone started; a run that stopped workloads then
+	// moves the snapshot to its restartedAt and tags it quiesced, so a restore
+	// can recover the databases to the same moment.
 	// +optional
 	SnapshotTime *metav1.Time `json:"snapshotTime,omitempty"`
 	// Empty reports a volume VolSync did not back up because it held no

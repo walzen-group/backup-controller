@@ -8,6 +8,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -112,6 +113,59 @@ func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 	}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: item.Destination}, rd); err == nil {
 		t.Error("the destination outlived the run")
+	}
+}
+
+// quiet is a snapshot a quiesced BackupRun moved to its restart moment, taken
+// between sunday's and monday's.
+var quiet = restic.Snapshot{ID: "c0ffee00" + "00000000", Time: time.Date(2026, 9, 21, 3, 0, 5, 0, time.UTC), Tags: []string{restic.QuiescedTag}}
+
+// A synced restore takes the newest quiesced snapshot, passes over monday's
+// untagged one, and restores the volume and the database to that snapshot's
+// moment.
+func TestASyncedRestoreRestoresEverythingToTheQuiescedMoment(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday},
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true }),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
+	r.Snapshots = snapshots{sunday, quiet, monday}
+
+	restoreStep(t, r) // plan
+	run := readRestoreRun(t, c)
+	if run.Status.SyncedTo == nil || !run.Status.SyncedTo.Equal(&metav1.Time{Time: quiet.Time}) {
+		t.Fatalf("syncedTo = %v (%s), want the quiesced snapshot's %s", run.Status.SyncedTo, readyReason(run.Status.Conditions), quiet.Time)
+	}
+	if run.Status.Items[0].Snapshot != "c0ffee00" {
+		t.Errorf("volume snapshot = %q, want c0ffee00, the quiesced one", run.Status.Items[0].Snapshot)
+	}
+
+	restoreStep(t, r) // restore the volume
+	run = readRestoreRun(t, c)
+	rd := &volsyncv1alpha1.ReplicationDestination{}
+	get(t, c, ns, run.Status.Items[0].Destination, rd)
+	if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-21T03:00:05Z" || rd.Spec.Restic.Previous != nil {
+		t.Errorf("destination restoreAsOf = %v, previous = %v; want 2026-09-21T03:00:05Z and none, so the mover selects the quiesced snapshot",
+			rd.Spec.Restic.RestoreAsOf, rd.Spec.Restic.Previous)
+	}
+}
+
+// A snapshot without the tag was taken while the app ran, so no moment makes
+// the database match it. The run refuses before touching anything.
+func TestASyncedRestoreRefusesUntaggedSnapshots(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday},
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true }),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
+
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonNoBackupInReach {
+		t.Fatalf("phase = %q, reason = %q; want Failed, NoBackupInReach", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	if !strings.Contains(run.Status.Items[0].Message, restic.QuiescedTag) {
+		t.Errorf("message = %q, want it to say no snapshot is tagged %s", run.Status.Items[0].Message, restic.QuiescedTag)
+	}
+	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+		t.Error("the Cluster was deleted by a run that could not restore it")
 	}
 }
 

@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"fmt"
+	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -106,7 +107,16 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 // holding the snapshot rather than a merge of the two. cleanupCachePVC drops
 // the mover's cache claim when the run ends. The trigger is the run's UID, so a
 // controller that restarts mid-restore recognises its own work.
+//
+// A synced run hands the mover its syncedTo and no previous: the quiesced
+// snapshot carries exactly that time, so the mover's newest-at-or-before rule
+// selects it.
 func directDestination(run *backupv1alpha1.RestoreRun, claim string, settings restoreSettings, name string) *volsyncv1alpha1.ReplicationDestination {
+	restoreAsOf, previous := run.Spec.RestoreAsOf, run.Spec.Previous
+	if run.Status.SyncedTo != nil {
+		moment := run.Status.SyncedTo.UTC().Format(time.RFC3339)
+		restoreAsOf, previous = &moment, nil
+	}
 	return &volsyncv1alpha1.ReplicationDestination{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: run.Namespace},
 		Spec: volsyncv1alpha1.ReplicationDestinationSpec{
@@ -117,8 +127,8 @@ func directDestination(run *backupv1alpha1.RestoreRun, claim string, settings re
 					DestinationPVC: &claim,
 				},
 				Repository:            settings.Secret,
-				RestoreAsOf:           run.Spec.RestoreAsOf,
-				Previous:              run.Spec.Previous,
+				RestoreAsOf:           restoreAsOf,
+				Previous:              previous,
 				CacheStorageClassName: settings.CacheStorageClassName,
 				EnableFileDeletion:    true,
 				CleanupCachePVC:       true,

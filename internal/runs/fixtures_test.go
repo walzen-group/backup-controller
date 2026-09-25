@@ -85,6 +85,28 @@ var (
 	monday = restic.Snapshot{ID: "6e473100" + "00000000", Time: time.Date(2026, 9, 21, 5, 0, 2, 0, time.UTC)}
 )
 
+// retimeCall is one question a retimer was asked.
+type retimeCall struct {
+	short string
+	at    time.Time
+	tag   string
+}
+
+// retimer is a restic.Retimer that records what it was asked and answers with
+// the snapshot rewritten as c0ffee00, or with err while err is set.
+type retimer struct {
+	calls []retimeCall
+	err   error
+}
+
+func (r *retimer) Retime(_ context.Context, _ *corev1.Secret, short string, at time.Time, tag string) (restic.Snapshot, error) {
+	r.calls = append(r.calls, retimeCall{short: short, at: at, tag: tag})
+	if r.err != nil {
+		return restic.Snapshot{}, r.err
+	}
+	return restic.Snapshot{ID: "c0ffee00" + "00000000", Time: at, Tags: []string{tag}, Original: short}, nil
+}
+
 // prober answers the base backup questions without an object store.
 type prober []bootstrap.BaseBackup
 

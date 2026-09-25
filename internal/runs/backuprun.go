@@ -35,6 +35,10 @@ type BackupRunReconciler struct {
 	// the one a mover saved.
 	Snapshots restic.Lister
 
+	// Retimer moves a quiesced run's snapshots to the moment it restarted the
+	// workloads and tags them quiesced.
+	Retimer restic.Retimer
+
 	// Recorder writes an event on the run each time its Ready reason changes.
 	Recorder events.EventRecorder
 
@@ -405,13 +409,25 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 			return
 		}
 		snapshot, empty := moverOutcome(source)
-		item.Phase = backupv1alpha1.ItemSucceeded
-		item.Empty = empty
 		if empty {
+			item.Phase, item.Empty = backupv1alpha1.ItemSucceeded, true
 			item.Message = "the volume held no files, so VolSync took no snapshot"
 			return
 		}
-		item.Snapshot = snapshot
+		if quiesced(run) {
+			// The item stays Running until the rewrite goes through, so the run
+			// never reports success for a snapshot a synced restore cannot use.
+			moved, err := r.retime(ctx, run.Namespace, item.Name, snapshot, run.Status.RestartedAt.Time)
+			if err != nil {
+				item.Message = fmt.Sprintf("snapshot %s is saved and waits to be moved to %s and tagged %s: %v",
+					snapshot, run.Status.RestartedAt.UTC().Format(time.RFC3339), restic.QuiescedTag, err)
+				return
+			}
+			item.Phase, item.Message = backupv1alpha1.ItemSucceeded, ""
+			item.Snapshot, item.SnapshotTime = moved.ShortID(), newTime(metav1.NewTime(moved.Time))
+			return
+		}
+		item.Phase, item.Snapshot = backupv1alpha1.ItemSucceeded, snapshot
 		if at, err := r.snapshotTime(ctx, run.Namespace, item.Name, snapshot); err != nil {
 			item.Message = fmt.Sprintf("the snapshot's time could not be read: %v", err)
 		} else {
@@ -430,11 +446,26 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 	}
 }
 
-// snapshotTime reads the time restic stamped on the snapshot a mover saved.
-func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claimName, short string) (*metav1.Time, error) {
-	if short == "" || r.Snapshots == nil {
-		return nil, fmt.Errorf("the mover logged no snapshot")
+// quiesced reports whether the run stopped workloads and started them again,
+// which is what gives its snapshots a moment nothing was written.
+func quiesced(run *backupv1alpha1.BackupRun) bool {
+	return run.Spec.All && len(run.Status.Quiesced) > 0 && run.Status.RestartedAt != nil
+}
+
+// retime moves the snapshot a mover saved to at and tags it quiesced.
+func (r *BackupRunReconciler) retime(ctx context.Context, namespace, claimName, short string, at time.Time) (restic.Snapshot, error) {
+	if short == "" || r.Retimer == nil {
+		return restic.Snapshot{}, fmt.Errorf("the mover logged no snapshot")
 	}
+	secret, err := r.repositorySecret(ctx, namespace, claimName)
+	if err != nil {
+		return restic.Snapshot{}, err
+	}
+	return r.Retimer.Retime(ctx, secret, short, at, restic.QuiescedTag)
+}
+
+// repositorySecret reads the restic Secret the claim's VolumeRestore names.
+func (r *BackupRunReconciler) repositorySecret(ctx context.Context, namespace, claimName string) (*corev1.Secret, error) {
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: claimName}, claim); err != nil {
 		return nil, err
@@ -446,6 +477,18 @@ func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claim
 	secret := &corev1.Secret{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: vr.Spec.Repository}, secret); err != nil {
 		return nil, fmt.Errorf("get Secret %s: %w", vr.Spec.Repository, err)
+	}
+	return secret, nil
+}
+
+// snapshotTime reads the time restic stamped on the snapshot a mover saved.
+func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claimName, short string) (*metav1.Time, error) {
+	if short == "" || r.Snapshots == nil {
+		return nil, fmt.Errorf("the mover logged no snapshot")
+	}
+	secret, err := r.repositorySecret(ctx, namespace, claimName)
+	if err != nil {
+		return nil, err
 	}
 	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
 	if err != nil {

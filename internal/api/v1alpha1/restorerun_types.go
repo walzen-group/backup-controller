@@ -16,6 +16,7 @@ import (
 // +kubebuilder:validation:XValidation:rule="((has(self.claim) || has(self.repository)) ? 1 : 0) + (has(self.database) ? 1 : 0) + ((has(self.all) && self.all) ? 1 : 0) == 1",message="set exactly one of claim (or repository), database and all"
 // +kubebuilder:validation:XValidation:rule="!has(self.previous) || has(self.claim) || has(self.repository)",message="previous applies to one volume only"
 // +kubebuilder:validation:XValidation:rule="!has(self.into) || has(self.claim) || has(self.repository)",message="into needs claim or repository"
+// +kubebuilder:validation:XValidation:rule="!has(self.syncDatabaseToVolume) || !self.syncDatabaseToVolume || (has(self.all) && self.all)",message="syncDatabaseToVolume needs all"
 type RestoreRunSpec struct {
 	// Claim is the claim in this namespace whose repository to restore from,
 	// and, unless Into names another, the claim the restore writes into.
@@ -74,6 +75,15 @@ type RestoreRunSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	Previous *int32 `json:"previous,omitempty"`
 
+	// SyncDatabaseToVolume recovers the databases to the moment the volumes'
+	// snapshots were taken, instead of to RestoreAsOf. It needs All, and takes
+	// only snapshots a quiesced BackupRun tagged quiesced: those carry the
+	// moment the run stopped the workloads, when neither the volumes nor the
+	// databases were written. Every volume has to select a snapshot of the
+	// same moment.
+	// +optional
+	SyncDatabaseToVolume bool `json:"syncDatabaseToVolume,omitempty"`
+
 	// Timeout is how long to wait for the movers and the recovered databases
 	// before giving up.
 	// +optional
@@ -102,6 +112,12 @@ type RestoreRunStatus struct {
 	// Target is the claim an Into restore creates and fills.
 	// +optional
 	Target string `json:"target,omitempty"`
+
+	// SyncedTo is the moment a SyncDatabaseToVolume run restores everything
+	// to: the time on the volumes' quiesced snapshots, which the databases
+	// recover to as well.
+	// +optional
+	SyncedTo *metav1.Time `json:"syncedTo,omitempty"`
 
 	// StartedAt is when the run passed its checks and began restoring.
 	// +optional

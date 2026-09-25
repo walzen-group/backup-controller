@@ -232,11 +232,16 @@ func waitingRun(ctx context.Context, c client.Reader, namespace, name string) (*
 }
 
 // restoreTarget returns the moment to recover to and what asked for it: the
-// waiting RestoreRun's restoreAsOf, else the Cluster's restore-as-of
-// annotation, else no target, which replays to the end of the archive.
+// waiting RestoreRun's syncedTo, else its restoreAsOf, else the Cluster's
+// restore-as-of annotation, else no target, which replays to the end of the
+// archive.
 func restoreTarget(cluster *unstructured.Unstructured, run *backupv1alpha1.RestoreRun) (*time.Time, string, error) {
 	if run != nil {
 		source := "RestoreRun " + run.Name
+		if run.Status.SyncedTo != nil {
+			t := run.Status.SyncedTo.UTC()
+			return &t, source, nil
+		}
 		if run.Spec.RestoreAsOf == nil {
 			return nil, source, nil
 		}

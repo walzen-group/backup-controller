@@ -8,6 +8,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,7 +32,7 @@ func backupRun(mutate ...func(*backupv1alpha1.BackupRun)) *backupv1alpha1.Backup
 func backupReconciler(t *testing.T, objects ...client.Object) (*BackupRunReconciler, client.Client) {
 	t.Helper()
 	c := newClient(t, objects...)
-	return &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Now: func() time.Time { return frozen }}, c
+	return &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}, c
 }
 
 // step reconciles the run once and returns what the reconcile asked for.
@@ -107,6 +108,9 @@ func TestAVolumeRunWritesTheSourceAndReportsResticsTime(t *testing.T) {
 	item := run.Status.Items[0]
 	if item.Snapshot != "6e473100" || item.SnapshotTime == nil || !item.SnapshotTime.Equal(&metav1.Time{Time: monday.Time}) {
 		t.Errorf("item = %+v, want snapshot 6e473100 at %s", item, monday.Time)
+	}
+	if calls := r.Retimer.(*retimer).calls; len(calls) != 0 {
+		t.Errorf("retimed %+v; a run that stopped nothing has no quiesce moment to move the snapshot to", calls)
 	}
 	if len(run.Finalizers) != 0 {
 		t.Error("the finished run kept its finalizer")
@@ -407,6 +411,90 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 	}
 	if _, ok := getUnstructured(t, c, WorkloadGVK, ns, workloadName(runUID)); ok {
 		t.Error("the Workload outlived the run and holds its queue slot")
+	}
+}
+
+// quiescedRunToUpload drives a namespace run with the app marked for quiesce
+// through the clone and the restart, and completes the upload and the base
+// backup. The next step collects the results.
+func quiescedRunToUpload(t *testing.T) (*BackupRunReconciler, client.Client) {
+	t.Helper()
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // start
+
+	clone := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "volsync-" + claimN + "-src", Namespace: ns},
+		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+	if err := c.Create(context.Background(), clone); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Status().Update(context.Background(), clone); err != nil {
+		t.Fatal(err)
+	}
+	step(t, r) // restart
+	if run := readBackupRun(t, c); run.Status.RestartedAt == nil {
+		t.Fatal("the app was not restarted once the clone was cut")
+	}
+
+	complete(t, c, "snapshot 6e473100 saved")
+	backup, _ := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
+	_ = unstructured.SetNestedField(backup.Object, "completed", "status", "phase")
+	if err := c.Update(context.Background(), backup); err != nil {
+		t.Fatal(err)
+	}
+	return r, c
+}
+
+// A run that stopped the app moves the volume's snapshot to the moment it
+// started the app again. Nothing wrote the volume or the database between the
+// last pod stopping and that moment, so a restore can recover the database to
+// the snapshot's time and the two agree.
+func TestAQuiescedRunMovesTheSnapshotToItsRestartMoment(t *testing.T) {
+	r, c := quiescedRunToUpload(t)
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+		t.Fatalf("phase = %q (%s), want Succeeded", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	calls := r.Retimer.(*retimer).calls
+	if len(calls) != 1 || calls[0].short != "6e473100" || !calls[0].at.Equal(run.Status.RestartedAt.Time) || calls[0].tag != "quiesced" {
+		t.Fatalf("retime calls = %+v, want snapshot 6e473100 moved to restartedAt %s and tagged quiesced", calls, run.Status.RestartedAt)
+	}
+	item := run.Status.Items[0]
+	if item.Snapshot != "c0ffee00" || item.SnapshotTime == nil || !item.SnapshotTime.Equal(run.Status.RestartedAt) {
+		t.Errorf("item = %+v, want the rewritten snapshot c0ffee00 at restartedAt %s", item, run.Status.RestartedAt)
+	}
+}
+
+// The rewrite needs restic's exclusive lock. While another process holds a
+// lock the volume's item waits, and the run finishes once the rewrite goes
+// through, so a run never reports success for a snapshot left untagged.
+func TestAQuiescedRunWaitsForTheRepositoryLock(t *testing.T) {
+	r, c := quiescedRunToUpload(t)
+	fake := r.Retimer.(*retimer)
+	fake.err = &restic.LockedError{Hostname: "volsync-dst-restore-1a2b", Time: frozen.Add(-time.Minute)}
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase.Finished() {
+		t.Fatalf("phase = %q while the repository was locked, want the run still going", run.Status.Phase)
+	}
+	item := run.Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemRunning || !strings.Contains(item.Message, "volsync-dst-restore-1a2b") {
+		t.Errorf("item = %+v, want it Running with a message naming the lock's host", item)
+	}
+
+	fake.err = nil
+	step(t, r)
+	run = readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Snapshot != "c0ffee00" {
+		t.Errorf("phase = %q, item = %+v; want Succeeded with the rewritten snapshot", run.Status.Phase, run.Status.Items[0])
 	}
 }
 

@@ -1,6 +1,7 @@
 package restic
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -105,7 +107,7 @@ func ParseRepository(repository string) (Location, error) {
 	return at, nil
 }
 
-// S3Store reads a repository's files out of its bucket.
+// S3Store keeps a repository's files in its bucket.
 type S3Store struct {
 	client *minio.Client
 	at     Location
@@ -157,18 +159,42 @@ func (s *S3Store) Get(ctx context.Context, name string) ([]byte, error) {
 	return raw, nil
 }
 
+// Put writes one file.
+func (s *S3Store) Put(ctx context.Context, name string, data []byte) error {
+	_, err := s.client.PutObject(ctx, s.at.Bucket, s.key(name), bytes.NewReader(data), int64(len(data)),
+		minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	if err != nil {
+		return fmt.Errorf("put %s/%s: %w", s.at.Bucket, s.key(name), err)
+	}
+	return nil
+}
+
+// Remove deletes one file.
+func (s *S3Store) Remove(ctx context.Context, name string) error {
+	if err := s.client.RemoveObject(ctx, s.at.Bucket, s.key(name), minio.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("remove %s/%s: %w", s.at.Bucket, s.key(name), err)
+	}
+	return nil
+}
+
 // Lister returns a repository's snapshots. The interface lets the controllers
 // run their tests without an object store.
 type Lister interface {
 	Snapshots(ctx context.Context, secret *corev1.Secret) ([]Snapshot, error)
 }
 
-// S3Lister opens the repository a VolSync Secret names and lists it.
+// Retimer moves a snapshot to another time and tags it. The interface lets the
+// controllers run their tests without an object store.
+type Retimer interface {
+	Retime(ctx context.Context, secret *corev1.Secret, short string, at time.Time, tag string) (Snapshot, error)
+}
+
+// S3Lister opens the repository a VolSync Secret names, to list it or to
+// rewrite one of its snapshots.
 type S3Lister struct{}
 
-// Snapshots opens the repository and returns its snapshots, oldest first. A
-// repository VolSync has not initialised yet holds no snapshots.
-func (S3Lister) Snapshots(ctx context.Context, secret *corev1.Secret) ([]Snapshot, error) {
+// open connects to the repository a VolSync Secret names.
+func (S3Lister) open(ctx context.Context, secret *corev1.Secret) (*Repository, error) {
 	at, err := FromSecret(secret)
 	if err != nil {
 		return nil, err
@@ -177,7 +203,13 @@ func (S3Lister) Snapshots(ctx context.Context, secret *corev1.Secret) ([]Snapsho
 	if err != nil {
 		return nil, err
 	}
-	repo, err := Open(ctx, store, at.Password)
+	return Open(ctx, store, at.Password)
+}
+
+// Snapshots opens the repository and returns its snapshots, oldest first. A
+// repository VolSync has not initialised yet holds no snapshots.
+func (l S3Lister) Snapshots(ctx context.Context, secret *corev1.Secret) ([]Snapshot, error) {
+	repo, err := l.open(ctx, secret)
 	if errors.Is(err, ErrNoRepository) {
 		return nil, nil
 	}
@@ -185,4 +217,13 @@ func (S3Lister) Snapshots(ctx context.Context, secret *corev1.Secret) ([]Snapsho
 		return nil, err
 	}
 	return repo.Snapshots(ctx)
+}
+
+// Retime opens the repository and moves one snapshot, see Repository.Retime.
+func (l S3Lister) Retime(ctx context.Context, secret *corev1.Secret, short string, at time.Time, tag string) (Snapshot, error) {
+	repo, err := l.open(ctx, secret)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return repo.Retime(ctx, short, at, tag)
 }
