@@ -235,6 +235,11 @@ var backupDir = regexp.MustCompile(`^([^/]+)/base/(\d{8}T\d{6})/`)
 // writes: 2026-09-25 21:24:00.123456+00:00, with or without the fraction.
 var barmanTime = regexp.MustCompile(`^(\w+)=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?\+00:00)$`)
 
+// labelTime matches the start time PostgreSQL writes into the backup label,
+// which backup.info keeps on its backup_label line: START TIME: 2026-09-25
+// 21:52:25 UTC.
+var labelTime = regexp.MustCompile(`START TIME: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC`)
+
 // Shift moves the whole store in time by d, as if barman had written it that
 // much later: every backup ID, the times in every backup.info, and every
 // object's LastModified. WAL segment names don't carry a time and stay. The
@@ -267,7 +272,8 @@ func shiftID(id string, d time.Duration) string {
 }
 
 // shiftInfo moves every timestamp in a backup.info body by d, and replaces
-// the old backup ID wherever the body names it.
+// the old backup ID wherever the body names it. The times are barman's own
+// key=value timestamps and the START TIME in the backup label.
 func shiftInfo(body, oldID, newID string, d time.Duration) string {
 	lines := strings.Split(body, "\n")
 	for i, line := range lines {
@@ -277,7 +283,8 @@ func shiftInfo(body, oldID, newID string, d time.Duration) string {
 		}
 		layout := "2006-01-02 15:04:05-07:00"
 		if m[3] != "" {
-			layout = "2006-01-02 15:04:05.999999-07:00"
+			// Keep the fraction as wide as barman wrote it, trailing zeros too.
+			layout = "2006-01-02 15:04:05." + strings.Repeat("0", len(m[3])-1) + "-07:00"
 		}
 		t, err := time.Parse(layout, m[2])
 		if err != nil {
@@ -285,7 +292,15 @@ func shiftInfo(body, oldID, newID string, d time.Duration) string {
 		}
 		lines[i] = m[1] + "=" + t.Add(d).Format(layout)
 	}
-	return strings.ReplaceAll(strings.Join(lines, "\n"), oldID, newID)
+	out := labelTime.ReplaceAllStringFunc(strings.Join(lines, "\n"), func(s string) string {
+		const layout = "2006-01-02 15:04:05"
+		t, err := time.Parse(layout, labelTime.FindStringSubmatch(s)[1])
+		if err != nil {
+			return s
+		}
+		return "START TIME: " + t.Add(d).Format(layout) + " UTC"
+	})
+	return strings.ReplaceAll(out, oldID, newID)
 }
 
 // Backups returns the IDs of the base backups in the store, per server, in
