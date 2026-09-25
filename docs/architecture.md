@@ -72,7 +72,7 @@ database operation leaves it alone.
 | --- | --- | --- |
 | the ObjectStore | the Cluster's namespace, by `barmanObjectName` | |
 | `spec.configuration.destinationPath` | `s3://prod-cluster-backup-cnpg/canary-namespace-backup` | bucket `prod-cluster-backup-cnpg`, and the prefix `canary-namespace-backup/canary-namespace-backup-pg` once the server name is appended |
-| `spec.configuration.endpointURL` | `https://…` or `http://…`; a bare host reads as HTTPS | the S3 endpoint |
+| `spec.configuration.endpointURL` | `https://…` or `http://…`; a bare host, with or without a port, reads as HTTPS | the S3 endpoint |
 | `s3Credentials.accessKeyId`, `secretAccessKey` | the Secret and keys they name | the key pair |
 | `endpointCA`, when present | the Secret and key it names | a PEM bundle added to the image's public roots |
 

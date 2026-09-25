@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -114,15 +115,19 @@ func tlsTransport(bundle []byte) (*http.Transport, error) {
 
 // splitEndpoint turns an endpointURL into the host (with its port, when it has
 // one) and the TLS flag that minio.New takes. An https:// URL gives TLS and an
-// http:// URL gives plain HTTP. A bare host name such as s3.example.com is
-// read as HTTPS, which is what every endpoint this cluster talks to uses. A
-// bare host with a port, such as s3.example.com:9000, doesn't work: url.Parse
-// reads the host name as a scheme, and the function returns an error for it.
-// It also returns an error for an empty endpoint, an unparsable one, and any
-// other scheme.
+// http:// URL gives plain HTTP. An endpoint without "://" is a bare host, with
+// or without a port, such as s3.example.com or 10.0.0.1:9000, and is read as
+// HTTPS, which is what every endpoint this cluster talks to uses. A bare host
+// never goes through url.Parse, because url.Parse reads s3.example.com:9000 as
+// the scheme s3.example.com and refuses 10.0.0.1:9000 outright. It returns an
+// error for an empty endpoint, an unparsable URL, and any scheme other than
+// http and https.
 func splitEndpoint(endpoint string) (host string, secure bool, err error) {
 	if endpoint == "" {
 		return "", false, fmt.Errorf("the object store names no endpointURL")
+	}
+	if !strings.Contains(endpoint, "://") {
+		return endpoint, true, nil
 	}
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
