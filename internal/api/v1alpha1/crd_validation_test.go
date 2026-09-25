@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -191,6 +192,7 @@ func TestRunsNameExactlyOneScope(t *testing.T) {
 		})
 	}
 
+	size := resource.MustParse("2Gi")
 	restores := []struct {
 		name    string
 		spec    RestoreRunSpec
@@ -198,7 +200,8 @@ func TestRunsNameExactlyOneScope(t *testing.T) {
 	}{
 		{"claim", RestoreRunSpec{Claim: "notes-data"}, false},
 		{"claim into", RestoreRunSpec{Claim: "notes-data", Into: "notes-data-monday"}, false},
-		{"repository into", RestoreRunSpec{Repository: "notes-restic", Into: "copy"}, false},
+		{"repository into", RestoreRunSpec{Repository: "notes-restic", Into: "copy", IntoSize: &size}, false},
+		{"repository into without a size", RestoreRunSpec{Repository: "notes-restic", Into: "copy"}, true},
 		{"database", RestoreRunSpec{Database: "notes-pg"}, false},
 		{"all", RestoreRunSpec{All: true}, false},
 		{"nothing", RestoreRunSpec{}, true},

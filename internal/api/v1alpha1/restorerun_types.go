@@ -18,6 +18,7 @@ import (
 // +kubebuilder:validation:XValidation:rule="((has(self.claim) || has(self.repository)) ? 1 : 0) + (has(self.database) ? 1 : 0) + ((has(self.all) && self.all) ? 1 : 0) == 1",message="set exactly one of claim (or repository), database and all"
 // +kubebuilder:validation:XValidation:rule="!has(self.previous) || has(self.claim) || has(self.repository)",message="previous applies to one volume only"
 // +kubebuilder:validation:XValidation:rule="!has(self.into) || has(self.claim) || has(self.repository)",message="into needs claim or repository"
+// +kubebuilder:validation:XValidation:rule="!has(self.repository) || has(self.claim) || !has(self.into) || has(self.intoSize)",message="into from a repository needs intoSize, because there is no source claim to copy a size from"
 // +kubebuilder:validation:XValidation:rule="!has(self.syncDatabaseToVolume) || !self.syncDatabaseToVolume || (has(self.all) && self.all)",message="syncDatabaseToVolume needs all"
 // +kubebuilder:validation:XValidation:rule="!has(self.quiesce) || size(self.quiesce) == 0 || !has(self.into)",message="quiesce restores in place; an into restore leaves the app alone"
 type RestoreRunSpec struct {
@@ -48,15 +49,18 @@ type RestoreRunSpec struct {
 
 	// Into is the name of a new claim to create and fill. The source claim
 	// stays untouched. When omitted, the restore overwrites Claim in place,
-	// and the workload that mounts it has to stop first.
+	// and the workload that mounts it has to stop first. With Claim, the new
+	// claim is filled through a VolumeRestore on the source claim's node. With
+	// Repository alone, the run creates an empty claim and a mover that
+	// writes into it, and the scheduler places the claim with the mover pod.
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
 	Into string `json:"into,omitempty"`
 
 	// IntoSize is the storage request of the claim that Into creates. When
 	// omitted, the new claim requests the same size as the source claim. A
-	// restore from Repository has no source claim to copy a size from, so
-	// set it there.
+	// restore from Repository alone has no source claim to copy a size from,
+	// so it is required there.
 	// +optional
 	IntoSize *resource.Quantity `json:"intoSize,omitempty"`
 

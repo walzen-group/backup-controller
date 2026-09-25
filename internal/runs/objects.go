@@ -144,9 +144,10 @@ func selectedMoment(item backupv1alpha1.RestoreItem) *string {
 	return &moment
 }
 
-// directDestination builds the ReplicationDestination for an in-place
-// restore. Its mover mounts the claim the app uses and writes the chosen
-// snapshot into it.
+// directDestination builds the ReplicationDestination for a restore that
+// writes straight into a claim: an in-place restore, whose claim is the one
+// the app uses, and a restore from spec.repository alone into a new claim.
+// Its mover mounts the claim and writes the chosen snapshot into it.
 //
 // Parameters:
 //   - run is the RestoreRun. Its UID becomes the manual trigger.
@@ -262,7 +263,9 @@ func pointInTimeRestore(run *backupv1alpha1.RestoreRun, item backupv1alpha1.Rest
 //     spec.intoSize, when set, replaces the source claim's size.
 //   - settings are the source claim's settings from repositoryFor.
 //   - restore is the name of the VolumeRestore that the claim's
-//     dataSourceRef names, which is the one pointInTimeRestore builds.
+//     dataSourceRef names, which is the one pointInTimeRestore builds. An
+//     empty name leaves the claim with no data source, for a restore from
+//     spec.repository alone, whose mover writes into the claim directly.
 //
 // The claim takes the source claim's size and class, so the copy is
 // provisioned the way the original was. It is an ordinary dynamic claim.
@@ -279,7 +282,8 @@ func pointInTimeRestore(run *backupv1alpha1.RestoreRun, item backupv1alpha1.Rest
 //
 // The source's node is also where the copy belongs. The copy is made to be
 // compared against the original, and both datasets belong on the pool that
-// already holds one of them.
+// already holds one of them. A restore from spec.repository alone has no
+// source node, and restoreIntoEmptyClaim lets the mover pod place the claim.
 func scratchClaim(run *backupv1alpha1.RestoreRun, settings restoreSettings, restore string) *corev1.PersistentVolumeClaim {
 	size := settings.Capacity
 	if run.Spec.IntoSize != nil {
@@ -303,12 +307,14 @@ func scratchClaim(run *backupv1alpha1.RestoreRun, settings restoreSettings, rest
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			StorageClassName: settings.StorageClassName,
-			DataSourceRef: &corev1.TypedObjectReference{
-				APIGroup: &backupv1alpha1.GroupVersion.Group,
-				Kind:     "VolumeRestore",
-				Name:     restore,
-			},
 		},
+	}
+	if restore != "" {
+		claim.Spec.DataSourceRef = &corev1.TypedObjectReference{
+			APIGroup: &backupv1alpha1.GroupVersion.Group,
+			Kind:     "VolumeRestore",
+			Name:     restore,
+		}
 	}
 	if size != nil {
 		claim.Spec.Resources = corev1.VolumeResourceRequirements{

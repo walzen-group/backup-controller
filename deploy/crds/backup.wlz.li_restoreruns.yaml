@@ -97,7 +97,10 @@ spec:
                 description: |-
                   Into is the name of a new claim to create and fill. The source claim
                   stays untouched. When omitted, the restore overwrites Claim in place,
-                  and the workload that mounts it has to stop first.
+                  and the workload that mounts it has to stop first. With Claim, the new
+                  claim is filled through a VolumeRestore on the source claim's node. With
+                  Repository alone, the run creates an empty claim and a mover that
+                  writes into it, and the scheduler places the claim with the mover pod.
                 maxLength: 253
                 type: string
               intoSize:
@@ -107,8 +110,8 @@ spec:
                 description: |-
                   IntoSize is the storage request of the claim that Into creates. When
                   omitted, the new claim requests the same size as the source claim. A
-                  restore from Repository has no source claim to copy a size from, so
-                  set it there.
+                  restore from Repository alone has no source claim to copy a size from,
+                  so it is required there.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
               moverSecurityContext:
@@ -439,6 +442,10 @@ spec:
               rule: '!has(self.previous) || has(self.claim) || has(self.repository)'
             - message: into needs claim or repository
               rule: '!has(self.into) || has(self.claim) || has(self.repository)'
+            - message: into from a repository needs intoSize, because there is no
+                source claim to copy a size from
+              rule: '!has(self.repository) || has(self.claim) || !has(self.into) ||
+                has(self.intoSize)'
             - message: syncDatabaseToVolume needs all
               rule: '!has(self.syncDatabaseToVolume) || !self.syncDatabaseToVolume
                 || (has(self.all) && self.all)'

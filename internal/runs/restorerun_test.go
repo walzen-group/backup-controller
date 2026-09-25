@@ -16,6 +16,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -1152,5 +1153,88 @@ func TestAnIntoRestoreDeletedBeforeThePopulatorStartedReleasesItsVolumeRestore(t
 	get(t, c, ns, "notes-data-monday", vr)
 	if slices.Contains(vr.Finalizers, populator.Finalizer) {
 		t.Errorf("VolumeRestore finalizers = %v, want %s released", vr.Finalizers, populator.Finalizer)
+	}
+}
+
+// fromRepository is a mutate function for restoreRun that restores the
+// repository Secret into a new 2Gi claim named scratch, with no source claim.
+func fromRepository(r *backupv1alpha1.RestoreRun) {
+	size := resource.MustParse("2Gi")
+	r.Spec.Repository, r.Spec.Into, r.Spec.IntoSize = repoN, "scratch", &size
+}
+
+// An into restore from a repository no claim backs up to has no source claim
+// to take a node from, and a claim on a WaitForFirstConsumer class gets one
+// only from the pod that first uses it. So the run creates a plain claim of
+// spec.intoSize and a ReplicationDestination whose mover writes the selected
+// snapshot into it. The mover pod is the claim's first consumer, and the
+// scheduler places the claim with it. The run succeeds once the mover has
+// completed the run's trigger, and deletes the destination.
+func TestAnIntoRestoreFromARepositoryFillsAClaimTheMoverPlaces(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // create
+
+	scratch := &corev1.PersistentVolumeClaim{}
+	get(t, c, ns, "scratch", scratch)
+	if request := scratch.Spec.Resources.Requests[corev1.ResourceStorage]; request.Cmp(resource.MustParse("2Gi")) != 0 || scratch.Spec.DataSourceRef != nil {
+		t.Fatalf("claim request = %s, dataSourceRef = %v; want 2Gi and none", request.String(), scratch.Spec.DataSourceRef)
+	}
+	run := readRestoreRun(t, c)
+	rd := &volsyncv1alpha1.ReplicationDestination{}
+	get(t, c, ns, run.Status.Items[0].Destination, rd)
+	if *rd.Spec.Restic.DestinationPVC != "scratch" || rd.Spec.Restic.Repository != repoN ||
+		rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-21T05:00:02Z" {
+		t.Fatalf("destination = %+v, want it writing monday's snapshot into scratch", rd.Spec.Restic)
+	}
+
+	completeVolume(t, c)
+	restoreStep(t, r)
+	run = readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
+		t.Fatalf("phase = %q, item = %+v; want Succeeded", run.Status.Phase, run.Status.Items[0])
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: rd.Name}, rd); err == nil {
+		t.Error("the destination outlived the run")
+	}
+}
+
+// An into restore from a repository without spec.intoSize ends as Invalid at
+// its checks. With no source claim there is no size to copy, and the API
+// server refuses a claim without a storage request.
+func TestAnIntoRestoreFromARepositoryNeedsASize(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(fromRepository, func(r *backupv1alpha1.RestoreRun) { r.Spec.IntoSize = nil }), repository())
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid || !strings.Contains(readyMessage(run.Status.Conditions), "intoSize") {
+		t.Fatalf("reason = %q, message = %q; want Invalid naming intoSize", readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
+	}
+}
+
+// An into restore whose claim the API server keeps refusing still times out.
+// The run checks its deadline before it creates anything, so an error from
+// the create can't keep it waiting past spec.timeout.
+func TestAnIntoRestoreTimesOutWhileItsClaimIsRefused(t *testing.T) {
+	r, c := restoreReconciler(t, nil,
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "notes-data-monday" }),
+		claim(), volumeRestore(), repository())
+	restoreStep(t, r) // plan
+
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.PersistentVolumeClaim); ok {
+				return apierrors.NewServiceUnavailable("admission webhook timed out")
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err != nil {
+		t.Fatalf("reconcile past the timeout returned %v, want the run ended", err)
+	}
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+		t.Fatalf("phase = %q, reason = %q; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
 }
