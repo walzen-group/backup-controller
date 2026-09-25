@@ -319,6 +319,6 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code string)
 // rule that drops the response after the write landed.
 type discard struct{ header http.Header }
 
-func (d discard) Header() http.Header         { return d.header }
-func (discard) Write(b []byte) (int, error)   { return len(b), nil }
-func (discard) WriteHeader(int)               {}
+func (d discard) Header() http.Header       { return d.header }
+func (discard) Write(b []byte) (int, error) { return len(b), nil }
+func (discard) WriteHeader(int)             {}

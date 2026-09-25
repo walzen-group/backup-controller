@@ -186,7 +186,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, http.StatusNotImplemented, "NotImplemented", "The fake does not list buckets.", "", "")
 		return
 	}
-	if !exists && !(key == "" && r.Method == http.MethodPut) {
+	if !exists && (key != "" || r.Method != http.MethodPut) {
 		s.fail(w, r, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist", bucket, "")
 		return
 	}

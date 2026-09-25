@@ -91,13 +91,12 @@ func startRecorder(endpoint string) (*recorder, error) {
 		return nil, err
 	}
 	rec := &recorder{}
-	forward := httputil.NewSingleHostReverseProxy(target)
-	base := forward.Director
-	forward.Director = func(r *http.Request) {
-		host := r.Host
-		base(r)
-		r.Host = host
-	}
+	forward := &httputil.ReverseProxy{Rewrite: func(r *httputil.ProxyRequest) {
+		r.SetURL(target)
+		r.Out.Host = r.In.Host
+		r.Out.URL.Path = r.In.URL.Path
+		r.Out.URL.RawPath = r.In.URL.RawPath
+	}}
 	forward.ModifyResponse = func(resp *http.Response) error {
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
