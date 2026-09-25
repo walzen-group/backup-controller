@@ -1,7 +1,7 @@
 // Package bootstrap decides how a new CloudNativePG Cluster starts. When the
-// Cluster's object store already holds a base backup, the package rewrites the
-// Cluster to recover from it. When the store is empty, the Cluster keeps its
-// initdb bootstrap and starts as an empty database.
+// Cluster's object store already holds a completed base backup, the package
+// rewrites the Cluster to recover from it. When the store holds none, the
+// Cluster keeps its initdb bootstrap and starts as an empty database.
 //
 // Neither kustomize nor OpenTofu can make that choice, because both render
 // their manifests before anything has spoken to the object store. An admission
@@ -79,8 +79,8 @@ func (l Location) BasePrefix() string {
 // S3Prober is the real one. The interface exists so the webhook and the
 // RestoreRun controller can be tested without an object store.
 type Prober interface {
-	// HasBaseBackup reports whether anything is stored under the
-	// location's base prefix.
+	// HasBaseBackup reports whether the location holds at least one
+	// completed base backup, one whose backup.info has status DONE.
 	HasBaseBackup(ctx context.Context, at Location) (bool, error)
 	// BaseBackups lists the location's completed base backups, oldest
 	// first.

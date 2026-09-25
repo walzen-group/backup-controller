@@ -66,8 +66,8 @@ type Decider struct {
 }
 
 // Handle answers one admission request for a Cluster. For a new Cluster whose
-// object store already holds a base backup, it rewrites the Cluster to recover
-// from that backup.
+// object store already holds a completed base backup, it rewrites the Cluster
+// to recover from that backup.
 //
 // The req argument is the admission request. Its Operation, DryRun, Object and
 // OldObject decide what happens:
@@ -83,13 +83,15 @@ type Decider struct {
 //   - A create is refused when a RestoreRun's restoreAsOf or the Cluster's
 //     restore-as-of annotation isn't an RFC 3339 time.
 //   - A create is refused when a RestoreRun or the restore-as-of annotation
-//     asks for a recovery and the store holds no base backup, or no base
-//     backup finished by the requested moment.
-//   - Otherwise, when the store holds a base backup, the response patches the
-//     Cluster to recover from it (see setRecovery). When a RestoreRun waits
-//     for the Cluster, the patch also sets the backup.wlz.li/restore-run
-//     annotation to the run's name. With no base backup and nothing asking
-//     for a recovery, the Cluster is allowed unchanged and starts empty.
+//     asks for a recovery and the store holds no completed base backup, or
+//     none finished by the requested moment.
+//   - Otherwise, when the store holds a completed base backup, the response
+//     patches the Cluster to recover from it (see setRecovery). When a
+//     RestoreRun waits for the Cluster, the patch also sets the
+//     backup.wlz.li/restore-run annotation to the run's name. With no
+//     completed base backup and nothing asking for a recovery, the Cluster is
+//     allowed unchanged and starts empty. A store whose only base backups
+//     failed or never finished counts as holding none.
 //
 // Failures to read the store, list Clusters or RestoreRuns, or talk to the
 // object store return an HTTP 500 error response, which the API server treats
@@ -201,11 +203,11 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	if !has {
 		if run != nil || target != nil {
 			return admission.Denied(fmt.Sprintf(
-				"%s asks for a recovery, and %s/%s holds no base backup to recover from.",
+				"%s asks for a recovery, and %s/%s holds no completed base backup to recover from.",
 				source, at.Bucket, at.BasePrefix(),
 			))
 		}
-		logger.Info("leaving the Cluster to initdb", "reason", "no base backup in the store", "prefix", at.BasePrefix())
+		logger.Info("leaving the Cluster to initdb", "reason", "no completed base backup in the store", "prefix", at.BasePrefix())
 		return admission.Allowed("no base backup")
 	}
 

@@ -130,13 +130,20 @@ func secret() *corev1.Secret {
 // objects passed in existing.
 func decide(t *testing.T, c *unstructured.Unstructured, prober Prober, existing ...runtime.Object) admission.Response {
 	t.Helper()
+	return decideWith(t, c, prober, store(), existing...)
+}
+
+// decideWith is decide with the Cluster's ObjectStore passed in, for the cases
+// that point the store at another endpoint, such as a fake S3 server.
+func decideWith(t *testing.T, c *unstructured.Unstructured, prober Prober, objectStore *unstructured.Unstructured, existing ...runtime.Object) admission.Response {
+	t.Helper()
 	raw, err := json.Marshal(c)
 	if err != nil {
 		t.Fatalf("marshal the cluster: %v", err)
 	}
 
 	builder := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(secret())
-	objects := append([]runtime.Object{store()}, existing...)
+	objects := append([]runtime.Object{objectStore}, existing...)
 	builder = builder.WithRuntimeObjects(objects...)
 
 	decider := &Decider{Client: builder.Build(), Prober: prober}
