@@ -199,7 +199,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	case key == "" && r.Method == http.MethodGet && query.Has("location"):
 		w.Header().Set("Content-Type", "application/xml")
-		_, _ = io.WriteString(w, xml.Header+`<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`)
+		_, _ = io.WriteString(w, xmlHeader+`<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>`)
 	case key == "" && r.Method == http.MethodGet && query.Get("list-type") == "2":
 		s.list(w, r, bucket, objects)
 	case key == "":
@@ -235,61 +235,109 @@ func (s *Server) authorized(r *http.Request) bool {
 	return access == s.AccessKey
 }
 
-// errorDocument is the XML body S3 sends with an error status.
+// xmlHeader is the XML declaration RustFS starts every document with, with
+// no line break after it.
+const xmlHeader = `<?xml version="1.0" encoding="UTF-8"?>`
+
+// errorDocument is the XML body RustFS sends with an error status: the code
+// and the message alone, without the BucketName, Key, Resource and RequestId
+// fields AWS S3 adds.
 type errorDocument struct {
-	XMLName    xml.Name `xml:"Error"`
-	Code       string   `xml:"Code"`
-	Message    string   `xml:"Message"`
-	BucketName string   `xml:"BucketName,omitempty"`
-	Key        string   `xml:"Key,omitempty"`
-	Resource   string   `xml:"Resource"`
-	RequestID  string   `xml:"RequestId"`
+	XMLName xml.Name `xml:"Error"`
+	Code    string   `xml:"Code"`
+	Message string   `xml:"Message"`
 }
 
-// fail writes an S3 error response. A HEAD request gets the status alone, as
-// S3 sends no body with a HEAD.
-func (s *Server) fail(w http.ResponseWriter, r *http.Request, status int, code, message, bucket, key string) {
+// fail writes an S3 error response. The bucket and key name the resource
+// for a reader of the code; RustFS leaves them out of the document. A HEAD
+// request gets the status alone, as S3 sends no body with a HEAD.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, status int, code, message, _, _ string) {
 	if r.Method == http.MethodHead {
 		w.WriteHeader(status)
 		return
 	}
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
-	_, _ = io.WriteString(w, xml.Header)
+	_, _ = io.WriteString(w, xmlHeader)
 	_ = xml.NewEncoder(w).Encode(errorDocument{
-		Code: code, Message: message, BucketName: bucket, Key: key, Resource: r.URL.Path, RequestID: "s3fake",
+		Code: code, Message: message,
 	})
 }
 
 // listContent is one object in a ListObjectsV2 result.
 type listContent struct {
+	ETag         string `xml:"ETag"`
 	Key          string `xml:"Key"`
 	LastModified string `xml:"LastModified"`
-	ETag         string `xml:"ETag"`
+	Owner        *owner `xml:"Owner,omitempty"`
 	Size         int64  `xml:"Size"`
 	StorageClass string `xml:"StorageClass"`
 }
+
+// owner is the Owner element RustFS puts in each listed object when the
+// client asks for it with fetch-owner=true.
+type owner struct {
+	DisplayName string `xml:"DisplayName"`
+	ID          string `xml:"ID"`
+}
+
+// rustfsOwner is the owner RustFS 1.0.0 reports for its root user.
+var rustfsOwner = &owner{DisplayName: "rustfs", ID: "c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66"}
 
 // commonPrefix is one rolled-up prefix in a delimited listing.
 type commonPrefix struct {
 	Prefix string `xml:"Prefix"`
 }
 
-// listResult is the ListBucketResult document of ListObjectsV2.
+// listResult is the ListBucketResult document of ListObjectsV2, with its
+// elements in the order RustFS writes them.
 type listResult struct {
 	XMLName               xml.Name       `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListBucketResult"`
 	Name                  string         `xml:"Name"`
 	Prefix                string         `xml:"Prefix"`
-	StartAfter            string         `xml:"StartAfter,omitempty"`
-	ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
-	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
-	KeyCount              int            `xml:"KeyCount"`
 	MaxKeys               int            `xml:"MaxKeys"`
-	Delimiter             string         `xml:"Delimiter,omitempty"`
-	EncodingType          string         `xml:"EncodingType,omitempty"`
+	KeyCount              int            `xml:"KeyCount"`
+	ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
 	IsTruncated           bool           `xml:"IsTruncated"`
+	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
 	Contents              []listContent  `xml:"Contents"`
 	CommonPrefixes        []commonPrefix `xml:"CommonPrefixes"`
+	Delimiter             string         `xml:"Delimiter,omitempty"`
+	EncodingType          string         `xml:"EncodingType,omitempty"`
+	StartAfter            string         `xml:"StartAfter,omitempty"`
+}
+
+// tokenSuffix ends every continuation token the fake hands out. RustFS 1.0.0
+// appends a cache marker in brackets to the last key before it base64-encodes
+// the token, such as "[rustfs_cache:v2,id:<uuid>,src:walker,gen:live]"; the
+// fake appends its own, so that it takes its own tokens and RustFS's alike.
+const tokenSuffix = "[s3fake]"
+
+// encodeToken returns the continuation token that resumes after key.
+func encodeToken(key string) string {
+	return base64.StdEncoding.EncodeToString([]byte(key + tokenSuffix))
+}
+
+// decodeToken returns the key a continuation token resumes after: the
+// decoded token without its bracketed marker. It returns false when the token
+// is not base64 or carries no marker.
+func decodeToken(token string) (string, bool) {
+	raw, err := base64.StdEncoding.DecodeString(token)
+	if err != nil || !strings.HasSuffix(string(raw), "]") {
+		return "", false
+	}
+	i := strings.LastIndex(string(raw), "[")
+	if i < 0 {
+		return "", false
+	}
+	return string(raw[:i]), true
+}
+
+// urlEncode encodes a key for a listing asked for with encoding-type=url, as
+// RustFS does: every byte a query escapes, a space as %20, and the slash left
+// as it is.
+func urlEncode(v string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(url.QueryEscape(v), "+", "%20"), "%2F", "/")
 }
 
 // maxPage is the most keys one ListObjectsV2 page holds, on S3 and on RustFS.
@@ -298,7 +346,10 @@ const maxPage = 1000
 // list answers ListObjectsV2. Keys and rolled-up prefixes come in byte order
 // after start-after or after the key the continuation token names, at most
 // max-keys (1000 at most) of them together. The continuation token is the
-// base64 of the last key or prefix of the previous page.
+// base64 of the last key or prefix of the previous page with a bracketed
+// marker after it, the shape of a RustFS token. With encoding-type=url the keys
+// and rolled-up prefixes are URL-encoded; the Prefix, Delimiter and StartAfter
+// fields come back as the client sent them, as RustFS returns them.
 func (s *Server) list(w http.ResponseWriter, r *http.Request, bucket string, objects map[string]Object) {
 	query := r.URL.Query()
 	prefix, delimiter := query.Get("prefix"), query.Get("delimiter")
@@ -314,12 +365,12 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, bucket string, obj
 	after := query.Get("start-after")
 	token := query.Get("continuation-token")
 	if token != "" {
-		raw, err := base64.StdEncoding.DecodeString(token)
-		if err != nil {
+		key, ok := decodeToken(token)
+		if !ok {
 			s.fail(w, r, http.StatusBadRequest, "InvalidArgument", "The continuation token provided is incorrect", bucket, "")
 			return
 		}
-		after = string(raw)
+		after = key
 	}
 
 	s.mu.Lock()
@@ -338,12 +389,12 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, bucket string, obj
 
 	encode := func(v string) string { return v }
 	if query.Get("encoding-type") == "url" {
-		encode = func(v string) string { return strings.ReplaceAll(url.QueryEscape(v), "%2F", "/") }
+		encode = urlEncode
 	}
 
 	out := listResult{
-		Name: bucket, Prefix: encode(prefix), StartAfter: encode(query.Get("start-after")),
-		ContinuationToken: token, MaxKeys: maxKeys, Delimiter: encode(delimiter),
+		Name: bucket, Prefix: prefix, StartAfter: query.Get("start-after"),
+		ContinuationToken: token, MaxKeys: maxKeys, Delimiter: delimiter,
 	}
 	if query.Get("encoding-type") == "url" {
 		out.EncodingType = "url"
@@ -362,7 +413,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, bucket string, obj
 		}
 		if out.KeyCount == maxKeys {
 			out.IsTruncated = true
-			out.NextContinuationToken = base64.StdEncoding.EncodeToString([]byte(last))
+			out.NextContinuationToken = encodeToken(last)
 			break
 		}
 		seen[entry] = true
@@ -373,16 +424,20 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, bucket string, obj
 			continue
 		}
 		o := snapshot[k]
-		out.Contents = append(out.Contents, listContent{
+		item := listContent{
 			Key:          encode(k),
 			LastModified: o.LastModified.UTC().Format("2006-01-02T15:04:05.000Z"),
 			ETag:         o.ETag,
 			Size:         o.Size,
 			StorageClass: "STANDARD",
-		})
+		}
+		if query.Get("fetch-owner") == "true" {
+			item.Owner = rustfsOwner
+		}
+		out.Contents = append(out.Contents, item)
 	}
 	w.Header().Set("Content-Type", "application/xml")
-	_, _ = io.WriteString(w, xml.Header)
+	_, _ = io.WriteString(w, xmlHeader)
 	_ = xml.NewEncoder(w).Encode(out)
 }
 
