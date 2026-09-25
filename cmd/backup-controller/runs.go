@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
@@ -82,11 +83,16 @@ type BootstrapWebhook struct {
 //     and nothing else can register metrics into that one.
 //   - hook says where the bootstrap webhook listens. An empty hook.CertDir
 //     serves no webhook.
+//   - fail is called, from the manager's goroutine, when the manager stops
+//     while the context is still live, with the error it stopped on. main
+//     passes exitOnFailure, so the kubelet restarts the pod. A manager that
+//     fails to sync its caches, for one, would otherwise leave the process
+//     running with no webhook server and no reconcilers.
 //
 // It returns an error when the client configuration can't be built, a scheme
 // fails to register, or the manager or one of its controllers can't be set
-// up. An error from the running manager is only logged.
-func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook) error {
+// up. An error from a manager stopped by the context is only logged.
+func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook, fail func(error)) error {
 	config, err := restConfig(kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client configuration: %w", err)
@@ -155,9 +161,19 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 	}
 
 	go func() {
-		if err := manager.Start(ctx); err != nil {
-			klog.Errorf("the run controllers stopped: %v", err)
+		err := manager.Start(ctx)
+		if ctx.Err() != nil {
+			// main cancelled the context, so the process is shutting down
+			// and the manager stopping is expected.
+			if err != nil {
+				klog.Errorf("the run controllers stopped: %v", err)
+			}
+			return
 		}
+		if err == nil {
+			err = errors.New("the manager returned while its context was live")
+		}
+		fail(err)
 	}()
 
 	klog.Infof("starting backup-controller: reconciling %s BackupRun and RestoreRun, scheduling namespaces", backupv1alpha1.GroupVersion.String())

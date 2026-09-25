@@ -73,11 +73,12 @@ func main() {
 	// BackupRun and RestoreRun are reconciled by a controller-runtime manager
 	// that this binary starts itself. The deferred cancel stops that manager
 	// once the library returns, which is the only shutdown signal this process
-	// gets.
+	// gets. A manager that stops on its own calls exitOnFailure, so the
+	// process never runs on with the populator alone.
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
-	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook); err != nil {
+	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook, exitOnFailure); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)
 	}
@@ -86,7 +87,10 @@ func main() {
 	// closes the stop channel itself. This binary installs no second handler,
 	// because two handlers closing one channel race and the loser panics.
 	// RunControllerWithConfig returns once the controller has stopped, and
-	// returning from main after it is the clean exit.
+	// returning from main after it is the clean exit. When the library fails
+	// instead, to build its clients or to sync its caches, it calls
+	// klog.Fatalf, which exits the process with a non-zero status, so a
+	// failed populator restarts the pod without help from this binary.
 	populatormachinery.RunControllerWithConfig(populatormachinery.VolumePopulatorConfig{
 		Kubeconfig:   kubeconfig(),
 		HttpEndpoint: *metricsAddr,
@@ -103,6 +107,19 @@ func main() {
 	})
 
 	klog.Info("stopping backup-controller")
+}
+
+// exitOnFailure ends the process with status 1 after logging why. main hands
+// it to startRunControllers, which calls it when the manager stops on its own.
+//
+// Without the manager the process serves no webhook and reconciles no run,
+// while the populator keeps it alive. The webhook's failurePolicy is Fail, so
+// every Cluster create on the cluster is refused until something restarts the
+// pod, and exiting is what gets the kubelet to restart it.
+func exitOnFailure(err error) {
+	klog.Errorf("the run controllers stopped, exiting so the pod restarts: %v", err)
+	klog.Flush()
+	os.Exit(1)
 }
 
 // newClientOperations builds the cluster operations the populator callbacks
