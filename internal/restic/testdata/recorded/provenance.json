@@ -1,5 +1,5 @@
 {
-  "generator": "hack/testdata/restic-fixtures.sh",
+  "generator": "hack/fixtures/restic.sh",
   "recorded": "2026-09-25T21:25:56Z",
   "tools": {
     "restic-mover": "0.18.1",

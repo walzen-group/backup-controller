@@ -335,7 +335,7 @@ for version in "$mover_version" "$latest_version"; do
 	record_killed_mover "$version"
 done
 
-jq -n --arg generator "hack/testdata/restic-fixtures.sh" --arg recorded "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+jq -n --arg generator "hack/fixtures/restic.sh" --arg recorded "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 	--arg mover "$mover_version" --arg latest "$latest_version" --arg volsync "$volsync_version" \
 	--arg bwrapSeen "$(bwrap --version | awk '{print $2}')" \
 	'{generator: $generator, recorded: $recorded,

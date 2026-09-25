@@ -17,7 +17,7 @@ import (
 )
 
 // The tests in this file compare this package with restic itself, through the
-// repositories and verdicts that hack/testdata/restic-fixtures.sh recorded
+// repositories and verdicts that hack/fixtures/restic.sh recorded
 // under testdata/recorded with real restic 0.18.1 (the VolSync v0.16.0 mover's
 // version) and 0.19.1, running VolSync's own mover script in a sandbox shaped
 // like the mover container. make fixtures-restic regenerates them.
