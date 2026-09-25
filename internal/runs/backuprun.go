@@ -461,9 +461,15 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 // backs up. That is the moment the stopped workloads can start again, because
 // VolSync uploads from the clone and no longer reads the app's volume.
 //
-// A clone counts as cut when the claim volsync-<claim>-src is Bound. A
-// ReplicationSource that has already completed the run's trigger tag has cut
-// its clone too. That check catches a clone VolSync created and deleted
+// A clone counts as cut when the claim volsync-<claim>-src is Bound, is not
+// being deleted, and was created after status.quiescedAt. VolSync marks a sync
+// done before its cleanup deletes the clone, so the clone of the previous
+// sync can still be there when this run starts, and it holds the data from
+// before the app stopped. This run writes its trigger at least one pass after
+// quiescedAt, so its own clone is always newer.
+//
+// A ReplicationSource that has already completed the run's trigger tag has
+// cut its clone too. That check catches a clone VolSync created and deleted
 // between two passes. A Pending volume item means no clone yet, and items
 // that failed or were skipped are left out.
 func (r *BackupRunReconciler) clonesCut(ctx context.Context, run *backupv1alpha1.BackupRun) bool {
@@ -485,6 +491,9 @@ func (r *BackupRunReconciler) clonesCut(ctx context.Context, run *backupv1alpha1
 		clone := &corev1.PersistentVolumeClaim{}
 		key := types.NamespacedName{Namespace: run.Namespace, Name: "volsync-" + item.Name + "-src"}
 		if err := r.Reader.Get(ctx, key, clone); err != nil || clone.Status.Phase != corev1.ClaimBound {
+			return false
+		}
+		if !clone.DeletionTimestamp.IsZero() || run.Status.QuiescedAt == nil || !clone.CreationTimestamp.After(run.Status.QuiescedAt.Time) {
 			return false
 		}
 	}

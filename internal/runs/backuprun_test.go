@@ -409,17 +409,7 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 		t.Fatal("the app was restarted before its clone was cut")
 	}
 
-	// VolSync cuts the clone.
-	clone := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "volsync-" + claimN + "-src", Namespace: ns},
-		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
-	}
-	if err := c.Create(context.Background(), clone); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Status().Update(context.Background(), clone); err != nil {
-		t.Fatal(err)
-	}
+	cutClone(t, c) // VolSync cuts the clone.
 	step(t, r)
 
 	get(t, c, ns, appN, d)
@@ -459,17 +449,7 @@ func quiescedRunToUpload(t *testing.T) (*BackupRunReconciler, client.Client) {
 	step(t, r) // admit, no queue
 	step(t, r) // quiesce
 	step(t, r) // start
-
-	clone := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "volsync-" + claimN + "-src", Namespace: ns},
-		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
-	}
-	if err := c.Create(context.Background(), clone); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Status().Update(context.Background(), clone); err != nil {
-		t.Fatal(err)
-	}
+	cutClone(t, c)
 	step(t, r) // restart
 	if run := readBackupRun(t, c); run.Status.RestartedAt == nil {
 		t.Fatal("the app was not restarted once the clone was cut")
@@ -572,12 +552,21 @@ func TestATimedOutRunRestartsTheApp(t *testing.T) {
 }
 
 // cutClone stands in for VolSync cutting the clone of the claim: it creates
-// the Bound claim volsync-<claim>-src.
+// the Bound claim volsync-<claim>-src, five seconds after the frozen clock's
+// time, which is after the run stopped the app.
 func cutClone(t *testing.T, c client.Client) {
 	t.Helper()
+	cloneAt(t, c, frozen.Add(5*time.Second))
+}
+
+// cloneAt creates the Bound claim volsync-<claim>-src with the given creation
+// time, and returns it.
+func cloneAt(t *testing.T, c client.Client, created time.Time) *corev1.PersistentVolumeClaim {
+	t.Helper()
 	clone := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "volsync-" + claimN + "-src", Namespace: ns},
-		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+		ObjectMeta: metav1.ObjectMeta{Name: "volsync-" + claimN + "-src", Namespace: ns, CreationTimestamp: metav1.NewTime(created),
+			Finalizers: []string{"kubernetes.io/pvc-protection"}},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 	}
 	if err := c.Create(context.Background(), clone); err != nil {
 		t.Fatal(err)
@@ -585,6 +574,7 @@ func cutClone(t *testing.T, c client.Client) {
 	if err := c.Status().Update(context.Background(), clone); err != nil {
 		t.Fatal(err)
 	}
+	return clone
 }
 
 // A quiesce pass whose status write is lost after the app was stopped is
@@ -687,5 +677,41 @@ func TestARestartMomentIsKeptInWholeSeconds(t *testing.T) {
 	}
 	if run.Status.QuiescedAt.Time != run.Status.QuiescedAt.Truncate(time.Second) {
 		t.Errorf("quiescedAt = %s, want whole seconds", run.Status.QuiescedAt.Format(time.RFC3339Nano))
+	}
+}
+
+// A clone left from the previous sync does not count as this run's clone.
+// VolSync marks a sync done before its cleanup deletes the clone, so the old
+// clone can still be there, Bound, when the next run starts. Taking it for
+// the new clone would start the app before the new clone is cut, and the
+// snapshot would still be tagged quiesced.
+func TestALeftoverCloneDoesNotRestartTheApp(t *testing.T) {
+	for name, leave := range map[string]func(t *testing.T, c client.Client){
+		"terminating": func(t *testing.T, c client.Client) {
+			clone := cloneAt(t, c, frozen.Add(-time.Hour))
+			if err := c.Delete(context.Background(), clone); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"created before the run": func(t *testing.T, c client.Client) {
+			cloneAt(t, c, frozen.Add(-time.Minute))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+				claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+			leave(t, c)
+			step(t, r) // plan
+			step(t, r) // admit, no queue
+			step(t, r) // quiesce
+			step(t, r) // start
+
+			if run := readBackupRun(t, c); run.Status.RestartedAt != nil {
+				t.Errorf("restartedAt = %s; the app was started on the clone of the previous sync", run.Status.RestartedAt)
+			}
+			if got := replicasOf(t, c); got != 0 {
+				t.Errorf("replicas = %d before this run's clone was cut, want 0", got)
+			}
+		})
 	}
 }
