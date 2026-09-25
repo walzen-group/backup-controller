@@ -21,7 +21,9 @@
 package barmanstore
 
 import (
+	"crypto/md5" //nolint:gosec // S3 ETags are MD5 digests of the body.
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path"
@@ -30,6 +32,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/walzen-group/backup-controller/internal/testinfra/s3fake"
 )
 
 // The recorded stores, one directory each, and provenance.json.
@@ -202,8 +206,10 @@ func RustFSBehaviour() (Behaviour, error) {
 	return b, readJSON("recorded/rustfs-behaviour.json", &b)
 }
 
-// Writer is an S3 server a store can be written into. s3fake.Server
-// implements it, and so does a thin wrapper over a minio client for RustFS.
+// Writer is an S3 server a store can be written into, such as a thin wrapper
+// over a minio client for RustFS. A real server sets each object's ETag
+// itself, so PutObject has no ETag parameter; s3fake.Server implements Writer
+// too, and Upload gives it the recorded ETags through s3fake's Put instead.
 type Writer interface {
 	PutObject(bucket, key string, body []byte, size int64, modified time.Time) error
 }
@@ -212,18 +218,35 @@ type Writer interface {
 // an object recorded as app-pg/base/x/backup.info lands at
 // <prefix>/app-pg/base/x/backup.info. A placeholder is written with its
 // recorded size and no body.
+//
+// When w is an *s3fake.Server, each object keeps its recorded ETag, so a
+// listing shows what RustFS showed, such as the "-2" multipart ETag of a
+// data.tar. Any other Writer gets PutObject, and the server picks the ETag.
+// It returns the first error a put gives.
 func (s Store) Upload(w Writer, bucket, prefix string) error {
+	fake, isFake := w.(*s3fake.Server)
 	for _, o := range s.Objects {
 		var body []byte
 		if o.Body != nil {
 			body = []byte(*o.Body)
 		}
 		key := strings.TrimPrefix(strings.TrimSuffix(prefix, "/")+"/"+o.Key, "/")
+		if isFake {
+			fake.Put(bucket, key, s3fake.Object{Body: body, Size: o.Size, LastModified: o.LastModified, ETag: o.ETag})
+			continue
+		}
 		if err := w.PutObject(bucket, key, body, o.Size, o.LastModified); err != nil {
 			return fmt.Errorf("put %s: %w", key, err)
 		}
 	}
 	return nil
+}
+
+// bodyETag returns the quoted MD5 of a body, the ETag RustFS gives an object
+// uploaded in one part, as barman uploads a backup.info.
+func bodyETag(body string) string {
+	sum := md5.Sum([]byte(body)) //nolint:gosec // S3 ETags are MD5 digests.
+	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
 // backupDir matches the base backup directory in a key: the server name, then
@@ -242,8 +265,9 @@ var labelTime = regexp.MustCompile(`START TIME: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\
 
 // Shift moves the whole store in time by d, as if barman had written it that
 // much later: every backup ID, the times in every backup.info, and every
-// object's LastModified. WAL segment names don't carry a time and stay. The
-// shifted store has no verdicts.
+// object's LastModified. WAL segment names don't carry a time and stay. A
+// rewritten backup.info gets the MD5 ETag of its new body. The shifted store
+// has no verdicts.
 func (s Store) Shift(d time.Duration) Store {
 	out := Store{Manifest: Manifest{Store: s.Store}}
 	for _, o := range s.Objects {
@@ -254,6 +278,7 @@ func (s Store) Shift(d time.Duration) Store {
 			if o.Body != nil && path.Base(o.Key) == "backup.info" {
 				body := shiftInfo(*o.Body, m[2], id, d)
 				o.Body = &body
+				o.ETag = bodyETag(body)
 			}
 		}
 		out.Objects = append(out.Objects, o)
@@ -301,6 +326,72 @@ func shiftInfo(body, oldID, newID string, d time.Duration) string {
 		return "START TIME: " + t.Add(d).Format(layout) + " UTC"
 	})
 	return strings.ReplaceAll(out, oldID, newID)
+}
+
+// WithFailedBackup returns the store with one more FAILED base backup for
+// server, a copy of the one barman left in failed-base (a backup.info with
+// status=FAILED and no data), started at start.
+//
+// Parameters:
+//   - server is the server name, the first part of the keys, such as app-pg.
+//   - start is the backup's start time. barman's backup ID is that time in
+//     UTC to the second, so start is truncated to the second.
+//
+// It returns an error when the server already has a backup with that ID. See
+// withBackup for how the copy is made.
+func (s Store) WithFailedBackup(server string, start time.Time) (Store, error) {
+	return s.withBackup("failed-base", server, start)
+}
+
+// WithDoneBackup returns the store with one more DONE base backup for server,
+// a copy of the one barman left in done-base (its backup.info with
+// status=DONE and the data.tar placeholder), started at start. The
+// parameters and errors are WithFailedBackup's; see withBackup for how the
+// copy is made.
+func (s Store) WithDoneBackup(server string, start time.Time) (Store, error) {
+	return s.withBackup("done-base", server, start)
+}
+
+// withBackup adds a copy of the single base backup of the recorded store
+// template to s, for server, started at start. It moves the copy the way
+// Shift moves a store: by d, the time from the recorded backup's ID to the
+// new one, it moves the directory name, every time in the backup.info and
+// each object's LastModified. The copied backup.info gets the MD5 ETag of its
+// new body; a placeholder keeps its recorded ETag. The WAL of the template
+// isn't copied. The result is in key order and has no verdicts.
+func (s Store) withBackup(template, server string, start time.Time) (Store, error) {
+	tmpl, err := Load(template)
+	if err != nil {
+		return Store{}, err
+	}
+	newID := start.UTC().Truncate(time.Second).Format("20060102T150405")
+	for _, id := range s.Backups()[server] {
+		if id == newID {
+			return Store{}, fmt.Errorf("server %s already has a base backup %s", server, newID)
+		}
+	}
+	out := Store{Manifest: Manifest{Store: s.Store, Objects: append([]Object(nil), s.Objects...)}}
+	for _, o := range tmpl.Objects {
+		m := backupDir.FindStringSubmatch(o.Key)
+		if m == nil {
+			continue
+		}
+		oldStart, err := time.Parse("20060102T150405", m[2])
+		if err != nil {
+			return Store{}, fmt.Errorf("recorded backup ID %s: %w", m[2], err)
+		}
+		d := start.UTC().Truncate(time.Second).Sub(oldStart)
+		o.Key = server + "/base/" + newID + "/" + strings.TrimPrefix(o.Key, m[0])
+		o.LastModified = o.LastModified.Add(d)
+		if o.Body != nil && path.Base(o.Key) == "backup.info" {
+			body := shiftInfo(*o.Body, m[2], newID, d)
+			o.Body = &body
+			o.ETag = bodyETag(body)
+		}
+		out.Objects = append(out.Objects, o)
+	}
+	sort.Slice(out.Objects, func(i, j int) bool { return out.Objects[i].Key < out.Objects[j].Key })
+	return out, nil
 }
 
 // Backups returns the IDs of the base backups in the store, per server, in
