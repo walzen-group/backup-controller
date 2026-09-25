@@ -10,10 +10,9 @@
 
 internal/volsync builds the ReplicationDestinations both the populator and a
 RestoreRun create, and internal/restic reads a repository's snapshots for the
-restore checks and each BackupRun's `snapshotTime`. The sections below this
-table are about the populator; the runs are in
-[namespace-backups.md](namespace-backups.md) and the webhook in
-[restores.md](restores.md).
+restore checks and each BackupRun's `snapshotTime`. Databases below covers the
+database side of all three parts; the sections after it are about the
+populator, and the volume runs are in [namespace-backups.md](namespace-backups.md).
 
 ## Objects the controller writes
 
@@ -47,6 +46,116 @@ Its own BackupRuns and RestoreRuns carry a finalizer, which releases whatever a
 run changed when the run fails, times out or is deleted. The sources it writes
 make VolSync create the clone claim `volsync-<claim>-src`, the restic cache
 claims and the mover Jobs; those are VolSync's objects.
+
+## Databases
+
+The controller moves no database byte. The barman-cloud plugin archives WAL and
+writes base backups; the controller asks it for a base backup, reads what it
+wrote, and decides how a new Cluster bootstraps. It reads CloudNativePG objects
+as unstructured, so it carries no dependency on CloudNativePG's Go module.
+
+### Where a database's backups are
+
+Every database operation starts by finding the archive. `bootstrap.Archiver`
+reads the Cluster's `spec.plugins`, takes the `barman-cloud.cloudnative-pg.io`
+entry with `isWALArchiver: true`, and returns its `barmanObjectName` and
+`serverName`. An unset `serverName` means the Cluster's own name, the same
+default barman uses. A Cluster with no such entry archives nowhere, and every
+database operation leaves it alone.
+
+`bootstrap.ResolveLocation` then turns the store's name into an S3 location:
+
+| Read | From | Becomes |
+| --- | --- | --- |
+| the ObjectStore | the Cluster's namespace, by `barmanObjectName` | |
+| `spec.configuration.destinationPath` | `s3://prod-cluster-backup-cnpg/canary-namespace-backup` | bucket `prod-cluster-backup-cnpg`, and the prefix `canary-namespace-backup/canary-namespace-backup-pg` once the server name is appended |
+| `spec.configuration.endpointURL` | `https://…` or `http://…`; a bare host reads as HTTPS | the S3 endpoint |
+| `s3Credentials.accessKeyId`, `secretAccessKey` | the Secret and keys they name | the key pair |
+| `endpointCA`, when present | the Secret and key it names | a PEM bundle added to the image's public roots |
+
+`bootstrap.S3Prober` answers two questions at that location with the minio
+client. HasBaseBackup lists `<prefix>/base/` with MaxKeys 1, so a store holding
+years of backups costs one object. BaseBackups lists the whole of `base/`, reads
+every `backup.info`, keeps the ones whose `status` is `DONE`, and orders them by
+`end_time`. barman-cloud writes no `backup_id` into backup.info, so the ID is the
+directory's name, such as `20260924T221544`.
+
+### A base backup
+
+A run with `database:` or `all: true` has one item per enabled Cluster. For
+each, it:
+
+1. skips the Cluster when it carries `cnpg.io/hibernation: "on"`, because
+   CloudNativePG fails a Backup of a hibernated Cluster and the Backup stays
+   failed after it wakes;
+2. creates a CloudNativePG Backup named `<cluster>-<first 8 characters of the
+   run's UID>`, with `method: plugin` and `pluginConfiguration.name:
+   barman-cloud.cloudnative-pg.io`, labelled
+   `app.kubernetes.io/managed-by: backup-controller`. The name comes from the
+   run, so a restarted controller finds the Backup it made;
+3. reads the Backup's `status.phase` on every reconcile, and marks the item
+   Succeeded on `completed`, or Failed with `status.error` on `failed`.
+
+The Backup stays after the run; it is CloudNativePG's record of the base backup,
+and the plugin's retention window decides when the backup itself is deleted.
+
+### A database restore
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant run as RestoreRun
+    participant cnpg as CloudNativePG
+    participant owner as Flux or tofu
+    participant hook as bootstrap webhook
+
+    run->>run: checks: BaseBackups at the location,<br/>one finished at or before restoreAsOf
+    Note over run: volumes in the run restore first;<br/>a failed one leaves the databases running
+    run->>run: marks the item Deleted
+    run->>cnpg: deletes the Cluster
+    Note over run: Waiting: recreate <cluster><br/>to finish the restore
+    owner->>hook: creates the Cluster again
+    hook->>hook: finds this run waiting, item Deleted
+    hook-->>owner: bootstrap.recovery to restoreAsOf,<br/>backup.wlz.li/restore-run: <run>
+    run->>run: sees the annotation, item Recovering
+    cnpg-->>run: phase "Cluster in healthy state"
+    run->>run: item Succeeded
+```
+
+The item is marked Deleted before the Cluster is deleted, because the webhook
+recovers a Cluster for a run only when that run's item says Deleted. A Cluster
+that comes back without `backup.wlz.li/restore-run` naming the run was not
+recovered for it, so the run deletes it again. A recovered Cluster deleted
+before it turns healthy fails the item.
+
+### A Cluster being created
+
+The webhook's checks run in this order: dry-run requests pass unchanged, then
+the `backup.wlz.li/bootstrap: initdb` opt-out, then a Cluster that archives
+nowhere, then ResolveLocation, whose failure refuses the Cluster. Next come the
+shared-archive check across every Cluster on the cluster, the waiting RestoreRun
+and a recovery the Cluster declares itself, the target from the run or from
+`backup.wlz.li/restore-as-of`, HasBaseBackup, and BaseBackups when there is a
+target. [restores.md](restores.md) has what each outcome does.
+
+A Cluster it recovers gets, in one patch:
+
+| Field | Value |
+| --- | --- |
+| `spec.bootstrap.recovery` | `source: backup-controller`, `recoveryTarget.targetTime` when there is a target, and the `database`, `owner` and `secret` its `initdb` named |
+| `spec.bootstrap.initdb` | removed |
+| `spec.externalClusters` | an entry `backup-controller` naming the same plugin, `barmanObjectName` and `serverName` |
+| `cnpg.io/skipEmptyWalArchiveCheck` | `enabled`, so the database archives into the prefix it recovered from |
+| `backup.wlz.li/restore-run` | the run's name, when a RestoreRun waits for it |
+
+Carrying `database` and `owner` over matters: CloudNativePG defaults a
+recovery's database and owner to `app`, so a Cluster created with database
+`canary` would come back with its data in `canary`, an empty `app` beside it,
+and the `<cluster>-app` Secret pointing at the empty one.
+
+On UPDATE of a Cluster whose stored recovery has `source: backup-controller`,
+the webhook drops the `initdb` a GitOps tool applies from its source again,
+which CloudNativePG would otherwise refuse as a second bootstrap method.
 
 ## Built on lib-volume-populator
 

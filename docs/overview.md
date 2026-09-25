@@ -3,8 +3,9 @@
 backup-controller fills a new PersistentVolumeClaim from a restic repository
 without leaving a ZFS clone behind. This page is about that fill, the first of
 the controller's three jobs. The scheduled and on-demand runs are in
-[namespace-backups.md](namespace-backups.md), and the database recovery in
-[restores.md](restores.md).
+[namespace-backups.md](namespace-backups.md), the database recovery in
+[restores.md](restores.md), and how every database operation finds and reads
+a Cluster's archive in [architecture.md](architecture.md#databases).
 
 ## The mechanism it replaces
 
