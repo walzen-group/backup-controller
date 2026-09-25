@@ -108,14 +108,13 @@ func placeLock(t *testing.T, store DirStore, repo *Repository, at time.Time, exc
 }
 
 // placeUserLock writes a lock file like placeLock does, with the username
-// given as well. An empty username leaves the field out, as a VolSync mover
-// running as no named user does.
+// given as well. These locks are sealed by this package's own writer; the
+// conformance tests read the locks restic itself wrote. An empty username is
+// written as "username": "", the way restic writes the lock of a VolSync mover
+// whose uid has no passwd entry (testdata/recorded/*/killed-mover/locks.json).
 func placeUserLock(t *testing.T, store DirStore, repo *Repository, at time.Time, exclusive bool, host string, pid int, user string) {
 	t.Helper()
-	fields := map[string]any{"time": at, "exclusive": exclusive, "hostname": host, "pid": pid}
-	if user != "" {
-		fields["username"] = user
-	}
+	fields := map[string]any{"time": at, "exclusive": exclusive, "hostname": host, "pid": pid, "username": user}
 	plain, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)

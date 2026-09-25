@@ -1,0 +1,14 @@
+{
+  "forget": {
+    "exitCode": 11,
+    "output": "repo already locked, waiting up to 0s for the lock\nunable to create lock in backend: repository is already locked by PID 35 on volsync-src-notes-data-7xk2p by  (UID 0, GID 0)\nlock was created at 2026-09-25 21:25:50 (3.311769413s ago)\nstorage ID 608b548d\nthe `unlock` command can be used to remove stale locks"
+  },
+  "unlock": {
+    "output": "",
+    "locksLeft": 1
+  },
+  "unlockRemoveAll": {
+    "output": "successfully removed 1 locks",
+    "locksLeft": 0
+  }
+}

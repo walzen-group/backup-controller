@@ -1,0 +1,39 @@
+{
+  "source": "a8e74b4b8ecc6f4dca0da28a6179856fb55812a3aca780fb3d6131d1887601b8",
+  "newTime": "2026-09-25T21:23:03Z",
+  "tag": "quiesced",
+  "id": "a50cf2dc3a7e92088bc71d503cd08f34264219fec17250b77a50e6d7418b9eb7",
+  "document": {
+    "time": "2026-09-25T21:23:03Z",
+    "parent": "680c9c19c55109bf2ff5a28308cbb8c4606cf726edd68793810da8f7e1c439ec",
+    "tree": "eaef2101eadba3506ea6149455f639fac6712df823ad1c6426e426d397121800",
+    "paths": [
+      "/data"
+    ],
+    "hostname": "volsync",
+    "excludes": [
+      "lost+found"
+    ],
+    "tags": [
+      "quiesced"
+    ],
+    "original": "a8e74b4b8ecc6f4dca0da28a6179856fb55812a3aca780fb3d6131d1887601b8",
+    "program_version": "restic 0.19.1",
+    "summary": {
+      "backup_start": "2026-09-25T21:23:06.033606411Z",
+      "backup_end": "2026-09-25T21:23:06.777981475Z",
+      "files_new": 0,
+      "files_changed": 1,
+      "files_unmodified": 0,
+      "dirs_new": 0,
+      "dirs_changed": 0,
+      "dirs_unmodified": 0,
+      "data_blobs": 1,
+      "tree_blobs": 1,
+      "data_added": 336,
+      "data_added_packed": 365,
+      "total_files_processed": 1,
+      "total_bytes_processed": 2
+    }
+  }
+}

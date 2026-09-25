@@ -1,0 +1,13 @@
+{
+  "generator": "hack/testdata/restic-fixtures.sh",
+  "recorded": "2026-09-25T21:25:56Z",
+  "tools": {
+    "restic-mover": "0.18.1",
+    "restic": "0.19.1",
+    "volsync": "0.16.0",
+    "bubblewrap": "0.12.0"
+  },
+  "password": "backup",
+  "moverHost": "volsync-src-notes-data-7xk2p",
+  "moverUID": 65532
+}

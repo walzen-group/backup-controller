@@ -7,12 +7,14 @@ CONTROLLER_GEN := $(NIX) controller-gen
 # The envtest shell adds a kube-apiserver and an etcd from the store, at the
 # Kubernetes version versions.json pins, and points KUBEBUILDER_ASSETS at them.
 ENVTEST := nix develop .\#envtest -c
+# The fixtures shell adds every real program a recorded fixture comes from.
+FIXTURES := nix develop .\#fixtures -c
 
 # config/crd is the generated original. deploy/ and chart/ each need their own
 # copy, because kustomize and helm both read a directory of their own. Every
 # generated file is copied, so a new kind needs no edit here.
 
-.PHONY: build test vet lint check envtest generate manifests verify
+.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic
 
 ## build: compile every package.
 build:
@@ -36,6 +38,13 @@ check: vet test lint build
 ## envtest: run the suites tagged envtest against a real kube-apiserver and etcd, as CI's envtest job does.
 envtest:
 	$(ENVTEST) go test -tags envtest ./...
+
+## fixtures: re-record every checked-in fixture that real programs produce. Run it after a pin in versions.json moves; check fails until it has.
+fixtures: fixtures-restic
+
+## fixtures-restic: re-record the restic repositories and restic's verdicts under internal/restic/testdata/recorded.
+fixtures-restic:
+	$(FIXTURES) hack/testdata/restic-fixtures.sh
 
 ## generate: regenerate deepcopy functions into the API package.
 generate:

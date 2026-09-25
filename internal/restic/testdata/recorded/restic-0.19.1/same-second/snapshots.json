@@ -1,0 +1,94 @@
+[
+  {
+    "time": "2026-09-25T21:25:12.325165023Z",
+    "tree": "f4fdf15908aff0f65c7f95f69ddfba0aaaebfb70c574c770b5dda5a6ddb47604",
+    "paths": [
+      "/data"
+    ],
+    "hostname": "volsync",
+    "excludes": [
+      "lost+found"
+    ],
+    "program_version": "restic 0.19.1",
+    "summary": {
+      "backup_start": "2026-09-25T21:25:12.325165023Z",
+      "backup_end": "2026-09-25T21:25:13.073613419Z",
+      "files_new": 1,
+      "files_changed": 0,
+      "files_unmodified": 0,
+      "dirs_new": 0,
+      "dirs_changed": 0,
+      "dirs_unmodified": 0,
+      "data_blobs": 1,
+      "tree_blobs": 1,
+      "data_added": 336,
+      "data_added_packed": 365,
+      "total_files_processed": 1,
+      "total_bytes_processed": 2
+    },
+    "id": "aa5f2c813d435302bd394d48e2024653530e75db90003f9404ea37a2d5e9ece0",
+    "short_id": "aa5f2c81"
+  },
+  {
+    "time": "2026-09-25T21:25:13.131788546Z",
+    "parent": "aa5f2c813d435302bd394d48e2024653530e75db90003f9404ea37a2d5e9ece0",
+    "tree": "3a4f9e45d5a9b4215c5b3b944801459d363204a2cd1744f89987fc069a1cf5f9",
+    "paths": [
+      "/data"
+    ],
+    "hostname": "volsync",
+    "excludes": [
+      "lost+found"
+    ],
+    "program_version": "restic 0.19.1",
+    "summary": {
+      "backup_start": "2026-09-25T21:25:13.131788546Z",
+      "backup_end": "2026-09-25T21:25:13.880050178Z",
+      "files_new": 0,
+      "files_changed": 1,
+      "files_unmodified": 0,
+      "dirs_new": 0,
+      "dirs_changed": 0,
+      "dirs_unmodified": 0,
+      "data_blobs": 1,
+      "tree_blobs": 1,
+      "data_added": 336,
+      "data_added_packed": 366,
+      "total_files_processed": 1,
+      "total_bytes_processed": 2
+    },
+    "id": "c2a06cdd8f600cfbe2de6b57f47f053771523f6c515845bd981d705db1929b9b",
+    "short_id": "c2a06cdd"
+  },
+  {
+    "time": "2026-09-25T21:25:13.908576459Z",
+    "parent": "c2a06cdd8f600cfbe2de6b57f47f053771523f6c515845bd981d705db1929b9b",
+    "tree": "4548a4f242a76cdcb495fe3fec66612df17cf24ee49a1d5bb5419912b8731700",
+    "paths": [
+      "/data"
+    ],
+    "hostname": "volsync",
+    "excludes": [
+      "lost+found"
+    ],
+    "program_version": "restic 0.19.1",
+    "summary": {
+      "backup_start": "2026-09-25T21:25:13.908576459Z",
+      "backup_end": "2026-09-25T21:25:14.648459781Z",
+      "files_new": 0,
+      "files_changed": 1,
+      "files_unmodified": 0,
+      "dirs_new": 0,
+      "dirs_changed": 0,
+      "dirs_unmodified": 0,
+      "data_blobs": 1,
+      "tree_blobs": 1,
+      "data_added": 336,
+      "data_added_packed": 364,
+      "total_files_processed": 1,
+      "total_bytes_processed": 2
+    },
+    "id": "ea10d83fe9dc7b8afdea08c3f4c68264aa3cc575d52d32c24c7e2094c1d3c482",
+    "short_id": "ea10d83f"
+  }
+]

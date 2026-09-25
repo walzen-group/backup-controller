@@ -86,10 +86,6 @@
     "bubblewrap": {
       "version": "0.12.0",
       "tests": "nixpkgs bubblewrap; it gives a mover run the container's /data, PID 1 and hostname"
-    },
-    "libfaketime": {
-      "version": "0.9.11",
-      "tests": "nixpkgs libfaketime; it dates the stale lock fixture"
     }
   }
 }

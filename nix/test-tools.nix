@@ -177,5 +177,4 @@ in
   restic = fromNixpkgs "restic" pkgs.restic;
   postgresql = fromNixpkgs "postgresql" pkgs.postgresql_18;
   bubblewrap = fromNixpkgs "bubblewrap" pkgs.bubblewrap;
-  libfaketime = fromNixpkgs "libfaketime" pkgs.libfaketime;
 }

@@ -39,7 +39,7 @@
       # or run on its own (nix build .#rustfs). The control-plane binaries
       # exist only for Linux, which is where the envtest and fixture shells
       # run.
-      packages = forLinux (pkgs: removeAttrs (testTools pkgs) [ "restic" "postgresql" "bubblewrap" "libfaketime" "etcd" ]);
+      packages = forLinux (pkgs: removeAttrs (testTools pkgs) [ "restic" "postgresql" "bubblewrap" "etcd" ]);
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
@@ -66,7 +66,6 @@
               barman
               postgresql
               bubblewrap
-              libfaketime
               kube-controller-manager
               kube-scheduler
             ]) ++ [ pkgs.coreutils pkgs.util-linux pkgs.curl ];
