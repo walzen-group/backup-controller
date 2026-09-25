@@ -63,6 +63,17 @@ rules:
   - apiGroups: ["backup.wlz.li"]
     resources: ["backupruns/status", "restoreruns/status"]
     verbs: ["patch", "update"]
+  # The Workload, scratch claim and VolumeRestore a run creates name the run
+  # as their controller, and each ReplicationSource names its claim, with
+  # blockOwnerDeletion set. An API server running the
+  # OwnerReferencesPermissionEnforcement admission plugin refuses such a
+  # reference unless the writer may update the owner's finalizers.
+  - apiGroups: ["backup.wlz.li"]
+    resources: ["backupruns/finalizers", "restoreruns/finalizers"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/finalizers"]
+    verbs: ["update"]
   # The controller writes each enabled claim's source and triggers it with a
   # manual tag.
   - apiGroups: ["volsync.backube"]

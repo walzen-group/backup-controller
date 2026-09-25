@@ -61,6 +61,15 @@ var grants = []grant{
 	{"kueue.x-k8s.io", "workloads", []string{"get", "create", "delete"}, "the Workload that admits a run"},
 	{"kueue.x-k8s.io", "workloads/status", []string{"update"}, "the PodsReady condition on that Workload"},
 	{"kueue.x-k8s.io", "localqueues", []string{"list"}, "the queue a namespace's runs are admitted through"},
+
+	// The OwnerReferencesPermissionEnforcement admission plugin refuses an
+	// owner reference with blockOwnerDeletion unless the writer may update
+	// the owner's finalizers. The controller writes such references from the
+	// Workload, the scratch claim and the VolumeRestore to their run, and from
+	// each ReplicationSource to its claim.
+	{"backup.wlz.li", "backupruns/finalizers", []string{"update"}, "owner references to a BackupRun, under OwnerReferencesPermissionEnforcement"},
+	{"backup.wlz.li", "restoreruns/finalizers", []string{"update"}, "owner references to a RestoreRun, under OwnerReferencesPermissionEnforcement"},
+	{"", "persistentvolumeclaims/finalizers", []string{"update"}, "owner references to a claim, under OwnerReferencesPermissionEnforcement"},
 }
 
 // TestTheClusterRoleCoversEverythingTheControllerDoes checks that the
