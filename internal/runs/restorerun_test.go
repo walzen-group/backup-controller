@@ -1027,3 +1027,48 @@ func TestAClusterCreatedAgainOptedOutIsSkipped(t *testing.T) {
 		t.Error("the Cluster created again with the opt-out was deleted")
 	}
 }
+
+// loseNextStatusWrite returns a client over c that fails the first status
+// write of a RestoreRun with a conflict, the way a lost write or a controller
+// crash loses it.
+func loseNextStatusWrite(c client.Client) client.Client {
+	lost := false
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := obj.(*backupv1alpha1.RestoreRun); ok && !lost {
+				lost = true
+				return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("restoreruns").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+}
+
+// A volume restore whose mover finished, but whose pass lost the status write
+// that recorded it, finishes on the next pass. The run records the item's
+// success before it deletes the ReplicationDestination, so the next pass still
+// finds the destination, and the run does not wait on a destination that is
+// gone until its timeout.
+func TestAVolumeRestoreWhoseSuccessWasNotRecordedFinishes(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
+		claim(), volumeRestore(), repository())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // restore
+	destination := readRestoreRun(t, c).Status.Items[0].Destination
+	completeVolume(t, c)
+
+	r.Client = loseNextStatusWrite(c)
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
+	}
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
+		t.Fatalf("phase = %q, item = %+v; want Succeeded", run.Status.Phase, run.Status.Items[0])
+	}
+	rd := &volsyncv1alpha1.ReplicationDestination{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: destination}, rd); err == nil {
+		t.Error("the destination outlived the run")
+	}
+}

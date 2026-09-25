@@ -550,6 +550,22 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 		}
 	}
 
+	// A finished volume item's phase goes into the status before its
+	// ReplicationDestination is deleted. The destination's lastManualSync is
+	// the only record that the mover completed the run's trigger. Deleted
+	// first, a lost status write or a crash would leave a Running item whose
+	// destination is gone, and no later pass could tell how it ended. A later
+	// pass deletes the destination of any finished item that still names one,
+	// and a destination that is already gone counts as deleted.
+	if finishedWithDestination(run.Status.Items) {
+		if err := r.writeStatus(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.removeDestinations(ctx, run, finished); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	var recreate, shuttingDown []string
 	if volumesDone {
 		for i := range run.Status.Items {
@@ -620,9 +636,10 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // A Pending item waits until no pod mounts the claim. restoreVolume then
 // creates the item's ReplicationDestination and moves the item to Running.
 // A Running item succeeds once the destination has completed the run's
-// trigger, or fails with the mover's logs. Either way, restoreVolume then
-// deletes the destination. A claim that is gone, or whose VolumeRestore is
-// missing, fails the item.
+// trigger, or fails with the mover's logs. It also fails when its destination
+// is gone. restoreVolume leaves the destination in place, and work deletes it
+// once the item's end is in the status. A claim that is gone, or whose
+// VolumeRestore is missing, fails the item.
 //
 // It returns reason ClaimInUse and a message naming the pod while a pod
 // mounts the claim, and empty strings otherwise. It returns an error, and
@@ -655,19 +672,19 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 	case backupv1alpha1.ItemRunning:
 		destination := &volsyncv1alpha1.ReplicationDestination{}
 		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Destination}, destination); err != nil {
-			return "", "", fmt.Errorf("get ReplicationDestination %s: %w", item.Destination, err)
+			if !apierrors.IsNotFound(err) {
+				return "", "", fmt.Errorf("get ReplicationDestination %s: %w", item.Destination, err)
+			}
+			// The run records an item's end before it deletes the
+			// destination, so something else deleted this one.
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, fmt.Sprintf("the ReplicationDestination %s was deleted before its mover finished", item.Destination)
+			return "", "", nil
 		}
 		if reason, failed := failedMover(destination); failed {
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, reason
 		} else if destination.Status != nil && destination.Status.LastManualSync == string(run.UID) {
 			item.Phase = backupv1alpha1.ItemSucceeded
-		} else {
-			return "", "", nil
 		}
-		if err := r.Delete(ctx, destination); err != nil && !apierrors.IsNotFound(err) {
-			return "", "", fmt.Errorf("delete ReplicationDestination %s: %w", item.Destination, err)
-		}
-		item.Destination = ""
 	}
 	return "", "", nil
 }
@@ -959,7 +976,7 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // other reason. It sets the Ready condition to reason and message, records
 // status.completedAt, and removes the finalizer.
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
-	if err := r.removeDestinations(ctx, run); err != nil {
+	if err := r.removeDestinations(ctx, run, anyItem); err != nil {
 		return err
 	}
 	if stopped(run) {
@@ -989,7 +1006,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return nil
 	}
-	if err := r.removeDestinations(ctx, run); err != nil {
+	if err := r.removeDestinations(ctx, run, anyItem); err != nil {
 		return err
 	}
 	if stopped(run) {
@@ -1000,13 +1017,14 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	return dropFinalizer(ctx, r.Client, run)
 }
 
-// removeDestinations deletes the ReplicationDestination each item still
-// names, and clears the item's destination. A destination that is already
-// gone is not an error.
-func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+// removeDestinations deletes the ReplicationDestination that each item
+// chosen by the function given in which still names, and clears the item's
+// destination. finish and finalize pass anyItem, and work passes finished. A
+// destination that is already gone is not an error.
+func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
-		if item.Destination == "" {
+		if item.Destination == "" || !which(*item) {
 			continue
 		}
 		destination := &volsyncv1alpha1.ReplicationDestination{
@@ -1089,9 +1107,7 @@ func destinationName(uid types.UID, index int) string {
 // none has anything more to do.
 func restoreDone(items []backupv1alpha1.RestoreItem) bool {
 	for _, item := range items {
-		switch item.Phase {
-		case backupv1alpha1.ItemSucceeded, backupv1alpha1.ItemFailed, backupv1alpha1.ItemSkipped:
-		default:
+		if !finished(item) {
 			return false
 		}
 	}
@@ -1132,4 +1148,28 @@ var optedOutMessage = fmt.Sprintf("the Cluster carries %s: %s, which asks for an
 // leaves it alone.
 func optsOut(cluster *unstructured.Unstructured) bool {
 	return cluster.GetAnnotations()[bootstrap.OptOutAnnotation] == bootstrap.OptOutValue
+}
+
+// anyItem chooses every item, for removeDestinations.
+func anyItem(backupv1alpha1.RestoreItem) bool { return true }
+
+// finished reports whether an item is Succeeded, Failed or Skipped, so its
+// ReplicationDestination has no more work to do.
+func finished(item backupv1alpha1.RestoreItem) bool {
+	switch item.Phase {
+	case backupv1alpha1.ItemSucceeded, backupv1alpha1.ItemFailed, backupv1alpha1.ItemSkipped:
+		return true
+	}
+	return false
+}
+
+// finishedWithDestination reports whether any finished item still names a
+// ReplicationDestination.
+func finishedWithDestination(items []backupv1alpha1.RestoreItem) bool {
+	for _, item := range items {
+		if finished(item) && item.Destination != "" {
+			return true
+		}
+	}
+	return false
 }
