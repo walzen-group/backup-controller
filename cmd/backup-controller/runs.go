@@ -17,6 +17,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -81,6 +83,8 @@ type BootstrapWebhook struct {
 //   - metricsAddr is the address where the manager serves the scheduler's
 //     metrics. The populator library serves its own registry on another port,
 //     and nothing else can register metrics into that one.
+//   - healthAddr is the address where the manager serves /healthz and
+//     /readyz for the Deployment's probes. "0" serves neither.
 //   - hook says where the bootstrap webhook listens. An empty hook.CertDir
 //     serves no webhook.
 //   - fail is called, from the manager's goroutine, when the manager stops
@@ -92,7 +96,7 @@ type BootstrapWebhook struct {
 // It returns an error when the client configuration can't be built, a scheme
 // fails to register, or the manager or one of its controllers can't be set
 // up. An error from a manager stopped by the context is only logged.
-func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook, fail func(error)) error {
+func startRunControllers(ctx context.Context, kubeconfig, metricsAddr, healthAddr string, hook BootstrapWebhook, fail func(error)) error {
 	config, err := restConfig(kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client configuration: %w", err)
@@ -112,10 +116,16 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 		}
 	}
 
+	skipNameValidation := true
 	options := ctrl.Options{
-		Scheme:         scheme,
-		Metrics:        metricsserver.Options{BindAddress: metricsAddr},
-		LeaderElection: false,
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		HealthProbeBindAddress: healthAddr,
+		LeaderElection:         false,
+		// controller-runtime refuses a controller name it has seen before in
+		// the process. The binary builds one manager, so its names are unique
+		// already, and the tests build several managers in one process.
+		Controller: ctrlconfig.Controller{SkipNameValidation: &skipNameValidation},
 	}
 	if hook.CertDir != "" {
 		options.WebhookServer = webhook.NewServer(webhook.Options{
@@ -144,6 +154,21 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 			&admission.Webhook{Handler: decider},
 		)
 		klog.Infof("serving the bootstrap webhook on :%d%s", hook.Port, bootstrap.WebhookPath)
+	}
+
+	// /healthz answers while the process runs. /readyz waits for the webhook
+	// server to accept TLS connections, so the webhook's Service sends the
+	// API server to a pod only once it can answer. Without a webhook there is
+	// nothing to wait for.
+	if err := manager.AddHealthzCheck("ping", healthz.Ping); err != nil {
+		return fmt.Errorf("add the health check: %w", err)
+	}
+	ready := healthz.Ping
+	if hook.CertDir != "" {
+		ready = manager.GetWebhookServer().StartedChecker()
+	}
+	if err := manager.AddReadyzCheck("webhook", ready); err != nil {
+		return fmt.Errorf("add the readiness check: %w", err)
 	}
 
 	reader := manager.GetAPIReader()

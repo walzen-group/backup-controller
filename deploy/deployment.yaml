@@ -44,6 +44,11 @@ spec:
         - name: webhook
           containerPort: 9443
           protocol: TCP
+        # The run controllers' manager serves /healthz and /readyz here
+        # (--health-probe-addr, default :8082).
+        - name: health
+          containerPort: 8082
+          protocol: TCP
         # cert-manager writes tls.crt and tls.key here and rewrites them on
         # renewal. controller-runtime watches the directory and reloads the
         # certificate without a restart, so a renewal is not an outage.
@@ -51,12 +56,25 @@ spec:
         - name: webhook-tls
           mountPath: /etc/webhook/tls
           readOnly: true
-        # The library registers only the configured metrics path and serves no
-        # health route, so this container declares no liveness or readiness
-        # probe: a probe against the metrics port would prove the process
-        # listens and nothing about its state. The image is a static binary on
-        # scratch with no writable path, and the container runs with no
-        # capabilities, which is what lets the root filesystem stay read-only.
+        # /healthz answers while the manager runs. A manager that stops exits
+        # the process, so the liveness probe covers a manager that hangs.
+        # /readyz waits until the webhook server accepts TLS connections, so
+        # the webhook's Service sends the API server to this pod only once it
+        # can answer. The populator library serves no health route of its own,
+        # and exits the process when it fails.
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          periodSeconds: 5
+        # The image is a static binary on scratch with no writable path, and
+        # the container runs with no capabilities, which is what lets the root
+        # filesystem stay read-only.
         securityContext:
           runAsNonRoot: true
           allowPrivilegeEscalation: false

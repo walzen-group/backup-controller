@@ -50,6 +50,7 @@ func main() {
 		metricsAddr = flag.String("metrics-addr", ":8080", "address the populator library's metrics listener binds")
 		metricsPath = flag.String("metrics-path", "/metrics", "path the metrics listener serves")
 		runsMetrics = flag.String("runs-metrics-addr", ":8081", "address the scheduler's metrics listener binds, at /metrics")
+		healthAddr  = flag.String("health-probe-addr", ":8082", "address serving /healthz and /readyz for the run controllers; 0 serves none")
 		webhookCert = flag.String("webhook-cert-dir", "", "directory holding tls.crt and tls.key; empty serves no webhook")
 		webhookPort = flag.Int("webhook-port", 9443, "port the admission webhook listens on")
 		printVer    = flag.Bool("version", false, "print the version and exit")
@@ -78,7 +79,7 @@ func main() {
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
-	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook, exitOnFailure); err != nil {
+	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, *healthAddr, hook, exitOnFailure); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)
 	}

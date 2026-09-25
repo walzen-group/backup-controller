@@ -35,7 +35,7 @@ func TestAManagerThatStopsOnItsOwnIsReported(t *testing.T) {
 
 	failed := make(chan error, 1)
 	fail := func(err error) { failed <- err }
-	if err := startRunControllers(ctx, testKubeconfig(t, server.URL), taken.Addr().String(), BootstrapWebhook{}, fail); err != nil {
+	if err := startRunControllers(ctx, testKubeconfig(t, server.URL), taken.Addr().String(), "0", BootstrapWebhook{}, fail); err != nil {
 		t.Fatalf("startRunControllers: %v", err)
 	}
 
@@ -46,5 +46,47 @@ func TestAManagerThatStopsOnItsOwnIsReported(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the manager stopped and nothing was told")
+	}
+}
+
+// TestTheManagerServesHealthAndReadiness checks that the manager answers
+// /healthz and /readyz with 200 on the address it is given, which the
+// Deployment's liveness and readiness probes call. The manager answers them
+// while its caches are still syncing against an API server that knows
+// nothing.
+func TestTheManagerServesHealthAndReadiness(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(server.Close)
+
+	// Reserve a free port and let it go, so the manager can bind it.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := probe.Addr().String()
+	_ = probe.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	fail := func(err error) { t.Errorf("the manager stopped: %v", err) }
+	if err := startRunControllers(ctx, testKubeconfig(t, server.URL), "0", addr, BootstrapWebhook{}, fail); err != nil {
+		t.Fatalf("startRunControllers: %v", err)
+	}
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			response, err := http.Get("http://" + addr + path)
+			if err == nil {
+				_ = response.Body.Close()
+				if response.StatusCode == http.StatusOK {
+					break
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s never answered 200: last error %v", path, err)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
