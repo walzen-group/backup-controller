@@ -170,11 +170,11 @@ type Proxy struct {
 // New builds a Proxy in front of the S3 server at the upstream URL, such as
 // http://127.0.0.1:9000. It returns an error when the URL doesn't parse.
 //
-// The proxy forwards each request with its Host header and path unchanged, so
-// the SigV4 signature the client computed for the proxy's address stays
-// valid only when the upstream does not check the host. RustFS and s3fake
-// both accept it: the client signs the host it dials, and the upstream checks
-// the signature against the Host header it receives, which is the same.
+// The proxy forwards each request with its Host header, path and query
+// unchanged. The client signs the proxy's address as the host, and the
+// upstream checks the signature against the Host header it receives, which is
+// that same address, so the SigV4 signature stays valid. RustFS checks it
+// that way; s3fake checks only the access key.
 func New(upstream string) (*Proxy, error) {
 	target, err := url.Parse(upstream)
 	if err != nil {
