@@ -2,6 +2,7 @@ package populator
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -233,6 +234,76 @@ func TestCompleteReportsFailedMover(t *testing.T) {
 	}
 	if len(status.Status.Claims) != 1 || status.Status.Claims[0].Phase != backupv1alpha1.RestorePhaseFailed {
 		t.Fatalf("claim status = %#v, want Failed", status.Status.Claims)
+	}
+}
+
+// versionedStatus is a fakeOperations whose status writes behave like the API
+// server's: a write whose resourceVersion is older than the stored one fails
+// with a conflict, and a write that changes the status bumps the version.
+type versionedStatus struct {
+	*fakeOperations
+	stored  *backupv1alpha1.VolumeRestore
+	version int
+}
+
+func (v *versionedStatus) SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
+	if vr.ResourceVersion != v.stored.ResourceVersion {
+		return apierrors.NewConflict(schema.GroupResource{Group: "backup.wlz.li", Resource: "volumerestores"}, vr.Name, nil)
+	}
+	// The API server keeps times to the second, so the comparison and the
+	// stored copy go through the same serialisation.
+	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vr)
+	if err != nil {
+		return err
+	}
+	written := new(backupv1alpha1.VolumeRestore)
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object, written); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(written.Status, v.stored.Status) {
+		v.version++
+		v.stored = written
+		v.stored.ResourceVersion = fmt.Sprint(v.version)
+	}
+	vr.ResourceVersion = v.stored.ResourceVersion
+	return v.fakeOperations.SetStatus(ctx, vr)
+}
+
+// TestAFailingMoverKeepsTheStatusFailed checks that while the mover keeps
+// failing, the VolumeRestore reports RestoreFailed with the mover's logs on
+// every pass. The library calls Populate and then Complete on each pass with
+// the same cached object. When Populate wrote Restoring over the Failed entry,
+// Complete's write of Failed conflicted, and the reason flipped between
+// Restoring and RestoreFailed from one pass to the next.
+func TestAFailingMoverKeepsTheStatusFailed(t *testing.T) {
+	ops := &versionedStatus{fakeOperations: restoringOperations(), version: 1}
+	ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{
+		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "mover logs"},
+	}
+	ops.stored = &backupv1alpha1.VolumeRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3, ResourceVersion: "1"},
+		Spec:       backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"},
+	}
+	callbacks := New(ops, "backup-system", nil)
+
+	var reasons []string
+	for range 4 {
+		object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ops.stored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := params()
+		p.Unstructured = &unstructured.Unstructured{Object: object}
+		// Errors are the library's cue to requeue, so the pass goes on to the
+		// next one the way the library's would.
+		_ = callbacks.Populate(context.Background(), p)
+		_, _ = callbacks.Complete(context.Background(), p)
+		reasons = append(reasons, findCondition(ops.stored.Status.Conditions, backupv1alpha1.ConditionReady).Reason)
+	}
+	for i, reason := range reasons[1:] {
+		if reason != backupv1alpha1.ReasonRestoreFailed {
+			t.Fatalf("Ready reason after each pass = %v, want %s from pass %d on", reasons, backupv1alpha1.ReasonRestoreFailed, i+2)
+		}
 	}
 }
 

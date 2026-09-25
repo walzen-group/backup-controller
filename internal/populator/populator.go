@@ -115,9 +115,14 @@ func (c *Callbacks) pinnedOutOfReach(ctx context.Context, vr *backupv1alpha1.Vol
 // VolumeRestore's status. Then it returns an error and creates no
 // destination.
 //
-// Otherwise it marks the claim Restoring, sets Ready to False with reason
-// Restoring and a message that names the destination and its namespace,
-// writes the status, and returns nil.
+// When the destination already exists and its latest mover run failed, it
+// leaves the status alone and returns nil. Complete, which the library calls
+// next, reports that failure, and the status stays Failed with the mover's
+// logs until a later sync succeeds.
+//
+// Otherwise it marks the claim Restoring and sets Ready to False with reason
+// Restoring and a message that names the destination and its namespace. It
+// writes the status only when that changed something, and returns nil.
 func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.PopulatorParams) error {
 	if err := validateParams(params); err != nil {
 		return err
@@ -144,7 +149,17 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 	}
 
 	destinationName := "restore-" + internalvolsync.Trigger(claim)
-	if _, err := c.operations.GetReplicationDestination(ctx, c.namespace, destinationName); err != nil {
+	existing, err := c.operations.GetReplicationDestination(ctx, c.namespace, destinationName)
+	if err == nil {
+		// The library calls Complete right after this, with the same cached
+		// VolumeRestore. While the mover keeps failing, Complete reports
+		// RestoreFailed with the logs. Writing Restoring here would change the
+		// status and bump its resource version, Complete's write would then
+		// conflict, and the reason would flip on every pass.
+		if _, failed := internalvolsync.Failure(existing); failed {
+			return nil
+		}
+	} else {
 		if !apierrors.IsNotFound(err) {
 			return fmt.Errorf("get ReplicationDestination %s/%s: %w", c.namespace, destinationName, err)
 		}
@@ -171,12 +186,16 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 		}
 	}
 
+	before := vr.Status.DeepCopy()
 	setClaimStatus(vr, claim, backupv1alpha1.RestorePhaseRestoring)
 	// The message names the namespace too. The destination is in the
 	// controller's namespace, and a reader who looks in the app's namespace
 	// won't find it.
 	waiting := fmt.Sprintf("waiting for ReplicationDestination %s in %s", destinationName, c.namespace)
 	backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoring, waiting)
+	if equality.Semantic.DeepEqual(before, &vr.Status) {
+		return nil
+	}
 	if err := c.operations.SetStatus(ctx, vr); err != nil {
 		return fmt.Errorf("set VolumeRestore status: %w", err)
 	}
