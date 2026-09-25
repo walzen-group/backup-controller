@@ -12,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -28,6 +29,29 @@ import (
 // every defect found in this controller so far was found by reading a log.
 func configureLogging() {
 	ctrl.SetLogger(klog.Background())
+}
+
+// restConfig builds the client configuration for the API server, with
+// client-go's own rate limiter turned off. The kubeconfig argument is the path
+// from the --kubeconfig flag, and an empty path means the in-cluster
+// configuration. It returns an error when the configuration can't be built.
+//
+// clientcmd leaves QPS at 0, which client-go reads as 5 requests a second
+// with a burst of 10. The bootstrap webhook reads an ObjectStore for every
+// archiving Cluster within its 15 second timeout and fails closed, so that
+// limit made every Cluster create time out on a cluster with a few dozen
+// databases. A negative QPS turns the limiter off and leaves the API server's
+// priority and fairness to share out requests, which is what ctrl.GetConfig
+// does too.
+func restConfig(kubeconfig string) (*rest.Config, error) {
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	if config.QPS == 0 {
+		config.QPS = -1
+	}
+	return config, nil
 }
 
 // BootstrapWebhook says where the admission webhook for CloudNativePG
@@ -63,7 +87,7 @@ type BootstrapWebhook struct {
 // fails to register, or the manager or one of its controllers can't be set
 // up. An error from the running manager is only logged.
 func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook) error {
-	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	config, err := restConfig(kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client configuration: %w", err)
 	}
@@ -94,7 +118,7 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 		})
 	}
 
-	manager, err := ctrl.NewManager(restConfig, options)
+	manager, err := ctrl.NewManager(config, options)
 	if err != nil {
 		return fmt.Errorf("create the manager: %w", err)
 	}

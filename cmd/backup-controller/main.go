@@ -23,7 +23,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -114,7 +113,7 @@ func main() {
 // It returns an error when the client configuration can't be built or a
 // scheme fails to register.
 func newClientOperations(kubeconfig string) (populator.Operations, error) {
-	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	config, err := restConfig(kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("build client configuration: %w", err)
 	}
@@ -130,7 +129,7 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 		}
 	}
 
-	kubeClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	kubeClient, err := client.New(config, client.Options{Scheme: scheme})
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
 	}
