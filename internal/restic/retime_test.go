@@ -284,3 +284,58 @@ func TestRetimeOfAnUnknownSnapshotSaysSo(t *testing.T) {
 		t.Fatal("retime of a snapshot the repository does not hold succeeded")
 	}
 }
+
+// failFirstRemove is a Store that refuses the first Remove of one file, the
+// way an S3 DELETE can fail after the PUT before it went through.
+type failFirstRemove struct {
+	DirStore
+	name   string
+	failed bool
+}
+
+func (s *failFirstRemove) Remove(ctx context.Context, name string) error {
+	if name == s.name && !s.failed {
+		s.failed = true
+		return errors.New("delete refused")
+	}
+	return s.DirStore.Remove(ctx, name)
+}
+
+// TestRetimeAfterAFailedRemoveWritesNoSecondCopy checks that when Retime wrote
+// the copy but couldn't delete the old snapshot file, the next Retime deletes
+// the old file and returns the copy it already wrote. Encryption uses a random
+// IV, so writing the copy again would add a second snapshot with another ID.
+func TestRetimeAfterAFailedRemoveWritesNoSecondCopy(t *testing.T) {
+	dir, _ := writableFixture(t)
+	store := &failFirstRemove{DirStore: dir, name: path.Join("snapshots", mondayID)}
+	repo, err := Open(context.Background(), store, "backup")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err == nil {
+		t.Fatal("first retime succeeded, want the refused delete")
+	}
+	got, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	if err != nil {
+		t.Fatalf("second retime: %v", err)
+	}
+
+	snapshots, err := repo.Snapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, s := range snapshots {
+		ids = append(ids, s.ID)
+	}
+	if len(snapshots) != 2 {
+		t.Fatalf("snapshots after the retry = %v, want Sunday's and one copy of Monday's", ids)
+	}
+	if slices.Contains(ids, mondayID) {
+		t.Errorf("the old Monday snapshot %s is still there", mondayID)
+	}
+	if !slices.Contains(ids, got.ID) {
+		t.Errorf("the retry returned %s, which the repository doesn't hold: %v", got.ID, ids)
+	}
+}

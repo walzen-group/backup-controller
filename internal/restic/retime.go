@@ -128,6 +128,11 @@ func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag
 // snapshot was itself a rewrite and already has one. It saves the copy under
 // its new ID and then removes the old snapshot file. If that removal fails, the
 // copy stays in the repository and the error names both IDs.
+//
+// When the old snapshot is still there next to a copy an earlier call wrote,
+// that earlier call failed to remove it. retime then removes the old file and
+// returns that copy. Writing the copy again would add a second snapshot under
+// another ID, because every encryption uses a fresh random IV.
 func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag string) (Snapshot, error) {
 	files, err := r.snapshotFiles(ctx)
 	if err != nil {
@@ -148,6 +153,20 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 			}
 		}
 		return Snapshot{}, fmt.Errorf("the repository holds no snapshot %s", short)
+	}
+
+	origin := old.snapshot.Original
+	if origin == "" {
+		origin = old.snapshot.ID
+	}
+	for _, f := range files {
+		s := f.snapshot
+		if s.ID != old.snapshot.ID && s.Original == origin && s.Time.Equal(at) && slices.Contains(s.Tags, tag) {
+			if err := r.store.Remove(ctx, path.Join("snapshots", old.snapshot.ID)); err != nil {
+				return Snapshot{}, fmt.Errorf("remove snapshot %s, already written as %s: %w", old.snapshot.ID, s.ID, err)
+			}
+			return s, nil
+		}
 	}
 
 	fields := make(map[string]json.RawMessage, len(old.fields)+2)
