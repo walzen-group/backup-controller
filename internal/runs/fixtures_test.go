@@ -200,7 +200,9 @@ func repository() *corev1.Secret {
 }
 
 // cluster returns a Cluster that is marked for backup and archives its WAL
-// through the barman-cloud plugin. Each function passed in mutate changes the
+// through the barman-cloud plugin. Its UID is old-cluster-uid, and a test
+// that stands in for the Cluster being created again gives the new one
+// another UID. Each function passed in mutate changes the
 // Cluster before it is returned.
 func cluster(mutate ...func(*unstructured.Unstructured)) *unstructured.Unstructured {
 	c := &unstructured.Unstructured{Object: map[string]any{
@@ -215,6 +217,7 @@ func cluster(mutate ...func(*unstructured.Unstructured)) *unstructured.Unstructu
 	c.SetGroupVersionKind(ClusterGVK)
 	c.SetNamespace(ns)
 	c.SetName(pgN)
+	c.SetUID("old-cluster-uid")
 	c.SetAnnotations(map[string]string{backupv1alpha1.AnnotationEnabled: "true"})
 	for _, m := range mutate {
 		m(c)

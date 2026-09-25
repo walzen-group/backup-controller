@@ -523,6 +523,13 @@ spec:
                         BaseBackup is the ID of the barman base backup a database's recovery
                         starts from.
                       type: string
+                    clusterUID:
+                      description: |-
+                        ClusterUID is the UID of the Cluster a database item deletes, recorded
+                        before the delete. A Cluster of the same name with this UID is the old
+                        one, which the delete has not reached yet. Only a Cluster with another
+                        UID can be the recovery.
+                      type: string
                     destination:
                       description: |-
                         Destination is the name of the ReplicationDestination restoring a

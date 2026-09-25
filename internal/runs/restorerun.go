@@ -667,15 +667,34 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 // The item is marked Deleted, and the status written, before the Cluster is
 // deleted. The bootstrap webhook recovers a Cluster only for a run whose item
 // says Deleted, so the mark has to be in place before anything can create the
-// Cluster again.
+// Cluster again. The same write records the old Cluster's UID in
+// status.items[].clusterUID.
+//
+// A Deleted item tells the old Cluster from a new one by that UID. The
+// webhook's backup.wlz.li/restore-run annotation stays on a recovered Cluster
+// for good, so a run created again under the same name finds it on the old
+// Cluster too. When the delete failed, or the controller stopped after the
+// mark was written, the Cluster still there carries the recorded UID, and the
+// run deletes it again. Only a Cluster with another UID and the annotation
+// naming this run counts as the recovery.
 func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
+		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
+		if err != nil {
+			return err
+		}
+		if found {
+			item.ClusterUID = cluster.GetUID()
+		}
 		item.Phase = backupv1alpha1.ItemDeleted
 		if err := r.writeStatus(ctx, run); err != nil {
 			return err
 		}
-		return r.deleteCluster(ctx, run.Namespace, item.Name)
+		if !found {
+			return nil
+		}
+		return r.deleteCluster(ctx, cluster)
 
 	case backupv1alpha1.ItemDeleted:
 		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
@@ -684,13 +703,17 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 			return err
 		case !found || cluster.GetDeletionTimestamp() != nil:
 			return nil
+		case item.ClusterUID != "" && cluster.GetUID() == item.ClusterUID:
+			// The old Cluster, which the earlier delete did not reach. Its
+			// annotations say nothing about this run.
+			return r.deleteCluster(ctx, cluster)
 		case cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun] == run.Name:
 			item.Phase = backupv1alpha1.ItemRecovering
 		default:
 			// The webhook writes backup.wlz.li/restore-run on every Cluster it
 			// recovers for a run whose item says Deleted. A live Cluster
-			// without it is one the earlier delete did not reach.
-			return r.deleteCluster(ctx, run.Namespace, item.Name)
+			// without it was not created through this run.
+			return r.deleteCluster(ctx, cluster)
 		}
 
 	case backupv1alpha1.ItemRecovering:
@@ -707,15 +730,14 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 	return nil
 }
 
-// deleteCluster deletes a Cluster, given by its namespace and name. A Cluster
-// that is already gone is not an error.
-func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, namespace, name string) error {
-	cluster, found, err := getCluster(ctx, r.Reader, namespace, name)
-	if err != nil || !found {
-		return err
-	}
-	if err := r.Delete(ctx, cluster); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete Cluster %s/%s: %w", namespace, name, err)
+// deleteCluster deletes the Cluster the run read. The delete carries the
+// Cluster's UID as a precondition, so it never reaches a Cluster of the same
+// name created since the read. A Cluster that is already gone is not an
+// error.
+func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster client.Object) error {
+	uid := cluster.GetUID()
+	if err := r.Delete(ctx, cluster, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete Cluster %s/%s: %w", cluster.GetNamespace(), cluster.GetName(), err)
 	}
 	return nil
 }

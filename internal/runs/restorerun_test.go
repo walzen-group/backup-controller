@@ -239,6 +239,7 @@ func TestADatabaseRestoreDeletesAndFollowsTheCluster(t *testing.T) {
 
 	// Flux or tofu creates the Cluster again and the webhook recovers it.
 	recovered := cluster(func(u *unstructured.Unstructured) {
+		u.SetUID("new-cluster-uid")
 		annotations := u.GetAnnotations()
 		annotations[backupv1alpha1.AnnotationRestoreRun] = "back-to-monday"
 		u.SetAnnotations(annotations)
@@ -887,5 +888,46 @@ func TestARestoreWhoseChecksKeepFailingSaysWhyAndTimesOut(t *testing.T) {
 	}
 	if cond := readyMessage(run.Status.Conditions); !strings.Contains(cond, "wrong password") {
 		t.Errorf("ready message = %q, want the error the run gave up on", cond)
+	}
+}
+
+// A database restore whose delete of the Cluster failed deletes it again on
+// the next pass. The old Cluster still carries backup.wlz.li/restore-run with
+// this run's name, left there by an earlier run named back-to-monday, and
+// that must not count as the recovery. Only a Cluster created again, with
+// another UID, does.
+func TestADatabaseRestoreWhoseDeleteFailedDeletesTheOldClusterAgain(t *testing.T) {
+	old := cluster(func(u *unstructured.Unstructured) {
+		annotations := u.GetAnnotations()
+		annotations[backupv1alpha1.AnnotationRestoreRun] = "back-to-monday"
+		u.SetAnnotations(annotations)
+		_ = unstructured.SetNestedField(u.Object, healthyPhase, "status", "phase")
+	})
+	r, c := restoreReconciler(t, prober{saturday},
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), old, objectStore(), storeSecret())
+	restoreStep(t, r) // plan
+
+	refused := false
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == ClusterGVK.Kind && !refused {
+				refused = true
+				return apierrors.NewServiceUnavailable("etcd leader changed")
+			}
+			return cl.Delete(ctx, obj, opts...)
+		},
+	})
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+		t.Fatal("the pass whose delete failed succeeded, want the error returned")
+	}
+	restoreStep(t, r)
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase.Finished() || run.Status.Items[0].Phase != backupv1alpha1.ItemDeleted {
+		t.Errorf("phase = %q, item = %+v; want the run waiting with the item Deleted", run.Status.Phase, run.Status.Items[0])
+	}
+	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); ok {
+		t.Error("the old Cluster is still there; the run took it for its recovery")
 	}
 }

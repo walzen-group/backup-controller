@@ -4,6 +4,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // RestoreRunSpec asks for one restore. It names one volume, one database, or
@@ -218,6 +219,12 @@ type RestoreItem struct {
 	// starts from.
 	// +optional
 	BaseBackup string `json:"baseBackup,omitempty"`
+	// ClusterUID is the UID of the Cluster a database item deletes, recorded
+	// before the delete. A Cluster of the same name with this UID is the old
+	// one, which the delete has not reached yet. Only a Cluster with another
+	// UID can be the recovery.
+	// +optional
+	ClusterUID types.UID `json:"clusterUID,omitempty"`
 }
 
 // +kubebuilder:object:root=true
