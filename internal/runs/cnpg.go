@@ -7,6 +7,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,6 +30,36 @@ const hibernationAnnotation = "cnpg.io/hibernation"
 
 // healthyPhase is the phase CloudNativePG reports for a Cluster that is up.
 const healthyPhase = "Cluster in healthy state"
+
+// clusterLabel names the Cluster on each instance pod and PVC CloudNativePG
+// creates for it.
+const clusterLabel = "cnpg.io/cluster"
+
+// instanceLeft names a pod or PVC of Cluster name still in the namespace, and
+// returns empty once none is. An instance pod outlives its deleted Cluster
+// until Postgres has shut down, which takes up to the Cluster's
+// smartShutdownTimeout, and until then the Cluster's Services still reach it
+// and a new Cluster cannot take its names.
+func instanceLeft(ctx context.Context, c client.Reader, namespace, name string) (string, error) {
+	selector := client.MatchingLabels{clusterLabel: name}
+	pods := &corev1.PodList{}
+	if err := c.List(ctx, pods, client.InNamespace(namespace), selector); err != nil {
+		return "", fmt.Errorf("list the pods of Cluster %s/%s: %w", namespace, name, err)
+	}
+	for _, pod := range pods.Items {
+		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+			return "pod " + pod.Name, nil
+		}
+	}
+	claims := &corev1.PersistentVolumeClaimList{}
+	if err := c.List(ctx, claims, client.InNamespace(namespace), selector); err != nil {
+		return "", fmt.Errorf("list the PVCs of Cluster %s/%s: %w", namespace, name, err)
+	}
+	if len(claims.Items) > 0 {
+		return "PVC " + claims.Items[0].Name, nil
+	}
+	return "", nil
+}
 
 // getCluster reads one Cluster, and reports false when it does not exist.
 func getCluster(ctx context.Context, c client.Reader, namespace, name string) (*unstructured.Unstructured, bool, error) {

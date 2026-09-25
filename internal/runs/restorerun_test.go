@@ -333,6 +333,76 @@ func TestAQuiescedRestoreStopsTheAppUntilTheDatabaseIsDeleted(t *testing.T) {
 	}
 }
 
+// oldInstance is the deleted Cluster's instance pod and its PVC, which
+// Kubernetes removes only after Postgres has shut down.
+func oldInstance() (*corev1.Pod, *corev1.PersistentVolumeClaim) {
+	meta := func() metav1.ObjectMeta {
+		return metav1.ObjectMeta{
+			Name: pgN + "-1", Namespace: ns,
+			Labels: map[string]string{clusterLabel: pgN},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: ClusterGVK.GroupVersion().String(), Kind: ClusterGVK.Kind, Name: pgN, UID: "old-cluster-uid",
+			}},
+		}
+	}
+	return &corev1.Pod{ObjectMeta: meta()}, &corev1.PersistentVolumeClaim{ObjectMeta: meta()}
+}
+
+// A Cluster's instance pod keeps running through its shutdown after the
+// Cluster is gone. The run gives the app back and resumes Flux only once that
+// pod and its PVC are gone, so the app never reaches the old Postgres and the
+// new Cluster never waits behind the old one's names.
+func TestAQuiescedRestoreWaitsForTheOldInstanceToShutDown(t *testing.T) {
+	pod, pvc := oldInstance()
+	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), pod, pvc)
+
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // quiesce
+	restoreStep(t, r) // restore the volume
+	run := readRestoreRun(t, c)
+	rd := &volsyncv1alpha1.ReplicationDestination{}
+	get(t, c, ns, run.Status.Items[0].Destination, rd)
+	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	if err := c.Status().Update(context.Background(), rd); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreStep(t, r) // volume done, database deleted
+	restoreStep(t, r) // the old instance is still shutting down
+	run = readRestoreRun(t, c)
+	if run.Status.Items[1].Phase != backupv1alpha1.ItemDeleted {
+		t.Fatalf("database item = %+v, want Deleted", run.Status.Items[1])
+	}
+	if got := replicasOf(t, c); got != 0 {
+		t.Errorf("replicas = %d while pod %s-1 was still shutting down, want 0", got, pgN)
+	}
+	if !suspended(t, c) {
+		t.Errorf("the Kustomization was resumed while pod %s-1 was still shutting down", pgN)
+	}
+	if !strings.Contains(readyMessage(run.Status.Conditions), pgN+"-1") {
+		t.Errorf("ready message = %q, want it to name the instance the run waits for", readyMessage(run.Status.Conditions))
+	}
+
+	if err := c.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), pvc); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d once the old instance was gone, want the 2 it had", got)
+	}
+	if suspended(t, c) {
+		t.Error("the Kustomization stayed suspended after the old instance was gone")
+	}
+	if msg := readyMessage(readRestoreRun(t, c).Status.Conditions); !strings.Contains(msg, "recreate "+pgN) {
+		t.Errorf("ready message = %q, want the run asking for the Cluster to be created again", msg)
+	}
+}
+
 // A run that gives up after stopping the app starts it again.
 func TestATimedOutQuiescedRestoreGivesTheAppBack(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),

@@ -347,8 +347,19 @@ exits 0, and the restore reports success having written nothing.
 
 ### A database restore
 
-The run marks the item Deleted, then deletes the Cluster, and waits in phase
-Waiting:
+The run marks the item Deleted, then deletes the Cluster. Deleting the Cluster
+only starts its instance pod's shutdown: Postgres does a smart shutdown, which
+refuses new connections and waits for open sessions until the Cluster's
+`smartShutdownTimeout`, 180 seconds by default. On the Flux canary on
+2026-09-25 the old pod was gone a little over three minutes after the delete. While it runs, the Cluster's
+Services still send clients to it, and a new Cluster cannot take its pod and
+PVC names.
+
+So the run waits, with reason WaitingForShutdown, until no pod or PVC labelled
+`cnpg.io/cluster: <name>` is left in the namespace. Its message names the one
+it is waiting for. Only then does it give the workloads under `quiesce` back,
+resume the Kustomizations it suspended, and wait in phase Waiting for the
+Cluster to be created again:
 
 ```text
 recreate canary-namespace-backup-pg to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it
@@ -431,9 +442,12 @@ spec:
    zero, and waits until no pod of it is left.
 3. It restores each volume with `restoreAsOf` set to `syncedTo`. The quiesced
    snapshot carries exactly that time, so the mover selects it.
-4. It deletes each Cluster, then gives the workloads their replicas back and
-   resumes the Kustomizations it suspended. A suspended Kustomization would never
-   create the Cluster again, and resuming it reapplies the replicas as well.
+4. It deletes each Cluster and waits until the Cluster's instance pods and
+   PVCs are gone, as [A database restore](#a-database-restore) describes. Then
+   it gives the workloads their replicas back and resumes the Kustomizations it
+   suspended. A suspended Kustomization would never create the Cluster again,
+   and resuming it reapplies the replicas as well. The app starts before the
+   new Cluster is ready, and can't connect to its database until it is.
 5. When the Cluster is created again, the webhook sets its `targetTime` to
    `syncedTo`.
 

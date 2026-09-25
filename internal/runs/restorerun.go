@@ -370,7 +370,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 		}
 	}
 
-	var recreate []string
+	var recreate, shuttingDown []string
 	if volumesDone {
 		for i := range run.Status.Items {
 			item := &run.Status.Items[i]
@@ -385,15 +385,24 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 				return ctrl.Result{}, err
 			}
 			if item.Phase == backupv1alpha1.ItemDeleted {
-				recreate = append(recreate, item.Name)
+				left, err := instanceLeft(ctx, r.Client, run.Namespace, item.Name)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if left != "" {
+					shuttingDown = append(shuttingDown, left)
+				} else {
+					recreate = append(recreate, item.Name)
+				}
 			}
 		}
 	}
 
 	// The databases come back only when their owner creates them again, and a
 	// Kustomization this run suspended creates nothing. So the app is given
-	// back once every volume is restored and every database deleted.
-	if stopped(run) && volumesDone && !anyRestorePending(run.Status.Items) {
+	// back once every volume is restored and every database deleted, down to
+	// its last instance pod and PVC.
+	if stopped(run) && volumesDone && !anyRestorePending(run.Status.Items) && len(shuttingDown) == 0 {
 		if err := r.restart(ctx, run); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -407,6 +416,9 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	}
 
 	switch {
+	case len(shuttingDown) > 0:
+		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonShutdown,
+			fmt.Sprintf("waiting for %s of the deleted Cluster to be gone before anything creates it again", strings.Join(shuttingDown, ", "))))
 	case len(recreate) > 0:
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonRecreate,
 			fmt.Sprintf("recreate %s to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it", strings.Join(recreate, ", "))))
