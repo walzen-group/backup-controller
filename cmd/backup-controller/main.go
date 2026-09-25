@@ -22,6 +22,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	// The image is FROM scratch, so a CRON_TZ schedule loads its zone from the
+	// copy of the zone database compiled in here.
+	_ "time/tzdata"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=...". The

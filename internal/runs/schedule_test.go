@@ -60,6 +60,20 @@ func TestADueTickCreatesARunOfTheWholeNamespace(t *testing.T) {
 	}
 }
 
+// A CRON_TZ prefix puts the schedule on that zone's clock: 04:00 in Berlin is
+// 02:00 UTC in September.
+func TestAScheduleWithAZoneTicksOnThatZonesClock(t *testing.T) {
+	created := time.Date(2026, 9, 24, 1, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 9, 24, 2, 0, 30, 0, time.UTC)
+
+	_, c := schedule(t, now, scheduledNamespace("CRON_TZ=Europe/Berlin 0 4 * * *", created))
+
+	runs := scheduledRuns(t, c)
+	if len(runs) != 1 || runs[0].Labels[backupv1alpha1.LabelScheduledFor] != "1790215200" {
+		t.Fatalf("runs = %v, want one for 2026-09-24T02:00:00Z (1790215200)", runs)
+	}
+}
+
 func TestATickNotYetDueCreatesNothing(t *testing.T) {
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 4, 58, 0, 0, time.UTC)

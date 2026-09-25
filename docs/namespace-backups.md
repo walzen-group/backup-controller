@@ -47,7 +47,7 @@ metadata:
 
 | Annotation | On | Decides |
 | --- | --- | --- |
-| backup.wlz.li/schedule | Namespace | when the namespace's backups run, five-field cron |
+| backup.wlz.li/schedule | Namespace | when the namespace's backups run, five-field cron in UTC, or on a zone's clock with a prefix such as `CRON_TZ=Europe/Berlin 0 4 * * *` |
 | backup.wlz.li/enabled | claim, Cluster | whether a run includes it; nothing else is read to find what to back up |
 | backup.wlz.li/retain-last and the six other retain- annotations | claim | which snapshots the volume's repository keeps; see [Retention](#retention) |
 | backup.wlz.li/quiesce | Deployment, StatefulSet | whether the workload stops while the volumes' clones are cut |
