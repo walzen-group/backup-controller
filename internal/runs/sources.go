@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
+	"strconv"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -86,17 +88,71 @@ func volumeAffinity(ctx context.Context, c client.Reader, claim *corev1.Persiste
 	}, nil
 }
 
-// retainLast reads the claim's retention annotation.
-func retainLast(claim *corev1.PersistentVolumeClaim) (*string, error) {
-	value, ok := claim.Annotations[backupv1alpha1.AnnotationRetainLast]
-	if !ok || value == "" {
-		return nil, fmt.Errorf("claim %s has no %s annotation", claim.Name, backupv1alpha1.AnnotationRetainLast)
+// resticSpan is a restic --keep-within span: counts of years, months, days and
+// hours, such as 30d or 1y6m.
+var resticSpan = regexp.MustCompile(`^([0-9]+[ymdh])+$`)
+
+// retention reads the claim's retention annotations into restic's policy. A
+// claim names at least one; with none, restic would keep every snapshot.
+func retention(claim *corev1.PersistentVolumeClaim) (*volsyncv1alpha1.ResticRetainPolicy, error) {
+	policy := &volsyncv1alpha1.ResticRetainPolicy{}
+	counts := []struct {
+		annotation string
+		field      **int32
+	}{
+		{backupv1alpha1.AnnotationRetainHourly, &policy.Hourly},
+		{backupv1alpha1.AnnotationRetainDaily, &policy.Daily},
+		{backupv1alpha1.AnnotationRetainWeekly, &policy.Weekly},
+		{backupv1alpha1.AnnotationRetainMonthly, &policy.Monthly},
+		{backupv1alpha1.AnnotationRetainYearly, &policy.Yearly},
 	}
-	var n int
-	if _, err := fmt.Sscanf(value, "%d", &n); err != nil || n < 1 {
-		return nil, fmt.Errorf("claim %s has %s %q, which is not a positive count", claim.Name, backupv1alpha1.AnnotationRetainLast, value)
+	set := false
+
+	// last is a string in VolSync's CRD and the tiers are integers.
+	if value, ok := claim.Annotations[backupv1alpha1.AnnotationRetainLast]; ok {
+		if _, err := positiveCount(value); err != nil {
+			return nil, fmt.Errorf("claim %s has %s %q, which is not a positive count", claim.Name, backupv1alpha1.AnnotationRetainLast, value)
+		}
+		policy.Last = &value
+		set = true
 	}
-	return &value, nil
+	for _, c := range counts {
+		value, ok := claim.Annotations[c.annotation]
+		if !ok {
+			continue
+		}
+		n, err := positiveCount(value)
+		if err != nil {
+			return nil, fmt.Errorf("claim %s has %s %q, which is not a positive count", claim.Name, c.annotation, value)
+		}
+		*c.field = &n
+		set = true
+	}
+	if value, ok := claim.Annotations[backupv1alpha1.AnnotationRetainWithin]; ok {
+		if !resticSpan.MatchString(value) {
+			return nil, fmt.Errorf("claim %s has %s %q, which is not a span such as 30d or 1y6m", claim.Name, backupv1alpha1.AnnotationRetainWithin, value)
+		}
+		policy.Within = &value
+		set = true
+	}
+
+	if !set {
+		return nil, fmt.Errorf("claim %s names no retention; set at least one of %s, %s, %s, %s, %s, %s or %s",
+			claim.Name, backupv1alpha1.AnnotationRetainLast, backupv1alpha1.AnnotationRetainHourly,
+			backupv1alpha1.AnnotationRetainDaily, backupv1alpha1.AnnotationRetainWeekly,
+			backupv1alpha1.AnnotationRetainMonthly, backupv1alpha1.AnnotationRetainYearly,
+			backupv1alpha1.AnnotationRetainWithin)
+	}
+	return policy, nil
+}
+
+// positiveCount parses a retention count, which is at least one.
+func positiveCount(value string) (int32, error) {
+	n, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("not a positive count")
+	}
+	return int32(n), nil
 }
 
 // ensureSource writes the claim's ReplicationSource with the run's tag, and
@@ -104,7 +160,7 @@ func retainLast(claim *corev1.PersistentVolumeClaim) (*string, error) {
 //
 // The controller owns every field: the repository, the cache class and the
 // mover's security context come from the claim's VolumeRestore, the retention
-// from the claim's annotation, and the node from the claim's volume. The
+// from the claim's annotations, and the node from the claim's volume. The
 // source is owned by the claim, so a claim deleted for a restore takes its
 // source with it and the next run writes a new one.
 //
@@ -120,7 +176,7 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 	if err != nil {
 		return nil, err
 	}
-	last, err := retainLast(claim)
+	retain, err := retention(claim)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +216,7 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 				},
 				Repository:            vr.Spec.Repository,
 				PruneIntervalDays:     new(pruneIntervalDays),
-				Retain:                &volsyncv1alpha1.ResticRetainPolicy{Last: last},
+				Retain:                retain,
 				CacheCapacity:         vr.Spec.CacheCapacity,
 				CacheStorageClassName: vr.Spec.CacheStorageClassName,
 				MoverConfig: volsyncv1alpha1.MoverConfig{

@@ -16,6 +16,17 @@ const (
 	// keeps.
 	AnnotationRetainLast = "backup.wlz.li/retain-last"
 
+	// The age tiers restic keeps a snapshot for, on a claim: how many of the
+	// newest hourly, daily, weekly, monthly and yearly snapshots survive a
+	// prune, and a span such as 30d or 1y6m inside which every one does. A
+	// claim sets any mix of these and retain-last, and at least one.
+	AnnotationRetainHourly  = "backup.wlz.li/retain-hourly"
+	AnnotationRetainDaily   = "backup.wlz.li/retain-daily"
+	AnnotationRetainWeekly  = "backup.wlz.li/retain-weekly"
+	AnnotationRetainMonthly = "backup.wlz.li/retain-monthly"
+	AnnotationRetainYearly  = "backup.wlz.li/retain-yearly"
+	AnnotationRetainWithin  = "backup.wlz.li/retain-within"
+
 	// AnnotationQuiesce, set to "true" on a Deployment or a StatefulSet, stops
 	// that workload while a namespace backup cuts its volumes' clones.
 	AnnotationQuiesce = "backup.wlz.li/quiesce"

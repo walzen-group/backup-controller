@@ -49,7 +49,7 @@ metadata:
 | --- | --- | --- |
 | backup.wlz.li/schedule | Namespace | when the namespace's backups run, five-field cron |
 | backup.wlz.li/enabled | claim, Cluster | whether a run includes it; nothing else is read to find what to back up |
-| backup.wlz.li/retain-last | claim | how many snapshots the volume's repository keeps |
+| backup.wlz.li/retain-last and the six other retain- annotations | claim | which snapshots the volume's repository keeps; see [Retention](#retention) |
 | backup.wlz.li/quiesce | Deployment, StatefulSet | whether the workload stops while the volumes' clones are cut |
 | backup.wlz.li/restore-as-of | claim, Cluster | the moment every automatic restore of it goes back to |
 
@@ -57,6 +57,39 @@ A claim still names its VolumeRestore in `dataSourceRef`; that object supplies
 the repository Secret, the cache class and the mover security context. A
 database's retention stays a window on its ObjectStore, because the barman-cloud
 plugin accepts `retentionPolicy: "30d"` and no count.
+
+### Retention
+
+A claim sets any mix of seven annotations, and at least one. The controller
+copies each onto the matching field of the retain block in the claim's
+ReplicationSource, and VolSync's mover passes that block to `restic forget`:
+
+| Annotation | retain field | restic flag | Value |
+| --- | --- | --- | --- |
+| backup.wlz.li/retain-last | last | `--keep-last` | a count |
+| backup.wlz.li/retain-hourly | hourly | `--keep-hourly` | a count |
+| backup.wlz.li/retain-daily | daily | `--keep-daily` | a count |
+| backup.wlz.li/retain-weekly | weekly | `--keep-weekly` | a count |
+| backup.wlz.li/retain-monthly | monthly | `--keep-monthly` | a count |
+| backup.wlz.li/retain-yearly | yearly | `--keep-yearly` | a count |
+| backup.wlz.li/retain-within | within | `--keep-within` | a span of y, m, d and h, such as 30d or 1y6m |
+
+restic keeps a snapshot when any one of the flags keeps it. This claim holds
+the seven newest daily snapshots, the newest of each of the last four weeks,
+and the newest of each of the last six months:
+
+```yaml
+metadata:
+  annotations:
+    backup.wlz.li/enabled: "true"
+    backup.wlz.li/retain-daily: "7"
+    backup.wlz.li/retain-weekly: "4"
+    backup.wlz.li/retain-monthly: "6"
+```
+
+A claim carrying none of the seven fails its item before the run writes a
+source, and the message lists all seven. A count below 1, or a span restic
+cannot read, fails the item with a message naming that annotation.
 
 ## Scheduled runs
 

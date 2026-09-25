@@ -119,6 +119,89 @@ func TestAVolumeRunWritesTheSourceAndReportsResticsTime(t *testing.T) {
 	}
 }
 
+// startVolumeRun runs a volume run on the claim up to the source being written,
+// and returns the client.
+func startVolumeRun(t *testing.T, annotations map[string]string) client.Client {
+	t.Helper()
+	pvc := claim()
+	pvc.Annotations = annotations
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		pvc, volume(), volumeRestore(), repository())
+	step(t, r)
+	step(t, r)
+	step(t, r)
+	return c
+}
+
+// A claim keeping snapshots by age gets restic's tiers on its source, the way
+// VolSync's own retain block takes them.
+func TestTieredRetentionReachesTheSource(t *testing.T) {
+	c := startVolumeRun(t, map[string]string{
+		backupv1alpha1.AnnotationEnabled:       "true",
+		backupv1alpha1.AnnotationRetainHourly:  "24",
+		backupv1alpha1.AnnotationRetainDaily:   "7",
+		backupv1alpha1.AnnotationRetainWeekly:  "4",
+		backupv1alpha1.AnnotationRetainMonthly: "6",
+		backupv1alpha1.AnnotationRetainYearly:  "2",
+		backupv1alpha1.AnnotationRetainWithin:  "3d",
+	})
+
+	source := &volsyncv1alpha1.ReplicationSource{}
+	get(t, c, ns, claimN, source)
+	retain := source.Spec.Restic.Retain
+	if retain.Last != nil {
+		t.Errorf("last = %q, want unset on a claim that names no retain-last", *retain.Last)
+	}
+	for field, got := range map[string]*int32{"hourly": retain.Hourly, "daily": retain.Daily, "weekly": retain.Weekly, "monthly": retain.Monthly, "yearly": retain.Yearly} {
+		if got == nil {
+			t.Errorf("%s is unset", field)
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	if *retain.Hourly != 24 || *retain.Daily != 7 || *retain.Weekly != 4 || *retain.Monthly != 6 || *retain.Yearly != 2 {
+		t.Errorf("retain = hourly %d daily %d weekly %d monthly %d yearly %d, want 24 7 4 6 2",
+			*retain.Hourly, *retain.Daily, *retain.Weekly, *retain.Monthly, *retain.Yearly)
+	}
+	if retain.Within == nil || *retain.Within != "3d" {
+		t.Errorf("within = %v, want 3d", retain.Within)
+	}
+}
+
+// A claim with no retention would keep every snapshot forever.
+func TestAClaimWithNoRetentionFails(t *testing.T) {
+	c := startVolumeRun(t, map[string]string{backupv1alpha1.AnnotationEnabled: "true"})
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Fatalf("phase = %q, want Failed", run.Status.Phase)
+	}
+	message := run.Status.Items[0].Message
+	for _, name := range []string{"retain-last", "retain-daily", "retain-within"} {
+		if !strings.Contains(message, name) {
+			t.Errorf("message %q does not name %s", message, name)
+		}
+	}
+}
+
+func TestAnUnparseableRetentionFails(t *testing.T) {
+	for annotation, value := range map[string]string{
+		backupv1alpha1.AnnotationRetainWeekly: "four",
+		backupv1alpha1.AnnotationRetainDaily:  "0",
+		backupv1alpha1.AnnotationRetainWithin: "3 days",
+	} {
+		t.Run(annotation, func(t *testing.T) {
+			c := startVolumeRun(t, map[string]string{backupv1alpha1.AnnotationEnabled: "true", annotation: value})
+
+			run := readBackupRun(t, c)
+			if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(run.Status.Items[0].Message, annotation) {
+				t.Fatalf("run = %+v, want the item failed naming %s", run.Status, annotation)
+			}
+		})
+	}
+}
+
 func TestAClaimNotMarkedEnabledIsRefused(t *testing.T) {
 	unmarked := claim()
 	unmarked.Annotations = nil
