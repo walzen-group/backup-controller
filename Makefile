@@ -4,12 +4,15 @@
 
 NIX := nix develop -c
 CONTROLLER_GEN := $(NIX) controller-gen
+# The envtest shell adds a kube-apiserver and an etcd from the store, at the
+# Kubernetes version versions.json pins, and points KUBEBUILDER_ASSETS at them.
+ENVTEST := nix develop .\#envtest -c
 
 # config/crd is the generated original. deploy/ and chart/ each need their own
 # copy, because kustomize and helm both read a directory of their own. Every
 # generated file is copied, so a new kind needs no edit here.
 
-.PHONY: build test vet lint check generate manifests verify
+.PHONY: build test vet lint check envtest generate manifests verify
 
 ## build: compile every package.
 build:
@@ -29,6 +32,10 @@ lint:
 
 ## check: the gate a person runs, and the one CI's check job mirrors.
 check: vet test lint build
+
+## envtest: run the suites tagged envtest against a real kube-apiserver and etcd, as CI's envtest job does.
+envtest:
+	$(ENVTEST) go test -tags envtest ./...
 
 ## generate: regenerate deepcopy functions into the API package.
 generate:

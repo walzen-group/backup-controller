@@ -88,22 +88,14 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@v14
 
       # The suite carries the envtest build tag, so the plain check job never
-      # compiles it. It needs the control-plane binaries: without usable
-      # assets in KUBEBUILDER_ASSETS the suite fails in TestMain rather than
-      # skipping, which is why the asset path is resolved by a standalone
-      # assignment here. When setup-envtest cannot fetch the 1.37.0 binaries
-      # (a fresh runner downloads them on first use), set -e aborts the step
-      # there; the prefix form, KUBEBUILDER_ASSETS=$(setup-envtest use ...)
-      # go test, would pass an empty path to a suite that then fails for a
-      # reason that names the wrong cause.
+      # compiles it. It needs the control-plane binaries, and the flake's
+      # envtest shell provides them: kube-apiserver at production's
+      # Kubernetes version and etcd, both store paths pinned by versions.json,
+      # with KUBEBUILDER_ASSETS pointing at them. Nothing is downloaded at
+      # test time, so the step has no fetch that could fail for another
+      # reason than the suite.
       - name: Run the tagged envtest suite
-        run: |
-          # shellcheck disable=SC2016  # the inner bash expands these
-          nix develop -c bash -c '
-            set -euo pipefail
-            assets=$(setup-envtest use 1.37.0 -p path)
-            KUBEBUILDER_ASSETS="$assets" go test -tags envtest ./internal/api/...
-          '
+        run: make envtest
 
   chart:
     name: Chart and install manifests render

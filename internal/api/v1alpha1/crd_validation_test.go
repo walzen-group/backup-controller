@@ -6,9 +6,11 @@
 // they reject what they should. This suite starts an envtest control plane,
 // installs config/crd, creates objects and reads the server's answer.
 //
-// Run it with the envtest assets on the path:
+// Run it with make envtest. The flake's envtest shell sets KUBEBUILDER_ASSETS
+// to a kube-apiserver and an etcd at production's Kubernetes version, taken
+// from the store, so nothing is downloaded:
 //
-//	KUBEBUILDER_ASSETS=$(setup-envtest use 1.37.0 -p path) go test -tags envtest ./internal/api/...
+//	nix develop .#envtest -c go test -tags envtest ./internal/api/...
 package v1alpha1
 
 import (

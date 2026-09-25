@@ -1,0 +1,95 @@
+{
+  "about": "The versions of every component the controller depends on, as walzen prod runs them, and of every tool the tests take from the flake. flake.nix reads the pins and hashes here, and the tests read the versions to check that each recorded fixture came from these tools. After a bump, change the entry here (and its hashes), regenerate the recorded fixtures with make fixtures, and run make check and make envtest.",
+  "components": {
+    "kubernetes": {
+      "version": "1.36.3",
+      "prod": "environments/prod/infra/talos/cluster.yaml (kubernetes_version)",
+      "tests": "kube-apiserver, kube-controller-manager and kube-scheduler release binaries from dl.k8s.io, pinned in nix/test-tools.nix",
+      "hashes": {
+        "kube-apiserver": {
+          "x86_64-linux": "sha256-HyF9OXI0ptBl2mY8bghv2wLA8N6XoHWP8+bzlW9O+Ks=",
+          "aarch64-linux": "sha256-FgAbnTXSNjTDYaHit7D8er4YaYSvaX73qGnIyM3teLc="
+        },
+        "kube-controller-manager": {
+          "x86_64-linux": "sha256-ft/pdtWgbHpwLWU+kUCV9KcyoEuyE5EVtqbrpqm3gcc=",
+          "aarch64-linux": "sha256-J4aKXIIoJJRbk/LYpySl3Nma/8aLRyMK52a/+Hlbu4Q="
+        },
+        "kube-scheduler": {
+          "x86_64-linux": "sha256-uJVdRRjJAhELUKglNkM5sftnOCJRjOC6CBpp7WNPju4=",
+          "aarch64-linux": "sha256-yhx80AM5Qr+e9+rIDhg3XZH28pSHJEw+aF8RFjsBqI0="
+        }
+      }
+    },
+    "etcd": {
+      "version": "3.6.14",
+      "prod": "Talos v1.14 runs its own etcd; Kubernetes 1.36.3 is built against etcd 3.6.8 (build/dependencies.yaml)",
+      "tests": "nixpkgs etcd, the newest 3.6 patch in the locked nixpkgs"
+    },
+    "flux": {
+      "version": "2.9.5",
+      "prod": "environments/prod/cluster/flux/inputs.yaml (flux_version)"
+    },
+    "cloudnative-pg": {
+      "version": "1.30.0",
+      "prod": "environments/prod/cluster/cloudnative-pg/inputs.yaml (chart 0.29.0, whose appVersion is 1.30.0)"
+    },
+    "plugin-barman-cloud": {
+      "version": "0.15.0",
+      "prod": "environments/prod/cluster/barman-cloud-plugin/inputs.yaml (chart 0.8.0, whose appVersion is v0.15.0)"
+    },
+    "barman": {
+      "version": "3.20.0",
+      "prod": "the barman-cloud sidecar of plugin-barman-cloud v0.15.0 (containers/sidecar-requirements.in: barman==3.20.0)",
+      "tests": "nixpkgs barman with its source moved to the release/3.20.0 tag in nix/test-tools.nix",
+      "hash": "sha256-PWPcEymAHxKdmTWcN0X5umE4fVYWBx29nTspElcqWW8="
+    },
+    "postgresql": {
+      "version": "18.6",
+      "prod": "the CloudNativePG operand image; barman reads the WAL and base backup layout, which does not change within a major",
+      "tests": "nixpkgs postgresql, only to produce the recorded barman stores"
+    },
+    "kueue": {
+      "version": "0.19.5",
+      "prod": "environments/prod/cluster/kueue/inputs.yaml (chart_version)"
+    },
+    "volsync": {
+      "version": "0.16.0",
+      "prod": "environments/prod/cluster/volsync/inputs.yaml (chart_version)",
+      "tests": "the Go module github.com/backube/volsync v0.16.0 in go.mod; the recorders run its mover-restic/entry.sh from the module cache"
+    },
+    "restic-mover": {
+      "version": "0.18.1",
+      "prod": "the restic inside the VolSync v0.16.0 mover image (mover-restic/SOURCE_VERSIONS)",
+      "tests": "the restic release binary, pinned in nix/test-tools.nix as restic-0.18.1",
+      "hashes": {
+        "x86_64-linux": "sha256-aAg48Z1nFRrboifhVwzdivEsGc8XNXg+0bqSi8QfNj0=",
+        "aarch64-linux": "sha256-h/U/3d44dkCV6cBYo7MYNAUsN+WCbSrPNOGJI8AGvUU=",
+        "x86_64-darwin": "sha256-64VD7ZL/Hdtndi2uvwn3vqSww30h7bapEL7j1PUUAV8=",
+        "aarch64-darwin": "sha256-GT/MyLtFZ7SYkjvHAmHhBP8ivogBbw8QiwNdrTcqtxE="
+      }
+    },
+    "restic": {
+      "version": "0.19.1",
+      "prod": "the restic an operator runs by hand against the prod repositories",
+      "tests": "nixpkgs restic"
+    },
+    "rustfs": {
+      "version": "1.0.0",
+      "prod": "the S3 store at http://quasar.wan.walzen.org:10172 (shared-secrets/backup/backup.yaml)",
+      "tests": "the RustFS release binary, pinned in nix/test-tools.nix; there is no x86_64-darwin build",
+      "hashes": {
+        "x86_64-linux": "sha256-wwqVt2VG8lEiyco4cJDdsww5HKVgViGw18iBcDwPIcg=",
+        "aarch64-linux": "sha256-iCAsBEbQqjH6R1sdyM25L20y5i1vNKY/IBiJnBlD8QA=",
+        "aarch64-darwin": "sha256-BuMqaBwWkw+1QU32TJYVH+M3AyH6sEA6g6g6AVh0w5o="
+      }
+    },
+    "bubblewrap": {
+      "version": "0.12.0",
+      "tests": "nixpkgs bubblewrap; it gives a mover run the container's /data, PID 1 and hostname"
+    },
+    "libfaketime": {
+      "version": "0.9.11",
+      "tests": "nixpkgs libfaketime; it dates the stale lock fixture"
+    }
+  }
+}
