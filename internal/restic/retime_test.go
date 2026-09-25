@@ -339,3 +339,36 @@ func TestRetimeAfterAFailedRemoveWritesNoSecondCopy(t *testing.T) {
 		t.Errorf("the retry returned %s, which the repository doesn't hold: %v", got.ID, ids)
 	}
 }
+
+// TestRetimeStampsWholeSeconds checks that Retime drops the fraction of a
+// second from the time it writes, and that a retry after a failed delete
+// finds the copy when the caller passes the time without its fraction. A
+// BackupRun reports whole seconds, and VolSync compares whole seconds, so a
+// copy stamped T.123456789 would miss the check that reuses it, and a second
+// copy would land in the repository.
+func TestRetimeStampsWholeSeconds(t *testing.T) {
+	dir, _ := writableFixture(t)
+	store := &failFirstRemove{DirStore: dir, name: path.Join("snapshots", mondayID)}
+	repo, err := Open(context.Background(), store, "backup")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt.Add(123456789), QuiescedTag); err == nil {
+		t.Fatal("first retime succeeded, want the refused delete")
+	}
+	got, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	if err != nil {
+		t.Fatalf("second retime: %v", err)
+	}
+	if !got.Time.Equal(quiescedAt) {
+		t.Errorf("retimed to %s, want %s", got.Time, quiescedAt)
+	}
+	snapshots, err := repo.Snapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots) != 2 {
+		t.Errorf("got %d snapshots after the retry, want Sunday's and one copy of Monday's", len(snapshots))
+	}
+}

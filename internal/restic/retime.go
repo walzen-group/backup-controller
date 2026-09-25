@@ -78,7 +78,11 @@ func (e *LockedError) Error() string {
 //     log line is the only place it learns the ID.
 //   - at is the time the snapshot should carry. A BackupRun passes its
 //     restartedAt: the volume didn't change between the last pod stopping and
-//     that moment, so a database recovered to at matches the files.
+//     that moment, so a database recovered to that time matches the files.
+//     Retime drops any fraction of a second from it: VolSync compares
+//     snapshot times in whole seconds, a BackupRun reports whole seconds,
+//     and a retry that passes the time without its fraction must find the
+//     copy an earlier call wrote.
 //   - tag is added to the snapshot's tags. A BackupRun passes QuiescedTag, which
 //     is how a RestoreRun with syncDatabaseToVolume finds the snapshots it can
 //     recover a database alongside.
@@ -106,7 +110,7 @@ func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag
 	if err != nil {
 		return Snapshot{}, err
 	}
-	written, err := r.retime(ctx, short, at, tag)
+	written, err := r.retime(ctx, short, at.Truncate(time.Second), tag)
 	if unlockErr := unlock(); unlockErr != nil {
 		return Snapshot{}, errors.Join(err, fmt.Errorf("remove the controller's lock: %w", unlockErr))
 	}
@@ -131,7 +135,8 @@ func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag
 //
 // When the old snapshot is still there next to a copy an earlier call wrote,
 // that earlier call failed to remove it. retime then removes the old file and
-// returns that copy. Writing the copy again would add a second snapshot under
+// returns that copy. It matches the copy's time to the second, so a copy that
+// an older controller stamped with a fraction of a second still counts. Writing the copy again would add a second snapshot under
 // another ID, because every encryption uses a fresh random IV.
 func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag string) (Snapshot, error) {
 	files, err := r.snapshotFiles(ctx)
@@ -161,7 +166,7 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 	}
 	for _, f := range files {
 		s := f.snapshot
-		if s.ID != old.snapshot.ID && s.Original == origin && s.Time.Equal(at) && slices.Contains(s.Tags, tag) {
+		if s.ID != old.snapshot.ID && s.Original == origin && s.Time.Unix() == at.Unix() && slices.Contains(s.Tags, tag) {
 			if err := r.store.Remove(ctx, path.Join("snapshots", old.snapshot.ID)); err != nil {
 				return Snapshot{}, fmt.Errorf("remove snapshot %s, already written as %s: %w", old.snapshot.ID, s.ID, err)
 			}
