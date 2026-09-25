@@ -57,7 +57,7 @@ as unstructured, so it carries no dependency on CloudNativePG's Go module.
 ### Where a database's backups are
 
 Every database operation starts by finding the archive. `bootstrap.Archiver`
-reads the Cluster's `spec.plugins`, takes the `barman-cloud.cloudnative-pg.io`
+reads the Cluster's `spec.plugins`, picks the `barman-cloud.cloudnative-pg.io`
 entry with `isWALArchiver: true`, and returns its `barmanObjectName` and
 `serverName`. An unset `serverName` means the Cluster's own name, the same
 default barman uses. A Cluster with no such entry archives nowhere, and every
@@ -74,8 +74,8 @@ database operation leaves it alone.
 | `endpointCA`, when present | the Secret and key it names | a PEM bundle added to the image's public roots |
 
 `bootstrap.S3Prober` answers two questions at that location with the minio
-client. HasBaseBackup lists `<prefix>/base/` with MaxKeys 1, so a store holding
-years of backups costs one object. BaseBackups lists the whole of `base/`, reads
+client. HasBaseBackup lists `<prefix>/base/` with MaxKeys 1, so the store
+returns one object however many years of backups it holds. BaseBackups lists the whole of `base/`, reads
 every `backup.info`, keeps the ones whose `status` is `DONE`, and orders them by
 `end_time`. barman-cloud writes no `backup_id` into backup.info, so the ID is the
 directory's name, such as `20260924T221544`.
