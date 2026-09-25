@@ -272,6 +272,24 @@ func declaredBootstrap(cluster *unstructured.Unstructured) string {
 	return methods[0]
 }
 
+// OwnerBootstrap names the bootstrap method a Cluster's owner declares, such
+// as "pg_basebackup", and returns an empty string when there is none. A
+// RestoreRun leaves such a Cluster alone: Flux would create it again with that
+// method, and the webhook refuses it while a run waits for it.
+//
+// It is declaredBootstrap without the recovery this webhook wrote itself,
+// whose source is RecoverySource. A Cluster the webhook recovered keeps that
+// recovery in its spec, and a later restore of it is the controller's own.
+func OwnerBootstrap(cluster *unstructured.Unstructured) string {
+	method := declaredBootstrap(cluster)
+	if method == "recovery" {
+		if source, _, _ := unstructured.NestedString(cluster.Object, "spec", "bootstrap", "recovery", "source"); source == RecoverySource {
+			return ""
+		}
+	}
+	return method
+}
+
 // waitingRun finds the RestoreRun that deleted a Cluster and is waiting for it
 // to be created again, so the webhook can recover the new Cluster for that
 // run.

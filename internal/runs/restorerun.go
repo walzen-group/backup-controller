@@ -300,7 +300,8 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 // neither takes every claim and every Cluster in the namespace marked
 // backup.wlz.li/enabled: "true", claims first. A Cluster that archives nowhere
 // has no backup to restore, so its item starts out Skipped. So does a Cluster
-// that opts out of the bootstrap webhook (see optsOut).
+// that opts out of the bootstrap webhook, or whose owner declares its own
+// bootstrap method (see leftAlone).
 //
 // items returns a refusal when spec.repository is set and spec.claim is not,
 // because a restore in place needs a claim to write into, and when nothing in
@@ -321,9 +322,10 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 		if err != nil {
 			return nil, err
 		}
-		if found && optsOut(cluster) {
-			return nil, refuse("the Cluster %s carries %s: %s, which asks for an empty database, so a RestoreRun does not restore it",
-				run.Spec.Database, bootstrap.OptOutAnnotation, bootstrap.OptOutValue)
+		if found {
+			if why := leftAlone(cluster); why != "" {
+				return nil, refuse("Cluster %s: %s", run.Spec.Database, why)
+			}
 		}
 		return []backupv1alpha1.RestoreItem{pending("Cluster", run.Spec.Database)}, nil
 	}
@@ -342,8 +344,8 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	}
 	for i := range clusters {
 		item := pending("Cluster", clusters[i].GetName())
-		if optsOut(&clusters[i]) {
-			item.Phase, item.Message = backupv1alpha1.ItemSkipped, optedOutMessage
+		if why := leftAlone(&clusters[i]); why != "" {
+			item.Phase, item.Message = backupv1alpha1.ItemSkipped, why
 		} else if _, _, archives := bootstrap.Archiver(&clusters[i]); !archives {
 			item.Phase, item.Message = backupv1alpha1.ItemSkipped, "the Cluster archives nowhere, so it has no backup to restore"
 		}
@@ -700,9 +702,10 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 // which moves the item to Recovering. A Recovering item succeeds once the
 // Cluster is healthy, and fails if the recovered Cluster is deleted.
 //
-// A Cluster that opts out of the bootstrap webhook (see optsOut) moves the
-// item to Skipped, and the run never deletes it. That holds for the old
-// Cluster before the delete reaches it and for a Cluster created again.
+// A Cluster that opts out of the bootstrap webhook, or whose owner declares
+// its own bootstrap method (see leftAlone), moves the item to Skipped, and the
+// run never deletes it. That holds for the old Cluster before the delete
+// reaches it and for a Cluster created again.
 //
 // The item is marked Deleted, and the status written, before the Cluster is
 // deleted. The bootstrap webhook recovers a Cluster only for a run whose item
@@ -724,9 +727,11 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		if err != nil {
 			return err
 		}
-		if found && optsOut(cluster) {
-			item.Phase, item.Message = backupv1alpha1.ItemSkipped, optedOutMessage
-			return nil
+		if found {
+			if why := leftAlone(cluster); why != "" {
+				item.Phase, item.Message = backupv1alpha1.ItemSkipped, why
+				return nil
+			}
 		}
 		if found {
 			item.ClusterUID = cluster.GetUID()
@@ -747,10 +752,11 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 			return err
 		case !found || cluster.GetDeletionTimestamp() != nil:
 			return nil
-		case optsOut(cluster):
-			// Created again empty by the owner's choice, or opted out before
-			// the delete reached it. Deleting it again would only loop.
-			item.Phase, item.Message = backupv1alpha1.ItemSkipped, optedOutMessage
+		case leftAlone(cluster) != "":
+			// Created again by the owner's choice, empty or with its own
+			// bootstrap, or marked that way before the delete reached it.
+			// Deleting it again would only loop.
+			item.Phase, item.Message = backupv1alpha1.ItemSkipped, leftAlone(cluster)
 		case item.ClusterUID != "" && cluster.GetUID() == item.ClusterUID:
 			// The old Cluster, which the earlier delete did not reach. Its
 			// annotations say nothing about this run.
@@ -1242,17 +1248,30 @@ func failedMover(destination *volsyncv1alpha1.ReplicationDestination) (string, b
 	return mover.Logs, mover.Result == volsyncv1alpha1.MoverResultFailed
 }
 
-// optedOutMessage is the item message for a Cluster that optsOut reports on.
-var optedOutMessage = fmt.Sprintf("the Cluster carries %s: %s, which asks for an empty database, so the run leaves it alone",
-	bootstrap.OptOutAnnotation, bootstrap.OptOutValue)
-
-// optsOut reports whether a Cluster opts out of the bootstrap webhook with
-// backup.wlz.li/bootstrap: initdb. The webhook lets such a Cluster through
-// empty and never marks it as a run's recovery. A run that deleted it would
-// see it come back empty and delete it again until the timeout, so a run
-// leaves it alone.
-func optsOut(cluster *unstructured.Unstructured) bool {
-	return cluster.GetAnnotations()[bootstrap.OptOutAnnotation] == bootstrap.OptOutValue
+// leftAlone says why a run must not restore a Cluster, and returns an empty
+// string when it may. The run never deletes a Cluster whose next creation it
+// can't turn into its recovery:
+//
+//   - A Cluster carrying backup.wlz.li/bootstrap: initdb opts out of the
+//     bootstrap webhook. The webhook lets it through empty and never marks it
+//     as a run's recovery, so a run that deleted it would see it come back
+//     empty and delete it again until the timeout.
+//   - A Cluster whose owner declares a bootstrap method, such as
+//     pg_basebackup or a recovery of their own (see bootstrap.OwnerBootstrap),
+//     comes back with that method. The webhook refuses it while the run waits,
+//     so the database would stay down until the timeout and nothing would be
+//     restored.
+//
+// The returned text is the item's message.
+func leftAlone(cluster *unstructured.Unstructured) string {
+	if cluster.GetAnnotations()[bootstrap.OptOutAnnotation] == bootstrap.OptOutValue {
+		return fmt.Sprintf("the Cluster carries %s: %s, which asks for an empty database, so the run leaves it alone",
+			bootstrap.OptOutAnnotation, bootstrap.OptOutValue)
+	}
+	if method := bootstrap.OwnerBootstrap(cluster); method != "" {
+		return fmt.Sprintf("the Cluster declares its own spec.bootstrap.%s, so the run leaves it alone", method)
+	}
+	return ""
 }
 
 // anyItem chooses every item, for removeDestinations.

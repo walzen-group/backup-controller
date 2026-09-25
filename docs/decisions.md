@@ -204,6 +204,12 @@ Cluster that gains the annotation after the run marked it Deleted, or comes back
 with it, is Skipped and never deleted again. [restores.md](restores.md#starting-a-database-empty)
 has the messages.
 
+From v0.8.1 the same holds for a Cluster whose owner declares its own bootstrap
+method, such as `pg_basebackup` or a `recovery` with a source other than
+`backup-controller`. The webhook refuses such a Cluster while a run waits for
+it, so a run that deleted it would keep the database down until its timeout
+and restore nothing.
+
 ## Read namespace settings from annotations, and treat an empty one as absent
 
 The timeout and the prune interval live beside the schedule, as

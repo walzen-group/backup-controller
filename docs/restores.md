@@ -394,3 +394,13 @@ The webhook admits an opted-out Cluster empty and never marks it as a run's
 recovery. A run that deleted one would find it back empty, delete it again, and
 repeat until its timeout. [decisions.md](decisions.md#leave-an-opted-out-cluster-out-of-a-restorerun)
 has the decision.
+
+From v0.8.1 a RestoreRun treats a Cluster whose owner declares its own
+bootstrap method the same way, with the item message `the Cluster declares its
+own spec.bootstrap.<method>, so the run leaves it alone`. That covers
+`pg_basebackup` and a `recovery` the owner wrote. A `recovery` whose source is
+`backup-controller` is the one this webhook wrote in an earlier restore, and
+that Cluster restores as usual. A run that deleted a Cluster declaring
+`pg_basebackup` would see Flux create it again with that method, the webhook
+refuse it while the run waits, and the database stay down until the run's
+timeout with nothing restored.

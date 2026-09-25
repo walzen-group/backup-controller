@@ -200,8 +200,8 @@ spec:
 | `repository` | the same | the restic Secret in this namespace, for a repository no claim here owns; needs `into` and `intoSize` |
 | `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository`. With `claim`, a VolumeRestore fills it on the source claim's node; with `repository`, a mover writes into it directly, and the scheduler places it with the mover pod |
 | `intoSize` | with `repository` and `into` | the size of that claim; omitted with `claim`, the source claim's request |
-| `database` | one of the three | the Cluster to restore; the run deletes it and it recovers when it is created again. A Cluster carrying `backup.wlz.li/bootstrap: initdb` ends the run Invalid |
-| `all` | one of the three | every enabled claim in place, then every enabled Cluster; a Cluster carrying `backup.wlz.li/bootstrap: initdb` gets a Skipped item |
+| `database` | one of the three | the Cluster to restore; the run deletes it and it recovers when it is created again. A Cluster carrying `backup.wlz.li/bootstrap: initdb`, or declaring its own bootstrap method such as `pg_basebackup`, ends the run Invalid |
+| `all` | one of the three | every enabled claim in place, then every enabled Cluster; a Cluster carrying `backup.wlz.li/bootstrap: initdb`, or declaring its own bootstrap method, gets a Skipped item |
 | `restoreAsOf` | no | the moment to restore to. A volume restores the newest snapshot at or before it, a database replays WAL to it exactly. Omitted, the newest snapshot and the end of the archive |
 | `previous` | no | how many snapshots further back than the selected one; one volume only |
 | `syncDatabaseToVolume` | no | with `all` only: recover the databases to the moment of the volumes' newest `quiesced` snapshot at or before `restoreAsOf`, so the files and the rows agree. Refused when a volume has no such snapshot, or two volumes' snapshots are from different moments |

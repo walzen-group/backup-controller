@@ -1238,3 +1238,83 @@ func TestAnIntoRestoreTimesOutWhileItsClaimIsRefused(t *testing.T) {
 		t.Fatalf("phase = %q, reason = %q; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
 }
+
+// declaring returns a mutate function for cluster that gives the Cluster its
+// own bootstrap method in spec.bootstrap, with the given content.
+func declaring(method string, content map[string]any) func(*unstructured.Unstructured) {
+	return func(u *unstructured.Unstructured) {
+		if err := unstructured.SetNestedMap(u.Object, map[string]any{method: content}, "spec", "bootstrap"); err != nil {
+			panic(err)
+		}
+	}
+}
+
+// A namespace restore skips a Cluster that declares its own bootstrap method,
+// names the method in the item's message, and never deletes it. Flux would
+// create it again with that method, the webhook would refuse it while the run
+// waits, and the database would stay down until the timeout. The volumes
+// restore as usual.
+func TestANamespaceRestoreLeavesAClusterWithADeclaredBootstrapAlone(t *testing.T) {
+	for name, method := range map[string]func(*unstructured.Unstructured){
+		"pg_basebackup": declaring("pg_basebackup", map[string]any{"source": "legacy-db"}),
+		"recovery":      declaring("recovery", map[string]any{"source": "owners-archive"}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, c := restoreReconciler(t, prober{saturday},
+				restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
+				claim(), volumeRestore(), repository(), cluster(method), objectStore(), storeSecret())
+
+			restoreStep(t, r) // plan
+			run := readRestoreRun(t, c)
+			if item := run.Status.Items[1]; item.Phase != backupv1alpha1.ItemSkipped || !strings.Contains(item.Message, "spec.bootstrap."+name) {
+				t.Fatalf("database item = %+v (%s), want Skipped naming spec.bootstrap.%s", item, readyMessage(run.Status.Conditions), name)
+			}
+			restoreStep(t, r) // restore the volume
+			completeVolume(t, c)
+			restoreStep(t, r)
+
+			run = readRestoreRun(t, c)
+			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
+				t.Errorf("phase = %q, items = %+v; want Succeeded with the volume restored", run.Status.Phase, run.Status.Items)
+			}
+			if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+				t.Errorf("the Cluster declaring %s was deleted", name)
+			}
+		})
+	}
+}
+
+// A restore of one database that declares its own bootstrap method ends as
+// Invalid at its checks, naming the method, and leaves the Cluster alone.
+func TestARestoreOfADatabaseWithADeclaredBootstrapIsInvalid(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday},
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }),
+		cluster(declaring("pg_basebackup", map[string]any{"source": "legacy-db"})), objectStore(), storeSecret())
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
+		!strings.Contains(readyMessage(run.Status.Conditions), "spec.bootstrap.pg_basebackup") {
+		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, naming spec.bootstrap.pg_basebackup",
+			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
+	}
+	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+		t.Error("the Cluster declaring pg_basebackup was deleted")
+	}
+}
+
+// A Cluster the webhook recovered in an earlier restore carries the recovery
+// the webhook wrote, with source backup-controller. That recovery is the
+// controller's own, so a later restore restores the Cluster as usual.
+func TestARestoreOfAClusterTheWebhookRecoveredBeforeDeletesIt(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday},
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }),
+		cluster(declaring("recovery", map[string]any{"source": bootstrap.RecoverySource})), objectStore(), storeSecret())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // delete
+
+	run := readRestoreRun(t, c)
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemDeleted {
+		t.Fatalf("phase = %q, item = %+v (%s); want the Cluster deleted for recovery", run.Status.Phase, item, readyMessage(run.Status.Conditions))
+	}
+}
