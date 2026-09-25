@@ -267,6 +267,14 @@ spec:
                   backup.wlz.li/quiesce, or found that none were marked.
                 format: date-time
                 type: string
+              restartPending:
+                description: |-
+                  RestartPending is true from the moment the run records restartedAt
+                  until it has given every stopped workload its replicas back and resumed
+                  every Kustomization it suspended. The run records the moment first, so
+                  a pass that starts the workloads and then loses its status write is
+                  retried with the same restartedAt.
+                type: boolean
               restartedAt:
                 description: RestartedAt is when the run gave those workloads their
                   replicas back.

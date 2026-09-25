@@ -668,7 +668,7 @@ func TestAQuiescedRestoreRetriedAfterALostStatusWriteGivesTheAppBack(t *testing.
 		deployment(), kustomization(false), writerPod())
 	restoreStep(t, r) // plan
 
-	r.Client = loseStatusWriteAfterStop(c)
+	r.Client = loseStatusWriteAt(c, 0)
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
 		t.Fatal("the quiesce pass succeeded, want its lost status write returned")
 	}

@@ -597,7 +597,7 @@ func TestAQuiesceRetriedAfterALostStatusWriteStillRestartsTheApp(t *testing.T) {
 	step(t, r) // plan
 	step(t, r) // admit, no queue
 
-	r.Client = loseStatusWriteAfterStop(c)
+	r.Client = loseStatusWriteAt(c, 0)
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err == nil {
 		t.Fatal("the quiesce pass succeeded, want its lost status write returned")
 	}
@@ -620,5 +620,72 @@ func TestAQuiesceRetriedAfterALostStatusWriteStillRestartsTheApp(t *testing.T) {
 	}
 	if suspended(t, c) {
 		t.Error("the Kustomization the run suspended stayed suspended")
+	}
+}
+
+// A restart pass whose status write is lost after the app was started again
+// is run again a minute later. The retry keeps the restart moment the first
+// pass chose, so the snapshot is moved to a time before the app wrote
+// anything.
+func TestARestartRetriedAfterALostStatusWriteKeepsItsMoment(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // start
+	cutClone(t, c)
+
+	r.Client = loseStatusWriteAt(c, 2)
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err == nil {
+		t.Fatal("the restart pass succeeded, want its lost status write returned")
+	}
+	if got := replicasOf(t, c); got != 2 {
+		t.Fatalf("replicas = %d after the restart pass, want 2", got)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(time.Minute) }
+	step(t, r) // restart again
+	complete(t, c, "snapshot 6e473100 saved")
+	step(t, r) // collect
+
+	run := readBackupRun(t, c)
+	if run.Status.RestartedAt == nil || !run.Status.RestartedAt.Time.Equal(frozen) {
+		t.Errorf("restartedAt = %v, want %s, the moment of the first restart", run.Status.RestartedAt, frozen)
+	}
+	calls := r.Retimer.(*retimer).calls
+	if len(calls) != 1 || !calls[0].at.Equal(frozen) {
+		t.Errorf("retime calls = %+v, want the snapshot moved to %s", calls, frozen)
+	}
+}
+
+// A clock with a fraction of a second gives the run a restartedAt in whole
+// seconds, the precision the status keeps. A snapshot moved in the same pass
+// that starts the app carries that same whole-second time, so it matches
+// restartedAt as later passes and a synced restore read it back.
+func TestARestartMomentIsKeptInWholeSeconds(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	r.Now = func() time.Time { return frozen.Add(500 * time.Millisecond) }
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // start
+
+	// The mover finishes and VolSync removes the clone before the run looks
+	// again, so the run starts the app and moves the snapshot in one pass.
+	complete(t, c, "snapshot 6e473100 saved")
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+		t.Fatalf("phase = %q (%s), want Succeeded", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	calls := r.Retimer.(*retimer).calls
+	if len(calls) != 1 || !calls[0].at.Equal(run.Status.RestartedAt.Time) {
+		t.Errorf("retime calls = %+v, want the snapshot moved to restartedAt %s", calls, run.Status.RestartedAt)
+	}
+	if run.Status.QuiescedAt.Time != run.Status.QuiescedAt.Truncate(time.Second) {
+		t.Errorf("quiescedAt = %s, want whole seconds", run.Status.QuiescedAt.Format(time.RFC3339Nano))
 	}
 }

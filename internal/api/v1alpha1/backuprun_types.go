@@ -78,6 +78,14 @@ type BackupRunStatus struct {
 	// +optional
 	RestartedAt *metav1.Time `json:"restartedAt,omitempty"`
 
+	// RestartPending is true from the moment the run records restartedAt
+	// until it has given every stopped workload its replicas back and resumed
+	// every Kustomization it suspended. The run records the moment first, so
+	// a pass that starts the workloads and then loses its status write is
+	// retried with the same restartedAt.
+	// +optional
+	RestartPending bool `json:"restartPending,omitempty"`
+
 	// Quiesced lists the workloads this run scaled to zero, each with the
 	// replica count the run restores when it starts them again.
 	// +optional

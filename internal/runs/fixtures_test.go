@@ -305,12 +305,13 @@ func getUnstructured(t *testing.T, c client.Client, gvk schema.GroupVersionKind,
 	return u, err == nil
 }
 
-// loseStatusWriteAfterStop returns a client over c that fails one status
-// write of a BackupRun or RestoreRun with a conflict: the first one made
-// while the app's Deployment stands at zero replicas. It stands in for a
-// quiesce pass whose status write is lost after the app was stopped, through
-// a conflict or a controller crash.
-func loseStatusWriteAfterStop(c client.Client) client.Client {
+// loseStatusWriteAt returns a client over c that fails one status write of a
+// BackupRun or RestoreRun with a conflict: the first one made while the app's
+// Deployment stands at the replica count given in replicas. With 0 it stands
+// in for a quiesce pass whose status write is lost after the app was
+// stopped, and with 2 for a pass that loses it after the app was started
+// again. A conflict and a controller crash both lose the write.
+func loseStatusWriteAt(c client.Client, replicas int32) client.Client {
 	lost := false
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
@@ -318,7 +319,7 @@ func loseStatusWriteAfterStop(c client.Client) client.Client {
 			_, restore := obj.(*backupv1alpha1.RestoreRun)
 			if (backup || restore) && !lost {
 				d := &appsv1.Deployment{}
-				if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: appN}, d); err == nil && d.Spec.Replicas != nil && *d.Spec.Replicas == 0 {
+				if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: appN}, d); err == nil && d.Spec.Replicas != nil && *d.Spec.Replicas == replicas {
 					lost = true
 					return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("runs").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
 				}

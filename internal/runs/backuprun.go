@@ -243,9 +243,13 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // On a run with spec.all set, the first pass calls quiesce to stop the
 // workloads marked backup.wlz.li/quiesce and does nothing else. Later passes
 // start no item until every pod of those workloads is gone. work then starts
-// every Pending item. Once every volume's clone is cut, it scales the
-// workloads back up, resumes the Kustomizations it suspended, and records
-// status.restartedAt. Last, it collects the result of every Running item.
+// every Pending item. Once every volume's clone is cut, it records the time
+// of the pass in status.restartedAt with status.restartPending set, and
+// writes the status. It then scales the workloads back up, resumes the
+// Kustomizations it suspended, and clears status.restartPending. A pass that
+// finds status.restartPending set repeats the restart and keeps the recorded
+// moment. Times in the status are whole seconds. Last, it collects the result
+// of every Running item.
 //
 // The run finishes once every item is done and, on a run with spec.all set,
 // the workloads are running again. It finishes Succeeded when no item failed
@@ -253,7 +257,9 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // workloads are stopped, work looks again every two seconds; otherwise it
 // waits pollInterval.
 func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
-	now := metav1.NewTime(r.Now())
+	// The status keeps times in whole seconds. A snapshot moved in this pass
+	// must carry the restartedAt that later passes read back.
+	now := metav1.NewTime(r.Now()).Rfc3339Copy()
 	deadline, over, err := r.overdue(ctx, run)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -293,10 +299,18 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	}
 
 	if run.Spec.All && run.Status.RestartedAt == nil && r.clonesCut(ctx, run) {
+		// The moment is written before the workloads start, so a pass that
+		// starts them and then loses its status write is retried with it.
+		run.Status.RestartedAt, run.Status.RestartPending = newTime(now), true
+		if err := r.writeStatus(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if run.Status.RestartPending {
 		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 			return ctrl.Result{}, err
 		}
-		run.Status.RestartedAt = newTime(now)
+		run.Status.RestartPending = false
 	}
 
 	for i := range run.Status.Items {
@@ -663,12 +677,20 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 // before status.quiescedAt is set, because the pass that wrote the plan may
 // have stopped them and then lost its status write. release then deletes the
 // run's Workload.
+//
+// A run with status.restartPending set has chosen its restart moment and may
+// not have started the workloads yet. release starts them and keeps that
+// moment.
 func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.BackupRun) error {
-	if (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil {
+	holding := (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil
+	if holding || run.Status.RestartPending {
 		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 			return err
 		}
-		run.Status.RestartedAt = newTime(metav1.NewTime(r.Now()))
+		if run.Status.RestartedAt == nil {
+			run.Status.RestartedAt = newTime(metav1.NewTime(r.Now()).Rfc3339Copy())
+		}
+		run.Status.RestartPending = false
 	}
 	return deleteWorkload(ctx, r.Client, run.Namespace, run.UID)
 }
