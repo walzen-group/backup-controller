@@ -504,12 +504,19 @@ func (r *BackupRunReconciler) clonesCut(ctx context.Context, run *backupv1alpha1
 // leaves the item Running until then.
 //
 // A volume item is done when its ReplicationSource has completed the run's
-// trigger tag. A failed mover fails the item with the mover's logs. A volume
-// with no files succeeds with Empty set, since VolSync takes no snapshot of
-// it. Otherwise the item records the snapshot ID the mover logged and the
-// time restic stamped on it. On a quiesced run, the snapshot is first moved to
-// status.restartedAt and tagged quiesced, and the item stays Running until
-// that rewrite succeeds.
+// trigger tag. VolSync completes a tag only after a mover Job succeeds. A Job
+// that fails leaves the tag open: VolSync writes the logs into
+// status.latestMoverStatus, deletes the Job and starts another, for as long
+// as the tag stays. So while the tag is open, a Failed result that
+// moverFailed places in this run's sync fails the item with the mover's
+// logs, and collectItem deletes the source to stop the retries. The next run
+// writes a fresh source, where the dead tag would have kept it waiting with
+// reason SourceBusy. When the delete fails, the item's message says so. A
+// volume with no files succeeds with Empty set, since
+// VolSync takes no snapshot of it. Otherwise the item records the snapshot ID
+// the mover logged and the time restic stamped on it. On a quiesced run, the
+// snapshot is first moved to status.restartedAt and tagged quiesced, and the
+// item stays Running until that rewrite succeeds.
 //
 // A database item follows the phase of its CloudNativePG Backup.
 func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) {
@@ -520,6 +527,15 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 			return
 		}
 		if lastManual(source) != item.Trigger {
+			if logs, failed := moverFailed(source, item.Trigger, run.Status.StartedAt); failed {
+				// VolSync retries a failed Job forever and keeps the trigger
+				// until one succeeds. Deleting the source stops the retries,
+				// and the next run writes a fresh one.
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, logs
+				if err := r.Delete(ctx, source); err != nil && !apierrors.IsNotFound(err) {
+					item.Message += fmt.Sprintf("\nthe ReplicationSource could not be deleted, so VolSync keeps retrying it and later runs wait for it: %v", err)
+				}
+			}
 			return
 		}
 		if source.Status.LatestMoverStatus != nil && source.Status.LatestMoverStatus.Result == volsyncv1alpha1.MoverResultFailed {

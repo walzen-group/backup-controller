@@ -715,3 +715,67 @@ func TestALeftoverCloneDoesNotRestartTheApp(t *testing.T) {
 		})
 	}
 }
+
+// failMover stands in for VolSync reporting a failed mover Job on the claim's
+// source while it syncs the run's trigger. VolSync writes the logs into
+// latestMoverStatus, deletes the Job and tries again, and it leaves
+// lastManualSync alone until a Job succeeds. The sync started at the time
+// given in started.
+func failMover(t *testing.T, c client.Client, started time.Time) {
+	t.Helper()
+	source := &volsyncv1alpha1.ReplicationSource{}
+	get(t, c, ns, claimN, source)
+	at := metav1.NewTime(started)
+	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{
+		LastSyncStartTime: &at,
+		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "Fatal: unable to open config file"},
+	}
+	if err := c.Status().Update(context.Background(), source); err != nil {
+		t.Fatalf("fail the mover: %v", err)
+	}
+}
+
+// A mover that fails during the run's sync fails the item with the mover's
+// logs, and the run ends Failed. VolSync would retry the Job forever and
+// never complete the trigger. The run deletes the source, which stops those
+// retries, so the next run writes a fresh source and does not wait on the
+// dead trigger.
+func TestAFailedMoverFailsTheItem(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore(), repository())
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // start
+
+	failMover(t, c, frozen.Add(10*time.Second))
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Fatalf("phase = %q (%s), want Failed", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "unable to open config file") {
+		t.Errorf("item = %+v, want it Failed with the mover's logs", item)
+	}
+	source := &volsyncv1alpha1.ReplicationSource{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: claimN}, source); err == nil {
+		t.Errorf("the source still holds the dead trigger %q, and the next run would wait on it", manualTag(source))
+	}
+}
+
+// A Failed result from a sync that started before this run is not this
+// run's, so the item keeps waiting for its own sync.
+func TestAFailedResultFromAnEarlierSyncIsIgnored(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore(), repository())
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // start
+
+	failMover(t, c, frozen.Add(-time.Hour))
+	step(t, r)
+
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
+		t.Errorf("item = %+v, want it still Running", item)
+	}
+}

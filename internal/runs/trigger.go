@@ -14,6 +14,7 @@ import (
 	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -105,4 +106,34 @@ func moverOutcome(source *volsyncv1alpha1.ReplicationSource) (snapshot string, e
 		return match[1], false
 	}
 	return "", strings.Contains(logs, emptyDirectory)
+}
+
+// moverFailed reports whether a mover Job failed in the sync of a run's
+// trigger, and returns the mover's logs when it did.
+//
+// Parameters:
+//   - trigger is the item's trigger tag.
+//   - started is the run's status.startedAt. The run writes its trigger
+//     after that moment, so VolSync starts the sync of that trigger after it
+//     too.
+//
+// VolSync writes status.latestMoverStatus only when a mover Job ends, and it
+// never clears it. A sync completes only after a Job succeeds, so when the
+// previous sync completed, the status held a Successful result. A Failed
+// result counts only while the source still carries the trigger, has not
+// completed it, and is in a sync that VolSync started at or after the run's
+// start, which it records in status.lastSyncStartTime. A Failed result
+// written before that sync began belongs to an earlier one.
+func moverFailed(source *volsyncv1alpha1.ReplicationSource, trigger string, started *metav1.Time) (string, bool) {
+	if manualTag(source) != trigger || lastManual(source) == trigger || source.Status == nil || started == nil {
+		return "", false
+	}
+	status := source.Status
+	if status.LatestMoverStatus == nil || status.LatestMoverStatus.Result != volsyncv1alpha1.MoverResultFailed {
+		return "", false
+	}
+	if status.LastSyncStartTime == nil || status.LastSyncStartTime.Before(started) {
+		return "", false
+	}
+	return status.LatestMoverStatus.Logs, true
 }
