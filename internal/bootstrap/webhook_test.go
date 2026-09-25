@@ -11,12 +11,15 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/testinfra/barmanstore"
+	"github.com/walzen-group/backup-controller/internal/testinfra/s3fault"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,11 +32,12 @@ import (
 )
 
 // stubProber is a Prober that returns fixed answers, so the handler can be
-// tested without an object store. Both methods also return the err field.
+// tested without an object store, for the cases whose outcome doesn't depend
+// on what the store holds. BaseBackups lists no backup. Both methods also
+// return the err field.
 type stubProber struct {
-	has     bool
-	err     error
-	backups []BaseBackup
+	has bool
+	err error
 }
 
 func (s stubProber) HasBaseBackup(context.Context, Location) (bool, error) {
@@ -41,7 +45,7 @@ func (s stubProber) HasBaseBackup(context.Context, Location) (bool, error) {
 }
 
 func (s stubProber) BaseBackups(context.Context, Location) ([]BaseBackup, error) {
-	return s.backups, s.err
+	return nil, s.err
 }
 
 // scheme registers the core and backup types, plus ObjectStore and Cluster as
@@ -377,7 +381,7 @@ func TestARecreateOfTheSameClusterIsNotACollision(t *testing.T) {
 	existing.SetAPIVersion("postgresql.cnpg.io/v1")
 	existing.SetKind("Cluster")
 
-	response := decide(t, cluster(t, nil), stubProber{has: true}, existing)
+	response := decideOn(t, cluster(t, nil), recordedS3(t, barmanstore.MustLoad(t, "done-base")), existing)
 
 	if !response.Allowed {
 		t.Fatalf("recreating a database was refused: %v", response.Result)
@@ -388,9 +392,10 @@ func TestARecreateOfTheSameClusterIsNotACollision(t *testing.T) {
 }
 
 // TestAnEmptyStoreLeavesTheClusterOnInitdb checks that a Cluster whose store
-// holds no base backup is admitted without a patch.
+// holds no base backup is admitted without a patch, through the real S3Prober
+// against the empty store that barman-cloud 3.20.0 recorded.
 func TestAnEmptyStoreLeavesTheClusterOnInitdb(t *testing.T) {
-	response := decide(t, cluster(t, nil), stubProber{has: false})
+	response := decideOn(t, cluster(t, nil), recordedS3(t, barmanstore.MustLoad(t, "empty")))
 
 	if !response.Allowed {
 		t.Fatalf("the cluster was refused: %v", response.Result)
@@ -403,10 +408,11 @@ func TestAnEmptyStoreLeavesTheClusterOnInitdb(t *testing.T) {
 // TestAStoreWithABackupRecoversTheCluster checks the rewrite of a Cluster
 // whose store holds a base backup: initdb is gone, the recovery reads through
 // one externalClusters entry named RecoverySource with the Cluster's own name
-// as serverName, and SkipCheckAnnotation is "enabled".
+// as serverName, and SkipCheckAnnotation is "enabled". The store is the
+// recorded done-base store, read through the real S3Prober.
 func TestAStoreWithABackupRecoversTheCluster(t *testing.T) {
 	original := cluster(t, nil)
-	response := decide(t, original, stubProber{has: true})
+	response := decideOn(t, original, recordedS3(t, barmanstore.MustLoad(t, "done-base")))
 
 	if !response.Allowed {
 		t.Fatalf("the cluster was refused: %v", response.Result)
@@ -462,7 +468,7 @@ func TestTheDatabaseAndOwnerSurviveTheRewrite(t *testing.T) {
 		}
 	})
 
-	response := decide(t, original, stubProber{has: true})
+	response := decideOn(t, original, recordedS3(t, barmanstore.MustLoad(t, "done-base")))
 	patched := applied(t, original, response)
 
 	database, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "database")
@@ -527,10 +533,6 @@ func waiting(asOf *string) *backupv1alpha1.RestoreRun {
 	}
 }
 
-// monday is midnight UTC on Monday 2026-09-21, the reference moment for the
-// base backup times in the RestoreRun cases.
-var monday = time.Date(2026, 9, 21, 0, 0, 0, 0, time.UTC)
-
 // TestADeclaredRecoveryIsRefusedWhenAnotherArchivesThere checks that the
 // collision check also applies to a Cluster that declares its own recovery. A
 // declared recovery archives like any other Cluster, and two databases writing
@@ -560,13 +562,14 @@ func TestADeclaredRecoveryIsRefusedWhenAnotherArchivesThere(t *testing.T) {
 
 // TestARunWaitingForTheClusterSetsItsTarget checks that a RestoreRun waiting
 // for the Cluster sets the recovery target to its restoreAsOf, and that the
-// Cluster is annotated with the run's name.
+// Cluster is annotated with the run's name. The store is done-base, shifted
+// so its completed backup starts at sunday.
 func TestARunWaitingForTheClusterSetsItsTarget(t *testing.T) {
 	asOf := "2026-09-22T00:00:00Z"
 	original := cluster(t, nil)
-	prober := stubProber{has: true, backups: []BaseBackup{{ID: "20260920T030000", End: monday.Add(-24 * time.Hour)}}}
+	server := recordedS3(t, recordedAt(t, "done-base", sunday))
 
-	response := decide(t, original, prober, waiting(&asOf))
+	response := decideOn(t, original, server, waiting(&asOf))
 	if !response.Allowed {
 		t.Fatalf("the cluster was refused: %v", response.Result)
 	}
@@ -584,15 +587,16 @@ func TestARunWaitingForTheClusterSetsItsTarget(t *testing.T) {
 
 // TestASyncedRunRecoversToTheVolumesMoment checks that a RestoreRun with
 // syncDatabaseToVolume recovers the database to its status.syncedTo. That is
-// the moment the run found on the volumes' quiesced snapshots.
+// the moment the run found on the volumes' quiesced snapshots. The store is
+// done-base, shifted so its completed backup starts at sunday.
 func TestASyncedRunRecoversToTheVolumesMoment(t *testing.T) {
 	original := cluster(t, nil)
-	prober := stubProber{has: true, backups: []BaseBackup{{ID: "20260920T030000", End: monday.Add(-24 * time.Hour)}}}
+	server := recordedS3(t, recordedAt(t, "done-base", sunday))
 	run := waiting(nil)
 	run.Spec.SyncDatabaseToVolume = true
 	run.Status.SyncedTo = &metav1.Time{Time: time.Date(2026, 9, 21, 3, 0, 5, 0, time.UTC)}
 
-	response := decide(t, original, prober, run)
+	response := decideOn(t, original, server, run)
 	if !response.Allowed {
 		t.Fatalf("the cluster was refused: %v", response.Result)
 	}
@@ -609,7 +613,7 @@ func TestASyncedRunRecoversToTheVolumesMoment(t *testing.T) {
 // Cluster is still annotated with the run's name.
 func TestARunWithoutAMomentRecoversToTheEndOfTheArchive(t *testing.T) {
 	original := cluster(t, nil)
-	response := decide(t, original, stubProber{has: true}, waiting(nil))
+	response := decideOn(t, original, recordedS3(t, barmanstore.MustLoad(t, "done-base")), waiting(nil))
 	patched := applied(t, original, response)
 
 	if _, found, _ := unstructured.NestedMap(patched, "spec", "bootstrap", "recovery", "recoveryTarget"); found {
@@ -637,15 +641,16 @@ func TestADeclaredRecoveryIsRefusedWhileARunWaits(t *testing.T) {
 
 // TestTheRestoreAsOfAnnotationSetsTheTarget checks that, with no RestoreRun
 // waiting, the Cluster's backup.wlz.li/restore-as-of annotation sets the
-// recovery target.
+// recovery target. The store is done-base, shifted so its completed backup
+// starts at sunday.
 func TestTheRestoreAsOfAnnotationSetsTheTarget(t *testing.T) {
 	original := cluster(t, func(object map[string]any) {
 		metadata, _ := object["metadata"].(map[string]any)
 		metadata["annotations"] = map[string]any{backupv1alpha1.AnnotationRestoreAsOf: "2026-09-22T00:00:00Z"}
 	})
-	prober := stubProber{has: true, backups: []BaseBackup{{ID: "a", End: monday}}}
+	server := recordedS3(t, recordedAt(t, "done-base", sunday))
 
-	response := decide(t, original, prober)
+	response := decideOn(t, original, server)
 	patched := applied(t, original, response)
 
 	target, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "recoveryTarget", "targetTime")
@@ -657,25 +662,35 @@ func TestTheRestoreAsOfAnnotationSetsTheTarget(t *testing.T) {
 // TestATargetBeforeEveryBaseBackupIsRefused checks that a target before the
 // oldest base backup finished is refused, and that the refusal names that
 // backup. Postgres can never reach such a target.
+//
+// The store is many-failed, as barman-cloud 3.20.0 recorded it: 160 failed
+// base backups and then one completed one, shifted so the completed one
+// starts at sunday. The refusal must name the completed backup, since a
+// failed one is no base backup to recover from.
 func TestATargetBeforeEveryBaseBackupIsRefused(t *testing.T) {
 	asOf := "2026-09-01T00:00:00Z"
-	prober := stubProber{has: true, backups: []BaseBackup{{ID: "20260920T030000", End: monday}}}
+	recorded := recordedAt(t, "many-failed", sunday)
+	oldestFailed := recorded.Backups()["app-pg"][0]
 
-	response := decide(t, cluster(t, nil), prober, waiting(&asOf))
+	response := decideOn(t, cluster(t, nil), recordedS3(t, recorded), waiting(&asOf))
 
 	if response.Allowed {
 		t.Fatal("a target before every base backup was admitted")
 	}
-	if !strings.Contains(response.Result.Message, "20260920T030000") {
-		t.Errorf("the refusal does not name the oldest backup: %q", response.Result.Message)
+	if !strings.Contains(response.Result.Message, sundayID) {
+		t.Errorf("the refusal does not name the oldest completed backup %s: %q", sundayID, response.Result.Message)
+	}
+	if strings.Contains(response.Result.Message, oldestFailed) {
+		t.Errorf("the refusal names the failed backup %s: %q", oldestFailed, response.Result.Message)
 	}
 }
 
 // TestARunIsRefusedWhenTheStoreHoldsNoBaseBackup checks that a Cluster a
 // RestoreRun waits for is refused when its store holds no base backup. A run
-// that asks for a recovery must never get an empty database back.
+// that asks for a recovery must never get an empty database back. The store
+// is the recorded empty store.
 func TestARunIsRefusedWhenTheStoreHoldsNoBaseBackup(t *testing.T) {
-	response := decide(t, cluster(t, nil), stubProber{has: false}, waiting(nil))
+	response := decideOn(t, cluster(t, nil), recordedS3(t, barmanstore.MustLoad(t, "empty")), waiting(nil))
 
 	if response.Allowed {
 		t.Fatal("a Cluster a RestoreRun waits for was admitted to initdb")
@@ -772,11 +787,21 @@ func TestAClusterThatArchivesNowhereIsLeftAlone(t *testing.T) {
 // the object store can't be listed. Allowing it would create an empty database
 // beside a full archive and report success, which is the failure this webhook
 // exists to remove.
+//
+// The store is the recorded done-base store behind an s3fault proxy that
+// answers every request with 503 SlowDown, so the real S3Prober gets the
+// error after minio-go has spent its own retries.
 func TestAnUnreadableStoreRefusesTheCluster(t *testing.T) {
-	response := decide(t, cluster(t, nil), stubProber{err: errors.New("the endpoint refused the connection")})
+	endpoint, proxy := faultyS3(t, recordedS3(t, barmanstore.MustLoad(t, "done-base")))
+	unavailable := proxy.Add(s3fault.Rule{Status: http.StatusServiceUnavailable, Code: "SlowDown"})
+
+	response := decideWith(t, cluster(t, nil), S3Prober{}, storeAt(endpoint))
 
 	if response.Allowed {
 		t.Fatal("a cluster was admitted while its store could not be read")
+	}
+	if unavailable.Hits() == 0 {
+		t.Error("the store was refused without a request reaching the 503 rule")
 	}
 }
 
