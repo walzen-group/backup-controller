@@ -17,6 +17,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // Operations are the Kubernetes API calls the callbacks make. The binary
@@ -30,7 +31,20 @@ type Operations interface {
 	CreateSecret(ctx context.Context, secret *corev1.Secret) error
 	DeleteSecret(ctx context.Context, namespace, name string) error
 	SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error
+	// UpdateVolumeRestore writes the VolumeRestore's metadata, which is how
+	// the callbacks add and remove Finalizer. The write carries the
+	// resourceVersion of the object passed, so it fails with a conflict when
+	// the object has changed since it was read.
+	UpdateVolumeRestore(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error
 }
+
+// Finalizer is the finalizer the populator keeps on a VolumeRestore while a
+// claim has an entry in its status.claims. The library looks the VolumeRestore
+// up before it handles a deleted claim, and when the VolumeRestore is gone it
+// returns without calling Cleanup and leaves its own finalizer on the claim.
+// This finalizer keeps the VolumeRestore in place until Cleanup has deleted
+// the claim's ReplicationDestination and Secret copy.
+const Finalizer = "backup.wlz.li/volume-populator"
 
 // Callbacks holds the three functions that the volume populator library calls
 // for a claim whose data source is a VolumeRestore: Populate, Complete and
@@ -103,11 +117,12 @@ func (c *Callbacks) pinnedOutOfReach(ctx context.Context, vr *backupv1alpha1.Vol
 // Populate starts filling one claim from its VolumeRestore. The params the
 // library passes carry the claim, the prime claim and the VolumeRestore.
 //
-// It copies the repository Secret that the VolumeRestore names from the
-// claim's namespace into the controller namespace, and creates the
-// ReplicationDestination that restores into the prime claim. Both steps leave
-// an object that already exists alone, so a repeated call creates nothing
-// twice.
+// It first puts Finalizer on the VolumeRestore with holdVolumeRestore, and
+// returns an error when it can't. Then it copies the repository Secret that
+// the VolumeRestore names from the claim's namespace into the controller
+// namespace, and creates the ReplicationDestination that restores into the
+// prime claim. Both steps leave an object that already exists alone, so a
+// repeated call creates nothing twice.
 //
 // Before it creates the destination, it checks a pinned restore with
 // pinnedOutOfReach. When no snapshot reaches the pinned moment, it marks the
@@ -133,6 +148,9 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 	}
 	claim := params.Pvc
 	prime := params.PvcPrime
+	if err := c.holdVolumeRestore(ctx, vr); err != nil {
+		return err
+	}
 
 	repo, err := c.operations.GetSecret(ctx, claim.Namespace, vr.Spec.Repository)
 	if err != nil {
@@ -241,7 +259,12 @@ func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.Popu
 // It then removes the claim's entry from the VolumeRestore's status.claims.
 // It sets Ready to True with reason Restored when no claim is left, and to
 // False with reason Restoring while other claims are still being filled. It
-// writes the status only when that changed something.
+// writes the status only when that changed something. When the VolumeRestore
+// is gone by then, it returns nil, because nothing is left to report on.
+//
+// Once no claim is left in status.claims, it removes Finalizer from the
+// VolumeRestore. A VolumeRestore deleted while a claim was being filled goes
+// then.
 func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.PopulatorParams) error {
 	if err := validateCleanupParams(params); err != nil {
 		return err
@@ -275,11 +298,50 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 	// calls Cleanup again, for the life of the claim. Writing every time would
 	// send one status update per volume every resync interval, for as long as
 	// the claim exists, and none of them would change anything.
-	if equality.Semantic.DeepEqual(before, &vr.Status) {
+	if !equality.Semantic.DeepEqual(before, &vr.Status) {
+		if err := c.operations.SetStatus(ctx, vr); err != nil {
+			if apierrors.IsNotFound(err) {
+				// The VolumeRestore is gone, and so is the status that
+				// reported this claim. The Secret copy and the destination
+				// are already deleted, which is all this claim needed.
+				return nil
+			}
+			return fmt.Errorf("set VolumeRestore status: %w", err)
+		}
+	}
+
+	// The status write above bumped the resource version in vr, so this
+	// update doesn't conflict with it. It does conflict when another claim's
+	// Populate has added an entry since the object was read, and then the
+	// finalizer stays for that claim.
+	if len(vr.Status.Claims) == 0 && controllerutil.ContainsFinalizer(vr, Finalizer) {
+		controllerutil.RemoveFinalizer(vr, Finalizer)
+		if err := c.operations.UpdateVolumeRestore(ctx, vr); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("remove finalizer %s from VolumeRestore: %w", Finalizer, err)
+		}
+	}
+	return nil
+}
+
+// holdVolumeRestore adds Finalizer to the VolumeRestore that vr holds, and
+// writes it, unless it's there already. Populate calls it before it creates
+// anything, so the VolumeRestore stays until Cleanup has deleted what
+// Populate created.
+//
+// It returns an error, and adds nothing, when the VolumeRestore is being
+// deleted without the finalizer: the API server refuses a new finalizer on
+// such an object, so a restore started from it could leave the Secret copy
+// behind. It also returns an error when the write fails.
+func (c *Callbacks) holdVolumeRestore(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
+	if controllerutil.ContainsFinalizer(vr, Finalizer) {
 		return nil
 	}
-	if err := c.operations.SetStatus(ctx, vr); err != nil {
-		return fmt.Errorf("set VolumeRestore status: %w", err)
+	if vr.DeletionTimestamp != nil {
+		return fmt.Errorf("VolumeRestore %s/%s is being deleted, so no restore starts from it", vr.Namespace, vr.Name)
+	}
+	controllerutil.AddFinalizer(vr, Finalizer)
+	if err := c.operations.UpdateVolumeRestore(ctx, vr); err != nil {
+		return fmt.Errorf("add finalizer %s to VolumeRestore %s/%s: %w", Finalizer, vr.Namespace, vr.Name, err)
 	}
 	return nil
 }
