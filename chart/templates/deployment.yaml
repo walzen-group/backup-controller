@@ -6,6 +6,11 @@ metadata:
     {{- include "backup-controller.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # The controller runs without leader election, so two pods would run two
+  # schedulers and two sets of reconcilers. Recreate stops the old pod before
+  # the new one starts, where the default RollingUpdate overlaps them.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "backup-controller.selectorLabels" . | nindent 6 }}
@@ -40,6 +45,11 @@ spec:
         - name: runs-metrics
           containerPort: 8081
           protocol: TCP
+        # The run controllers' manager serves /healthz and /readyz here
+        # (--health-probe-addr, default :8082).
+        - name: health
+          containerPort: 8082
+          protocol: TCP
         {{- if .Values.webhook.enabled }}
         - name: webhook
           containerPort: {{ .Values.webhook.port }}
@@ -52,12 +62,25 @@ spec:
           mountPath: /etc/webhook/tls
           readOnly: true
         {{- end }}
-        # The library registers only the configured metrics path and serves no
-        # health route, so this container declares no liveness or readiness
-        # probe: a probe against the metrics port would prove the process
-        # listens and nothing about its state. The image is a static binary on
-        # scratch with no writable path, and the container runs with no
-        # capabilities, which is what lets the root filesystem stay read-only.
+        # /healthz answers while the manager runs. A manager that stops exits
+        # the process, so the liveness probe covers a manager that hangs.
+        # /readyz waits until the webhook server, when there is one, accepts
+        # TLS connections, so the webhook's Service sends the API server to
+        # this pod only once it can answer. The populator library serves no
+        # health route of its own, and exits the process when it fails.
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          periodSeconds: 5
+        # The image is a static binary on scratch with no writable path, and
+        # the container runs with no capabilities, which is what lets the root
+        # filesystem stay read-only.
         securityContext:
           runAsNonRoot: true
           allowPrivilegeEscalation: false

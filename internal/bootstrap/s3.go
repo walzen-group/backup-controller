@@ -18,37 +18,46 @@ import (
 // Location it's given.
 type S3Prober struct{}
 
-// HasBaseBackup reports whether the location holds at least one object under
-// its base prefix. The webhook calls it to decide between recovering a new
-// Cluster and leaving it on initdb.
+// HasBaseBackup reports whether the location holds at least one completed base
+// backup, one whose backup.info has status DONE. The webhook calls it to
+// decide between recovering a new Cluster and leaving it as written.
 //
 // The at argument is the database's Location, as ResolveLocation returns it.
 //
-// It asks the store for one object and stops. barman writes a directory per
-// backup, so anything below <server>/base/ answers the question, and a store
-// holding years of backups is as quick to check as an empty one. It returns an
-// error when the client can't be built from the location or the listing
-// fails.
+// barman writes a backup's directory under <server>/base/ when the backup
+// starts, so a backup that failed or never finished leaves objects there too,
+// and a recovery can't start from one. The method walks the listing in key
+// order, reads each backup.info it meets, and stops at the first DONE one.
+// barman names each directory by its start time, so the oldest backup is read
+// first, and in a store that keeps its backups that one is done. It returns an
+// error when the client can't be built from the location, when the listing
+// fails, or when a backup.info can't be read or a DONE one has an unparsable
+// end_time.
 func (p S3Prober) HasBaseBackup(ctx context.Context, at Location) (bool, error) {
 	client, err := p.client(at)
 	if err != nil {
 		return false, err
 	}
 
-	// MaxKeys makes the server stop after one object. Breaking out of the
-	// channel early would leak the goroutine the SDK starts for the listing.
-	listing := client.ListObjects(ctx, at.Bucket, minio.ListObjectsOptions{
-		Prefix:  at.BasePrefix(),
-		MaxKeys: 1,
-	})
-	object, ok := <-listing
-	if !ok {
-		return false, nil
+	// The iterator form has no goroutine behind it, so returning from inside
+	// the loop stops the listing without leaking anything.
+	listing := client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.BasePrefix(), Recursive: true})
+	for object := range listing {
+		if object.Err != nil {
+			return false, fmt.Errorf("list %s/%s: %w", at.Bucket, at.BasePrefix(), object.Err)
+		}
+		if !strings.HasSuffix(object.Key, "/backup.info") {
+			continue
+		}
+		_, done, err := readBaseBackup(ctx, client, at.Bucket, object.Key)
+		if err != nil {
+			return false, err
+		}
+		if done {
+			return true, nil
+		}
 	}
-	if object.Err != nil {
-		return false, fmt.Errorf("list %s/%s: %w", at.Bucket, at.BasePrefix(), object.Err)
-	}
-	return true, nil
+	return false, nil
 }
 
 // client builds a minio client for the location's endpoint and credentials.

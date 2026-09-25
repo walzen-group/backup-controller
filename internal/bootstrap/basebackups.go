@@ -56,18 +56,9 @@ func (p S3Prober) BaseBackups(ctx context.Context, at Location) ([]BaseBackup, e
 		if !strings.HasSuffix(object.Key, "/backup.info") {
 			continue
 		}
-		reader, err := client.GetObject(ctx, at.Bucket, object.Key, minio.GetObjectOptions{})
+		backup, done, err := readBaseBackup(ctx, client, at.Bucket, object.Key)
 		if err != nil {
-			return nil, fmt.Errorf("get %s/%s: %w", at.Bucket, object.Key, err)
-		}
-		raw, err := io.ReadAll(reader)
-		_ = reader.Close()
-		if err != nil {
-			return nil, fmt.Errorf("read %s/%s: %w", at.Bucket, object.Key, err)
-		}
-		backup, done, err := baseBackupAt(object.Key, raw)
-		if err != nil {
-			return nil, fmt.Errorf("%s/%s: %w", at.Bucket, object.Key, err)
+			return nil, err
 		}
 		if done {
 			backups = append(backups, backup)
@@ -75,6 +66,29 @@ func (p S3Prober) BaseBackups(ctx context.Context, at Location) ([]BaseBackup, e
 	}
 	sort.Slice(backups, func(i, j int) bool { return backups[i].End.Before(backups[j].End) })
 	return backups, nil
+}
+
+// readBaseBackup downloads one backup.info from the bucket and parses it with
+// baseBackupAt. The key is the object's full key, ending in
+// base/<id>/backup.info.
+//
+// It returns the same values as baseBackupAt. It returns an error, naming the
+// object, when the download or the parse fails.
+func readBaseBackup(ctx context.Context, client *minio.Client, bucket, key string) (BaseBackup, bool, error) {
+	reader, err := client.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return BaseBackup{}, false, fmt.Errorf("get %s/%s: %w", bucket, key, err)
+	}
+	raw, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil {
+		return BaseBackup{}, false, fmt.Errorf("read %s/%s: %w", bucket, key, err)
+	}
+	backup, done, err := baseBackupAt(key, raw)
+	if err != nil {
+		return BaseBackup{}, false, fmt.Errorf("%s/%s: %w", bucket, key, err)
+	}
+	return backup, done, nil
 }
 
 // baseBackupAt parses one backup.info and fills in the backup's ID from the

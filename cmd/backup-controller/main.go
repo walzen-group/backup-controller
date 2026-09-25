@@ -23,7 +23,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -51,6 +50,7 @@ func main() {
 		metricsAddr = flag.String("metrics-addr", ":8080", "address the populator library's metrics listener binds")
 		metricsPath = flag.String("metrics-path", "/metrics", "path the metrics listener serves")
 		runsMetrics = flag.String("runs-metrics-addr", ":8081", "address the scheduler's metrics listener binds, at /metrics")
+		healthAddr  = flag.String("health-probe-addr", ":8082", "address serving /healthz and /readyz for the run controllers; 0 serves none")
 		webhookCert = flag.String("webhook-cert-dir", "", "directory holding tls.crt and tls.key; empty serves no webhook")
 		webhookPort = flag.Int("webhook-port", 9443, "port the admission webhook listens on")
 		printVer    = flag.Bool("version", false, "print the version and exit")
@@ -74,11 +74,12 @@ func main() {
 	// BackupRun and RestoreRun are reconciled by a controller-runtime manager
 	// that this binary starts itself. The deferred cancel stops that manager
 	// once the library returns, which is the only shutdown signal this process
-	// gets.
+	// gets. A manager that stops on its own calls exitOnFailure, so the
+	// process never runs on with the populator alone.
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
-	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook); err != nil {
+	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, *healthAddr, hook, exitOnFailure); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)
 	}
@@ -87,7 +88,10 @@ func main() {
 	// closes the stop channel itself. This binary installs no second handler,
 	// because two handlers closing one channel race and the loser panics.
 	// RunControllerWithConfig returns once the controller has stopped, and
-	// returning from main after it is the clean exit.
+	// returning from main after it is the clean exit. When the library fails
+	// instead, to build its clients or to sync its caches, it calls
+	// klog.Fatalf, which exits the process with a non-zero status, so a
+	// failed populator restarts the pod without help from this binary.
 	populatormachinery.RunControllerWithConfig(populatormachinery.VolumePopulatorConfig{
 		Kubeconfig:   kubeconfig(),
 		HttpEndpoint: *metricsAddr,
@@ -106,6 +110,19 @@ func main() {
 	klog.Info("stopping backup-controller")
 }
 
+// exitOnFailure ends the process with status 1 after logging why. main hands
+// it to startRunControllers, which calls it when the manager stops on its own.
+//
+// Without the manager the process serves no webhook and reconciles no run,
+// while the populator keeps it alive. The webhook's failurePolicy is Fail, so
+// every Cluster create on the cluster is refused until something restarts the
+// pod, and exiting is what gets the kubelet to restart it.
+func exitOnFailure(err error) {
+	klog.Errorf("the run controllers stopped, exiting so the pod restarts: %v", err)
+	klog.Flush()
+	os.Exit(1)
+}
+
 // newClientOperations builds the cluster operations the populator callbacks
 // run through. They use a client whose scheme knows the core, VolSync and
 // backup.wlz.li types. The kubeconfig argument is the path from the
@@ -114,7 +131,7 @@ func main() {
 // It returns an error when the client configuration can't be built or a
 // scheme fails to register.
 func newClientOperations(kubeconfig string) (populator.Operations, error) {
-	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	config, err := restConfig(kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("build client configuration: %w", err)
 	}
@@ -130,7 +147,7 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 		}
 	}
 
-	kubeClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	kubeClient, err := client.New(config, client.Options{Scheme: scheme})
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
 	}

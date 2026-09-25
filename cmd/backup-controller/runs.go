@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
@@ -12,9 +13,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -28,6 +32,29 @@ import (
 // every defect found in this controller so far was found by reading a log.
 func configureLogging() {
 	ctrl.SetLogger(klog.Background())
+}
+
+// restConfig builds the client configuration for the API server, with
+// client-go's own rate limiter turned off. The kubeconfig argument is the path
+// from the --kubeconfig flag, and an empty path means the in-cluster
+// configuration. It returns an error when the configuration can't be built.
+//
+// clientcmd leaves QPS at 0, which client-go reads as 5 requests a second
+// with a burst of 10. The bootstrap webhook reads an ObjectStore for every
+// archiving Cluster within its 15 second timeout and fails closed, so that
+// limit made every Cluster create time out on a cluster with a few dozen
+// databases. A negative QPS turns the limiter off and leaves the API server's
+// priority and fairness to share out requests, which is what ctrl.GetConfig
+// does too.
+func restConfig(kubeconfig string) (*rest.Config, error) {
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	if config.QPS == 0 {
+		config.QPS = -1
+	}
+	return config, nil
 }
 
 // BootstrapWebhook says where the admission webhook for CloudNativePG
@@ -56,14 +83,21 @@ type BootstrapWebhook struct {
 //   - metricsAddr is the address where the manager serves the scheduler's
 //     metrics. The populator library serves its own registry on another port,
 //     and nothing else can register metrics into that one.
+//   - healthAddr is the address where the manager serves /healthz and
+//     /readyz for the Deployment's probes. "0" serves neither.
 //   - hook says where the bootstrap webhook listens. An empty hook.CertDir
 //     serves no webhook.
+//   - fail is called, from the manager's goroutine, when the manager stops
+//     while the context is still live, with the error it stopped on. main
+//     passes exitOnFailure, so the kubelet restarts the pod. A manager that
+//     fails to sync its caches, for one, would otherwise leave the process
+//     running with no webhook server and no reconcilers.
 //
 // It returns an error when the client configuration can't be built, a scheme
 // fails to register, or the manager or one of its controllers can't be set
-// up. An error from the running manager is only logged.
-func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook) error {
-	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+// up. An error from a manager stopped by the context is only logged.
+func startRunControllers(ctx context.Context, kubeconfig, metricsAddr, healthAddr string, hook BootstrapWebhook, fail func(error)) error {
+	config, err := restConfig(kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client configuration: %w", err)
 	}
@@ -82,10 +116,16 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 		}
 	}
 
+	skipNameValidation := true
 	options := ctrl.Options{
-		Scheme:         scheme,
-		Metrics:        metricsserver.Options{BindAddress: metricsAddr},
-		LeaderElection: false,
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		HealthProbeBindAddress: healthAddr,
+		LeaderElection:         false,
+		// controller-runtime refuses a controller name it has seen before in
+		// the process. The binary builds one manager, so its names are unique
+		// already, and the tests build several managers in one process.
+		Controller: ctrlconfig.Controller{SkipNameValidation: &skipNameValidation},
 	}
 	if hook.CertDir != "" {
 		options.WebhookServer = webhook.NewServer(webhook.Options{
@@ -94,7 +134,7 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 		})
 	}
 
-	manager, err := ctrl.NewManager(restConfig, options)
+	manager, err := ctrl.NewManager(config, options)
 	if err != nil {
 		return fmt.Errorf("create the manager: %w", err)
 	}
@@ -116,6 +156,21 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 		klog.Infof("serving the bootstrap webhook on :%d%s", hook.Port, bootstrap.WebhookPath)
 	}
 
+	// /healthz answers while the process runs. /readyz waits for the webhook
+	// server to accept TLS connections, so the webhook's Service sends the
+	// API server to a pod only once it can answer. Without a webhook there is
+	// nothing to wait for.
+	if err := manager.AddHealthzCheck("ping", healthz.Ping); err != nil {
+		return fmt.Errorf("add the health check: %w", err)
+	}
+	ready := healthz.Ping
+	if hook.CertDir != "" {
+		ready = manager.GetWebhookServer().StartedChecker()
+	}
+	if err := manager.AddReadyzCheck("webhook", ready); err != nil {
+		return fmt.Errorf("add the readiness check: %w", err)
+	}
+
 	reader := manager.GetAPIReader()
 	recorder := manager.GetEventRecorder("backup-controller")
 	backups := &runs.BackupRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Retimer: restic.S3Lister{}, Recorder: recorder}
@@ -131,9 +186,19 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 	}
 
 	go func() {
-		if err := manager.Start(ctx); err != nil {
-			klog.Errorf("the run controllers stopped: %v", err)
+		err := manager.Start(ctx)
+		if ctx.Err() != nil {
+			// main cancelled the context, so the process is shutting down
+			// and the manager stopping is expected.
+			if err != nil {
+				klog.Errorf("the run controllers stopped: %v", err)
+			}
+			return
 		}
+		if err == nil {
+			err = errors.New("the manager returned while its context was live")
+		}
+		fail(err)
 	}()
 
 	klog.Infof("starting backup-controller: reconciling %s BackupRun and RestoreRun, scheduling namespaces", backupv1alpha1.GroupVersion.String())

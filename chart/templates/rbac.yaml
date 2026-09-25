@@ -39,10 +39,12 @@ rules:
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
   # The data source the claim names. create is for a RestoreRun writing the
-  # point-in-time VolumeRestore its scratch claim is filled from.
+  # point-in-time VolumeRestore its scratch claim is filled from. update is
+  # for the populator adding and removing its backup.wlz.li/volume-populator
+  # finalizer.
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores"]
-    verbs: ["get", "list", "watch", "create"]
+    verbs: ["get", "list", "watch", "create", "update"]
   # The conditions the controller reports on a VolumeRestore.
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores/status"]
@@ -60,11 +62,22 @@ rules:
   - apiGroups: ["backup.wlz.li"]
     resources: ["backupruns/status", "restoreruns/status"]
     verbs: ["patch", "update"]
+  # The Workload, scratch claim and VolumeRestore a run creates name the run
+  # as their controller, and each ReplicationSource names its claim, with
+  # blockOwnerDeletion set. An API server running the
+  # OwnerReferencesPermissionEnforcement admission plugin refuses such a
+  # reference unless the writer may update the owner's finalizers.
+  - apiGroups: ["backup.wlz.li"]
+    resources: ["backupruns/finalizers", "restoreruns/finalizers"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/finalizers"]
+    verbs: ["update"]
   # The controller writes each enabled claim's source and triggers it with a
-  # manual tag.
+  # manual tag. A BackupRun whose mover failed deletes the claim's source.
   - apiGroups: ["volsync.backube"]
     resources: ["replicationsources"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # The scheduler reads each namespace's backup.wlz.li/schedule annotation.
   - apiGroups: [""]
     resources: ["namespaces"]

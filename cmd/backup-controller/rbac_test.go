@@ -42,10 +42,12 @@ var grants = []grant{
 	{"", "secrets", []string{"get", "create", "delete"}, "the repository Secret copied for the length of a restore"},
 	{"", "events", []string{"create", "patch"}, "the recorder the library hands to the callbacks"},
 	{"backup.wlz.li", "volumerestores", []string{"create"}, "a RestoreRun's point-in-time VolumeRestore"},
+	{"backup.wlz.li", "volumerestores", []string{"update"}, "the populator's backup.wlz.li/volume-populator finalizer on a VolumeRestore"},
 	{"backup.wlz.li", "volumerestores/status", []string{"patch", "update"}, "the conditions reported on a VolumeRestore"},
 	{"volsync.backube", "replicationdestinations", []string{"get", "list", "watch", "create", "delete"}, "one destination per restore"},
 
 	{"volsync.backube", "replicationsources", []string{"get", "list", "watch", "create", "update", "patch"}, "each enabled claim's source, which the controller writes and triggers"},
+	{"volsync.backube", "replicationsources", []string{"delete"}, "a BackupRun deleting the source whose mover failed"},
 	{"backup.wlz.li", "backupruns", []string{"get", "list", "watch", "create", "update", "delete"}, "the runs, the finalizer each carries, and the scheduled runs"},
 	{"backup.wlz.li", "restoreruns", []string{"get", "list", "watch", "update", "delete"}, "the runs, the finalizer each carries, and the webhook's lookup of a waiting run"},
 	{"backup.wlz.li", "backupruns/status", []string{"patch", "update"}, "a BackupRun's phase and conditions"},
@@ -61,6 +63,15 @@ var grants = []grant{
 	{"kueue.x-k8s.io", "workloads", []string{"get", "create", "delete"}, "the Workload that admits a run"},
 	{"kueue.x-k8s.io", "workloads/status", []string{"update"}, "the PodsReady condition on that Workload"},
 	{"kueue.x-k8s.io", "localqueues", []string{"list"}, "the queue a namespace's runs are admitted through"},
+
+	// The OwnerReferencesPermissionEnforcement admission plugin refuses an
+	// owner reference with blockOwnerDeletion unless the writer may update
+	// the owner's finalizers. The controller writes such references from the
+	// Workload, the scratch claim and the VolumeRestore to their run, and from
+	// each ReplicationSource to its claim.
+	{"backup.wlz.li", "backupruns/finalizers", []string{"update"}, "owner references to a BackupRun, under OwnerReferencesPermissionEnforcement"},
+	{"backup.wlz.li", "restoreruns/finalizers", []string{"update"}, "owner references to a RestoreRun, under OwnerReferencesPermissionEnforcement"},
+	{"", "persistentvolumeclaims/finalizers", []string{"update"}, "owner references to a claim, under OwnerReferencesPermissionEnforcement"},
 }
 
 // TestTheClusterRoleCoversEverythingTheControllerDoes checks that the

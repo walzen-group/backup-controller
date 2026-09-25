@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -66,8 +67,8 @@ type Decider struct {
 }
 
 // Handle answers one admission request for a Cluster. For a new Cluster whose
-// object store already holds a base backup, it rewrites the Cluster to recover
-// from that backup.
+// object store already holds a completed base backup, it rewrites the Cluster
+// to recover from that backup.
 //
 // The req argument is the admission request. Its Operation, DryRun, Object and
 // OldObject decide what happens:
@@ -78,18 +79,21 @@ type Decider struct {
 //     set to OptOutValue, or when it has no archiving plugin (see Archiver).
 //   - A create is refused when the ObjectStore can't be resolved, or when
 //     another Cluster anywhere already archives to the same bucket and prefix.
-//   - A Cluster that declares its own spec.bootstrap.recovery is allowed
-//     unchanged, unless a RestoreRun is waiting for it. Then it's refused.
+//   - A Cluster that declares a bootstrap other than initdb, such as
+//     recovery or pg_basebackup (see declaredBootstrap), is allowed unchanged,
+//     unless a RestoreRun is waiting for it. Then it's refused.
 //   - A create is refused when a RestoreRun's restoreAsOf or the Cluster's
 //     restore-as-of annotation isn't an RFC 3339 time.
 //   - A create is refused when a RestoreRun or the restore-as-of annotation
-//     asks for a recovery and the store holds no base backup, or no base
-//     backup finished by the requested moment.
-//   - Otherwise, when the store holds a base backup, the response patches the
-//     Cluster to recover from it (see setRecovery). When a RestoreRun waits
-//     for the Cluster, the patch also sets the backup.wlz.li/restore-run
-//     annotation to the run's name. With no base backup and nothing asking
-//     for a recovery, the Cluster is allowed unchanged and starts empty.
+//     asks for a recovery and the store holds no completed base backup, or
+//     none finished by the requested moment.
+//   - Otherwise, when the store holds a completed base backup, the response
+//     patches the Cluster to recover from it (see setRecovery). When a
+//     RestoreRun waits for the Cluster, the patch also sets the
+//     backup.wlz.li/restore-run annotation to the run's name. With no
+//     completed base backup and nothing asking for a recovery, the Cluster is
+//     allowed unchanged and starts empty. A store whose only base backups
+//     failed or never finished counts as holding none.
 //
 // Failures to read the store, list Clusters or RestoreRuns, or talk to the
 // object store return an HTTP 500 error response, which the API server treats
@@ -132,7 +136,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Allowed("opted out")
 	}
 
-	_, declared, _ := unstructured.NestedMap(cluster.Object, "spec", "bootstrap", "recovery")
+	method := declaredBootstrap(cluster)
 
 	store, serverName, found := Archiver(cluster)
 	if !found {
@@ -153,7 +157,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	// archive unrestorable, which is silent and permanent. Nothing else on the
 	// cluster can see this coming: each Cluster is valid on its own, and the
 	// pair is the problem. Where a Cluster archives does not depend on how it
-	// bootstraps, so a Cluster declaring its own recovery is checked too.
+	// bootstraps, so a Cluster declaring its own bootstrap is checked too.
 	holder, err := archiveHolder(ctx, d.Client, req.Namespace, req.Name, at)
 	if err != nil {
 		logger.Error(err, "cannot check which databases archive here")
@@ -173,19 +177,20 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
-	// A Cluster that already asks for a recovery was written that way on
-	// purpose, by the Flux component or a unit's restore input. It keeps its
-	// own target, unless a RestoreRun is waiting to recover it: then two
-	// targets name one database, and neither may win by accident.
-	if declared {
+	// A Cluster that already names a bootstrap other than initdb was written
+	// that way on purpose: a recovery by the Flux component or a unit's
+	// restore input, a pg_basebackup by a replica or a migration. It keeps its
+	// own source, unless a RestoreRun is waiting to recover it: then two
+	// sources name one database, and neither may win by accident.
+	if method != "" {
 		if run != nil {
 			return admission.Denied(fmt.Sprintf(
-				"RestoreRun %s is waiting to recover %s/%s, and the Cluster declares its own spec.bootstrap.recovery. Remove the declared recovery (the terragrunt restore input or the postgres-recovery component), or delete the RestoreRun.",
-				run.Name, req.Namespace, req.Name,
+				"RestoreRun %s is waiting to recover %s/%s, and the Cluster declares its own spec.bootstrap.%s. Remove the declared bootstrap (for a recovery, the terragrunt restore input or the postgres-recovery component), or delete the RestoreRun.",
+				run.Name, req.Namespace, req.Name, method,
 			))
 		}
-		logger.Info("leaving the Cluster alone", "reason", "it already declares a recovery")
-		return admission.Allowed("already recovering")
+		logger.Info("leaving the Cluster alone", "reason", "it declares its own bootstrap", "method", method)
+		return admission.Allowed("declares its own bootstrap")
 	}
 
 	target, source, err := restoreTarget(cluster, run)
@@ -201,11 +206,11 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	if !has {
 		if run != nil || target != nil {
 			return admission.Denied(fmt.Sprintf(
-				"%s asks for a recovery, and %s/%s holds no base backup to recover from.",
+				"%s asks for a recovery, and %s/%s holds no completed base backup to recover from.",
 				source, at.Bucket, at.BasePrefix(),
 			))
 		}
-		logger.Info("leaving the Cluster to initdb", "reason", "no base backup in the store", "prefix", at.BasePrefix())
+		logger.Info("leaving the Cluster to initdb", "reason", "no completed base backup in the store", "prefix", at.BasePrefix())
 		return admission.Allowed("no base backup")
 	}
 
@@ -241,6 +246,30 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	}
 	logger.Info("recovering the Cluster from its object store", "prefix", at.BasePrefix(), "target", target, "for", source)
 	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
+}
+
+// declaredBootstrap names the bootstrap method a Cluster declares for itself,
+// one the webhook must leave alone.
+//
+// It returns the first key under spec.bootstrap, in sorted order, other than
+// initdb, such as "recovery" or "pg_basebackup". It returns an empty string
+// when spec.bootstrap is missing or holds initdb alone. Those are the Clusters
+// the webhook may rewrite: CloudNativePG runs initdb when no method is named,
+// and setRecovery replaces initdb and nothing else. Adding a recovery beside
+// any other method gives the Cluster two, and CloudNativePG refuses that.
+func declaredBootstrap(cluster *unstructured.Unstructured) string {
+	bootstrap, _, _ := unstructured.NestedMap(cluster.Object, "spec", "bootstrap")
+	methods := make([]string, 0, len(bootstrap))
+	for method := range bootstrap {
+		if method != "initdb" {
+			methods = append(methods, method)
+		}
+	}
+	if len(methods) == 0 {
+		return ""
+	}
+	sort.Strings(methods)
+	return methods[0]
 }
 
 // waitingRun finds the RestoreRun that deleted a Cluster and is waiting for it
@@ -363,8 +392,9 @@ func keepRecovery(req admission.Request) admission.Response {
 }
 
 // archiveHolder finds an existing Cluster that already archives to the same
-// bucket and prefix as the Cluster being admitted. Two databases archiving to
-// one prefix interleave their WAL and leave the archive unrestorable.
+// bucket and prefix, on the same S3 service, as the Cluster being admitted.
+// Two databases archiving to one prefix interleave their WAL and leave the
+// archive unrestorable.
 //
 // Parameters:
 //   - namespace and name identify the Cluster being admitted. A Cluster with
@@ -376,12 +406,17 @@ func keepRecovery(req admission.Request) admission.Response {
 // Cluster archives there. It returns an error only when the Cluster list
 // fails.
 //
-// It lists every Cluster in every namespace and resolves each one's location
-// with ResolveLocation, then compares bucket and prefix. Two Clusters can reach
-// one prefix through differently named ObjectStores, so comparing store names
-// would miss them. A Cluster whose own store can't be resolved is skipped.
-// Refusing a new database because an unrelated one is misconfigured would
-// block work this check has no reason to block.
+// It lists every Cluster in every namespace, reads each archiving one's
+// ObjectStore with archiveAt, and compares the two with sameArchive: endpoint,
+// bucket and prefix. Two Clusters can reach one prefix through differently
+// named ObjectStores, so comparing store names would miss them. The check
+// reads no Secret. Where a Cluster archives is written in its ObjectStore, so
+// a holder whose credentials are missing is still found, and each other
+// Cluster costs one read, which keeps a create on a cluster with many
+// databases inside the webhook's timeout. A Cluster whose ObjectStore can't be
+// read or names no s3:// destination is skipped. Refusing a new database
+// because an unrelated one is misconfigured would block work this check has no
+// reason to block.
 func archiveHolder(
 	ctx context.Context,
 	c client.Reader,
@@ -403,11 +438,11 @@ func archiveHolder(
 		if !found {
 			continue
 		}
-		theirs, err := ResolveLocation(ctx, c, other.GetNamespace(), store, serverName)
+		theirs, _, err := archiveAt(ctx, c, other.GetNamespace(), store, serverName)
 		if err != nil {
 			continue
 		}
-		if theirs.Bucket == at.Bucket && theirs.Prefix == at.Prefix {
+		if theirs.sameArchive(at) {
 			return fmt.Sprintf("%s/%s", other.GetNamespace(), other.GetName()), nil
 		}
 	}
