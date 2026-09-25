@@ -142,10 +142,14 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 // restoreAsOf that doesn't parse, a spec.quiesce entry the namespace does not
 // hold, or a synced run with no claim to take the moment from. plan returns
 // an error, and writes nothing, when listing the snapshots or the base
-// backups fails.
+// backups fails, and when a read fails in a way a retry may fix, such as a
+// timeout from the API server.
 func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	items, err := r.items(ctx, run)
 	if err != nil {
+		if !isRefusal(err) {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 	at, err := target(run)
@@ -239,9 +243,9 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 // backup.wlz.li/enabled: "true", claims first. A Cluster that archives nowhere
 // has no backup to restore, so its item starts out Skipped.
 //
-// items returns an error when spec.repository is set and spec.claim is not,
+// items returns a refusal when spec.repository is set and spec.claim is not,
 // because a restore in place needs a claim to write into, and when nothing in
-// the namespace is marked.
+// the namespace is marked. A failed list comes back as a plain error.
 func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	pending := func(kind, name string) backupv1alpha1.RestoreItem {
 		return backupv1alpha1.RestoreItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
@@ -250,7 +254,7 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	case run.Spec.Claim != "":
 		return []backupv1alpha1.RestoreItem{pending("PersistentVolumeClaim", run.Spec.Claim)}, nil
 	case run.Spec.Repository != "":
-		return nil, fmt.Errorf("spec.into is required when spec.repository names the source, because there is no claim to restore in place")
+		return nil, refuse("spec.into is required when spec.repository names the source, because there is no claim to restore in place")
 	case run.Spec.Database != "":
 		return []backupv1alpha1.RestoreItem{pending("Cluster", run.Spec.Database)}, nil
 	}
@@ -275,7 +279,7 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 		items = append(items, item)
 	}
 	if len(items) == 0 {
-		return nil, fmt.Errorf("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
+		return nil, refuse("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
 	}
 	return items, nil
 }
@@ -289,14 +293,18 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 //     it on a run with spec.syncDatabaseToVolume.
 //
 // It returns the snapshot, or a reason when there is none. It also returns a
-// reason when the claim's repository can't be resolved. It returns an error
-// only when listing the repository fails.
+// reason when repositoryFor refuses the claim, because the claim or its
+// VolumeRestore is missing. It returns an error when listing the repository
+// fails, and when a read fails for any other reason.
 //
 // This is the only place a missing snapshot is caught. VolSync restores
 // nothing and still reports success when no snapshot matches.
 func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
+		if !isRefusal(err) {
+			return restic.Snapshot{}, "", err
+		}
 		return restic.Snapshot{}, err.Error(), nil
 	}
 	return r.selectSnapshot(ctx, run, settings.Secret, at, quiescedOnly)
@@ -314,14 +322,18 @@ func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alp
 // When spec.previous is set, selectSnapshot then steps that many snapshots
 // further back. It relies on the lister returning the snapshots oldest first.
 //
-// It returns a reason, and no error, when the Secret can't be read, when no
+// It returns a reason, and no error, when the Secret doesn't exist, when no
 // snapshot qualifies, when none is at or before the moment, and when
 // spec.previous reaches past the oldest snapshot. It returns an error when
-// listing the repository fails.
+// the Secret can't be read for another reason and when listing the repository
+// fails.
 func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
 	secret := &corev1.Secret{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: secretName}, secret); err != nil {
-		return restic.Snapshot{}, fmt.Sprintf("read repository Secret %s: %v", secretName, err), nil
+		if !apierrors.IsNotFound(err) {
+			return restic.Snapshot{}, "", fmt.Errorf("read repository Secret %s: %w", secretName, err)
+		}
+		return restic.Snapshot{}, fmt.Sprintf("no repository Secret %s in this namespace", secretName), nil
 	}
 	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
 	if err != nil {
@@ -366,10 +378,11 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 //
 // It returns the base backup's ID, or a reason when there is none. It also
 // returns a reason when the Cluster is missing, archives nowhere, or names an
-// object store that can't be resolved. A store with no completed base backup
-// is a reason too, because deleting the Cluster would bring it back empty. It
-// returns an error when the Cluster can't be read or listing the base backups
-// fails.
+// object store that is missing or incomplete. A store with no completed base
+// backup is a reason too, because deleting the Cluster would bring it back
+// empty. It returns an error when the Cluster can't be read, when a read of
+// the store or its Secrets fails in a way a retry may fix, and when listing
+// the base backups fails.
 func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, name string, at *time.Time) (string, string, error) {
 	cluster, found, err := getCluster(ctx, r.Reader, namespace, name)
 	if err != nil {
@@ -384,6 +397,9 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 	}
 	location, err := bootstrap.ResolveLocation(ctx, r.Reader, namespace, store, serverName)
 	if err != nil {
+		if retryable(err) {
+			return "", "", err
+		}
 		return "", err.Error(), nil
 	}
 	backups, err := r.Prober.BaseBackups(ctx, location)
@@ -539,12 +555,12 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // creates the item's ReplicationDestination and moves the item to Running.
 // A Running item succeeds once the destination has completed the run's
 // trigger, or fails with the mover's logs. Either way, restoreVolume then
-// deletes the destination. A claim whose repository can't be resolved fails
-// the item.
+// deletes the destination. A claim that is gone, or whose VolumeRestore is
+// missing, fails the item.
 //
 // It returns reason ClaimInUse and a message naming the pod while a pod
-// mounts the claim, and empty strings otherwise. It returns an error when an
-// API call fails.
+// mounts the claim, and empty strings otherwise. It returns an error, and
+// leaves the item as it was, when an API call fails for any other reason.
 func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (string, string, error) {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
@@ -558,6 +574,9 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 		}
 		settings, err := repositoryFor(ctx, r.Reader, run.Namespace, item.Name, run.Spec.Repository, run.Spec.MoverSecurityContext)
 		if err != nil {
+			if !isRefusal(err) {
+				return "", "", err
+			}
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
 			return "", "", nil
 		}
@@ -662,6 +681,9 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 	run.Status.Target = run.Spec.Into
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
+		if !isRefusal(err) {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 

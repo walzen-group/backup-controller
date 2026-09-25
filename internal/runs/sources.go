@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -50,6 +52,31 @@ func isRefusal(err error) bool {
 	var refused refusal
 	var bad invalidSetting
 	return errors.As(err, &refused) || errors.As(err, &bad)
+}
+
+// retryable reports whether an error from a read may go away when the read is
+// tried again. That is a failed call to the API server, other than one that
+// found nothing, and a request that never reached it. A missing object, a kind
+// the cluster doesn't serve, and an error the caller built from what it read
+// are not retryable.
+//
+// It sorts the errors of a function that doesn't return refusals, such as
+// bootstrap.ResolveLocation, which wraps each failed read and describes a
+// missing field in an error of its own.
+func retryable(err error) bool {
+	if err == nil || apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		return false
+	}
+	var status apierrors.APIStatus
+	var request *url.Error
+	switch {
+	case errors.As(err, &status):
+		return true
+	case errors.As(err, &request):
+		// url.Parse reports a malformed URL as a url.Error too.
+		return request.Op != "parse"
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 // moverCPU is the CPU request on each backup mover. It sets the mover's share

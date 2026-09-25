@@ -71,10 +71,12 @@ type restoreSettings struct {
 //   - moverContext is the run's spec.moverSecurityContext. When it is set, it
 //     takes precedence over the VolumeRestore's.
 //
-// It returns an error when claimName and repository are both empty, or when
-// the claim doesn't exist. When the claim has no VolumeRestore, it returns an
-// error if repository is empty, and otherwise the settings it could read from
-// the claim alone.
+// It returns a refusal when the run names neither a claim nor a repository,
+// or when the claim doesn't exist. When the claim has no VolumeRestore, it
+// returns a refusal if the run names no repository, and otherwise the
+// settings it could read from the claim alone. A read that fails for another
+// reason, such as a timeout from the API server, comes back as a plain error,
+// which the caller retries.
 //
 // Naming a claim is the ordinary case, and it states nothing twice. The
 // claim's dataSourceRef names its VolumeRestore, and that object already
@@ -85,7 +87,7 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 	settings := restoreSettings{Secret: repository, MoverSecurityContext: moverContext}
 	if claimName == "" {
 		if repository == "" {
-			return settings, fmt.Errorf("one of spec.claim and spec.repository is required")
+			return settings, refuse("one of spec.claim and spec.repository is required")
 		}
 		return settings, nil
 	}
@@ -94,7 +96,7 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 	key := types.NamespacedName{Namespace: namespace, Name: claimName}
 	if err := c.Get(ctx, key, claim); err != nil {
 		if apierrors.IsNotFound(err) {
-			return settings, fmt.Errorf("no PersistentVolumeClaim %s in this namespace", claimName)
+			return settings, refuse("no PersistentVolumeClaim %s in this namespace", claimName)
 		}
 		return settings, fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
 	}
@@ -110,7 +112,7 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 	// repository itself can go on without any VolumeRestore.
 	vr, err := volumeRestoreFor(ctx, c, claim)
 	if err != nil {
-		if settings.Secret != "" {
+		if settings.Secret != "" && isRefusal(err) {
 			return settings, nil
 		}
 		return settings, err

@@ -751,3 +751,98 @@ func TestADatabaseRestoreSeesAnInstanceTheCacheHasNotSeenYet(t *testing.T) {
 		t.Errorf("replicas = %d while the old instance was still there, want 0", got)
 	}
 }
+
+// unavailable returns a client over c whose reads answer 503 Service
+// Unavailable, the way the API server does while etcd elects a leader. A Get
+// fails when match accepts the object read into, and a List fails when match
+// accepts the list.
+func unavailable(c client.Client, match func(any) bool) client.Client {
+	refused := apierrors.NewServiceUnavailable("etcd leader changed")
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if match(obj) {
+				return refused
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if match(list) {
+				return refused
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+}
+
+// is reports whether the value given is of type T. A test passes it to
+// unavailable, instantiated with the type whose reads should fail.
+func is[T any](v any) bool {
+	_, ok := v.(T)
+	return ok
+}
+
+// objectStores matches an unstructured ObjectStore read, for unavailable.
+func objectStores(v any) bool {
+	u, ok := v.(*unstructured.Unstructured)
+	return ok && u.GetKind() == "ObjectStore"
+}
+
+// reconcileExpectingRetry reconciles back-to-monday once and fails the test
+// unless the reconcile returned an error, the way a failed read is handed back
+// for a retry, and the run is still unfinished afterwards.
+func reconcileExpectingRetry(t *testing.T, r *RestoreRunReconciler, c client.Client) *backupv1alpha1.RestoreRun {
+	t.Helper()
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+		t.Error("reconcile succeeded, want the read error returned for a retry")
+	}
+	run := readRestoreRun(t, c)
+	if run.Status.Phase.Finished() {
+		t.Errorf("phase = %q, reason = %q after a failed read, want the run still going", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	return run
+}
+
+// A read that fails with a server error while a run checks its items is
+// returned for a retry. The run neither ends as Invalid nor reports the item
+// as having no backup in reach, because the next attempt may well succeed.
+func TestARestorePlanRetriesAFailedRead(t *testing.T) {
+	cases := []struct {
+		name  string
+		spec  func(*backupv1alpha1.RestoreRun)
+		match func(any) bool
+	}{
+		{"into, claim read", func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "notes-data-monday" }, is[*corev1.PersistentVolumeClaim]},
+		{"all, claim list", func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }, is[*corev1.PersistentVolumeClaimList]},
+		{"claim, VolumeRestore read", func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, is[*backupv1alpha1.VolumeRestore]},
+		{"claim, repository Secret read", func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, is[*corev1.Secret]},
+		{"database, ObjectStore read", func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }, objectStores},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, c := restoreReconciler(t, prober{saturday}, restoreRun(tc.spec),
+				claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
+			r.Reader = unavailable(c, tc.match)
+			run := reconcileExpectingRetry(t, r, c)
+			for _, item := range run.Status.Items {
+				if item.Phase == backupv1alpha1.ItemFailed {
+					t.Errorf("item %s %s failed with %q after a failed read", item.Kind, item.Name, item.Message)
+				}
+			}
+		})
+	}
+}
+
+// A failed read of a claim's VolumeRestore when its restore is about to start
+// is returned for a retry. The volume item stays Pending, and the database of
+// a namespace restore is not skipped as if the volume had failed.
+func TestARestoreRetriesAFailedReadBeforeAVolumeStarts(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
+	restoreStep(t, r) // plan
+
+	r.Reader = unavailable(c, is[*backupv1alpha1.VolumeRestore])
+	run := reconcileExpectingRetry(t, r, c)
+	if run.Status.Items[0].Phase != backupv1alpha1.ItemPending || run.Status.Items[1].Phase != backupv1alpha1.ItemPending {
+		t.Errorf("items = %+v, want both still Pending", run.Status.Items)
+	}
+}
