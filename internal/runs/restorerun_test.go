@@ -9,6 +9,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -230,6 +231,164 @@ func TestADatabaseRestoreDeletesAndFollowsTheCluster(t *testing.T) {
 	restoreStep(t, r)
 	if run := readRestoreRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q, want Succeeded", run.Status.Phase)
+	}
+}
+
+// readyMessage is the message on a run's Ready condition.
+func readyMessage(conditions []metav1.Condition) string {
+	for _, c := range conditions {
+		if c.Type == "Ready" {
+			return c.Message
+		}
+	}
+	return ""
+}
+
+// writerPod is the app's pod, mounting the claim.
+func writerPod() *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "notes-5d9f", Namespace: ns, Labels: map[string]string{"app": appN}},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimN},
+		}}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func quiescedRestore() *backupv1alpha1.RestoreRun {
+	return restoreRun(func(r *backupv1alpha1.RestoreRun) {
+		r.Spec.All = true
+		r.Spec.Quiesce = []backupv1alpha1.WorkloadRef{{Kind: "Deployment", Name: appN}}
+	})
+}
+
+func replicasOf(t *testing.T, c client.Client) int32 {
+	t.Helper()
+	d := &appsv1.Deployment{}
+	get(t, c, ns, appN, d)
+	return *d.Spec.Replicas
+}
+
+func suspended(t *testing.T, c client.Client) bool {
+	t.Helper()
+	k, _ := getUnstructured(t, c, KustomizationGVK, "flux-system", appN)
+	s, _, _ := unstructured.NestedBool(k.Object, "spec", "suspend")
+	return s
+}
+
+// A quiesced restore stops the app the way a BackupRun does, restores nothing
+// while its pod is still there, and gives the app back once the volume is
+// restored and the database deleted, so Flux can create the Cluster again.
+func TestAQuiescedRestoreStopsTheAppUntilTheDatabaseIsDeleted(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), writerPod())
+
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // quiesce
+	run := readRestoreRun(t, c)
+	if got := replicasOf(t, c); got != 0 {
+		t.Fatalf("replicas = %d after the run started, want 0", got)
+	}
+	if !suspended(t, c) {
+		t.Error("the Kustomization was not suspended, and Flux would put the replicas back")
+	}
+	if len(run.Status.Quiesced) != 1 || run.Status.Quiesced[0].Replicas != 2 || run.Status.QuiescedAt == nil {
+		t.Errorf("quiesced = %+v at %v, want the Deployment recorded with its 2 replicas", run.Status.Quiesced, run.Status.QuiescedAt)
+	}
+
+	restoreStep(t, r) // the pod is still there
+	if run := readRestoreRun(t, c); run.Status.Items[0].Phase != backupv1alpha1.ItemPending {
+		t.Fatalf("volume item = %+v while the app's pod was still running, want Pending", run.Status.Items[0])
+	}
+
+	if err := c.Delete(context.Background(), writerPod()); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r) // restore the volume
+	run = readRestoreRun(t, c)
+	rd := &volsyncv1alpha1.ReplicationDestination{}
+	get(t, c, ns, run.Status.Items[0].Destination, rd)
+	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	if err := c.Status().Update(context.Background(), rd); err != nil {
+		t.Fatal(err)
+	}
+	if got := replicasOf(t, c); got != 0 {
+		t.Fatalf("replicas = %d while the volume restored, want 0", got)
+	}
+
+	restoreStep(t, r) // volume done, database deleted
+	run = readRestoreRun(t, c)
+	if run.Status.Items[1].Phase != backupv1alpha1.ItemDeleted {
+		t.Fatalf("database item = %+v, want Deleted", run.Status.Items[1])
+	}
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d once the database was deleted, want the 2 it had", got)
+	}
+	if suspended(t, c) {
+		t.Error("the Kustomization is still suspended, so Flux never creates the Cluster again")
+	}
+	if run.Status.RestartedAt == nil {
+		t.Error("restartedAt is unset")
+	}
+}
+
+// A run that gives up after stopping the app starts it again.
+func TestATimedOutQuiescedRestoreGivesTheAppBack(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), writerPod())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // quiesce
+
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Fatalf("phase = %q, want Failed after the timeout", run.Status.Phase)
+	}
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d after the run gave up, want the 2 it had", got)
+	}
+	if suspended(t, c) {
+		t.Error("the Kustomization the run suspended stayed suspended")
+	}
+}
+
+// A workload the run cannot find is refused at the checks, before the run
+// stops anything or deletes a database.
+func TestAQuiescedRestoreOfAMissingWorkloadFailsBeforeStoppingAnything(t *testing.T) {
+	run := quiescedRestore()
+	run.Spec.Quiesce = append(run.Spec.Quiesce, backupv1alpha1.WorkloadRef{Kind: "StatefulSet", Name: "notes-worker"})
+	r, c := restoreReconciler(t, prober{saturday}, run,
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), writerPod())
+	restoreStep(t, r)
+
+	got := readRestoreRun(t, c)
+	if got.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(readyMessage(got.Status.Conditions), "notes-worker") {
+		t.Fatalf("phase = %q, message = %q; want Failed naming notes-worker", got.Status.Phase, readyMessage(got.Status.Conditions))
+	}
+	if replicas := replicasOf(t, c); replicas != 2 {
+		t.Errorf("replicas = %d, want the app untouched", replicas)
+	}
+}
+
+// The backup.wlz.li/quiesce annotation is the BackupRun's. A restore without
+// quiesce leaves the app alone, annotated or not, and waits for its pod to stop.
+func TestARestoreWithoutQuiesceLeavesTheAppRunning(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), writerPod())
+	restoreStep(t, r)
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d, want the app left at 2", got)
+	}
+	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonClaimInUse {
+		t.Errorf("reason = %q, want ClaimInUse", reason)
 	}
 }
 

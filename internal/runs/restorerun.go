@@ -114,6 +114,9 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 	if err != nil {
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
+	if _, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce); err != nil {
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
 
 	// A synced run takes its databases' moment from the volumes' quiesced
 	// snapshots. items lists the claims before the Clusters, so the moment is
@@ -327,6 +330,24 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
 	}
 
+	if len(run.Spec.Quiesce) > 0 && run.Status.QuiescedAt == nil {
+		return r.quiesce(ctx, run)
+	}
+	if stopped(run) && anyRestorePending(run.Status.Items) {
+		targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
+		if err != nil {
+			return ctrl.Result{}, r.abort(ctx, run, err.Error())
+		}
+		gone, pod, err := podsGone(ctx, r.Reader, run.Namespace, targets)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !gone {
+			return after(2*time.Second, r.waitFor(ctx, run, backupv1alpha1.ReasonRunning,
+				fmt.Sprintf("waiting for pod %s to stop before anything is restored", pod)))
+		}
+	}
+
 	waitReason, waitMessage := "", ""
 	volumesDone, volumesFailed := true, false
 	for i := range run.Status.Items {
@@ -366,6 +387,15 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 			if item.Phase == backupv1alpha1.ItemDeleted {
 				recreate = append(recreate, item.Name)
 			}
+		}
+	}
+
+	// The databases come back only when their owner creates them again, and a
+	// Kustomization this run suspended creates nothing. So the app is given
+	// back once every volume is restored and every database deleted.
+	if stopped(run) && volumesDone && !anyRestorePending(run.Status.Items) {
+		if err := r.restart(ctx, run); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -566,11 +596,61 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 	return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, message)
 }
 
-// finish removes the destinations the run created and records the terminal
-// phase.
+// quiesce stops the workloads spec.quiesce lists and records what it changed
+// before anything else happens, so a failure halfway is still undone.
+func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
+	targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
+	if err != nil {
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
+	halted, suspended, stopErr := stopWorkloads(ctx, r.Client, r.Reader, targets)
+	now := metav1.NewTime(r.Now())
+	run.Status.Quiesced, run.Status.SuspendedKustomizations, run.Status.QuiescedAt = halted, suspended, &now
+	if err := r.writeStatus(ctx, run); err != nil {
+		return ctrl.Result{}, err
+	}
+	if stopErr != nil {
+		return ctrl.Result{}, stopErr
+	}
+	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+}
+
+// restart gives the stopped workloads their replicas back and resumes the
+// Kustomizations the run suspended.
+func (r *RestoreRunReconciler) restart(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+	if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
+		return err
+	}
+	now := metav1.NewTime(r.Now())
+	run.Status.RestartedAt = &now
+	return nil
+}
+
+// stopped reports whether the run stopped workloads it has not given back.
+func stopped(run *backupv1alpha1.RestoreRun) bool {
+	return run.Status.QuiescedAt != nil && run.Status.RestartedAt == nil
+}
+
+// anyRestorePending reports whether an item has not been started.
+func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
+	for _, item := range items {
+		if item.Phase == backupv1alpha1.ItemPending {
+			return true
+		}
+	}
+	return false
+}
+
+// finish removes the destinations the run created, gives back whatever it
+// stopped, and records the terminal phase.
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
 	if err := r.removeDestinations(ctx, run); err != nil {
 		return err
+	}
+	if stopped(run) {
+		if err := r.restart(ctx, run); err != nil {
+			return err
+		}
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
@@ -594,6 +674,11 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	}
 	if err := r.removeDestinations(ctx, run); err != nil {
 		return err
+	}
+	if stopped(run) {
+		if err := r.restart(ctx, run); err != nil {
+			return err
+		}
 	}
 	return dropFinalizer(ctx, r.Client, run)
 }

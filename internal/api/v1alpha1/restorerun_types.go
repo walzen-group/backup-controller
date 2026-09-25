@@ -17,6 +17,7 @@ import (
 // +kubebuilder:validation:XValidation:rule="!has(self.previous) || has(self.claim) || has(self.repository)",message="previous applies to one volume only"
 // +kubebuilder:validation:XValidation:rule="!has(self.into) || has(self.claim) || has(self.repository)",message="into needs claim or repository"
 // +kubebuilder:validation:XValidation:rule="!has(self.syncDatabaseToVolume) || !self.syncDatabaseToVolume || (has(self.all) && self.all)",message="syncDatabaseToVolume needs all"
+// +kubebuilder:validation:XValidation:rule="!has(self.quiesce) || size(self.quiesce) == 0 || !has(self.into)",message="quiesce restores in place; an into restore leaves the app alone"
 type RestoreRunSpec struct {
 	// Claim is the claim in this namespace whose repository to restore from,
 	// and, unless Into names another, the claim the restore writes into.
@@ -84,6 +85,16 @@ type RestoreRunSpec struct {
 	// +optional
 	SyncDatabaseToVolume bool `json:"syncDatabaseToVolume,omitempty"`
 
+	// Quiesce lists the workloads in this namespace to stop before anything is
+	// restored. The run suspends the Flux Kustomization that applies each one
+	// and scales it to zero, and gives them back once the volumes are restored
+	// and the databases deleted, because the databases come back only when
+	// their owner creates them again. Omitted, the run waits for whoever mounts
+	// a claim to stop.
+	// +optional
+	// +kubebuilder:validation:MaxItems=32
+	Quiesce []WorkloadRef `json:"quiesce,omitempty"`
+
 	// Timeout is how long to wait for the movers and the recovered databases
 	// before giving up.
 	// +optional
@@ -119,6 +130,24 @@ type RestoreRunStatus struct {
 	// +optional
 	SyncedTo *metav1.Time `json:"syncedTo,omitempty"`
 
+	// QuiescedAt is when the run stopped the workloads spec.quiesce lists.
+	// +optional
+	QuiescedAt *metav1.Time `json:"quiescedAt,omitempty"`
+
+	// RestartedAt is when the run gave those workloads their replicas back.
+	// +optional
+	RestartedAt *metav1.Time `json:"restartedAt,omitempty"`
+
+	// Quiesced lists the workloads this run scaled to zero, with the replicas
+	// it gives each back.
+	// +optional
+	Quiesced []QuiescedWorkload `json:"quiesced,omitempty"`
+
+	// SuspendedKustomizations lists the Flux Kustomizations this run
+	// suspended, as namespace/name. The run resumes exactly these.
+	// +optional
+	SuspendedKustomizations []string `json:"suspendedKustomizations,omitempty"`
+
 	// StartedAt is when the run passed its checks and began restoring.
 	// +optional
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
@@ -134,6 +163,16 @@ type RestoreRunStatus struct {
 	// Conditions carry the kstatus-compatible state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// WorkloadRef names a Deployment or a StatefulSet in the run's namespace.
+type WorkloadRef struct {
+	// Kind is Deployment or StatefulSet.
+	// +kubebuilder:validation:Enum=Deployment;StatefulSet
+	Kind string `json:"kind"`
+	// Name is the workload's name.
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
 }
 
 // RestoreItem is one volume or database a RestoreRun restores.

@@ -73,6 +73,46 @@ func quiesceTargets(ctx context.Context, c client.Reader, namespace string) ([]w
 	return targets, nil
 }
 
+// namedTargets reads the workloads a RestoreRun's spec.quiesce lists. A name
+// the namespace does not hold is an error naming it, so the run refuses before
+// it stops anything.
+func namedTargets(ctx context.Context, c client.Reader, namespace string, refs []backupv1alpha1.WorkloadRef) ([]workload, error) {
+	replicas := func(r *int32) int32 {
+		if r == nil {
+			return 1
+		}
+		return *r
+	}
+	var targets []workload
+	for _, ref := range refs {
+		key := types.NamespacedName{Namespace: namespace, Name: ref.Name}
+		switch ref.Kind {
+		case "Deployment":
+			d := &appsv1.Deployment{}
+			if err := c.Get(ctx, key, d); err != nil {
+				return nil, missingWorkload(ref, err)
+			}
+			targets = append(targets, workload{kind: ref.Kind, object: d, replicas: replicas(d.Spec.Replicas), selector: d.Spec.Selector})
+		case "StatefulSet":
+			s := &appsv1.StatefulSet{}
+			if err := c.Get(ctx, key, s); err != nil {
+				return nil, missingWorkload(ref, err)
+			}
+			targets = append(targets, workload{kind: ref.Kind, object: s, replicas: replicas(s.Spec.Replicas), selector: s.Spec.Selector})
+		default:
+			return nil, fmt.Errorf("spec.quiesce lists %s %s; only a Deployment or a StatefulSet can be stopped", ref.Kind, ref.Name)
+		}
+	}
+	return targets, nil
+}
+
+func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
+	if apierrors.IsNotFound(err) {
+		return fmt.Errorf("spec.quiesce lists %s %s, which this namespace does not hold", ref.Kind, ref.Name)
+	}
+	return fmt.Errorf("get %s %s: %w", ref.Kind, ref.Name, err)
+}
+
 // stopWorkloads suspends the Flux Kustomizations that apply the targets, then
 // scales each target to zero, and returns what it changed so it can be put
 // back. A Kustomization already suspended is left out of the list: the run

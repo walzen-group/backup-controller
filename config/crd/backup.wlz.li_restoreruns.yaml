@@ -344,6 +344,34 @@ spec:
                 format: int32
                 minimum: 0
                 type: integer
+              quiesce:
+                description: |-
+                  Quiesce lists the workloads in this namespace to stop before anything is
+                  restored. The run suspends the Flux Kustomization that applies each one
+                  and scales it to zero, and gives them back once the volumes are restored
+                  and the databases deleted, because the databases come back only when
+                  their owner creates them again. Omitted, the run waits for whoever mounts
+                  a claim to stop.
+                items:
+                  description: WorkloadRef names a Deployment or a StatefulSet in
+                    the run's namespace.
+                  properties:
+                    kind:
+                      description: Kind is Deployment or StatefulSet.
+                      enum:
+                      - Deployment
+                      - StatefulSet
+                      type: string
+                    name:
+                      description: Name is the workload's name.
+                      maxLength: 253
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  type: object
+                maxItems: 32
+                type: array
               repository:
                 description: |-
                   Repository is the restic Secret in this namespace to restore from, for a
@@ -397,6 +425,8 @@ spec:
             - message: syncDatabaseToVolume needs all
               rule: '!has(self.syncDatabaseToVolume) || !self.syncDatabaseToVolume
                 || (has(self.all) && self.all)'
+            - message: quiesce restores in place; an into restore leaves the app alone
+              rule: '!has(self.quiesce) || size(self.quiesce) == 0 || !has(self.into)'
           status:
             description: RestoreRunStatus reports how far the restore got.
             properties:
@@ -504,11 +534,52 @@ spec:
                 description: Phase is the run's state, and the column `kubectl get`
                   prints.
                 type: string
+              quiesced:
+                description: |-
+                  Quiesced lists the workloads this run scaled to zero, with the replicas
+                  it gives each back.
+                items:
+                  description: QuiescedWorkload is one workload a run stopped.
+                  properties:
+                    kind:
+                      description: Kind is Deployment or StatefulSet.
+                      type: string
+                    name:
+                      description: Name is the workload's name in the run's namespace.
+                      type: string
+                    replicas:
+                      description: Replicas is what the workload ran with before the
+                        run stopped it.
+                      format: int32
+                      type: integer
+                  required:
+                  - kind
+                  - name
+                  - replicas
+                  type: object
+                type: array
+              quiescedAt:
+                description: QuiescedAt is when the run stopped the workloads spec.quiesce
+                  lists.
+                format: date-time
+                type: string
+              restartedAt:
+                description: RestartedAt is when the run gave those workloads their
+                  replicas back.
+                format: date-time
+                type: string
               startedAt:
                 description: StartedAt is when the run passed its checks and began
                   restoring.
                 format: date-time
                 type: string
+              suspendedKustomizations:
+                description: |-
+                  SuspendedKustomizations lists the Flux Kustomizations this run
+                  suspended, as namespace/name. The run resumes exactly these.
+                items:
+                  type: string
+                type: array
               syncedTo:
                 description: |-
                   SyncedTo is the moment a SyncDatabaseToVolume run restores everything

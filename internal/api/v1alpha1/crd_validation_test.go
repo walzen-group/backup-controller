@@ -202,6 +202,10 @@ func TestRunsNameExactlyOneScope(t *testing.T) {
 		{"into with database", RestoreRunSpec{Database: "notes-pg", Into: "copy"}, true},
 		{"sync with all", RestoreRunSpec{All: true, SyncDatabaseToVolume: true}, false},
 		{"sync with a database", RestoreRunSpec{Database: "notes-pg", SyncDatabaseToVolume: true}, true},
+		{"quiesce with all", RestoreRunSpec{All: true, Quiesce: []WorkloadRef{{Kind: "Deployment", Name: "notes"}}}, false},
+		{"quiesce with a claim", RestoreRunSpec{Claim: "notes-data", Quiesce: []WorkloadRef{{Kind: "StatefulSet", Name: "notes"}}}, false},
+		{"quiesce with into", RestoreRunSpec{Claim: "notes-data", Into: "copy", Quiesce: []WorkloadRef{{Kind: "Deployment", Name: "notes"}}}, true},
+		{"quiesce of a CronJob", RestoreRunSpec{All: true, Quiesce: []WorkloadRef{{Kind: "CronJob", Name: "notes"}}}, true},
 	}
 	for i, tc := range restores {
 		t.Run("RestoreRun "+tc.name, func(t *testing.T) {
