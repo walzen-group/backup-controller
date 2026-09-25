@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -71,11 +73,15 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // Reconcile moves the RestoreRun that req names one step further, and requeues
 // until the run has finished.
 //
-// A run with spec.into set goes to reconcileIntoNewClaim. Any other run starts
-// in plan, which checks that every item has a backup in reach before anything
-// is changed, and then continues in work. Before either, Reconcile adds the
-// run's finalizer. A run being deleted gets its changes put back by finalize,
-// and a finished run is deleted once spec.ttlSecondsAfterFinished has passed.
+// A new run starts in plan, which checks that every item has a backup in reach
+// before anything is changed, or in planIntoNewClaim when spec.into is set. An
+// error either returns for a retry goes through planFailed, which reports it
+// on the Ready condition and ends the run once spec.timeout has passed since
+// its creation. A run past its checks continues in work, or in
+// reconcileIntoNewClaim for an into restore. Before any of these, Reconcile
+// adds the run's finalizer. A run being deleted gets its changes put back by
+// finalize, and a finished run is deleted once spec.ttlSecondsAfterFinished
+// has passed.
 // Whenever the Ready reason changes during a reconcile, Reconcile records an
 // event on the run.
 func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -98,13 +104,59 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
+	if run.Status.Phase == "" {
+		plan := r.plan
+		if run.Spec.Into != "" {
+			plan = r.planIntoNewClaim
+		}
+		result, err := plan(ctx, run)
+		if err != nil {
+			return ctrl.Result{}, r.planFailed(ctx, run, err)
+		}
+		return result, nil
+	}
 	if run.Spec.Into != "" {
 		return r.reconcileIntoNewClaim(ctx, run)
 	}
-	if run.Status.Phase == "" {
-		return r.plan(ctx, run)
-	}
 	return r.work(ctx, run)
+}
+
+// planFailed handles an error that plan or planIntoNewClaim returned for a
+// retry, and returns the error the reconcile hands back.
+//
+// A run whose checks keep failing never records status.startedAt, so overdue
+// never fires for it. planFailed therefore counts spec.timeout from the run's
+// creation. Once that has passed, it ends the run as Failed with reason
+// TimedOut and the error in the message. Until then it sets Ready to False with
+// reason Retrying and the error as the message, so `kubectl get` shows why the
+// run has not started, and returns the error for a retry. It writes the
+// condition only when it changed, because every write starts another
+// reconcile.
+//
+// An error from a pass that had already given the run a phase, such as a lost
+// status write, is returned unchanged.
+func (r *RestoreRunReconciler) planFailed(ctx context.Context, run *backupv1alpha1.RestoreRun, err error) error {
+	if run.Status.Phase != "" {
+		return err
+	}
+	if run.Spec.Timeout != nil && !run.CreationTimestamp.IsZero() {
+		deadline := run.CreationTimestamp.Add(run.Spec.Timeout.Duration)
+		if !r.Now().Before(deadline) {
+			return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut,
+				fmt.Sprintf("the run had not passed its checks by %s: %v", deadline.UTC().Format(time.RFC3339), err))
+		}
+	}
+	before := meta.FindStatusCondition(run.Status.Conditions, backupv1alpha1.ConditionReady)
+	unchanged := before != nil && before.Status == metav1.ConditionFalse &&
+		before.Reason == backupv1alpha1.ReasonRetrying && before.Message == err.Error()
+	if unchanged {
+		return err
+	}
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRetrying, err.Error())
+	if werr := r.writeStatus(ctx, run); werr != nil {
+		return errors.Join(err, werr)
+	}
+	return err
 }
 
 // target parses the run's spec.restoreAsOf. It returns nil when the field is
@@ -143,7 +195,7 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 // hold, or a synced run with no claim to take the moment from. plan returns
 // an error, and writes nothing, when listing the snapshots or the base
 // backups fails, and when a read fails in a way a retry may fix, such as a
-// timeout from the API server.
+// timeout from the API server. Reconcile hands such an error to planFailed.
 func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	items, err := r.items(ctx, run)
 	if err != nil {
@@ -668,16 +720,18 @@ func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, namespace, nam
 	return nil
 }
 
-// reconcileIntoNewClaim restores a volume into the new claim that spec.into
-// names, and leaves the app's claim alone.
+// planIntoNewClaim checks an into restore before it creates anything. It
+// selects the snapshot the restore would use, records it on the run's single
+// item, and moves the run to Running with status.startedAt set. The check has
+// to come first, because the populator would otherwise bind an empty claim and
+// report success.
 //
-// It creates a VolumeRestore carrying spec.restoreAsOf and a claim whose data
-// source names it, so the ordinary populator path does the work. On the first
-// pass it checks that a snapshot is in reach, because the populator would
-// otherwise bind an empty claim and report success. The run succeeds once the
-// new claim is Bound, and is aborted when the claim has not bound by
-// spec.timeout.
-func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
+// A spec that can't work ends the run as Failed with reason Invalid: a source
+// claim or VolumeRestore that is missing, or a restoreAsOf that doesn't parse.
+// A run with no snapshot in reach ends with reason NoBackupInReach. Any other
+// failed read, and a failed listing of the repository, is returned for a
+// retry.
+func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	run.Status.Target = run.Spec.Into
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
@@ -686,30 +740,43 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 		}
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
+	at, err := target(run)
+	if err != nil {
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
+	snapshot, reason, err := r.selectSnapshot(ctx, run, settings.Secret, at, false)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if reason != "" {
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, reason)
+	}
+	now := metav1.NewTime(r.Now())
+	run.Status.Phase = backupv1alpha1.RunPhaseRunning
+	run.Status.StartedAt = &now
+	run.Status.Items = []backupv1alpha1.RestoreItem{{
+		Kind: "PersistentVolumeClaim", Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning, Snapshot: snapshot.ShortID(),
+	}}
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning,
+		fmt.Sprintf("restoring into claim %s", run.Spec.Into))
+	return after(time.Second, r.writeStatus(ctx, run))
+}
 
-	if run.Status.Phase == "" {
-		at, err := target(run)
-		if err != nil {
-			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
-		}
-		snapshot, reason, err := r.selectSnapshot(ctx, run, settings.Secret, at, false)
-		if err != nil {
+// reconcileIntoNewClaim restores a volume into the new claim that spec.into
+// names, and leaves the app's claim alone. planIntoNewClaim has checked the
+// run before this runs.
+//
+// It creates a VolumeRestore carrying spec.restoreAsOf and a claim whose data
+// source names it, so the ordinary populator path does the work. The run
+// succeeds once the new claim is Bound, and is aborted when the claim has not
+// bound by spec.timeout.
+func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
+	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
+	if err != nil {
+		if !isRefusal(err) {
 			return ctrl.Result{}, err
 		}
-		if reason != "" {
-			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, reason)
-		}
-		now := metav1.NewTime(r.Now())
-		run.Status.Phase = backupv1alpha1.RunPhaseRunning
-		run.Status.StartedAt = &now
-		run.Status.Items = []backupv1alpha1.RestoreItem{{
-			Kind: "PersistentVolumeClaim", Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning, Snapshot: snapshot.ShortID(),
-		}}
-		backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning,
-			fmt.Sprintf("restoring into claim %s", run.Spec.Into))
-		if err := r.writeStatus(ctx, run); err != nil {
-			return ctrl.Result{}, err
-		}
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 
 	vr := pointInTimeRestore(run, settings)

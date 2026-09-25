@@ -72,6 +72,7 @@ const (
 
 	// ReasonTimedOut reports a RestoreRun that had not finished by the end of
 	// its spec.timeout, or an into restore whose claim had not bound by then.
+	// A run whose checks never passed counts its timeout from its creation.
 	// The run removes its ReplicationDestinations and gives back any workloads
 	// it stopped before it reports this. A BackupRun that runs out of time
 	// reports ReasonFailed.
@@ -80,6 +81,12 @@ const (
 	// ReasonInvalid reports a spec the controller will not act on. The
 	// condition's message names the field at fault.
 	ReasonInvalid = "Invalid"
+
+	// ReasonRetrying reports a RestoreRun whose checks failed with an error it
+	// tries again, such as a repository it can't open. The condition's
+	// message holds the error. A run still retrying once spec.timeout has
+	// passed since it was created ends with reason TimedOut.
+	ReasonRetrying = "Retrying"
 )
 
 // SetReady sets or replaces the Ready condition in a status's condition list.

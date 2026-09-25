@@ -846,3 +846,46 @@ func TestARestoreRetriesAFailedReadBeforeAVolumeStarts(t *testing.T) {
 		t.Errorf("items = %+v, want both still Pending", run.Status.Items)
 	}
 }
+
+// brokenLister is a restic.Lister whose every listing fails with err, the
+// way restic fails against a repository whose password is wrong.
+type brokenLister struct{ err error }
+
+// Snapshots returns the lister's error.
+func (b brokenLister) Snapshots(context.Context, *corev1.Secret) ([]restic.Snapshot, error) {
+	return nil, b.err
+}
+
+// A run whose repository can't be listed says why on its Ready condition while
+// it retries, so `kubectl get` shows more than an empty phase. Once
+// spec.timeout has passed since the run was created, it gives up as Failed
+// with reason TimedOut, although it never started.
+func TestARestoreWhoseChecksKeepFailingSaysWhyAndTimesOut(t *testing.T) {
+	r, c := restoreReconciler(t, nil,
+		restoreRun(func(r *backupv1alpha1.RestoreRun) {
+			r.Spec.Claim = claimN
+			r.CreationTimestamp = metav1.NewTime(frozen)
+		}),
+		claim(), volumeRestore(), repository())
+	r.Snapshots = brokenLister{errors.New("Fatal: wrong password or no key found")}
+
+	run := reconcileExpectingRetry(t, r, c)
+	if cond := readyMessage(run.Status.Conditions); !strings.Contains(cond, "wrong password") {
+		t.Errorf("ready message = %q, want the listing error", cond)
+	}
+	if run.Status.Phase != "" {
+		t.Errorf("phase = %q, want the run still unplanned", run.Status.Phase)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(4 * time.Hour) }
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err != nil {
+		t.Fatalf("reconcile at the timeout returned %v, want the run ended", err)
+	}
+	run = readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+		t.Fatalf("phase = %q, reason = %q at the timeout; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	if cond := readyMessage(run.Status.Conditions); !strings.Contains(cond, "wrong password") {
+		t.Errorf("ready message = %q, want the error the run gave up on", cond)
+	}
+}
