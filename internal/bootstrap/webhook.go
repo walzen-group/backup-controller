@@ -392,8 +392,9 @@ func keepRecovery(req admission.Request) admission.Response {
 }
 
 // archiveHolder finds an existing Cluster that already archives to the same
-// bucket and prefix as the Cluster being admitted. Two databases archiving to
-// one prefix interleave their WAL and leave the archive unrestorable.
+// bucket and prefix, on the same S3 service, as the Cluster being admitted.
+// Two databases archiving to one prefix interleave their WAL and leave the
+// archive unrestorable.
 //
 // Parameters:
 //   - namespace and name identify the Cluster being admitted. A Cluster with
@@ -405,12 +406,17 @@ func keepRecovery(req admission.Request) admission.Response {
 // Cluster archives there. It returns an error only when the Cluster list
 // fails.
 //
-// It lists every Cluster in every namespace and resolves each one's location
-// with ResolveLocation, then compares bucket and prefix. Two Clusters can reach
-// one prefix through differently named ObjectStores, so comparing store names
-// would miss them. A Cluster whose own store can't be resolved is skipped.
-// Refusing a new database because an unrelated one is misconfigured would
-// block work this check has no reason to block.
+// It lists every Cluster in every namespace, reads each archiving one's
+// ObjectStore with archiveAt, and compares the two with sameArchive: endpoint,
+// bucket and prefix. Two Clusters can reach one prefix through differently
+// named ObjectStores, so comparing store names would miss them. The check
+// reads no Secret. Where a Cluster archives is written in its ObjectStore, so
+// a holder whose credentials are missing is still found, and each other
+// Cluster costs one read, which keeps a create on a cluster with many
+// databases inside the webhook's timeout. A Cluster whose ObjectStore can't be
+// read or names no s3:// destination is skipped. Refusing a new database
+// because an unrelated one is misconfigured would block work this check has no
+// reason to block.
 func archiveHolder(
 	ctx context.Context,
 	c client.Reader,
@@ -432,11 +438,11 @@ func archiveHolder(
 		if !found {
 			continue
 		}
-		theirs, err := ResolveLocation(ctx, c, other.GetNamespace(), store, serverName)
+		theirs, _, err := archiveAt(ctx, c, other.GetNamespace(), store, serverName)
 		if err != nil {
 			continue
 		}
-		if theirs.Bucket == at.Bucket && theirs.Prefix == at.Prefix {
+		if theirs.sameArchive(at) {
 			return fmt.Sprintf("%s/%s", other.GetNamespace(), other.GetName()), nil
 		}
 	}

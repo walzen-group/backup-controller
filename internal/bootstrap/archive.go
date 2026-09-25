@@ -115,24 +115,10 @@ func ResolveLocation(
 	c client.Reader,
 	namespace, objectStore, serverName string,
 ) (Location, error) {
-	store := &unstructured.Unstructured{}
-	store.SetGroupVersionKind(ObjectStoreGVK)
-	key := types.NamespacedName{Namespace: namespace, Name: objectStore}
-	if err := c.Get(ctx, key, store); err != nil {
-		return Location{}, fmt.Errorf("read ObjectStore %s/%s: %w", namespace, objectStore, err)
-	}
-
-	destination, _, err := unstructured.NestedString(store.Object, "spec", "configuration", "destinationPath")
-	if err != nil || destination == "" {
-		return Location{}, fmt.Errorf("ObjectStore %s/%s has no spec.configuration.destinationPath", namespace, objectStore)
-	}
-
-	bucket, prefix, err := splitDestination(destination)
+	at, store, err := archiveAt(ctx, c, namespace, objectStore, serverName)
 	if err != nil {
 		return Location{}, err
 	}
-
-	endpoint, _, _ := unstructured.NestedString(store.Object, "spec", "configuration", "endpointURL")
 
 	accessKey, err := credential(ctx, c, namespace, store, "accessKeyId")
 	if err != nil {
@@ -148,14 +134,69 @@ func ResolveLocation(
 		return Location{}, err
 	}
 
+	at.AccessKey = accessKey
+	at.SecretKey = secretKey
+	at.CABundle = bundle
+	return at, nil
+}
+
+// archiveAt works out where one database archives from its ObjectStore alone,
+// reading no Secret. The webhook's collision check calls it for every
+// archiving Cluster on the cluster, and ResolveLocation builds on it.
+//
+// The arguments are those of ResolveLocation. It returns a Location with only
+// Endpoint, Bucket and Prefix set, and the ObjectStore it read so the caller
+// can follow its Secret references. It returns an error when the ObjectStore
+// can't be read, or when its spec.configuration.destinationPath is missing or
+// isn't an s3:// URL with a bucket.
+func archiveAt(
+	ctx context.Context,
+	c client.Reader,
+	namespace, objectStore, serverName string,
+) (Location, *unstructured.Unstructured, error) {
+	store := &unstructured.Unstructured{}
+	store.SetGroupVersionKind(ObjectStoreGVK)
+	key := types.NamespacedName{Namespace: namespace, Name: objectStore}
+	if err := c.Get(ctx, key, store); err != nil {
+		return Location{}, nil, fmt.Errorf("read ObjectStore %s/%s: %w", namespace, objectStore, err)
+	}
+
+	destination, _, err := unstructured.NestedString(store.Object, "spec", "configuration", "destinationPath")
+	if err != nil || destination == "" {
+		return Location{}, nil, fmt.Errorf("ObjectStore %s/%s has no spec.configuration.destinationPath", namespace, objectStore)
+	}
+
+	bucket, prefix, err := splitDestination(destination)
+	if err != nil {
+		return Location{}, nil, err
+	}
+
+	endpoint, _, _ := unstructured.NestedString(store.Object, "spec", "configuration", "endpointURL")
+
 	return Location{
-		Endpoint:  endpoint,
-		Bucket:    bucket,
-		Prefix:    strings.Trim(prefix+"/"+serverName, "/"),
-		AccessKey: accessKey,
-		SecretKey: secretKey,
-		CABundle:  bundle,
-	}, nil
+		Endpoint: endpoint,
+		Bucket:   bucket,
+		Prefix:   strings.Trim(prefix+"/"+serverName, "/"),
+	}, store, nil
+}
+
+// sameArchive reports whether two Locations name one archive: the same bucket
+// and prefix on the same S3 service. Endpoints are compared by host and port,
+// ignoring letter case, so https://s3.example.com and S3.example.com are one
+// service. An endpoint that splitEndpoint can't read is compared as written.
+func (l Location) sameArchive(other Location) bool {
+	return l.Bucket == other.Bucket && l.Prefix == other.Prefix &&
+		endpointHost(l.Endpoint) == endpointHost(other.Endpoint)
+}
+
+// endpointHost returns the host and port an endpointURL points at, in lower
+// case, or the endpointURL itself in lower case when splitEndpoint refuses it.
+func endpointHost(endpoint string) string {
+	host, _, err := splitEndpoint(endpoint)
+	if err != nil {
+		host = endpoint
+	}
+	return strings.ToLower(host)
 }
 
 // endpointCA reads the PEM bundle that the ObjectStore's

@@ -22,7 +22,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -239,6 +241,131 @@ func TestAClusterIsRefusedWhenAnotherArchivesThere(t *testing.T) {
 	}
 	if !strings.Contains(response.Result.Message, "other/app-pg") {
 		t.Errorf("the refusal does not name the holder: %q", response.Result.Message)
+	}
+}
+
+// elsewhere builds the Cluster other/app-pg, which archives through the
+// ObjectStore other/app-pg-store to app-pg's own prefix, and that store. The
+// mutate function, when given, edits the store's spec.configuration.
+func elsewhere(t *testing.T, mutate func(map[string]any)) (*unstructured.Unstructured, *unstructured.Unstructured) {
+	t.Helper()
+	other := cluster(t, func(object map[string]any) {
+		metadata, _ := object["metadata"].(map[string]any)
+		metadata["namespace"] = "other"
+	})
+	other.SetAPIVersion("postgresql.cnpg.io/v1")
+	other.SetKind("Cluster")
+	otherStore := store()
+	otherStore.SetNamespace("other")
+	if mutate != nil {
+		configuration, _, _ := unstructured.NestedMap(otherStore.Object, "spec", "configuration")
+		mutate(configuration)
+		_ = unstructured.SetNestedMap(otherStore.Object, configuration, "spec", "configuration")
+	}
+	return other, otherStore
+}
+
+// TestTheCollisionCheckReadsNoSecretOfAnotherCluster checks that finding who
+// else archives to a prefix reads the other Clusters' ObjectStores and none of
+// their Secrets. Only the admitted Cluster's own two credentials are read.
+//
+// The webhook times out after 15 seconds and fails closed. Reading two
+// Secrets for every archiving Cluster on the cluster put each create behind
+// client-go's rate limiter, and around 43 archiving Clusters were enough for
+// every create to time out.
+func TestTheCollisionCheckReadsNoSecretOfAnotherCluster(t *testing.T) {
+	other, otherStore := elsewhere(t, func(configuration map[string]any) {
+		configuration["destinationPath"] = "s3://backups/other/"
+	})
+	otherSecret := secret()
+	otherSecret.Namespace = "other"
+
+	raw, err := json.Marshal(cluster(t, nil))
+	if err != nil {
+		t.Fatalf("marshal the cluster: %v", err)
+	}
+	reads := 0
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).
+		WithObjects(secret(), otherSecret).
+		WithRuntimeObjects(store(), otherStore, other).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Secret); ok {
+					reads++
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+
+	decider := &Decider{Client: c, Prober: stubProber{has: false}}
+	response := decider.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: admissionv1.Create,
+			Namespace: "app",
+			Name:      "app-pg",
+			Object:    runtime.RawExtension{Raw: raw},
+		},
+	})
+
+	if !response.Allowed {
+		t.Fatalf("the cluster was refused: %v", response.Result)
+	}
+	if reads != 2 {
+		t.Errorf("the webhook read %d Secrets, want the admitted Cluster's own 2", reads)
+	}
+}
+
+// TestAHolderWithoutItsSecretStillCollides checks that a Cluster archiving to
+// the same prefix is found even when the Secret its ObjectStore names is
+// missing. Where a Cluster archives is written in its ObjectStore, and a
+// missing credential does not move it.
+func TestAHolderWithoutItsSecretStillCollides(t *testing.T) {
+	other, otherStore := elsewhere(t, nil)
+
+	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore)
+
+	if response.Allowed {
+		t.Fatal("a Cluster was admitted while another database archives to its prefix")
+	}
+	if !strings.Contains(response.Result.Message, "other/app-pg") {
+		t.Errorf("the refusal does not name the holder: %q", response.Result.Message)
+	}
+}
+
+// TestTheSamePrefixOnAnotherEndpointIsNoCollision checks that a Cluster is
+// admitted when another Cluster uses the same bucket and prefix on a different
+// S3 service. The two archives are separate, and refusing would block a
+// database for nothing.
+func TestTheSamePrefixOnAnotherEndpointIsNoCollision(t *testing.T) {
+	other, otherStore := elsewhere(t, func(configuration map[string]any) {
+		configuration["endpointURL"] = "https://another-store.example"
+	})
+
+	otherSecret := secret()
+	otherSecret.Namespace = "other"
+
+	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore, otherSecret)
+
+	if !response.Allowed {
+		t.Fatalf("a Cluster was refused over an archive on another S3 service: %v", response.Result)
+	}
+}
+
+// TestTheSameEndpointWrittenTwoWaysIsACollision checks that endpointURLs
+// naming one service in two spellings, with and without https:// and in
+// another letter case, count as the same endpoint.
+func TestTheSameEndpointWrittenTwoWaysIsACollision(t *testing.T) {
+	other, otherStore := elsewhere(t, func(configuration map[string]any) {
+		configuration["endpointURL"] = "Store.example"
+	})
+
+	otherSecret := secret()
+	otherSecret.Namespace = "other"
+
+	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore, otherSecret)
+
+	if response.Allowed {
+		t.Fatal("a Cluster was admitted while another database archives to its prefix on the same service")
 	}
 }
 
