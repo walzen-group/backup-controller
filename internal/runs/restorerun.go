@@ -737,29 +737,45 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 	return r.finish(ctx, run, reason, message)
 }
 
-// quiesce stops the workloads spec.quiesce lists, and records in the status
-// what it changed before the run does anything else.
+// quiesce stops the workloads spec.quiesce lists, before the run does
+// anything else.
 //
-// stopWorkloads suspends the Flux Kustomizations that apply the workloads,
-// then scales each workload to zero. quiesce writes status.quiesced,
-// status.suspendedKustomizations and status.quiescedAt even when stopping
-// fails partway, so finish and finalize can still put back what was changed.
-// A failed stop then aborts the run with reason Failed, which starts the
-// workloads it stopped again and resumes the Kustomizations, the same as a
+// It first records the plan from planStop in status.quiesced and
+// status.suspendedKustomizations, with each workload's replica count, and
+// writes the status. Only then does applyStop suspend the Kustomizations and
+// scale the workloads to zero. A pass that finds a plan in the status reuses
+// it, so a retry after a lost status write still gives back the counts the
+// workloads had before the run touched them. quiesce then writes
+// status.quiescedAt. After a failed stop, it narrows the plan with
+// appliedPart to what is stopped now, and aborts the run with reason Failed,
+// which starts those workloads again and resumes the Kustomizations, the same as a
 // BackupRun. A spec.quiesce entry the namespace does not hold ends the run as
 // Failed with reason Invalid before anything is stopped, and a failed read of
-// an entry is returned for a retry.
+// an entry or a Kustomization is returned for a retry.
 func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
-	if err != nil {
-		if !isQuiesceSpecError(err) {
+	if len(run.Status.Quiesced) == 0 {
+		targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
+		if err != nil {
+			if !isQuiesceSpecError(err) {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+		}
+		stop, suspend, err := planStop(ctx, r.Reader, targets)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+		run.Status.Quiesced, run.Status.SuspendedKustomizations = stop, suspend
+		if err := r.writeStatus(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
-	halted, suspended, stopErr := stopWorkloads(ctx, r.Client, r.Reader, targets)
+	stopErr := applyStop(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+	if stopErr != nil {
+		run.Status.Quiesced, run.Status.SuspendedKustomizations = appliedPart(ctx, r.Reader, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+	}
 	now := metav1.NewTime(r.Now())
-	run.Status.Quiesced, run.Status.SuspendedKustomizations, run.Status.QuiescedAt = halted, suspended, &now
+	run.Status.QuiescedAt = &now
 	if err := r.writeStatus(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -782,9 +798,11 @@ func (r *RestoreRunReconciler) restart(ctx context.Context, run *backupv1alpha1.
 }
 
 // stopped reports whether the run has stopped workloads and not yet started
-// them again.
+// them again. A run that recorded its plan to stop them counts as having
+// stopped them, even before status.quiescedAt is set, because the pass that
+// wrote the plan may have stopped them and then lost its status write.
 func stopped(run *backupv1alpha1.RestoreRun) bool {
-	return run.Status.QuiescedAt != nil && run.Status.RestartedAt == nil
+	return (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil
 }
 
 // anyRestorePending reports whether any item is still Pending, which means

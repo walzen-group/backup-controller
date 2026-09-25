@@ -25,7 +25,7 @@ var KustomizationGVK = schema.GroupVersionKind{Group: "kustomize.toolkit.fluxcd.
 
 // fluxNameLabel and fluxNamespaceLabel are the labels kustomize-controller
 // writes on every object it applies. Together they name the Kustomization
-// that applied the object, which is the one stopWorkloads suspends.
+// that applied the object, which is the one planStop picks to suspend.
 const (
 	fluxNameLabel      = "kustomize.toolkit.fluxcd.io/name"
 	fluxNamespaceLabel = "kustomize.toolkit.fluxcd.io/namespace"
@@ -158,27 +158,29 @@ func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 	return fmt.Errorf("get %s %s: %w", ref.Kind, ref.Name, err)
 }
 
-// stopWorkloads scales the target workloads to zero. It first suspends the
-// Flux Kustomizations that apply them, so that Flux can't scale them back up.
+// planStop works out what stopping the target workloads changes, and changes
+// nothing yet. A run records the plan in its status before it calls
+// applyStop, so a pass that stops the workloads and then loses its status
+// write is retried from the plan. Reading the workloads again at that point
+// would find them at zero replicas and their Kustomizations suspended, and
+// the run would give back nothing.
 //
 // Parameters:
-//   - c writes the patches.
 //   - reader reads each Kustomization's current spec.suspend.
 //   - targets are the workloads to stop, from quiesceTargets or namedTargets.
 //
-// It returns the workloads it scaled down, with their replica counts, and the
-// Kustomizations it suspended as "namespace/name" keys. The caller records
-// both in the run's status, and restartWorkloads later reverses exactly those
-// changes. On an error it still returns what it changed up to that point, so
-// the caller can put that back.
+// It returns each workload with the replica count it has now, which is the
+// count restartWorkloads gives back, and the Kustomizations to suspend as
+// "namespace/name" keys. It returns an error when a Kustomization can't be
+// read.
 //
 // A target without the kustomize-controller labels, or whose Kustomization
-// no longer exists, is scaled down with nothing suspended. A Kustomization
-// that was already suspended is left out of the returned list, because the
-// run didn't suspend it and must not resume it. A Kustomization that applies
-// several targets is suspended once.
-func stopWorkloads(ctx context.Context, c client.Client, reader client.Reader, targets []workload) ([]backupv1alpha1.QuiescedWorkload, []string, error) {
-	var suspended []string
+// no longer exists, is stopped with nothing suspended. A Kustomization that
+// is already suspended is left out, because the run didn't suspend it and
+// must not resume it. A Kustomization that applies several targets is listed
+// once.
+func planStop(ctx context.Context, reader client.Reader, targets []workload) ([]backupv1alpha1.QuiescedWorkload, []string, error) {
+	var suspend []string
 	seen := map[string]bool{}
 	for _, t := range targets {
 		name := t.object.GetLabels()[fluxNameLabel]
@@ -198,25 +200,132 @@ func stopWorkloads(ctx context.Context, c client.Client, reader client.Reader, t
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return nil, suspended, fmt.Errorf("get Kustomization %s: %w", key, err)
+			return nil, nil, fmt.Errorf("get Kustomization %s: %w", key, err)
 		}
 		if already, _, _ := unstructured.NestedBool(kustomization.Object, "spec", "suspend"); already {
 			continue
 		}
-		if err := setSuspend(ctx, c, namespace, name, true); err != nil {
-			return nil, suspended, err
-		}
-		suspended = append(suspended, key)
+		suspend = append(suspend, key)
 	}
 
-	var stopped []backupv1alpha1.QuiescedWorkload
+	stop := make([]backupv1alpha1.QuiescedWorkload, 0, len(targets))
 	for _, t := range targets {
-		if err := scale(ctx, c, t.object, 0); err != nil {
-			return stopped, suspended, err
-		}
-		stopped = append(stopped, backupv1alpha1.QuiescedWorkload{Kind: t.kind, Name: t.object.GetName(), Replicas: t.replicas})
+		stop = append(stop, backupv1alpha1.QuiescedWorkload{Kind: t.kind, Name: t.object.GetName(), Replicas: t.replicas})
 	}
-	return stopped, suspended, nil
+	return stop, suspend, nil
+}
+
+// applyStop carries out a plan from planStop. It suspends the Kustomizations
+// first, so that Flux can't scale the workloads back up, then scales each
+// workload to zero. Both patches set a fixed value, so calling it again with
+// the same plan changes nothing more.
+//
+// Parameters:
+//   - namespace is the run's namespace, which holds the workloads.
+//   - stop is the run's status.quiesced.
+//   - suspend is the run's status.suspendedKustomizations.
+//
+// It returns the first error it meets and leaves the rest undone. The caller
+// then narrows the plan with appliedPart before it restarts the workloads.
+func applyStop(ctx context.Context, c client.Client, namespace string, stop []backupv1alpha1.QuiescedWorkload, suspend []string) error {
+	for _, key := range suspend {
+		ns, name, _ := strings.Cut(key, "/")
+		if err := setSuspend(ctx, c, ns, name, true); err != nil {
+			return err
+		}
+	}
+	for _, w := range stop {
+		object := workloadObject(namespace, w)
+		if object == nil {
+			continue
+		}
+		if err := scale(ctx, c, object, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// appliedPart returns the part of a stop plan that is in effect now. A run
+// calls it after applyStop failed, so that the restart that follows only
+// touches what the run stopped. A workload whose scale-down was refused
+// would refuse the scale-up too, and the run could then never finish.
+//
+// Parameters:
+//   - reader reads each workload and Kustomization as it stands.
+//   - namespace is the run's namespace, which holds the workloads.
+//   - stop and suspend are the plan, from the run's status.quiesced and
+//     status.suspendedKustomizations.
+//
+// It keeps a workload that stands at zero replicas and a Kustomization that
+// is suspended, since an earlier pass that lost its status write may have
+// stopped them. It drops what still runs and what is gone. An entry that
+// can't be read is kept, so the restart tries to put it back.
+func appliedPart(ctx context.Context, reader client.Reader, namespace string, stop []backupv1alpha1.QuiescedWorkload, suspend []string) ([]backupv1alpha1.QuiescedWorkload, []string) {
+	var stopped []backupv1alpha1.QuiescedWorkload
+	for _, w := range stop {
+		object := workloadObject(namespace, w)
+		if object == nil {
+			continue
+		}
+		err := reader.Get(ctx, client.ObjectKeyFromObject(object), object)
+		switch {
+		case apierrors.IsNotFound(err):
+		case err != nil:
+			stopped = append(stopped, w)
+		default:
+			if replicas := specReplicas(object); replicas != nil && *replicas == 0 {
+				stopped = append(stopped, w)
+			}
+		}
+	}
+	var suspended []string
+	for _, key := range suspend {
+		ns, name, _ := strings.Cut(key, "/")
+		kustomization := &unstructured.Unstructured{}
+		kustomization.SetGroupVersionKind(KustomizationGVK)
+		err := reader.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, kustomization)
+		switch {
+		case apierrors.IsNotFound(err):
+		case err != nil:
+			suspended = append(suspended, key)
+		default:
+			if on, _, _ := unstructured.NestedBool(kustomization.Object, "spec", "suspend"); on {
+				suspended = append(suspended, key)
+			}
+		}
+	}
+	return stopped, suspended
+}
+
+// specReplicas returns the spec.replicas of a Deployment or StatefulSet, or
+// nil for any other object.
+func specReplicas(object client.Object) *int32 {
+	switch o := object.(type) {
+	case *appsv1.Deployment:
+		return o.Spec.Replicas
+	case *appsv1.StatefulSet:
+		return o.Spec.Replicas
+	}
+	return nil
+}
+
+// workloadObject returns an empty Deployment or StatefulSet that carries the
+// namespace and name of a recorded workload, ready for a patch. It returns
+// nil for any other kind.
+func workloadObject(namespace string, w backupv1alpha1.QuiescedWorkload) client.Object {
+	var object client.Object
+	switch w.Kind {
+	case "Deployment":
+		object = &appsv1.Deployment{}
+	case "StatefulSet":
+		object = &appsv1.StatefulSet{}
+	default:
+		return nil
+	}
+	object.SetNamespace(namespace)
+	object.SetName(w.Name)
+	return object
 }
 
 // podsGone reports whether every pod of the target workloads has gone. A
@@ -248,7 +357,7 @@ func podsGone(ctx context.Context, c client.Reader, namespace string, targets []
 //
 // Parameters:
 //   - namespace is the run's namespace, which holds the stopped workloads.
-//   - stopped is the run's status.quiesced, as stopWorkloads returned it.
+//   - stopped is the run's status.quiesced, as planStop returned it.
 //   - suspended is the run's status.suspendedKustomizations, as
 //     "namespace/name" keys.
 //
@@ -257,17 +366,10 @@ func podsGone(ctx context.Context, c client.Reader, namespace string, targets []
 // error it meets.
 func restartWorkloads(ctx context.Context, c client.Client, namespace string, stopped []backupv1alpha1.QuiescedWorkload, suspended []string) error {
 	for _, w := range stopped {
-		var object client.Object
-		switch w.Kind {
-		case "Deployment":
-			object = &appsv1.Deployment{}
-		case "StatefulSet":
-			object = &appsv1.StatefulSet{}
-		default:
+		object := workloadObject(namespace, w)
+		if object == nil {
 			continue
 		}
-		object.SetNamespace(namespace)
-		object.SetName(w.Name)
 		if err := scale(ctx, c, object, w.Replicas); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}

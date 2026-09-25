@@ -657,3 +657,35 @@ func TestAQuiescedRestoreRetriesAFailedWorkloadRead(t *testing.T) {
 		t.Errorf("phase = %q after a failed read, want the run still going", run.Status.Phase)
 	}
 }
+
+// A quiesce pass whose status write is lost after the app was stopped is
+// run again. The retry keeps the replica count and the Kustomization the
+// first pass recorded, so a run that then times out gives the app its 2
+// replicas back and resumes the Kustomization.
+func TestAQuiescedRestoreRetriedAfterALostStatusWriteGivesTheAppBack(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), kustomization(false), writerPod())
+	restoreStep(t, r) // plan
+
+	r.Client = loseStatusWriteAfterStop(c)
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+		t.Fatal("the quiesce pass succeeded, want its lost status write returned")
+	}
+	restoreStep(t, r) // quiesce again
+
+	run := readRestoreRun(t, c)
+	if len(run.Status.Quiesced) != 1 || run.Status.Quiesced[0].Replicas != 2 {
+		t.Errorf("quiesced = %+v, want the Deployment with the 2 replicas it had", run.Status.Quiesced)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d after the run gave up, want the 2 it had", got)
+	}
+	if suspended(t, c) {
+		t.Error("the Kustomization the run suspended stayed suspended")
+	}
+}

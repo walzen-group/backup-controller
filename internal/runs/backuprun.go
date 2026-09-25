@@ -329,43 +329,59 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 }
 
 // quiesce stops the workloads in the run's namespace that are marked
-// backup.wlz.li/quiesce: "true", and records in the status what it changed
-// before the run does anything else. It stores its now argument, the time of
-// this pass, in status.quiescedAt.
+// backup.wlz.li/quiesce: "true", before the run does anything else. It stores
+// its now argument, the time of this pass, in status.quiescedAt.
 //
-// stopWorkloads suspends the Flux Kustomizations that apply the workloads,
-// then scales each workload to zero. quiesce writes status.quiesced and
-// status.suspendedKustomizations even when stopping fails partway, so release
-// can still put back what was changed, and a failure then aborts the run.
-// When no workload is marked, quiesce sets status.restartedAt to the same
-// moment, because there is nothing to start again.
+// It first records the plan from planStop in status.quiesced and
+// status.suspendedKustomizations, with each workload's replica count, and
+// writes the status. Only then does applyStop suspend the Kustomizations and
+// scale the workloads to zero. A pass that finds a plan in the status reuses
+// it, so a retry after a lost status write still gives back the counts the
+// workloads had before the run touched them. quiesce then writes
+// status.quiescedAt. After a failed stop, it narrows the plan with
+// appliedPart to what is stopped now, and aborts the run, which puts that
+// back. When no workload is marked, quiesce sets status.restartedAt to
+// the same moment, because there is nothing to start again.
 func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (ctrl.Result, error) {
-	// A volume still busy with another run's backup would keep the stopped
-	// workloads down for as long as that backup takes. The run waits with the
-	// workloads still running.
-	for _, item := range run.Status.Items {
-		if item.Kind != "ReplicationSource" {
-			continue
+	if len(run.Status.Quiesced) == 0 {
+		// A volume still busy with another run's backup would keep the
+		// stopped workloads down for as long as that backup takes. The run
+		// waits with the workloads still running.
+		for _, item := range run.Status.Items {
+			if item.Kind != "ReplicationSource" {
+				continue
+			}
+			source := &volsyncv1alpha1.ReplicationSource{}
+			err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
+			if err == nil && busy(source) && manualTag(source) != TriggerFor(run.UID) {
+				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy,
+					fmt.Sprintf("ReplicationSource %s is still completing another run's backup", item.Name)))
+			}
 		}
-		source := &volsyncv1alpha1.ReplicationSource{}
-		err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
-		if err == nil && busy(source) && manualTag(source) != TriggerFor(run.UID) {
-			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy,
-				fmt.Sprintf("ReplicationSource %s is still completing another run's backup", item.Name)))
+
+		targets, err := quiesceTargets(ctx, r.Reader, run.Namespace)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if len(targets) == 0 {
+			run.Status.QuiescedAt, run.Status.RestartedAt = newTime(now), newTime(now)
+			return after(time.Second, r.writeStatus(ctx, run))
+		}
+		stop, suspend, err := planStop(ctx, r.Reader, targets)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		run.Status.Quiesced, run.Status.SuspendedKustomizations = stop, suspend
+		if err := r.writeStatus(ctx, run); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
-	targets, err := quiesceTargets(ctx, r.Reader, run.Namespace)
-	if err != nil {
-		return ctrl.Result{}, err
+	stopErr := applyStop(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+	if stopErr != nil {
+		run.Status.Quiesced, run.Status.SuspendedKustomizations = appliedPart(ctx, r.Reader, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	}
-	stopped, suspended, stopErr := stopWorkloads(ctx, r.Client, r.Reader, targets)
-	run.Status.Quiesced = stopped
-	run.Status.SuspendedKustomizations = suspended
 	run.Status.QuiescedAt = newTime(now)
-	if len(targets) == 0 {
-		run.Status.RestartedAt = newTime(now)
-	}
 	if err := r.writeStatus(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -642,10 +658,13 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 
 // release puts back what the run changed in the cluster. When the run stopped
 // workloads and has not started them again, release scales them back up,
-// resumes the Kustomizations it suspended, and records status.restartedAt. It
-// then deletes the run's Workload.
+// resumes the Kustomizations it suspended, and records status.restartedAt. A
+// run that recorded its plan to stop them counts as having stopped them, even
+// before status.quiescedAt is set, because the pass that wrote the plan may
+// have stopped them and then lost its status write. release then deletes the
+// run's Workload.
 func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.BackupRun) error {
-	if run.Status.QuiescedAt != nil && run.Status.RestartedAt == nil {
+	if (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil {
 		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 			return err
 		}

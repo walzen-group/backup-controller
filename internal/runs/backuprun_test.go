@@ -570,3 +570,55 @@ func TestATimedOutRunRestartsTheApp(t *testing.T) {
 		t.Fatalf("phase = %q, want Failed", run.Status.Phase)
 	}
 }
+
+// cutClone stands in for VolSync cutting the clone of the claim: it creates
+// the Bound claim volsync-<claim>-src.
+func cutClone(t *testing.T, c client.Client) {
+	t.Helper()
+	clone := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "volsync-" + claimN + "-src", Namespace: ns},
+		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+	if err := c.Create(context.Background(), clone); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Status().Update(context.Background(), clone); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A quiesce pass whose status write is lost after the app was stopped is
+// run again. The retry keeps the replica count and the Kustomization the
+// first pass recorded, so the run still gives the app its 2 replicas back and
+// resumes the Kustomization once the clone is cut.
+func TestAQuiesceRetriedAfterALostStatusWriteStillRestartsTheApp(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+
+	r.Client = loseStatusWriteAfterStop(c)
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err == nil {
+		t.Fatal("the quiesce pass succeeded, want its lost status write returned")
+	}
+	step(t, r) // quiesce again
+
+	run := readBackupRun(t, c)
+	if len(run.Status.Quiesced) != 1 || run.Status.Quiesced[0].Replicas != 2 {
+		t.Errorf("quiesced = %+v, want the Deployment with the 2 replicas it had", run.Status.Quiesced)
+	}
+	if len(run.Status.SuspendedKustomizations) != 1 {
+		t.Errorf("suspended = %v, want the Kustomization the run suspended", run.Status.SuspendedKustomizations)
+	}
+
+	step(t, r) // start
+	cutClone(t, c)
+	step(t, r) // restart
+
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d once the clone was cut, want the 2 the app had", got)
+	}
+	if suspended(t, c) {
+		t.Error("the Kustomization the run suspended stayed suspended")
+	}
+}

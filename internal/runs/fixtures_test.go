@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -19,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // frozen is the time the tests' clocks stand at. A test reaches a deadline by
@@ -300,4 +303,27 @@ func getUnstructured(t *testing.T, c client.Client, gvk schema.GroupVersionKind,
 	u.SetGroupVersionKind(gvk)
 	err := c.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: name}, u)
 	return u, err == nil
+}
+
+// loseStatusWriteAfterStop returns a client over c that fails one status
+// write of a BackupRun or RestoreRun with a conflict: the first one made
+// while the app's Deployment stands at zero replicas. It stands in for a
+// quiesce pass whose status write is lost after the app was stopped, through
+// a conflict or a controller crash.
+func loseStatusWriteAfterStop(c client.Client) client.Client {
+	lost := false
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			_, backup := obj.(*backupv1alpha1.BackupRun)
+			_, restore := obj.(*backupv1alpha1.RestoreRun)
+			if (backup || restore) && !lost {
+				d := &appsv1.Deployment{}
+				if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: appN}, d); err == nil && d.Spec.Replicas != nil && *d.Spec.Replicas == 0 {
+					lost = true
+					return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("runs").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
+				}
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
 }
