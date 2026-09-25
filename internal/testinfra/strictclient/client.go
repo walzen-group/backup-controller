@@ -29,11 +29,17 @@
 //     write still succeeds. See checkNoNewFinalizers.
 //   - Status subresource writes keep the stored generation, uid and
 //     creationTimestamp. See Client.Status.
+//   - An update or status update whose object carries a uid other than the
+//     stored one fails with a Conflict. See checkUID.
+//   - Objects of a kind defined by a CRD in Options.CRDs are pruned against
+//     that CRD's schema on every write, with the apiextensions pruning code.
+//     See Client.coerce. Build registers the status subresources those CRDs
+//     declare, and Create drops the status of such a kind.
 //
 // It leaves out: generation for built-in kinds (each built-in strategy has
 // its own rule; the wrapper keeps the stored value and never bumps it), the
-// finalizer check for server-side apply patches, schema pruning, garbage
-// collection and blockOwnerDeletion. Those are separate behaviours; each one is added as a
+// finalizer check for server-side apply patches, CRD defaulting and
+// metadata coercion, garbage collection and blockOwnerDeletion. Those are separate behaviours; each one is added as a
 // method or an Options field of Client, the way Create, Update and Patch are
 // here.
 //
@@ -72,6 +78,12 @@ type Options struct {
 	// custom resource strategy, which owns metadata.generation. Nil means
 	// DefaultIsCustomResource.
 	IsCustomResource func(schema.GroupVersionKind) bool
+
+	// CRDs are CustomResourceDefinition manifests, normally the pinned copies
+	// in internal/testinfra/crds. Objects of a kind one of them defines are
+	// pruned against that version's schema on every write (see
+	// Client.coerce). Build also registers their status subresources.
+	CRDs []string
 }
 
 // Client is a client.WithWatch that sets the server-owned metadata the way
@@ -80,6 +92,7 @@ type Client struct {
 	client.WithWatch
 
 	opts Options
+	crds *crdSet
 }
 
 // New wraps a fake client.
@@ -88,9 +101,12 @@ type Client struct {
 //   - inner is the client to wrap, normally built with fake.NewClientBuilder.
 //     Objects seeded into it through the builder keep the metadata the test
 //     gave them, as objects restored from etcd would.
-//   - opts sets the server clock and the custom resource test.
+//   - opts sets the server clock, the custom resource test and the CRD
+//     files to prune against.
 //
-// New panics when opts.Clock is nil, since every create needs it.
+// New panics when opts.Clock is nil, since every create needs it, and when a
+// CRD file cannot be loaded. It does not register status subresources with
+// the fake; Build does.
 func New(inner client.WithWatch, opts Options) *Client {
 	if opts.Clock == nil {
 		panic("strictclient: Options.Clock is required")
@@ -98,7 +114,15 @@ func New(inner client.WithWatch, opts Options) *Client {
 	if opts.IsCustomResource == nil {
 		opts.IsCustomResource = DefaultIsCustomResource
 	}
-	return &Client{WithWatch: inner, opts: opts}
+	c := &Client{WithWatch: inner, opts: opts}
+	if len(opts.CRDs) > 0 {
+		set, err := loadCRDs(opts.CRDs)
+		if err != nil {
+			panic(err)
+		}
+		c.crds = set
+	}
+	return c
 }
 
 // DefaultIsCustomResource reports whether a group looks like a custom
@@ -135,23 +159,34 @@ func (c *Client) Create(ctx context.Context, obj client.Object, opts ...client.C
 	if isCR {
 		obj.SetGeneration(1)
 	}
+	if err := c.coerce(obj, true); err != nil {
+		return err
+	}
 	return c.WithWatch.Create(ctx, obj, opts...)
 }
 
 // Update stores obj with the stored creationTimestamp and generation, and the
 // stored uid when obj has none; for a custom resource whose content outside
-// metadata changed, the generation goes up by one. On success obj holds the
-// stored object. Errors are the fake client's, including NotFound for an
+// metadata changed, the generation goes up by one. obj is pruned against its
+// CRD first (see coerce). On success obj holds the stored object. Errors are
+// a Conflict when obj carries a uid other than the stored one (see
+// checkUID), and otherwise the fake client's, including NotFound for an
 // object that does not exist.
 func (c *Client) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
 	old, err := c.stored(ctx, obj)
 	if err != nil {
 		return c.WithWatch.Update(ctx, obj, opts...)
 	}
+	if err := c.checkUID(obj, old); err != nil {
+		return err
+	}
 	if err := c.checkNoNewFinalizers(obj, old); err != nil {
 		return err
 	}
 	keepServerFields(obj, old)
+	if err := c.coerce(obj, false); err != nil {
+		return err
+	}
 	if err := c.WithWatch.Update(ctx, obj, opts...); err != nil {
 		return err
 	}
@@ -168,7 +203,8 @@ func (c *Client) Update(ctx context.Context, obj client.Object, opts ...client.U
 
 // Patch applies patch through the fake client, then restores the server-owned
 // fields the patch may have changed and, for a custom resource whose content
-// outside metadata changed, raises the generation by one. On success obj holds
+// outside metadata changed, raises the generation by one. The patched object
+// is pruned against its CRD (see prunePatched). On success obj holds
 // the stored object. Errors are the fake client's, or from the follow-up
 // update that sets the server-owned fields.
 func (c *Client) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
@@ -186,6 +222,9 @@ func (c *Client) Patch(ctx context.Context, obj client.Object, patch client.Patc
 		}
 	}
 	err = c.WithWatch.Patch(ctx, obj, patch, opts...)
+	if err == nil {
+		err = c.prunePatched(ctx, obj, isDryRunPatch(opts))
+	}
 	if err == nil {
 		err = c.settleGeneration(ctx, obj, old, isDryRunPatch(opts))
 	}
