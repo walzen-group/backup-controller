@@ -25,9 +25,15 @@ const QuiescedTag = "quiesced"
 // running restic refreshes its lock every five minutes, so a lock older than
 // staleLockAge belongs to a process that is gone. lockCheckDelay is a variable
 // so the tests can set it to zero.
+//
+// unlockAttempts and unlockRetryDelay are the controller's own: how often it
+// tries to remove its lock, and how long it waits between tries. A lock it
+// leaves blocks every VolSync backup and prune until a later Retime removes it.
 var (
-	lockCheckDelay = 200 * time.Millisecond
-	staleLockAge   = 30 * time.Minute
+	lockCheckDelay   = 200 * time.Millisecond
+	staleLockAge     = 30 * time.Minute
+	unlockAttempts   = 3
+	unlockRetryDelay = time.Second
 )
 
 // lockUser is the username the controller writes into its lock files. restic
@@ -78,7 +84,11 @@ func (e *LockedError) Error() string {
 //     log line is the only place it learns the ID.
 //   - at is the time the snapshot should carry. A BackupRun passes its
 //     restartedAt: the volume didn't change between the last pod stopping and
-//     that moment, so a database recovered to at matches the files.
+//     that moment, so a database recovered to that time matches the files.
+//     Retime drops any fraction of a second from it: VolSync compares
+//     snapshot times in whole seconds, a BackupRun reports whole seconds,
+//     and a retry that passes the time without its fraction must find the
+//     copy an earlier call wrote.
 //   - tag is added to the snapshot's tags. A BackupRun passes QuiescedTag, which
 //     is how a RestoreRun with syncDatabaseToVolume finds the snapshots it can
 //     recover a database alongside.
@@ -106,7 +116,7 @@ func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag
 	if err != nil {
 		return Snapshot{}, err
 	}
-	written, err := r.retime(ctx, short, at, tag)
+	written, err := r.retime(ctx, short, at.Truncate(time.Second), tag)
 	if unlockErr := unlock(); unlockErr != nil {
 		return Snapshot{}, errors.Join(err, fmt.Errorf("remove the controller's lock: %w", unlockErr))
 	}
@@ -131,7 +141,8 @@ func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag
 //
 // When the old snapshot is still there next to a copy an earlier call wrote,
 // that earlier call failed to remove it. retime then removes the old file and
-// returns that copy. Writing the copy again would add a second snapshot under
+// returns that copy. It matches the copy's time to the second, so a copy that
+// an older controller stamped with a fraction of a second still counts. Writing the copy again would add a second snapshot under
 // another ID, because every encryption uses a fresh random IV.
 func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag string) (Snapshot, error) {
 	files, err := r.snapshotFiles(ctx)
@@ -161,7 +172,7 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 	}
 	for _, f := range files {
 		s := f.snapshot
-		if s.ID != old.snapshot.ID && s.Original == origin && s.Time.Equal(at) && slices.Contains(s.Tags, tag) {
+		if s.ID != old.snapshot.ID && s.Original == origin && s.Time.Unix() == at.Unix() && slices.Contains(s.Tags, tag) {
 			if err := r.store.Remove(ctx, path.Join("snapshots", old.snapshot.ID)); err != nil {
 				return Snapshot{}, fmt.Errorf("remove snapshot %s, already written as %s: %w", old.snapshot.ID, s.ID, err)
 			}
@@ -218,8 +229,10 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 // cancels the wait, and the lock is removed then too.
 //
 // On success it returns a function that removes the lock. That function
-// ignores the cancellation of ctx, so the lock is removed even after the
-// caller's context has ended.
+// ignores the cancellation of the context, so the lock is removed even after
+// the caller's context has ended. It tries unlockAttempts times, with
+// unlockRetryDelay between tries, and returns the last error when every try
+// fails.
 func (r *Repository) lockExclusive(ctx context.Context) (func() error, error) {
 	host, _ := os.Hostname()
 	pid := os.Getpid()
@@ -236,7 +249,16 @@ func (r *Repository) lockExclusive(ctx context.Context) (func() error, error) {
 		return nil, err
 	}
 	unlock := func() error {
-		return r.store.Remove(context.WithoutCancel(ctx), path.Join("locks", id))
+		var err error
+		for attempt := range unlockAttempts {
+			if attempt > 0 {
+				time.Sleep(unlockRetryDelay)
+			}
+			if err = r.store.Remove(context.WithoutCancel(ctx), path.Join("locks", id)); err == nil {
+				return nil
+			}
+		}
+		return err
 	}
 
 	select {
@@ -262,9 +284,16 @@ func (r *Repository) lockExclusive(ctx context.Context) (func() error, error) {
 //
 // Any lock from another process blocks an exclusive lock, whether that lock is
 // shared or exclusive. A lock older than staleLockAge is skipped, and so is a
-// file whose name isn't a storage ID. A lock that this process left behind is
-// removed. restic's prune doesn't skip stale locks, so a leftover lock would
-// stop every prune until someone ran restic unlock.
+// file whose name isn't a storage ID.
+//
+// Two kinds of leftover lock are removed. One is a lock that this process left
+// behind. The other is a stale lock that carries lockUser, whatever its host
+// and PID. Only this controller writes that username, and a controller pod
+// that was replaced before it removed its lock leaves one with a host no later
+// pod has. restic's prune doesn't skip stale locks, and VolSync runs restic
+// unlock only when spec.restic.unlock changes, so a leftover lock would stop
+// every prune, and a leftover exclusive lock every backup, until someone
+// removed it by hand.
 //
 // It returns an error when it can't list, read or decode a lock file, or can't
 // remove a leftover one.
@@ -289,6 +318,10 @@ func (r *Repository) checkLocks(ctx context.Context, own, host string, pid int) 
 		case lock.Hostname == host && lock.PID == pid:
 			if err := r.store.Remove(ctx, path.Join("locks", name)); err != nil {
 				return fmt.Errorf("remove the controller's earlier lock %s: %w", name, err)
+			}
+		case lock.Username == lockUser && time.Since(lock.Time) > staleLockAge:
+			if err := r.store.Remove(ctx, path.Join("locks", name)); err != nil {
+				return fmt.Errorf("remove the stale controller lock %s from %s: %w", name, lock.Hostname, err)
 			}
 		case time.Since(lock.Time) > staleLockAge:
 		default:

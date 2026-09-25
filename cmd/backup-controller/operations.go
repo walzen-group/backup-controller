@@ -66,6 +66,13 @@ func (o *clientOperations) SetStatus(ctx context.Context, vr *backupv1alpha1.Vol
 	return o.client.Status().Update(ctx, vr)
 }
 
+// UpdateVolumeRestore writes the VolumeRestore's metadata and spec, which is
+// how the callbacks add and remove their finalizer. The object carries the
+// resource version it was read at, so a stale write fails with a conflict.
+func (o *clientOperations) UpdateVolumeRestore(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
+	return o.client.Update(ctx, vr)
+}
+
 // objectMeta returns object metadata holding only a namespace and a name,
 // which is all a delete needs.
 func objectMeta(namespace, name string) metav1.ObjectMeta {

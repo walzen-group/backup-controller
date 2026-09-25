@@ -232,11 +232,17 @@ func isID(name string) bool {
 // false when every snapshot is later. A VolSync restore whose restoreAsOf is t
 // picks the same snapshot, so the controller uses AtOrBefore to check a
 // restore before it starts one.
+//
+// It compares whole seconds, the way VolSync's restic mover does: the mover
+// drops the fraction from each snapshot's time and from restoreAsOf before it
+// compares them. So a snapshot taken at 06:00:00.7 counts as taken at or before
+// 06:00:00, which is the time a BackupRun reports for it. Among the snapshots
+// in reach, the newest by full time wins.
 func AtOrBefore(snapshots []Snapshot, t time.Time) (Snapshot, bool) {
 	var found Snapshot
 	ok := false
 	for _, s := range snapshots {
-		if s.Time.After(t) {
+		if s.Time.Unix() > t.Unix() {
 			continue
 		}
 		if !ok || s.Time.After(found.Time) {

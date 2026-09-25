@@ -2,7 +2,9 @@ package populator
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,16 +23,20 @@ import (
 )
 
 // fakeOperations is an in-memory Operations. It keeps objects by
-// namespace/name, and records every create, delete and status write so the
-// tests can check them.
+// namespace/name, and records every create, delete, status write and
+// VolumeRestore update so the tests can check them. When volumeRestoreGone is
+// true, writes to the VolumeRestore fail with NotFound, as they do once it
+// has been deleted.
 type fakeOperations struct {
-	destinations map[string]*volsyncv1alpha1.ReplicationDestination
-	secrets      map[string]*corev1.Secret
-	createdRD    []*volsyncv1alpha1.ReplicationDestination
-	createdSec   []*corev1.Secret
-	deletedRD    []string
-	deletedSec   []string
-	statuses     []*backupv1alpha1.VolumeRestore
+	destinations      map[string]*volsyncv1alpha1.ReplicationDestination
+	secrets           map[string]*corev1.Secret
+	createdRD         []*volsyncv1alpha1.ReplicationDestination
+	createdSec        []*corev1.Secret
+	deletedRD         []string
+	deletedSec        []string
+	statuses          []*backupv1alpha1.VolumeRestore
+	updates           []*backupv1alpha1.VolumeRestore
+	volumeRestoreGone bool
 }
 
 // newFakeOperations returns a fakeOperations that holds no objects.
@@ -96,7 +102,18 @@ func (f *fakeOperations) DeleteSecret(_ context.Context, namespace, name string)
 }
 
 func (f *fakeOperations) SetStatus(_ context.Context, vr *backupv1alpha1.VolumeRestore) error {
+	if f.volumeRestoreGone {
+		return apierrors.NewNotFound(schema.GroupResource{Group: "backup.wlz.li", Resource: "volumerestores"}, vr.Name)
+	}
 	f.statuses = append(f.statuses, vr.DeepCopy())
+	return nil
+}
+
+func (f *fakeOperations) UpdateVolumeRestore(_ context.Context, vr *backupv1alpha1.VolumeRestore) error {
+	if f.volumeRestoreGone {
+		return apierrors.NewNotFound(schema.GroupResource{Group: "backup.wlz.li", Resource: "volumerestores"}, vr.Name)
+	}
+	f.updates = append(f.updates, vr.DeepCopy())
 	return nil
 }
 
@@ -236,6 +253,76 @@ func TestCompleteReportsFailedMover(t *testing.T) {
 	}
 }
 
+// versionedStatus is a fakeOperations whose status writes behave like the API
+// server's: a write whose resourceVersion is older than the stored one fails
+// with a conflict, and a write that changes the status bumps the version.
+type versionedStatus struct {
+	*fakeOperations
+	stored  *backupv1alpha1.VolumeRestore
+	version int
+}
+
+func (v *versionedStatus) SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
+	if vr.ResourceVersion != v.stored.ResourceVersion {
+		return apierrors.NewConflict(schema.GroupResource{Group: "backup.wlz.li", Resource: "volumerestores"}, vr.Name, nil)
+	}
+	// The API server keeps times to the second, so the comparison and the
+	// stored copy go through the same serialisation.
+	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vr)
+	if err != nil {
+		return err
+	}
+	written := new(backupv1alpha1.VolumeRestore)
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object, written); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(written.Status, v.stored.Status) {
+		v.version++
+		v.stored = written
+		v.stored.ResourceVersion = fmt.Sprint(v.version)
+	}
+	vr.ResourceVersion = v.stored.ResourceVersion
+	return v.fakeOperations.SetStatus(ctx, vr)
+}
+
+// TestAFailingMoverKeepsTheStatusFailed checks that while the mover keeps
+// failing, the VolumeRestore reports RestoreFailed with the mover's logs on
+// every pass. The library calls Populate and then Complete on each pass with
+// the same cached object. When Populate wrote Restoring over the Failed entry,
+// Complete's write of Failed conflicted, and the reason flipped between
+// Restoring and RestoreFailed from one pass to the next.
+func TestAFailingMoverKeepsTheStatusFailed(t *testing.T) {
+	ops := &versionedStatus{fakeOperations: restoringOperations(), version: 1}
+	ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{
+		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "mover logs"},
+	}
+	ops.stored = &backupv1alpha1.VolumeRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3, ResourceVersion: "1"},
+		Spec:       backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"},
+	}
+	callbacks := New(ops, "backup-system", nil)
+
+	var reasons []string
+	for range 4 {
+		object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ops.stored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := params()
+		p.Unstructured = &unstructured.Unstructured{Object: object}
+		// Errors are the library's cue to requeue, so the pass goes on to the
+		// next one the way the library's would.
+		_ = callbacks.Populate(context.Background(), p)
+		_, _ = callbacks.Complete(context.Background(), p)
+		reasons = append(reasons, findCondition(ops.stored.Status.Conditions, backupv1alpha1.ConditionReady).Reason)
+	}
+	for i, reason := range reasons[1:] {
+		if reason != backupv1alpha1.ReasonRestoreFailed {
+			t.Fatalf("Ready reason after each pass = %v, want %s from pass %d on", reasons, backupv1alpha1.ReasonRestoreFailed, i+2)
+		}
+	}
+}
+
 // TestCleanupDeletesDestinationAndSecret checks that Cleanup deletes the
 // destination and the Secret copy.
 func TestCleanupDeletesDestinationAndSecret(t *testing.T) {
@@ -313,6 +400,38 @@ func TestAPinnedClaimNoSnapshotReachesStaysPending(t *testing.T) {
 	last := ops.statuses[len(ops.statuses)-1]
 	if cond := last.Status.Conditions[0]; cond.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(cond.Message, "6e473100") {
 		t.Fatalf("condition = %+v, want NoBackupInReach naming the oldest snapshot", cond)
+	}
+}
+
+// TestAVolumeRestorePinnedBeforeEverySnapshotStaysPending checks that
+// Populate checks the VolumeRestore's own spec.restoreAsOf when the claim has
+// no annotation. The destination takes that time as its restoreAsOf, and when
+// it is before every snapshot VolSync prints "No eligible snapshots found",
+// exits 0, and the claim binds an empty volume. Populate returns an error,
+// creates no destination, and reports NoBackupInReach.
+func TestAVolumeRestorePinnedBeforeEverySnapshotStaysPending(t *testing.T) {
+	ops := populatedOperations()
+	callbacks := New(ops, "backup-system", fixedSnapshots{monday})
+	p := params()
+	vr := &backupv1alpha1.VolumeRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3},
+		Spec:       backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret", RestoreAsOf: new("2026-09-01T00:00:00Z")},
+	}
+	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Unstructured = &unstructured.Unstructured{Object: object}
+
+	if err := callbacks.Populate(context.Background(), p); err == nil {
+		t.Fatal("Populate() filled a claim whose VolumeRestore is pinned before every snapshot")
+	}
+	if len(ops.createdRD) != 0 {
+		t.Fatalf("a destination was created: %v", ops.createdRD)
+	}
+	last := ops.statuses[len(ops.statuses)-1]
+	if cond := last.Status.Conditions[0]; cond.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(cond.Message, "spec.restoreAsOf") {
+		t.Fatalf("condition = %+v, want NoBackupInReach naming spec.restoreAsOf", cond)
 	}
 }
 
@@ -516,16 +635,134 @@ func TestCleanupLeavesOtherClaimsRestoring(t *testing.T) {
 // paramsWithClaims returns the default params with a VolumeRestore whose
 // status.claims holds the given entries.
 func paramsWithClaims(claims ...backupv1alpha1.ClaimRestoreStatus) populatormachinery.PopulatorParams {
+	return paramsWith(func(vr *backupv1alpha1.VolumeRestore) { vr.Status.Claims = claims })
+}
+
+// paramsWith returns the default params with the VolumeRestore notes-data
+// changed by the function given.
+func paramsWith(change func(*backupv1alpha1.VolumeRestore)) populatormachinery.PopulatorParams {
 	p := params()
 	vr := &backupv1alpha1.VolumeRestore{
 		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3},
 		Spec:       backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"},
-		Status:     backupv1alpha1.VolumeRestoreStatus{Claims: claims},
 	}
+	change(vr)
 	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vr)
 	if err != nil {
 		panic(err)
 	}
 	p.Unstructured = &unstructured.Unstructured{Object: object}
 	return p
+}
+
+// TestPopulateHoldsTheVolumeRestoreWhileItRestores checks that Populate puts
+// the populator's finalizer on the VolumeRestore before it copies the
+// repository Secret. The library looks the VolumeRestore up before it handles
+// a deleted claim, and does nothing when it's gone. A RestoreRun's scratch
+// claim and its VolumeRestore are deleted together when the run times out or
+// is deleted, and without the finalizer the claim stayed Terminating with the
+// library's finalizer, and the Secret copy with the S3 keys was never
+// deleted.
+func TestPopulateHoldsTheVolumeRestoreWhileItRestores(t *testing.T) {
+	ops := populatedOperations()
+	callbacks := New(ops, "backup-system", nil)
+
+	if err := callbacks.Populate(context.Background(), params()); err != nil {
+		t.Fatalf("Populate() error = %v", err)
+	}
+	if len(ops.updates) != 1 || !slices.Contains(ops.updates[0].Finalizers, Finalizer) {
+		t.Fatalf("VolumeRestore updates = %v, want one that adds %s", ops.updates, Finalizer)
+	}
+
+	// A second pass finds the finalizer in place and writes nothing more.
+	held := paramsWith(func(vr *backupv1alpha1.VolumeRestore) { vr.Finalizers = []string{Finalizer} })
+	if err := callbacks.Populate(context.Background(), held); err != nil {
+		t.Fatalf("second Populate() error = %v", err)
+	}
+	if len(ops.updates) != 1 {
+		t.Errorf("VolumeRestore updates = %d, want the finalizer added once", len(ops.updates))
+	}
+}
+
+// TestPopulateStartsNothingForADeletedVolumeRestore checks that Populate
+// copies no Secret and creates no destination for a VolumeRestore that is
+// being deleted without the populator's finalizer. The API server refuses a
+// new finalizer on it, so nothing would keep it in place until Cleanup ran.
+func TestPopulateStartsNothingForADeletedVolumeRestore(t *testing.T) {
+	ops := populatedOperations()
+	callbacks := New(ops, "backup-system", nil)
+	deleted := paramsWith(func(vr *backupv1alpha1.VolumeRestore) {
+		vr.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		vr.Finalizers = []string{"someone.else/keeps-it"}
+	})
+
+	if err := callbacks.Populate(context.Background(), deleted); err == nil {
+		t.Fatal("Populate() started a restore from a VolumeRestore being deleted")
+	}
+	if len(ops.createdSec) != 0 || len(ops.createdRD) != 0 {
+		t.Fatalf("created Secrets %v and destinations %v, want none", ops.createdSec, ops.createdRD)
+	}
+}
+
+// TestCleanupReleasesTheVolumeRestoreOnceNoClaimIsLeft checks that Cleanup of
+// the last claim deletes the Secret copy, retires the claim, and then removes
+// the populator's finalizer, so a VolumeRestore deleted mid-restore goes once
+// its claim is cleaned up.
+func TestCleanupReleasesTheVolumeRestoreOnceNoClaimIsLeft(t *testing.T) {
+	ops := restoringOperations()
+	callbacks := New(ops, "backup-system", nil)
+	deleted := paramsWith(func(vr *backupv1alpha1.VolumeRestore) {
+		vr.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		vr.Finalizers = []string{Finalizer}
+		vr.Status.Claims = []backupv1alpha1.ClaimRestoreStatus{{Name: "notes", UID: "claim-123", Phase: backupv1alpha1.RestorePhaseRestoring}}
+	})
+
+	if err := callbacks.Cleanup(context.Background(), deleted); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+	if len(ops.deletedSec) != 1 {
+		t.Errorf("deleted Secrets = %v, want the copy", ops.deletedSec)
+	}
+	if len(ops.updates) != 1 || slices.Contains(ops.updates[0].Finalizers, Finalizer) {
+		t.Fatalf("VolumeRestore updates = %v, want one that removes %s", ops.updates, Finalizer)
+	}
+}
+
+// TestCleanupKeepsTheVolumeRestoreWhileAnotherClaimRestores checks that
+// Cleanup leaves the finalizer in place while another claim still has an
+// entry in status.claims. That claim's Cleanup needs the VolumeRestore too.
+func TestCleanupKeepsTheVolumeRestoreWhileAnotherClaimRestores(t *testing.T) {
+	ops := restoringOperations()
+	callbacks := New(ops, "backup-system", nil)
+	two := paramsWith(func(vr *backupv1alpha1.VolumeRestore) {
+		vr.Finalizers = []string{Finalizer}
+		vr.Status.Claims = []backupv1alpha1.ClaimRestoreStatus{
+			{Name: "notes", UID: "claim-123", Phase: backupv1alpha1.RestorePhaseRestoring},
+			{Name: "photos", UID: "claim-456", Phase: backupv1alpha1.RestorePhaseRestoring},
+		}
+	})
+
+	if err := callbacks.Cleanup(context.Background(), two); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+	if len(ops.updates) != 0 {
+		t.Errorf("VolumeRestore updates = %v, want the finalizer kept", ops.updates)
+	}
+}
+
+// TestCleanupOfAGoneVolumeRestoreSucceeds checks that Cleanup succeeds when the
+// VolumeRestore is gone by the time it writes the status. The destination
+// and the Secret copy are deleted, and there is no status left to write.
+func TestCleanupOfAGoneVolumeRestoreSucceeds(t *testing.T) {
+	ops := restoringOperations()
+	ops.volumeRestoreGone = true
+	callbacks := New(ops, "backup-system", nil)
+	p := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{Name: "notes", UID: "claim-123", Phase: backupv1alpha1.RestorePhaseRestoring})
+
+	if err := callbacks.Cleanup(context.Background(), p); err != nil {
+		t.Fatalf("Cleanup() error = %v, want NotFound from the status write ignored", err)
+	}
+	if len(ops.deletedSec) != 1 || len(ops.deletedRD) != 1 {
+		t.Errorf("deleted destinations/secrets = %v/%v, want one each", ops.deletedRD, ops.deletedSec)
+	}
 }

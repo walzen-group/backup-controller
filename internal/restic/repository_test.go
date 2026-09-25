@@ -107,6 +107,25 @@ func TestAtOrBeforeRoundsBackToTheSnapshotBefore(t *testing.T) {
 	}
 }
 
+// TestAtOrBeforeComparesWholeSecondsAsVolSyncDoes checks that AtOrBefore
+// drops the fraction of a second from each snapshot's time before it compares
+// it with the time asked for. VolSync's restic mover does the same, so a
+// snapshot taken at 06:00:00.7 is in reach of a restoreAsOf of 06:00:00, the
+// whole-second time a BackupRun reports for it.
+func TestAtOrBeforeComparesWholeSecondsAsVolSyncDoes(t *testing.T) {
+	snapshots := []Snapshot{
+		{ID: "a", Time: time.Date(2026, 9, 20, 5, 0, 0, 0, time.UTC)},
+		{ID: "b", Time: time.Date(2026, 9, 20, 6, 0, 0, 700_000_000, time.UTC)},
+	}
+	got, ok := AtOrBefore(snapshots, time.Date(2026, 9, 20, 6, 0, 0, 0, time.UTC))
+	if !ok || got.ID != "b" {
+		t.Errorf("AtOrBefore(06:00:00) = %q, %v; want the 06:00:00.7 snapshot", got.ID, ok)
+	}
+	if _, ok := AtOrBefore(snapshots[1:], time.Date(2026, 9, 20, 5, 59, 59, 999_000_000, time.UTC)); ok {
+		t.Error("AtOrBefore(05:59:59.999) found the 06:00:00.7 snapshot, which VolSync would not restore")
+	}
+}
+
 // TestByShortIDFindsTheSnapshotTheMoverLogged checks that ByShortID finds a
 // snapshot by the eight-character ID a mover logs, and that an empty ID
 // matches nothing.
