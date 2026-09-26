@@ -15,11 +15,11 @@ import (
 
 // messageRuleScope is the code TestNoDecisionReadsAMessage reads: the
 // non-test Go files of each directory, or only the named files when a scope
-// lists them. It covers what restic-jobs step 3 left free of message reads;
-// steps 4, 7b and 10 widen it until it holds every non-test file of
+// lists them. It covers what restic-jobs steps 3 and 4 left free of message
+// reads; steps 7b and 10 widen it until it holds every non-test file of
 // internal/runs and internal/populator.
 var messageRuleScope = []messageRuleDir{
-	{dir: ".", files: []string{"backuprun.go"}},
+	{dir: ".", files: []string{"backuprun.go", "restorerun.go"}},
 	{dir: "../populator"},
 }
 
@@ -47,10 +47,12 @@ type messageRuleEntry struct {
 
 // textMatcherAllowlist lets a declaration use a text matcher (part 1 of
 // the rule). A new entry needs a reviewer's eye like any rule exception.
-// Nothing in the scope needs one yet: walkFields, applyStop, appliedPart,
-// restartWorkloads, inPlaceClaimLost, retention, resticSpan and lastLines
-// join it with the files that hold them.
-var textMatcherAllowlist = []messageRuleEntry{}
+// walkFields, applyStop, appliedPart, restartWorkloads, retention,
+// resticSpan and lastLines join it with the files that hold them.
+var textMatcherAllowlist = []messageRuleEntry{
+	{pkg: "runs", decl: "RestoreRunReconciler.inPlaceClaimLost",
+		what: "strings.HasPrefix and TrimPrefix on a Lease name, to find the claim Leases by the prefix the controller gives them"},
+}
 
 // textMatcherPending holds the text matchers a later step removes. Each
 // entry is a known message read, kept only until that step lands, and the
@@ -61,10 +63,14 @@ var textMatcherPending = []messageRuleEntry{
 }
 
 // messageComparisonAllowlist lets a declaration compare a message, a log or
-// an error string (part 2 of the rule). readyChanged joins it with
-// restorerun.go: it compares a condition message only to skip an unchanged
-// status write.
-var messageComparisonAllowlist = []messageRuleEntry{}
+// an error string (part 2 of the rule). A new entry needs a reviewer's eye
+// like any rule exception.
+var messageComparisonAllowlist = []messageRuleEntry{
+	{pkg: "runs", decl: "readyChanged",
+		what: "compares the Ready condition's message only to skip a status write that would change nothing"},
+	{pkg: "runs", decl: "startErrorNote",
+		what: "adds status.items[].lastStartError to a failing item's message only when the item has one; no decision reads the note"},
+}
 
 // No decision in the scope reads text a component wrote for a person: the
 // controller's own messages, VolSync's mover logs, or an error's string.
@@ -104,10 +110,11 @@ func TestNoDecisionReadsAMessage(t *testing.T) {
 
 // The rule catches each shape of a message read in its fixture: a matcher
 // on a field, on a local and in a package-level var, a split, a Compare, a
-// bytes.Equal, a regexp method, a comparison of a field, of an Error()
-// string, of an index, a slice or a concatenation of one and of locals
-// assigned from them, and a switch on a message. A declaration on the allowlist is let
-// through, and an entry that matches nothing is reported.
+// bytes.Equal, a regexp method, a comparison of a field (lastStartError
+// included), of an Error() string, of an index, a slice or a concatenation
+// of one and of locals assigned from them, and a switch on a message. A
+// declaration on the allowlist is let through, and an entry that matches
+// nothing is reported.
 func TestTheMessageRuleCatchesEveryShape(t *testing.T) {
 	findings := scanMessageRule(t, messageRuleDir{dir: "testdata/nomessage"})
 	lists := messageRuleLists{
@@ -507,13 +514,14 @@ func taintedLocals(node ast.Node) map[string]bool {
 }
 
 // isMessage reports whether an expression is text a component wrote for a
-// person: a field .Message or .Logs, an Error() call, a string conversion
-// of one, a tainted local, or anything cut from one: an index, a slice, or
-// a + concatenation with a message on either side.
+// person: a field .Message, .Logs or .LastStartError (an error string
+// stored), an Error() call, a string conversion of one, a tainted local, or
+// anything cut from one: an index, a slice, or a + concatenation with a
+// message on either side.
 func isMessage(e ast.Expr, tainted map[string]bool) bool {
 	switch e := ast.Unparen(e).(type) {
 	case *ast.SelectorExpr:
-		return e.Sel.Name == "Message" || e.Sel.Name == "Logs"
+		return e.Sel.Name == "Message" || e.Sel.Name == "Logs" || e.Sel.Name == "LastStartError"
 	case *ast.IndexExpr:
 		return isMessage(e.X, tainted)
 	case *ast.SliceExpr:

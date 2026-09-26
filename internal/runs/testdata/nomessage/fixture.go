@@ -11,8 +11,9 @@ import (
 )
 
 type item struct {
-	Message string
-	Logs    string
+	Message        string
+	Logs           string
+	LastStartError string
 }
 
 type reconciler struct{}
@@ -45,6 +46,10 @@ func comparedLocal(it item) bool {
 	var text = it.Message
 	copied := text
 	return "" != copied // want comparison
+}
+
+func comparedStartError(it item) bool {
+	return it.LastStartError != "" // want comparison
 }
 
 func comparedError(err error) bool {

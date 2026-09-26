@@ -833,9 +833,8 @@ func (r *BackupRunReconciler) startPending(ctx context.Context, run *backupv1alp
 		if item.Phase != backupv1alpha1.ItemPending {
 			continue
 		}
-		if item.LastStartError != "" {
-			item.LastStartError, item.Message = "", ""
-		}
+		// A Pending item carries a message only from a failed start.
+		item.LastStartError, item.Message = "", ""
 		wait, err := r.startItem(ctx, run, item)
 		if err != nil {
 			item.LastStartError = err.Error()
@@ -1013,10 +1012,7 @@ func (r *BackupRunReconciler) giveUpUncut(ctx context.Context, run *backupv1alph
 		case backupv1alpha1.ItemPending:
 			message := fmt.Sprintf("not started before the workloads were given back at %s, when the %s limit of %s ran out, so the clone %s was never cut",
 				at, backupv1alpha1.AnnotationMaxQuiesce, limit, cloneName(item.Name))
-			if item.LastStartError != "" {
-				message += ": " + item.LastStartError
-			}
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, message+startErrorNote(*item, ": ")
 		case backupv1alpha1.ItemRunning:
 			if r.cloneCut(ctx, run, *item) {
 				continue
@@ -1373,9 +1369,7 @@ func (r *BackupRunReconciler) failUnfinished(ctx context.Context, run *backupv1a
 		text := message
 		switch item.Phase {
 		case backupv1alpha1.ItemPending:
-			if item.LastStartError != "" {
-				text += "; last error: " + item.LastStartError
-			}
+			text += startErrorNote(*item, "; last error: ")
 		case backupv1alpha1.ItemRunning:
 			if note := r.runningNote(ctx, run, *item); note != "" {
 				text += ". " + note
@@ -1386,6 +1380,24 @@ func (r *BackupRunReconciler) failUnfinished(ctx context.Context, run *backupv1a
 		}
 		fail(item, text)
 	}
+}
+
+// startErrorNote returns what the message of a Pending item that fails adds
+// for the item's last failed start.
+//
+// Parameters:
+//   - item is the Pending item that fails.
+//   - separator goes before the error, so the note reads on from the
+//     caller's message.
+//
+// It returns the separator and status.items[].lastStartError, or "" when
+// the item's last start attempt did not fail. The text goes into the item's
+// message and nothing else; no decision reads it.
+func startErrorNote(item backupv1alpha1.BackupItem, separator string) string {
+	if item.LastStartError == "" {
+		return ""
+	}
+	return separator + item.LastStartError
 }
 
 // finish ends the run. It records the ending, starts any workload the run
