@@ -335,14 +335,18 @@ snapshot 6e473100, which the checks selected, was rewritten as 2edf5bab at 2026-
 ```
 
 A repository Secret or a VolumeRestore that is gone by then fails the item the
-same way. When an earlier pass created the destination and lost the status
-write that recorded it, the message names that destination in place of
-`. Nothing was written`, and the run deletes it and waits for its mover to stop
-before it gives the app back:
+same way, with the same ending.
 
-```text
-repository Secret notes-restic-data does not exist in this namespace, so the run can't take the Lease that keeps other runs' movers off the repository. ReplicationDestination restore-9b7d4e21-0, which an earlier pass created before its status write was lost, is deleted, and its mover may have written part of claim notes-data. Create a new RestoreRun to restore it
-```
+A pass can create the destination and then lose the status write that records
+it. The item is still Pending on the next pass, which finds the item's
+ReplicationDestination, named restore-<first 8 characters of the run's
+UID>-<item index>, carrying the run's trigger. The run adopts that
+destination: the item moves to Running with it, and the restore goes on as if
+the write had gone through. The pass that created the destination ran every
+check first, and the item still succeeds only when the mover's log names the
+selected snapshot (see [What the mover restored](#what-the-mover-restored)).
+A mover pod of that destination may already mount the claim; the run does not
+wait for it with `ClaimInUse`, since it is the run's own mover.
 
 One kind of snapshot holds data older than its time. When a BackupRun fails a
 volume item, VolSync keeps retrying that sync with the clone it cut when the

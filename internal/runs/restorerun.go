@@ -683,40 +683,25 @@ func (r *RestoreRunReconciler) recheckSnapshot(ctx context.Context, run *backupv
 }
 
 // failBeforeStart returns the message of a Pending volume item that fails
-// before its mover's object is created, and names on the item a
-// ReplicationDestination an earlier pass created and lost the record of.
+// before the run created its ReplicationDestination.
 //
 // Parameters:
-//   - item is the Pending volume item. Its destination is set when the lost
-//     destination exists, so work deletes it once the item's end is in the
-//     status and waits for its mover to stop (rule X2).
-//   - name is the name the item's ReplicationDestination has, from
-//     destinationName.
+//   - claim is the name of the claim the item restores, which the message
+//     names.
 //   - why says why the item fails, such as a snapshot that changed since the
 //     checks or a repository Secret that is gone.
 //
-// It returns why followed by what the claim holds: when the run owns a
-// destination of that name, the message says that destination is deleted
-// and that its mover may have written part of the claim; otherwise it says
-// nothing was written (see nothingWritten). A read of the destination that
-// fails for any reason but NotFound comes back as an error, and the item is
-// left as it was.
+// It returns why followed by nothingWritten's end: nothing was written to
+// the claim, and a new RestoreRun selects again.
 //
-// A pass that created the destination and then lost the status write that
-// recorded it leaves the item Pending. Unnamed on the item, that
-// destination's mover would run on with nothing tracking it.
-func (r *RestoreRunReconciler) failBeforeStart(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, name, why string) (string, error) {
-	left := &volsyncv1alpha1.ReplicationDestination{}
-	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, left)
-	switch {
-	case err == nil && ownsDestination(run, left):
-		item.Destination = name
-		return fmt.Sprintf("%s. ReplicationDestination %s, which an earlier pass created before its status write was lost, is deleted, "+
-			"and its mover may have written part of claim %s. Create a new RestoreRun to restore it", why, name, item.Name), nil
-	case err == nil || apierrors.IsNotFound(err):
-		return why + nothingWritten(item.Name), nil
-	}
-	return "", fmt.Errorf("get ReplicationDestination %s: %w", name, err)
+// No mover of the item can have run at that point. quiesce calls it before
+// any destination exists. restoreVolume calls it only after lostDestination
+// found no destination the run owns under the item's name: a pass that
+// created one and lost the status write that recorded it leaves the item
+// Pending, and restoreVolume takes that destination over and moves the item
+// to Running before any of the checks that fail an item.
+func failBeforeStart(claim, why string) string {
+	return why + nothingWritten(claim)
 }
 
 // nothingWritten returns the end of the message of an item that
@@ -958,46 +943,45 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // restoreVolume moves one in-place volume restore a step further.
 //
 // Parameters:
+//   - run is the RestoreRun the item belongs to.
 //   - index is the item's position in status.items. It goes into the name of
-//     the item's ReplicationDestination.
+//     the item's ReplicationDestination (see destinationName).
 //   - item is the volume item, which restoreVolume updates in place.
 //
-// A Pending item waits until no pod mounts the claim. restoreVolume then
-// lists the repository again (see recheckSnapshot), creates the item's
-// ReplicationDestination and moves the item to Running. A snapshot the mover
-// would no longer restore, because it was forgotten, retimed or shadowed in
-// its second since the checks, fails the item before the destination exists.
-// A Pending item whose destination the run already owns (see
-// lostDestination) goes to Running with it before any of that: an earlier
-// pass ran the checks, created it, and lost the status write that recorded
-// it, and a pod of its mover may be the one that mounts the claim.
-//
-// A Running item fails with the mover's logs when the mover failed. Once the
-// destination has completed the run's trigger, the item succeeds only when
-// the mover's log names the snapshot the checks recorded (see
-// unconfirmedRestore) and the claim is still there, not being deleted, and
-// the one the mover wrote into (see inPlaceClaimLost), and fails otherwise.
-// It also fails when its destination is gone. restoreVolume leaves the destination in place, and work deletes it
-// once the item's end is in the status.
-//
-// A claim that is gone, or whose VolumeRestore or repository Secret is
-// missing, fails the item before the destination exists. When an item fails
-// before its destination exists, a destination an earlier pass created and
-// lost the record of is named on the item, so work deletes it (see
-// failBeforeStart). A destination with the item's name that the run did not
-// create (see ownsDestination), found at the create or on a later pass, fails
-// the item too; the item then names no destination, so nothing the run does
-// afterwards touches it.
-//
-// It returns reason ClaimInUse and a message naming the pod while a pod
-// mounts the claim, reason ClaimInUse and a message naming the destination
-// while another ReplicationDestination writes into the claim (see
-// claimWriter), and reason SourceBusy and a message naming the other run
+// It returns a Ready reason and message while a Pending item waits, and
+// empty strings otherwise. The reason is ClaimInUse with a message naming
+// the pod while a pod mounts the claim, ClaimInUse with a message naming the
+// destination while another ReplicationDestination writes into the claim
+// (see claimWriter), and SourceBusy with a message naming the other run
 // while another run holds the Lease of the claim or its repository (see
-// acquireLeases) or a backup of either is in progress (see
-// otherMover); the item stays Pending in both cases. It returns empty strings
-// otherwise. It returns an error, and leaves the item as it was, when an API
-// call fails for any other reason.
+// acquireLeases) or a backup of either is in progress (see otherMover). The
+// item stays Pending in each of these waits. It returns an error, and leaves
+// the item as it was, when an API call fails for any other reason.
+//
+// A Pending item whose destination the run already owns (see
+// lostDestination) goes to Running with it before anything else: an earlier
+// pass ran the checks, created the destination, and lost the status write
+// that recorded it, and a pod of its mover may be the one that mounts the
+// claim. Any other Pending item waits until no pod mounts the claim.
+// restoreVolume then takes the Leases, lists the repository again (see
+// recheckSnapshot), creates the item's destination and moves the item to
+// Running. A claim that is gone, a VolumeRestore or repository Secret that
+// is missing, or a snapshot the mover would no longer restore, because it
+// was forgotten, retimed or shadowed in its second since the checks, fails
+// the item before the destination exists, with a message that says nothing
+// was written (see failBeforeStart). A destination with the item's name that
+// the run did not create (see ownsDestination), found at the create or on a
+// later pass, fails the item too; the item then names no destination, so
+// nothing the run does afterwards touches it.
+//
+// A Running item fails with the mover's logs when the mover failed, and
+// fails when its destination is gone. Once the destination has completed the
+// run's trigger, the item succeeds only when the mover's log names the
+// snapshot the checks recorded (see unconfirmedRestore) and the claim is
+// still there, not being deleted, and the one the mover wrote into (see
+// inPlaceClaimLost); it fails otherwise. restoreVolume leaves the
+// destination in place, and work deletes it once the item's end is in the
+// status.
 func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (string, string, error) {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
@@ -1035,10 +1019,7 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			if !isRefusal(err) {
 				return "", "", err
 			}
-			message, err := r.failBeforeStart(ctx, run, item, destinationName(run.UID, index), err.Error())
-			if err != nil {
-				return "", "", err
-			}
+			message := failBeforeStart(item.Name, err.Error())
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 			return "", "", nil
 		}
@@ -1048,10 +1029,7 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 		busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: "RestoreRun", run: run, item: item.Name},
 			run.Namespace, item.Name, settings.Secret)
 		if isRefusal(err) {
-			message, err := r.failBeforeStart(ctx, run, item, destinationName(run.UID, index), err.Error())
-			if err != nil {
-				return "", "", err
-			}
+			message := failBeforeStart(item.Name, err.Error())
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 			return "", "", nil
 		}
@@ -1079,10 +1057,7 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			return "", "", err
 		}
 		if why != "" {
-			message, err := r.failBeforeStart(ctx, run, item, name, why)
-			if err != nil {
-				return "", "", err
-			}
+			message := failBeforeStart(item.Name, why)
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 			return "", "", nil
 		}
@@ -1856,10 +1831,7 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 			}
 			held, err := r.backupHeldElsewhere(ctx, run, item.Name)
 			if isRefusal(err) {
-				message, err := r.failBeforeStart(ctx, run, item, destinationName(run.UID, i), err.Error())
-				if err != nil {
-					return ctrl.Result{}, err
-				}
+				message := failBeforeStart(item.Name, err.Error())
 				item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 				continue
 			}
