@@ -171,10 +171,18 @@ func TestPatchKeepsServerFieldsAndBumpsGenerationOnSpecChange(t *testing.T) {
 	}
 	uid, created := obj.UID, obj.CreationTimestamp
 
+	// A patch that changes the uid is refused, as the real server's
+	// immutable-field check refuses it (differential_envtest_test.go).
 	base := obj.DeepCopy()
+	stale := obj.DeepCopy()
+	stale.UID = "patched"
+	stale.Spec.Source = "patched"
+	if err := c.Patch(ctx, stale, client.MergeFrom(base)); !apierrors.IsInvalid(err) {
+		t.Fatalf("patch changing the uid: got %v, want Invalid", err)
+	}
+
 	obj.Annotations = map[string]string{"x": "y"}
 	obj.CreationTimestamp = metav1.NewTime(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
-	obj.UID = "patched"
 	if err := c.Patch(ctx, obj, client.MergeFrom(base)); err != nil {
 		t.Fatal(err)
 	}

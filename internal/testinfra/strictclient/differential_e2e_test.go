@@ -51,9 +51,49 @@ type obs map[string]string
 type diffCase struct {
 	name  string
 	setup func(t *testing.T, c client.Client, ns string) obs
-	// settle, when set, reads the state again; the real cluster is polled
-	// with it until it matches the strict client's observation.
+	// settle, when set, reads the state again. On the real cluster it is
+	// polled until final reports the owner's final state and then until its
+	// observation stays the same for stableFor (see settleReal), so a
+	// transient state before the garbage collector has run is never
+	// compared.
 	settle func(t *testing.T, c client.Client, ns string) obs
+	// final reports whether a settle observation shows the owner in the
+	// state the case ends in: gone, or held in foreground deletion.
+	// Required with settle.
+	final func(obs) bool
+}
+
+// stableFor is how long a settle observation of the real cluster must stay
+// unchanged before it is compared.
+const stableFor = 5 * time.Second
+
+// settleReal polls tc.settle against the real cluster: first until tc.final
+// accepts the observation, then until the observation has not changed for
+// stableFor. It fails the test when either takes longer than 90 seconds,
+// and returns the last observation.
+func settleReal(t *testing.T, tc diffCase, c client.Client, ns string) obs {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	s := tc.settle(t, c, ns)
+	for !tc.final(s) {
+		if time.Now().After(deadline) {
+			t.Fatalf("owner never reached its final state; last observation %v", s)
+		}
+		time.Sleep(time.Second)
+		s = tc.settle(t, c, ns)
+	}
+	since := time.Now()
+	for time.Since(since) < stableFor {
+		if time.Now().After(deadline) {
+			t.Fatalf("observation did not settle; last observation %v", s)
+		}
+		time.Sleep(time.Second)
+		next := tc.settle(t, c, ns)
+		if !maps.Equal(next, s) {
+			s, since = next, time.Now()
+		}
+	}
+	return s
 }
 
 func realClient(t *testing.T) client.Client {
@@ -101,17 +141,7 @@ func TestDifferentialAgainstCluster(t *testing.T) {
 			}
 			got := tc.setup(t, real, ns)
 			if tc.settle != nil {
-				deadline := time.Now().Add(90 * time.Second)
-				for {
-					s := tc.settle(t, real, ns)
-					merged := maps.Clone(got)
-					maps.Copy(merged, s)
-					if maps.Equal(merged, want) || time.Now().After(deadline) {
-						got = merged
-						break
-					}
-					time.Sleep(time.Second)
-				}
+				maps.Copy(got, settleReal(t, tc, real, ns))
 			}
 			for _, k := range slices.Sorted(maps.Keys(merge(want, got))) {
 				if want[k] != got[k] {
@@ -338,6 +368,12 @@ func deleteCases() []diffCase {
 		}
 	}
 	policyCase := func(prefix string, policy metav1.DeletionPropagation, hold bool) diffCase {
+		// A held foreground deletion ends with the owner waiting on its
+		// blocking dependent; every other policy ends with the owner gone.
+		ownerFinal := "gone"
+		if hold {
+			ownerFinal = "deleting " + metav1.FinalizerDeleteDependents
+		}
 		return diffCase{
 			name: "delete " + string(policy) + " with blockOwnerDeletion dependents",
 			setup: func(t *testing.T, c client.Client, ns string) obs {
@@ -346,6 +382,7 @@ func deleteCases() []diffCase {
 				return obs{"delete": errReason(c.Delete(ctx, owner, client.PropagationPolicy(policy)))}
 			},
 			settle: state(prefix),
+			final:  func(o obs) bool { return o["owner"] == ownerFinal },
 		}
 	}
 
@@ -376,6 +413,25 @@ func deleteCases() []diffCase {
 					"job": objExists(ctx, c, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "orphaning"}}),
 					"pod": objExists(ctx, c, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "orphaning-pod"}}),
 				}
+			},
+			final: func(o obs) bool { return o["job"] == "gone" },
+		},
+		{
+			name: "status patch with a stale uid",
+			setup: func(t *testing.T, c client.Client, ns string) obs {
+				d := deployment(ns, "stale-uid-status")
+				must(t, c.Create(ctx, d))
+				uid := d.UID
+				patch := client.RawPatch(types.MergePatchType,
+					[]byte(`{"metadata":{"uid":"00000000-0000-0000-0000-000000000000"},"status":{"observedGeneration":7}}`))
+				o := obs{"status patch": errReason(c.Status().Patch(ctx, d.DeepCopy(), patch))}
+				patch = client.RawPatch(types.MergePatchType,
+					[]byte(`{"metadata":{"uid":"00000000-0000-0000-0000-000000000000"},"spec":{"minReadySeconds":3}}`))
+				o["patch"] = errReason(c.Patch(ctx, d.DeepCopy(), patch))
+				must(t, c.Get(ctx, client.ObjectKeyFromObject(d), d))
+				o["uid kept"] = fmt.Sprint(d.UID == uid)
+				o["minReadySeconds"] = fmt.Sprint(d.Spec.MinReadySeconds)
+				return o
 			},
 		},
 		{

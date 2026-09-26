@@ -31,6 +31,9 @@
 //     creationTimestamp. See Client.Status.
 //   - An update or status update whose object carries a uid other than the
 //     stored one fails with a Conflict. See checkUID.
+//   - A patch whose result carries another uid fails with an Invalid error;
+//     a status patch of a custom resource drops the uid and succeeds. See
+//     checkPatchedUID.
 //   - Objects of a kind defined by a CRD in Options.CRDs are pruned against
 //     that CRD's schema on every write, with the apiextensions pruning code.
 //     See Client.coerce. Build registers the status subresources those CRDs
@@ -47,7 +50,10 @@
 // The built-in rules (generation, Job's default propagation, UID
 // preconditions, finalizers, garbage collection) are checked against a real
 // cluster by differential_e2e_test.go, and the CRD rules against envtest's
-// kube-apiserver by differential_envtest_test.go.
+// kube-apiserver by differential_envtest_test.go. The envtest suite runs in
+// CI. The e2e suite runs only by hand, with make e2e against the
+// docker-desktop cluster, so the built-in rules are checked when someone runs
+// it and not in CI.
 //
 // It leaves out: generation for built-in kinds other than those above (the
 // wrapper keeps the stored value; a PersistentVolumeClaim's stays 0 on a real
@@ -243,8 +249,9 @@ func (c *Client) Update(ctx context.Context, obj client.Object, opts ...client.U
 // fields the patch may have changed and, for a custom resource whose content
 // outside metadata changed, raises the generation by one. The patched object
 // is pruned against its CRD (see prunePatched). On success obj holds
-// the stored object. Errors are the fake client's, or from the follow-up
-// update that sets the server-owned fields.
+// the stored object. Errors are an Invalid when the patch changes the uid
+// (see checkPatchedUID), the fake client's, or from the follow-up update that
+// sets the server-owned fields.
 func (c *Client) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 	old, err := c.stored(ctx, obj)
 	if err != nil {
@@ -255,6 +262,9 @@ func (c *Client) Patch(ctx context.Context, obj client.Object, patch client.Patc
 		return err
 	}
 	if result != nil {
+		if err := c.checkPatchedUID(result, old, false); err != nil {
+			return err
+		}
 		if err := c.checkNoNewFinalizers(result, old); err != nil {
 			return err
 		}

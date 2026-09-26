@@ -10,6 +10,7 @@ import (
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/validation"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
@@ -213,12 +214,22 @@ func (w *statusWriter) Update(ctx context.Context, obj client.Object, opts ...cl
 }
 
 // Patch patches obj's status and prunes the result against its CRD. Errors
-// are the fake client's, or from the follow-up updates that prune and
-// restore the server-owned fields.
+// are an Invalid when the patch changes the uid of a built-in kind (see
+// checkPatchedUID), the fake client's, or from the follow-up updates that
+// prune and restore the server-owned fields.
 func (w *statusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 	old, err := w.c.stored(ctx, obj)
 	if err != nil {
 		return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+	}
+	result, err := w.c.patchedObject(obj, old, patch)
+	if err != nil {
+		return err
+	}
+	if result != nil {
+		if err := w.c.checkPatchedUID(result, old, true); err != nil {
+			return err
+		}
 	}
 	if err := w.SubResourceWriter.Patch(ctx, obj, patch, opts...); err != nil {
 		return err
@@ -286,7 +297,7 @@ func decodeFrom(dst, src client.Object) error {
 // (pkg/storage/etcd3/store.go:501, pkg/storage/interfaces.go:138-163),
 // and InterpretUpdateError turns the invalid-object storage error into a
 // Conflict (pkg/storage/errors/storage.go:78-81). Status updates take the same
-// path. A patch sends no precondition, so Patch does not call this.
+// path. A patch sends no precondition; checkPatchedUID covers it.
 func (c *Client) checkUID(obj, old client.Object) error {
 	if obj.GetUID() == "" || obj.GetUID() == old.GetUID() {
 		return nil
@@ -307,4 +318,42 @@ func (c *Client) uidConflict(obj client.Object, want, stored types.UID) error {
 	return apierrors.NewConflict(gvr.GroupResource(), obj.GetName(),
 		fmt.Errorf("StorageError: invalid object, Code: 4, Key: %s, ResourceVersion: 0, AdditionalErrorMsg: "+
 			"Precondition failed: UID in precondition: %v, UID in object meta: %v", key, want, stored))
+}
+
+// checkPatchedUID refuses a patch whose result carries a uid other than the
+// stored one.
+//
+// Parameters:
+//   - result is the stored object with the patch applied (see
+//     patchedObject).
+//   - old is the stored object.
+//   - status is true for a patch of the status subresource.
+//
+// It returns nil when the uid is empty or unchanged, and for a status patch
+// of a custom resource, and otherwise the 422 Invalid error kube-apiserver
+// 1.36.3 returns. A patch sends no UID precondition, so the patched object
+// reaches rest.BeforeUpdate, which keeps the stored uid only when the
+// patched one is empty (k8s.io/apiserver@v0.36.3/pkg/registry/rest/update.go:131-133)
+// and then validates metadata.uid as immutable
+// (k8s.io/apimachinery@v0.36.0/pkg/api/validation/objectmeta.go:332). The
+// status strategy of a custom resource starts from a copy of the stored
+// object and takes only status from the request
+// (k8s.io/apiextensions-apiserver@v0.36.0/pkg/registry/customresource/status_strategy.go:67-91),
+// so there the patched uid is dropped and the write succeeds. The built-in
+// status strategies keep the request's metadata, so a status patch of a
+// built-in kind is refused like a plain patch.
+func (c *Client) checkPatchedUID(result, old client.Object, status bool) error {
+	if result.GetUID() == "" || result.GetUID() == old.GetUID() {
+		return nil
+	}
+	gvk, err := apiutil.GVKForObject(old, c.Scheme())
+	if err != nil {
+		return err
+	}
+	if status && c.opts.IsCustomResource(gvk) {
+		return nil
+	}
+	return apierrors.NewInvalid(gvk.GroupKind(), old.GetName(), field.ErrorList{
+		field.Invalid(field.NewPath("metadata", "uid"), result.GetUID(), validation.FieldImmutableErrorMsg),
+	})
 }
