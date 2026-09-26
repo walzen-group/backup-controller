@@ -62,12 +62,6 @@ func stepIn(t *testing.T, r *BackupRunReconciler, namespace, name string) ctrl.R
 	return result
 }
 
-// tryStepIn reconciles the named BackupRun once and returns the error.
-func tryStepIn(r *BackupRunReconciler, namespace, name string) error {
-	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}})
-	return err
-}
-
 // backupIn returns the named BackupRun as stored.
 func backupIn(t *testing.T, c client.Client, namespace, name string) *backupv1alpha1.BackupRun {
 	t.Helper()
