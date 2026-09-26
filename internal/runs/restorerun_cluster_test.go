@@ -395,3 +395,32 @@ func TestADeletedItemLeavesAnotherRunsRecoveryAlone(t *testing.T) {
 		t.Errorf("Cluster UID = %q, want back-to-monday's recovery (%s) left alone", uid, recovered.GetUID())
 	}
 }
+
+// Two runs that planned in the same instant both passed the check at their
+// plan, since neither had written its items yet. So a run checks again right
+// before it deletes the Cluster: back-to-monday finds second holding the
+// Cluster Pending, fails its item naming second, and deletes nothing. Before,
+// it deleted the Cluster, and second's later delete would have reached
+// back-to-monday's recovery.
+func TestARunChecksForAnotherRunAgainBeforeItDeletesTheCluster(t *testing.T) {
+	planned := func(r *backupv1alpha1.RestoreRun) {
+		r.Spec.Database = pgN
+		r.Finalizers = []string{Finalizer}
+		r.Status.Phase = backupv1alpha1.RunPhaseRunning
+		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "Cluster", Name: pgN, Phase: backupv1alpha1.ItemPending, BaseBackup: saturday.ID}}
+	}
+	second := restoreRun(planned, func(r *backupv1alpha1.RestoreRun) {
+		r.Name, r.UID = "second", "9b7d4e21-0000-4000-8000-00000000000a"
+	})
+	r, c := restoreReconciler(t, prober{saturday}, restoreRun(planned), second, cluster(), objectStore(), storeSecret())
+
+	stepRestore(t, r, "back-to-monday")
+
+	if uid := clusterUID(t, c); uid != "old-cluster-uid" {
+		t.Fatalf("Cluster UID = %q, want the Cluster left alone while second holds it", uid)
+	}
+	item := readRestoreRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "RestoreRun second is restoring Cluster "+pgN) {
+		t.Errorf("item = %+v, want Failed naming RestoreRun second", item)
+	}
+}

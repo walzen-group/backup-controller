@@ -485,8 +485,10 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 //
 // Two runs that both delete one Cluster race for its recovery: the webhook
 // recovers it for the first run it lists, and the other run fails. Refused
-// at its checks, the second run deletes nothing. The refusal names the other
-// run, so the user knows which run to wait for.
+// at its checks, the second run deletes nothing. Two runs that planned in the
+// same instant both pass that check, so restoreDatabase asks again right
+// before it marks a Pending item Deleted. The refusal names the other run,
+// so the user knows which run to wait for.
 func (r *RestoreRunReconciler) clustersRestoredElsewhere(ctx context.Context, run *backupv1alpha1.RestoreRun, items []backupv1alpha1.RestoreItem) error {
 	var clusters []string
 	for _, item := range items {
@@ -1211,6 +1213,13 @@ func (r *RestoreRunReconciler) claimWriter(ctx context.Context, run *backupv1alp
 // owner declares its own bootstrap method (see leftAlone), moves to Skipped,
 // and the run never deletes that Cluster.
 //
+// Right before it marks a Pending item Deleted, restoreDatabase checks
+// again that no other unfinished run is restoring the Cluster (see
+// clustersRestoredElsewhere), because two runs that planned in the same
+// instant both passed the check at their plan. When another run holds the
+// Cluster, the item fails with the refusal, naming that run, and the run
+// deletes nothing.
+//
 // The item is marked Deleted, and the status written, before the Cluster is
 // deleted. The bootstrap webhook recovers a Cluster only for a run whose item
 // says Deleted, so the mark has to be in place before anything can create the
@@ -1247,6 +1256,18 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 				item.Phase, item.Message = backupv1alpha1.ItemSkipped, why
 				return nil
 			}
+		}
+		// Two runs that planned in the same instant both passed this check
+		// at their plan. Checked again right before the mark, the second
+		// run finds the first one's item Pending or Deleted and deletes
+		// nothing; of two runs that get here together, each finds the other
+		// Pending and neither deletes.
+		if err := r.clustersRestoredElsewhere(ctx, run, []backupv1alpha1.RestoreItem{*item}); err != nil {
+			if !isRefusal(err) {
+				return err
+			}
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()+". The run deleted nothing"
+			return nil
 		}
 		if found {
 			item.ClusterUID = cluster.GetUID()
