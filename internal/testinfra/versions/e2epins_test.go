@@ -18,8 +18,10 @@ type pin struct {
 	// component is the versions.json component the value must match.
 	component string
 	// field is what of the component it must match: "version" (the default),
-	// "chart" for the Helm chart version, or "major" when only the major
-	// version has to agree.
+	// "chart" for the Helm chart version, "major" when only the major version
+	// has to agree, or "image" for the image reference. For "image", path
+	// names an object with repository, tag and digest, compared as
+	// repository:tag@digest.
 	field string
 }
 
@@ -44,9 +46,12 @@ var e2ePins = map[string][]pin{
 		{path: "cnpg.plugin.chart.version", component: "plugin-barman-cloud", field: "chart"},
 		{path: "cnpg.plugin.image.tag", component: "plugin-barman-cloud"},
 		{path: "cnpg.plugin.sidecarImage.tag", component: "plugin-barman-cloud"},
-		// The e2e Cluster runs the operator's default operand (18.4) and the
-		// fixtures come from nixpkgs postgresql (18.6). barman reads a layout
-		// that holds within a major, so only the major has to agree.
+		// The check Cluster runs the operand image prod's Clusters name, by
+		// tag and digest.
+		{path: "cnpg.postgres.tag", component: "postgresql-operand"},
+		{path: "cnpg.postgres", component: "postgresql-operand", field: "image"},
+		// The fixtures come from nixpkgs postgresql. barman reads a layout that
+		// holds within a major, so only the major has to agree with the operand.
 		{path: "cnpg.postgres.tag", component: "postgresql", field: "major"},
 	},
 	"csi": {
@@ -74,20 +79,44 @@ var e2ePins = map[string][]pin{
 // repoRoot returns the module's root, where versions.json sits.
 func repoRoot() string { return filepath.Dir(Path()) }
 
-// lookup walks doc along the dotted path and returns the string there. It
-// returns false when a key is missing or the value is no string.
-func lookup(doc any, path string) (string, bool) {
+// walk follows doc along the dotted path and returns the value there. It
+// returns false when a key is missing.
+func walk(doc any, path string) (any, bool) {
 	for _, key := range strings.Split(path, ".") {
 		m, ok := doc.(map[string]any)
 		if !ok {
-			return "", false
+			return nil, false
 		}
 		if doc, ok = m[key]; !ok {
-			return "", false
+			return nil, false
 		}
 	}
-	s, ok := doc.(string)
+	return doc, true
+}
+
+// lookup walks doc along the dotted path and returns the string there. It
+// returns false when a key is missing or the value is no string.
+func lookup(doc any, path string) (string, bool) {
+	v, _ := walk(doc, path)
+	s, ok := v.(string)
 	return s, ok
+}
+
+// lookupImage walks doc along the dotted path to an image object and returns
+// it as repository:tag@digest. It returns false when the object is missing or
+// lacks one of the three strings.
+func lookupImage(doc any, path string) (string, bool) {
+	v, ok := walk(doc, path)
+	if !ok {
+		return "", false
+	}
+	repo, okRepo := lookup(v, "repository")
+	tag, okTag := lookup(v, "tag")
+	digest, okDigest := lookup(v, "digest")
+	if !okRepo || !okTag || !okDigest {
+		return "", false
+	}
+	return repo + ":" + tag + "@" + digest, true
 }
 
 // normalise returns the version in a pinned value: the first word, without a
@@ -149,8 +178,11 @@ func TestE2EPinsMatchVersions(t *testing.T) {
 		doc := readPins(t, name)
 		for _, p := range pins {
 			raw, ok := lookup(doc, p.path)
+			if p.field == "image" {
+				raw, ok = lookupImage(doc, p.path)
+			}
 			if !ok {
-				t.Errorf("hack/e2e/%s/pins.json has no string at %s", name, p.path)
+				t.Errorf("hack/e2e/%s/pins.json has no %s at %s", name, valueName(p.field), p.path)
 				continue
 			}
 			c, ok := f.Components[p.component]
@@ -165,12 +197,22 @@ func TestE2EPinsMatchVersions(t *testing.T) {
 				want = c.Chart
 			case "major":
 				got, want = major(got), major(want)
+			case "image":
+				got, want = raw, c.Image
 			}
 			if want == "" || got != want {
 				t.Errorf("hack/e2e/%s/pins.json %s is %q, versions.json %s %s is %q", name, p.path, raw, p.component, fieldName(p.field), want)
 			}
 		}
 	}
+}
+
+// valueName names what a pin reads from pins.json.
+func valueName(field string) string {
+	if field == "image" {
+		return "image object with repository, tag and digest"
+	}
+	return "string"
 }
 
 // fieldName names the versions.json field a pin is compared with.

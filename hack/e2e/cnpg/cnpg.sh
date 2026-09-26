@@ -14,10 +14,11 @@
 # operator and the plugin to be Ready and for the Cluster, Backup and ObjectStore
 # CRDs to be served, then runs a one-instance Cluster on a 512Mi local-path
 # volume (StorageClass standard, or CNPG_CHECK_STORAGE_CLASS; WAL on the same
-# volume, no archiving) in a temporary namespace until
-# it is healthy, and deletes it. uninstall removes both releases, the namespace
-# and the charts' CRDs (the charts keep them on a helm uninstall). Needs helm,
-# kubectl and jq (nix develop -c).
+# volume, no archiving) in a temporary namespace on the PostgreSQL image prod's
+# Clusters name (pins.json postgres, by digest) until it is healthy, checks the
+# server reports that image's version, and deletes it. uninstall removes both
+# releases, the namespace and the charts' CRDs (the charts keep them on a helm
+# uninstall). Needs helm, kubectl and jq (nix develop -c).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -134,10 +135,17 @@ YAML
     echo "cluster phase is $phase" >&2
     exit 1
   fi
+  local want got
+  want="$(p .postgres.tag)"
+  got="$(k -n "$tns" exec check-1 -c postgres -- psql -tAc 'SHOW server_version')"
+  if [[ "${got%% *}" != "$want" ]]; then
+    echo "the check Cluster runs PostgreSQL $got, pins.json postgres is $want" >&2
+    exit 1
+  fi
   k -n "$tns" delete cluster/check --wait --timeout=2m
   k delete namespace "$tns" --wait --timeout=2m
   trap - EXIT
-  echo "cnpg: operator and plugin Ready, CRDs served, a one-instance Cluster became healthy"
+  echo "cnpg: operator and plugin Ready, CRDs served, a one-instance Cluster on PostgreSQL $(p .postgres.tag) became healthy"
 }
 
 uninstall() {

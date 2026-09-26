@@ -39,10 +39,10 @@
       }
     },
     "postgres": {
-      "comment": "The operator 1.30.0 default (POSTGRES_IMAGE_NAME built into the binary); check pins the Cluster to it by digest.",
+      "comment": "Prod's operand: every prod CloudNativePG Cluster sets spec.imageName to this reference (infra environments/prod/cluster/authentik/db/inputs.yaml postgres_image, and imageName in the flux templates' database.yaml). check pins its Cluster to it by digest and checks the server version.",
       "repository": "ghcr.io/cloudnative-pg/postgresql",
-      "tag": "18.4-system-trixie",
-      "digest": "sha256:42708a75345b7a48fdd9257b071830783a97fd228529196b6313187a7198e185"
+      "tag": "18.6",
+      "digest": "sha256:899d3ed526b659d77935dde0e6bf2d69dbbf17d3d8c6486ca8cfd04bd3c18533"
     }
   }
 }

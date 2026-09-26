@@ -29,6 +29,9 @@ type Component struct {
 	Chart string `json:"chart"`
 	// E2E says which hack/e2e component pins it for the e2e cluster.
 	E2E string `json:"e2e"`
+	// Image is the container image prod runs it as, in the form
+	// repository:tag@digest, for a component prod names by image reference.
+	Image string `json:"image"`
 }
 
 // File is versions.json as a whole.
