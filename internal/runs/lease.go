@@ -418,6 +418,19 @@ func releaseLeases(ctx context.Context, c client.Client, reader client.Reader, r
 	return nil
 }
 
+// leaseReleaseError returns the *releaseError for a failed release of the
+// Leases a run holds (see releaseLeases). It names the Lease release as the
+// step that failed and tells a person how to find the Leases and delete them
+// by hand, which is what releaseFailure puts on the run's Ready condition.
+func leaseReleaseError(run metav1.Object, err error) error {
+	return &releaseError{
+		action: "release the Leases it holds on its claims and repositories",
+		advice: fmt.Sprintf("Fix the cause, or delete the Leases labelled %s=%s yourself; either way the run then finishes by itself.",
+			labelLeaseHolderUID, run.GetUID()),
+		err: err,
+	}
+}
+
 // releaseQuiesceLeases deletes every quiesce Lease the run holds, in any
 // namespace: the namespace's Lease and the Kustomization Leases Q5 took. It
 // is called once the run's stored status shows the workloads back, so another
