@@ -59,6 +59,10 @@ type RestoreRunReconciler struct {
 	// Now returns the current time. Tests replace it so they can move time
 	// forward without sleeping.
 	Now func() time.Time
+
+	// schemas caches the check that the installed CRD of the run's kind
+	// declares every field the controller writes (see crdOutdated).
+	schemas schemaCache
 }
 
 // SetupWithManager registers the reconciler with mgr so it runs for every
@@ -85,6 +89,10 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // adds the run's finalizer. A run being deleted gets its changes put back by
 // finalize, and a finished run is deleted once spec.ttlSecondsAfterFinished
 // has passed.
+//
+// A new run is first checked against the installed RestoreRun CRD (see
+// schemaCache.crdOutdated), and a run whose CRD lacks a field the controller
+// writes ends with reason CRDOutdated before anything is planned.
 // Whenever the Ready reason changes during a reconcile, Reconcile records an
 // event on the run.
 func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -108,6 +116,16 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if run.Status.Phase == "" {
+		// The check comes first for both plans: the old RestoreRun CRD drops
+		// the items' clusterUID and snapshotTime, which the restore relies on.
+		message, err := r.schemas.crdOutdated(ctx, r.Reader, restoreRunsCRD, "RestoreRun", backupv1alpha1.RestoreRun{},
+			"the run would lose the Cluster UIDs and snapshot times it records to check its own work")
+		if err != nil {
+			return ctrl.Result{}, r.planFailed(ctx, run, err)
+		}
+		if message != "" {
+			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, message)
+		}
 		plan := r.plan
 		if run.Spec.Into != "" {
 			plan = r.planIntoNewClaim

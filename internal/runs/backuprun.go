@@ -52,6 +52,10 @@ type BackupRunReconciler struct {
 	// Now returns the current time. Tests replace it so they can move time
 	// forward without sleeping.
 	Now func() time.Time
+
+	// schemas caches the check that the installed CRD of the run's kind
+	// declares every field the controller writes (see crdOutdated).
+	schemas schemaCache
 }
 
 // SetupWithManager registers the reconciler with mgr so it runs for every
@@ -115,7 +119,13 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 // run to Queued. When items returns a refusal, plan ends the run as Failed
 // with reason Invalid and the refusal as the message. Any other error, such as
 // a timeout from the API server, is returned so the reconcile runs again.
+//
+// Before anything else, plan checks the installed BackupRun CRD (see
+// schemaOutdated) and ends a run it refuses with reason CRDOutdated.
 func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
+	if refused, err := r.schemaOutdated(ctx, run); refused || err != nil {
+		return ctrl.Result{}, err
+	}
 	items, err := r.items(ctx, run)
 	if err != nil {
 		if !isRefusal(err) {
@@ -128,6 +138,29 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonQueued,
 		"waiting for the backup queue to admit the run")
 	return after(time.Second, r.writeStatus(ctx, run))
+}
+
+// schemaOutdated checks that the installed BackupRun CRD declares every
+// field the controller writes on a BackupRun, such as status.restartPending,
+// and ends the run as Failed with reason CRDOutdated when it does not. Items
+// a planned run has not finished fail with the same message.
+//
+// It returns true when it ended the run, and an error when the CRD could not
+// be read in a way a retry may fix or when ending the run failed. The check
+// writes nothing else, so it is safe to repeat.
+func (r *BackupRunReconciler) schemaOutdated(ctx context.Context, run *backupv1alpha1.BackupRun) (bool, error) {
+	message, err := r.schemas.crdOutdated(ctx, r.Reader, backupRunsCRD, "BackupRun", backupv1alpha1.BackupRun{},
+		"the run could leave the workloads it stops at 0 replicas")
+	if err != nil || message == "" {
+		return false, err
+	}
+	for i := range run.Status.Items {
+		item := &run.Status.Items[i]
+		if item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+		}
+	}
+	return true, r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, message)
 }
 
 // items returns one Pending item for each thing the run's spec names.
@@ -426,8 +459,17 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 // appliedPart to what is stopped now, and aborts the run, which puts that
 // back. When no workload is marked, quiesce sets status.restartedAt to
 // the same moment, because there is nothing to start again.
+//
+// Before it records a plan, quiesce checks the installed BackupRun CRD again
+// with schemaOutdated, so a run an older controller planned is refused before
+// it stops anything.
 func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (ctrl.Result, error) {
 	if len(run.Status.Quiesced) == 0 {
+		// A run an older controller planned before the upgrade was never
+		// checked, so the check runs again before anything is stopped.
+		if refused, err := r.schemaOutdated(ctx, run); refused || err != nil {
+			return ctrl.Result{}, err
+		}
 		// A volume still busy with another run's backup would keep the
 		// stopped workloads down for as long as that backup takes. The run
 		// waits with the workloads still running. A volume busy with a

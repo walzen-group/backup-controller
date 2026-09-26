@@ -90,6 +90,17 @@ const (
 	// Backup that a CloudNativePG webhook it cannot reach refuses; the message
 	// names each such item and its error.
 	ReasonRetrying = "Retrying"
+
+	// ReasonCRDOutdated reports a run the controller refused before it
+	// changed anything, because the installed CustomResourceDefinition of the
+	// run's kind lacks a field the controller writes. The API server drops
+	// such a field from every write, so the run could lose track of what it
+	// did, such as a quiesced app it still has to start again. It also
+	// reports a run the controller could not check, because it may not read
+	// the CRD. The message names the missing field or permission. Applying
+	// the CRDs of the controller's release fixes it; Helm does not upgrade
+	// CRDs on its own.
+	ReasonCRDOutdated = "CRDOutdated"
 )
 
 // SetReady sets or replaces the Ready condition in a status's condition list.

@@ -3,6 +3,9 @@ package runs
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/yaml"
 )
 
 // frozen is the time the tests' clocks stand at. A test reaches a deadline by
@@ -46,7 +50,7 @@ const (
 var unstructuredKinds = []schema.GroupVersionKind{
 	ClusterGVK, BackupGVK, KustomizationGVK, WorkloadGVK,
 	{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueue"},
-	bootstrap.ObjectStoreGVK,
+	bootstrap.ObjectStoreGVK, crdGVK,
 }
 
 // scheme returns a scheme that holds the typed kinds the package uses and the
@@ -103,10 +107,20 @@ var crds = []string{
 // status subresource its CRD declares. The server clock stands at frozen.
 func newClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
+	return newClientWithCRDs(t, crds, objects...)
+}
+
+// newClientWithCRDs builds a strict fake client as newClient does, pruning
+// against the CRD files in crdFiles. The client also holds this project's
+// CustomResourceDefinitions from those files as objects, so a run's schema
+// check reads the same CRDs the client prunes against.
+func newClientWithCRDs(t *testing.T, crdFiles []string, objects ...client.Object) client.Client {
+	t.Helper()
 	now := frozen
+	objects = append(objects, ownCRDObjects(t, crdFiles)...)
 	c := strictclient.Build(fake.NewClientBuilder().WithObjects(objects...), scheme(t), strictclient.Options{
 		Clock: func() time.Time { return now },
-		CRDs:  crds,
+		CRDs:  crdFiles,
 	})
 	serverClocks[c] = &now
 	t.Cleanup(func() { delete(serverClocks, c) })
@@ -382,4 +396,27 @@ func loseStatusWriteAt(c client.Client, replicas int32) client.Client {
 			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
+}
+
+// ownCRDObjects reads this project's CustomResourceDefinitions, the files in
+// files whose name starts with backup.wlz.li_, as unstructured objects a fake
+// client can hold.
+func ownCRDObjects(t *testing.T, files []string) []client.Object {
+	t.Helper()
+	var objects []client.Object
+	for _, path := range files {
+		if !strings.HasPrefix(filepath.Base(path), backupv1alpha1.GroupVersion.Group+"_") {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		crd := &unstructured.Unstructured{}
+		if err := yaml.Unmarshal(data, &crd.Object); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		objects = append(objects, crd)
+	}
+	return objects
 }
