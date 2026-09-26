@@ -863,4 +863,63 @@ func TestTheEndingIsStoredWhenTheMoverWaitIsUnchanged(t *testing.T) {
 	if item := stored.Status.Items[1]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonTimedOut {
 		t.Errorf("item %s = %+v, want it stored Failed with reason TimedOut", other, item)
 	}
+
+	// A pass that finds the same wait and changes nothing writes nothing,
+	// since every write starts another reconcile.
+	restoreStep(t, r)
+	if again := readRestoreRun(t, c); again.ResourceVersion != stored.ResourceVersion {
+		t.Errorf("resourceVersion = %s after a pass that changed nothing, want %s: the status was written again",
+			again.ResourceVersion, stored.ResourceVersion)
+	}
+}
+
+// A pass of work that changes the items and then waits for the same stopped
+// mover as the pass before stores those items in that pass. Here the first
+// volume failed and its mover's pod is still there, the second volume's
+// mover is still restoring, and the Cluster waits for both. Then the
+// second mover fails: the pass that
+// finds it stores that volume's end, skips the Cluster because a volume
+// failed, and waits for the first mover's pod with the same message as
+// before. Before, the wait wrote only a changed Ready condition, so the
+// skipped Cluster was stored only by a later pass.
+func TestWorkStoresItsItemsWhenTheMoverWaitIsUnchanged(t *testing.T) {
+	const other = "notes-cache"
+	run, first := quiescedMidRestore()
+	run.Status.Items[0].Phase = backupv1alpha1.ItemFailed
+	run.Status.Items = append(run.Status.Items,
+		backupv1alpha1.RestoreItem{Kind: "PersistentVolumeClaim", Name: other, Phase: backupv1alpha1.ItemRunning,
+			Destination: destinationName(restoreUID, 1), Snapshot: monday.ShortID()},
+		backupv1alpha1.RestoreItem{Kind: "Cluster", Name: pgN, Phase: backupv1alpha1.ItemPending, BaseBackup: saturday.ID})
+	second := destinationFor(run, other)
+	second.Name = destinationName(restoreUID, 1)
+	mover := moverPod(first.Name, corev1.PodRunning)
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(), cluster(),
+		stoppedDeployment(), kustomization(true), first, second, mover)
+
+	restoreStep(t, r) // deletes the failed volume's destination
+	restoreStep(t, r) // finds that mover's pod still there
+	before := readRestoreRun(t, c)
+	if readyReason(before.Status.Conditions) != backupv1alpha1.ReasonShutdown || !strings.Contains(readyMessage(before.Status.Conditions), mover.Name) {
+		t.Fatalf("reason = %q, message = %q; want %s naming pod %s", readyReason(before.Status.Conditions),
+			readyMessage(before.Status.Conditions), backupv1alpha1.ReasonShutdown, mover.Name)
+	}
+	get(t, c, ns, second.Name, second)
+	second.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LatestMoverStatus: &volsyncv1alpha1.MoverStatus{
+		Result: volsyncv1alpha1.MoverResultFailed, Logs: "Fatal: unable to open repository",
+	}}
+	if err := c.Status().Update(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	stored := readRestoreRun(t, c)
+	if readyMessage(stored.Status.Conditions) != readyMessage(before.Status.Conditions) {
+		t.Fatalf("message = %q, want the wait unchanged: %q", readyMessage(stored.Status.Conditions), readyMessage(before.Status.Conditions))
+	}
+	if item := stored.Status.Items[1]; item.Phase != backupv1alpha1.ItemFailed {
+		t.Errorf("item %s = %+v, want it stored Failed", other, item)
+	}
+	if item := stored.Status.Items[2]; item.Phase != backupv1alpha1.ItemSkipped {
+		t.Errorf("item %s = %+v in the pass that skipped it, want it stored Skipped", pgN, item)
+	}
 }

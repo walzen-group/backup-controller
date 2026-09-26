@@ -68,8 +68,6 @@ var textMatcherPending = []messageRuleEntry{
 // an error string (part 2 of the rule). A new entry needs a reviewer's eye
 // like any rule exception.
 var messageComparisonAllowlist = []messageRuleEntry{
-	{pkg: "runs", decl: "readyChanged",
-		what: "compares the Ready condition's message only to skip a status write that would change nothing"},
 	{pkg: "runs", decl: "startErrorNote",
 		what: "adds status.items[].lastStartError to a failing item's message only when the item has one; no decision reads the note"},
 }
