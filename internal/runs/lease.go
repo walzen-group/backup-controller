@@ -487,8 +487,9 @@ func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Re
 // The Lease names come from leaseNamesFor, the same function acquireLeases
 // resolves them with, so this check can never look at a Lease the run would
 // not take. A repository Secret that does not exist comes back as the
-// refusal leaseNamesFor gives; the caller leaves it to the item's start,
-// which fails the item. Any other failed read comes back as an error, and
+// refusal leaseNamesFor gives. A BackupRun's pre-check fails the item with
+// it before anything is stopped; a RestoreRun's leaves it to
+// restoreVolume, which fails the item. Any other failed read comes back as an error, and
 // the caller retries with nothing stopped.
 func leaseHeldElsewhere(ctx context.Context, reader client.Reader, run metav1.Object, namespace, claim, secret string) (string, error) {
 	names, err := leaseNamesFor(ctx, reader, namespace, claim, secret)

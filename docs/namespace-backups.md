@@ -567,6 +567,10 @@ Secret appears:
 repository Secret notes-restic-data does not exist in this namespace, so the run can't take the Lease that keeps other runs' movers off the repository
 ```
 
+A namespace BackupRun fails such an item in the checks it makes before it stops
+anything. When those checks leave no item to back up, the run never stops the
+app.
+
 Any other failed read of the claim or the Secret is an error, which the run
 retries with nothing stopped. The
 Lease of an item that has finished is released on the run's next pass, and that

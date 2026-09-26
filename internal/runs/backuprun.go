@@ -503,8 +503,10 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 // workloads had before the run touched them. quiesce then writes
 // status.quiescedAt. After a failed stop, it narrows the plan with
 // appliedPart to what is stopped now, and aborts the run, which puts that
-// back. When no workload is marked, quiesce sets status.restartedAt to
-// the same moment, because there is nothing to start again.
+// back. When no workload is marked, or no item is left Pending once the
+// checks below have failed the others, quiesce stops nothing and sets
+// status.restartedAt to the same moment, because there is nothing to start
+// again.
 //
 // Before it records a plan, with nothing stopped, quiesce waits with reason
 // SourceBusy while a volume is busy with another run, while another run is in
@@ -529,6 +531,12 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			// A restore of the claim or its repository holds the item the
 			// same way, and startItem would wait for it with the app down.
 			restoring, err := r.heldElsewhere(ctx, run, item.Name)
+			if isRefusal(err) {
+				// A repository Secret that is gone fails the item now, so the
+				// app is not stopped for a backup that cannot start.
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
+				continue
+			}
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -563,7 +571,9 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if len(targets) == 0 {
+		// With no workload marked, or no item left to back up once the checks
+		// above failed the rest, there is nothing to stop.
+		if len(targets) == 0 || !anyPending(run.Status.Items) {
 			run.Status.QuiescedAt, run.Status.RestartedAt = newTime(now), newTime(now)
 			return after(time.Second, r.writeStatus(ctx, run))
 		}
@@ -626,11 +636,13 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 //   - run is the asking run; its namespace and UID are read.
 //   - claimName names the claim the run is about to back up.
 //
-// A claim that does not exist, a VolumeRestore the claim does not have and a
-// repository Secret that does not exist give "": startItem fails or retries
-// the item, and ensureSource checks again right before it writes the
-// trigger. Any other failed read comes back as an error, and the pass
-// retries with nothing stopped.
+// A claim that does not exist and a VolumeRestore the claim does not have
+// give "": startItem fails or retries the item, and ensureSource checks
+// again right before it writes the trigger. A repository Secret that does
+// not exist comes back as the refusal leaseNamesFor gives (see isRefusal),
+// and quiesce fails the item with it before anything is stopped. Any other
+// failed read comes back as an error, and the pass retries with nothing
+// stopped.
 //
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right
@@ -657,11 +669,7 @@ func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1al
 	if restoring != "" {
 		return restoring, nil
 	}
-	held, err := leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, vr.Spec.Repository)
-	if isRefusal(err) {
-		return "", nil
-	}
-	return held, err
+	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, vr.Spec.Repository)
 }
 
 // startItem starts the backup of one Pending item and sets the item's phase.

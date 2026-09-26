@@ -9,6 +9,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -284,5 +285,39 @@ func TestARestoreWaitThatOutlastsTheTimeoutNamesTheWait(t *testing.T) {
 	}
 	if got := replicasOf(t, c); got != 2 {
 		t.Errorf("replicas = %d after the timed-out restore, want 2", got)
+	}
+}
+
+// A namespace BackupRun whose claim's repository Secret is gone fails that
+// item in its pre-check, before it stops anything, and with no item left to
+// back up it never stops the app. Before, the pre-check left the refusal to
+// the item's start, so the run stopped the app, failed the item, and gave
+// the app back (UF7).
+func TestAMissingRepositorySecretFailsTheItemBeforeTheAppStops(t *testing.T) {
+	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), deployment(), kustomization(false))
+	scaled := 0
+	watching := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok {
+				scaled++
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	br := &BackupRunReconciler{Client: watching, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
+
+	step(t, br) // plan
+	step(t, br) // admit
+	step(t, br) // quiesce: the pre-check fails the item
+	step(t, br) // finish
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || len(run.Status.Items) != 1 ||
+		run.Status.Items[0].Phase != backupv1alpha1.ItemFailed || !strings.Contains(run.Status.Items[0].Message, "repository Secret "+repoN) {
+		t.Fatalf("phase = %q, items = %+v; want Failed with the item naming repository Secret %s", run.Status.Phase, run.Status.Items, repoN)
+	}
+	if scaled != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
+		t.Errorf("Deployment patches = %d, quiesced = %+v, suspended = %t; want the app never stopped", scaled, run.Status.Quiesced, suspended(t, c))
 	}
 }

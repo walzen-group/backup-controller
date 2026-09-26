@@ -422,11 +422,14 @@ func TestAQuiesceLeaseIsTakenOverOnlyWhenItsHolderRestarted(t *testing.T) {
 }
 
 // A run being deleted with a plan keeps others waiting: its finalizer may
-// still restart the app, so its quiesce Lease stays live until it has.
+// still restart the app, so its quiesce Lease stays live until it has. The
+// second run's volume item fails at its pre-check, since the deleted run's
+// tag stays open on the source; its Cluster item is what it still stops the
+// app for.
 func TestADeletedQuiescedRunKeepsOthersWaitingUntilItGaveTheAppBack(t *testing.T) {
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		secondBackupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
 	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
 	const second = "manual-notes"
 
