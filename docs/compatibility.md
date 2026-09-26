@@ -53,12 +53,16 @@ populator-machinery/controller.go in lib-volume-populator v3.3.0.
 | Listing a kind whose CRD is absent returns a no-match error (meta.IsNoMatchError). localQueue treats that error like NotFound, so a cluster without Kueue runs without admission. | envtest 1.36.3; internal/runs/kueue.go:30-45 |
 | The admission call carries the API server's deadline in the timeout query parameter. The bootstrap webhook answers inside that budget. | k8s.io/apiserver pkg/admission/plugin/webhook/mutating/dispatcher.go:276-293 |
 
-### Flux
+### Flux 2.9.5
+
+Flux 2.9.5 ships kustomize-controller v1.9.5. Its go.mod pins
+github.com/fluxcd/pkg/ssa v0.76.2 and github.com/fluxcd/cli-utils v1.2.3, and
+the rows below cite those modules where the behaviour lives in them.
 
 | Behaviour | Source |
 | --- | --- |
-| kustomize-controller labels every object it applies with kustomize.toolkit.fluxcd.io/name and kustomize.toolkit.fluxcd.io/namespace. | internal/runs/quiesce.go:26-33 |
-| A Kustomization's status.inventory.entries holds one entry per applied object, with id "<namespace>_<name>_<group>_<kind>" (for a Deployment, notes_notes_apps_Deployment). A quiesce suspends a Kustomization only when that list holds the workload. | Flux kustomize-controller inventory docs; internal/runs/quiesce.go:226-240 |
+| kustomize-controller labels every object it applies with kustomize.toolkit.fluxcd.io/name and kustomize.toolkit.fluxcd.io/namespace. | kustomize-controller internal/controller/kustomization_controller.go:458-462; fluxcd/pkg ssa/manager.go:66-78; internal/runs/quiesce.go:26-33 |
+| A Kustomization's status.inventory.entries holds one entry per applied object, with id "<namespace>_<name>_<group>_<kind>" (for a Deployment, notes_notes_apps_Deployment). A quiesce suspends a Kustomization only when that list holds the workload. | kustomize-controller internal/controller/kustomization_controller.go:482 and internal/inventory/inventory.go:39-50 (the id is ObjMetadata.String()); fluxcd/cli-utils pkg/object/objmetadata.go:32, 118-128; internal/runs/quiesce.go:226-240 |
 | spec.suspend: true stops kustomize-controller from scaling a stopped workload back up. | internal/runs/quiesce.go:22-25 |
 
 ### VolSync 0.16.0
@@ -92,19 +96,21 @@ The mover script, mover-restic/entry.sh in the same module:
 
 ### restic
 
-The line numbers are from restic 0.19.1. The mover runs 0.18.1, and the
-conformance tests replay repositories recorded with both versions.
+The VolSync mover runs restic 0.18.1, and the operator runs 0.19.1 by hand.
+Because the conformance tests replay repositories recorded with both versions,
+each row cites both releases. Where the two columns give the same lines, the
+cited code is identical in both.
 
-| Behaviour | Source |
-| --- | --- |
-| backup and restore acquire a shared lock, and forget acquires an exclusive lock. | cmd/restic/cmd_backup.go:513; cmd/restic/cmd_forget.go:189; cmd/restic/cmd_restore.go:134 |
-| An exclusive lock is refused while any other lock exists, stale or not; forget then exits 11 with "repository is already locked". | internal/restic/lock.go:160-216 (the branch at 188) |
-| restic does not retry a lock by default. | cmd/restic/global.go:108 |
-| A lock is stale when it is older than 30 minutes, or when it names this host and a dead PID. A mover pod never shares a hostname with a dead one, so for movers only the 30 minutes apply. | internal/restic/lock.go:252-288 |
-| A live restic refreshes its lock every 5 minutes and exits when it cannot. | internal/repository/lock.go:29, 37; internal/restic/lock.go:309-331 |
-| restic unlock removes only stale locks; unlock --remove-all removes every lock. | cmd/restic/cmd_unlock.go:45-65; internal/repository/lock.go:274-294 |
-| restic snapshots sorts by full time with an unstable sort. | cmd/restic/cmd_snapshots.go:100; internal/restic/snapshot.go:260 |
-| restic rewrite records the old snapshot as original and can change the tree. The controller's retime writes the same fields. | cmd/restic/cmd_rewrite.go:252-254 |
+| Behaviour | Source in 0.18.1 | Source in 0.19.1 |
+| --- | --- | --- |
+| backup and restore acquire a shared lock, and forget acquires an exclusive lock. | cmd/restic/cmd_backup.go:513; cmd/restic/cmd_forget.go:189; cmd/restic/cmd_restore.go:134 | cmd/restic/cmd_backup.go:534; cmd/restic/cmd_forget.go:193; cmd/restic/cmd_restore.go:149 |
+| An exclusive lock is refused while any other lock exists, stale or not; forget then exits 11 with "repository is already locked". | internal/restic/lock.go:56, 160-216 (the branch at 188); cmd/restic/main.go:211-212 | internal/restic/lock.go:56, 160-216 (the branch at 188); cmd/restic/main.go:231-232 |
+| restic does not retry a lock by default. | cmd/restic/global.go:108 | internal/global/global.go:101 |
+| A lock is stale when it is older than 30 minutes, or when it names this host and a dead PID. A mover pod never shares a hostname with a dead one, so for movers only the 30 minutes apply. | internal/restic/lock.go:252-288 | internal/restic/lock.go:252-288 |
+| A live restic refreshes its lock every 5 minutes. When a refresh has not succeeded in time, the lock monitor cancels the command's context and restic exits. | internal/repository/lock.go:29, 37, 161-170, 183-243; internal/restic/lock.go:309-330 | internal/repository/lock.go:29, 37, 161-170, 183-243; internal/restic/lock.go:309-330 |
+| restic unlock removes only stale locks; unlock --remove-all removes every lock. | cmd/restic/cmd_unlock.go:45-65; internal/repository/lock.go:274-294 | cmd/restic/cmd_unlock.go:49-70; internal/repository/lock.go:274-294 |
+| restic snapshots sorts by full time with an unstable sort. | cmd/restic/cmd_snapshots.go:100; internal/restic/snapshot.go:260 | cmd/restic/cmd_snapshots.go:115; internal/data/snapshot.go:261 |
+| restic rewrite records the old snapshot as original and can change the tree. The controller's retime writes the same fields. | cmd/restic/cmd_rewrite.go:252-254 | cmd/restic/cmd_rewrite.go:254-256 |
 
 ### Kueue 0.19.5
 
@@ -118,22 +124,22 @@ conformance tests replay repositories recorded with both versions.
 
 | Behaviour | Source |
 | --- | --- |
-| After initdb, the instance creates the marker file .check-empty-wal-archive, and removes it only once the ContinuousArchiving condition is True. | pkg/management/postgres/initdb.go:355-360; internal/management/controller/instance_controller.go:1143-1157 |
-| While the marker exists and the Cluster lacks cnpg.io/skipEmptyWalArchiveCheck: enabled, the archiver asks the plugin to check that the archive is empty. | pkg/utils/labels_annotations.go:532-534; pkg/management/postgres/archiver/archiver.go:312-319 |
+| After initdb, the instance creates the marker file .check-empty-wal-archive, and removes it only once the ContinuousArchiving condition is True. | pkg/management/postgres/initdb.go:355-360; internal/management/controller/instance_controller.go:1100-1110 |
+| When a Cluster enables a WAL archive plugin, the instance manager hands every segment to the plugin and skips its own empty-archive check. It sends the plugin no CheckEmptyWalArchive decision, so the plugin reads the marker and the cnpg.io/skipEmptyWalArchiveCheck annotation itself (next section). | pkg/management/postgres/archiver/archiver.go:165-176; pkg/utils/labels_annotations.go:203-205, 539-544 |
 | A pg_basebackup bootstrap creates the same marker after cloning. | internal/cmd/manager/instance/pgbasebackup/cmd.go:151-156 |
-| A failing archive_command sets ContinuousArchiving False with reason ContinuousArchivingFailing, and pg_wal grows until the volume is full. | pkg/management/postgres/webserver/local.go:264-272 |
+| A failing archive_command sets ContinuousArchiving False with reason ContinuousArchivingFailing, and pg_wal grows until the volume is full. | pkg/management/postgres/webserver/local.go:246-262 |
 
 ### plugin-barman-cloud 0.15.0 and barman 3.20.0
 
 | Behaviour | Source |
 | --- | --- |
-| The plugin runs barman-cloud-check-wal-archive before archiving each segment while the marker exists, and passes no --timeline. | plugin internal/cnpgi/common/wal.go:158-178, 239-254; internal/cnpgi/common/check.go:32-53 |
+| The plugin runs barman-cloud-check-wal-archive before archiving each segment while the marker exists and the Cluster lacks cnpg.io/skipEmptyWalArchiveCheck: enabled. It passes no --timeline. | plugin internal/cnpgi/common/wal.go:159-178, 239-254; internal/cnpgi/common/check.go:32-53; github.com/cloudnative-pg/barman-cloud v0.6.0 (the plugin's go.mod pin) pkg/archiver/archiver.go:139-166 |
 | barman-cloud-check-wal-archive lists <server>/wals/ and fails with "Expected empty archive" on any WAL file. A prefix holding only FAILED base backups and no WAL passes. | barman src/barman/clients/cloud_check_wal_archive.py:60-65; src/barman/cloud.py:2421-2446; src/barman/xlog.py:567-574 |
 | barman uploads each segment to <server>/wals/<hash dir>/<name> unconditionally, so a new database on timeline 1 overwrites an old archive's segments. | src/barman/clients/cloud_walarchive.py:308-333 |
-| barman names a backup directory by its start time and marks it STARTED, then FAILED or DONE. | src/barman/cloud.py:1629, 1703-1707, 1751-1768 |
+| barman names a backup directory by its start time and marks it STARTED, then FAILED or DONE. | src/barman/cloud.py:1629, 1703-1707, 1730, 1751-1768 |
 | Retention classes a non-DONE backup as NONE and deletes only OBSOLETE ones, so barman never deletes a FAILED backup. | src/barman/retention_policies.py:190-218; src/barman/clients/cloud_backup_delete.py:424-428 |
 | A base/<id>/ directory without backup.info counts as no backup. | src/barman/cloud.py:2541-2551; src/barman/cloud_providers/aws_s3.py:511-514 |
-| A declared recovery fails at start when the target archive is not empty. | plugin internal/cnpgi/restore/restore.go:105-119, 249-294 |
+| A declared recovery whose Cluster also archives to an ObjectStore (barmanObjectName set) fails at start when that target archive is not empty, unless the Cluster carries cnpg.io/skipEmptyWalArchiveCheck: enabled. | plugin internal/cnpgi/restore/restore.go:105-120, 249-297, 306-311 |
 
 ### lib-volume-populator v3.3.0
 
