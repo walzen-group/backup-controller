@@ -524,6 +524,25 @@ spec:
                   - type
                   type: object
                 type: array
+              ending:
+                description: |-
+                  Ending records why the run ended, from the pass that decided to end it.
+                  Every later pass, also one that waits for movers to stop or retries a
+                  restart, ends the run with this reason and message.
+                properties:
+                  message:
+                    description: Message is the Ready condition's message the run
+                      ends with.
+                    type: string
+                  reason:
+                    description: |-
+                      Reason is the Ready condition's reason the run ends with, such as
+                      TimedOut.
+                    type: string
+                required:
+                - message
+                - reason
+                type: object
               items:
                 description: |-
                   Items has one entry for each claim and each database the run restores.
@@ -537,6 +556,12 @@ spec:
                         BaseBackup is the ID of the barman base backup a database's recovery
                         starts from.
                       type: string
+                    clusterLeftDeleted:
+                      description: |-
+                        ClusterLeftDeleted is true when the run ended while this database's
+                        Cluster was deleted and not created again. The item's message and the
+                        run's Ready message then say that the Cluster is gone.
+                      type: boolean
                     clusterUID:
                       description: |-
                         ClusterUID is the UID of the Cluster a database item deletes, recorded
@@ -549,6 +574,11 @@ spec:
                         Destination is the name of the ReplicationDestination restoring a
                         volume. It is cleared once the restore ends and the destination is
                         deleted.
+                      type: string
+                    job:
+                      description: |-
+                        Job is the name of the restore Job the run created for a volume, in the
+                        run's namespace.
                       type: string
                     kind:
                       description: Kind is PersistentVolumeClaim for a volume and
@@ -563,11 +593,23 @@ spec:
                     phase:
                       description: Phase is how far this item got.
                       type: string
+                    reason:
+                      description: |-
+                        Reason is a one-word cause for the item's phase, one of the reasons
+                        listed in docs/api.md. It is empty when the path that ended the item
+                        records none.
+                      type: string
                     snapshot:
                       description: |-
                         Snapshot is the short ID of the restic snapshot the run's checks
                         selected for a volume. The item succeeds only when the mover's log
                         names this snapshot as the one it restored.
+                      type: string
+                    snapshotID:
+                      description: |-
+                        SnapshotID is the full ID of the snapshot the run selected for a
+                        volume. The restore Job restores exactly this ID, and Snapshot keeps the
+                        short form for display.
                       type: string
                     snapshotTime:
                       description: |-

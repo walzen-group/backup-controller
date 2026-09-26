@@ -175,6 +175,25 @@ spec:
                   - type
                   type: object
                 type: array
+              ending:
+                description: |-
+                  Ending records why the run ended, from the pass that decided to end it.
+                  Every later pass, also one that waits for movers to stop or retries a
+                  restart, ends the run with this reason and message.
+                properties:
+                  message:
+                    description: Message is the Ready condition's message the run
+                      ends with.
+                    type: string
+                  reason:
+                    description: |-
+                      Reason is the Ready condition's reason the run ends with, such as
+                      TimedOut.
+                    type: string
+                required:
+                - message
+                - reason
+                type: object
               items:
                 description: Items has one entry for each volume and each database
                   the run backs up.
@@ -196,6 +215,13 @@ spec:
                       description: Kind is ReplicationSource for a volume and Cluster
                         for a database.
                       type: string
+                    lastStartError:
+                      description: |-
+                        LastStartError is the error of the item's last failed attempt to
+                        start, while the item stays Pending and the run tries again. A start
+                        that succeeds clears it, and the run adds it to the item's message when
+                        it gives the item up.
+                      type: string
                     message:
                       description: |-
                         Message says why the item failed or was skipped, or what it is waiting
@@ -208,9 +234,20 @@ spec:
                     phase:
                       description: Phase is how far this item got.
                       type: string
+                    reason:
+                      description: |-
+                        Reason is a one-word cause for the item's phase, one of the reasons
+                        listed in docs/api.md. It is empty when the path that ended the item
+                        records none.
+                      type: string
                     snapshot:
                       description: Snapshot is the short ID of the restic snapshot
                         the mover wrote.
+                      type: string
+                    snapshotID:
+                      description: |-
+                        SnapshotID is the full ID of that snapshot, as the run found it in the
+                        repository. Snapshot keeps the short form for display.
                       type: string
                     snapshotTime:
                       description: |-

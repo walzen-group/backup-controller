@@ -186,6 +186,12 @@ type RestoreRunStatus struct {
 	// +optional
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 
+	// Ending records why the run ended, from the pass that decided to end it.
+	// Every later pass, also one that waits for movers to stop or retries a
+	// restart, ends the run with this reason and message.
+	// +optional
+	Ending *RunEnding `json:"ending,omitempty"`
+
 	// Items has one entry for each claim and each database the run restores.
 	// An into restore has a single entry, for the claim it creates.
 	// +optional
@@ -228,6 +234,15 @@ type RestoreItem struct {
 	// names this snapshot as the one it restored.
 	// +optional
 	Snapshot string `json:"snapshot,omitempty"`
+	// SnapshotID is the full ID of the snapshot the run selected for a
+	// volume. The restore Job restores exactly this ID, and Snapshot keeps the
+	// short form for display.
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
+	// Job is the name of the restore Job the run created for a volume, in the
+	// run's namespace.
+	// +optional
+	Job string `json:"job,omitempty"`
 	// SnapshotTime is the time of that snapshot. The run hands it to the mover
 	// as restoreAsOf, in whole seconds and with no previous, so the mover
 	// picks the snapshot the checks selected. Right before the mover starts,
@@ -245,6 +260,16 @@ type RestoreItem struct {
 	// UID can be the recovery.
 	// +optional
 	ClusterUID types.UID `json:"clusterUID,omitempty"`
+	// Reason is a one-word cause for the item's phase, one of the reasons
+	// listed in docs/api.md. It is empty when the path that ended the item
+	// records none.
+	// +optional
+	Reason ItemReason `json:"reason,omitempty"`
+	// ClusterLeftDeleted is true when the run ended while this database's
+	// Cluster was deleted and not created again. The item's message and the
+	// run's Ready message then say that the Cluster is gone.
+	// +optional
+	ClusterLeftDeleted bool `json:"clusterLeftDeleted,omitempty"`
 }
 
 // +kubebuilder:object:root=true

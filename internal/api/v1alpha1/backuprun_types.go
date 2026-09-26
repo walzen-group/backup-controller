@@ -96,6 +96,12 @@ type BackupRunStatus struct {
 	// +optional
 	SuspendedKustomizations []string `json:"suspendedKustomizations,omitempty"`
 
+	// Ending records why the run ended, from the pass that decided to end it.
+	// Every later pass, also one that waits for movers to stop or retries a
+	// restart, ends the run with this reason and message.
+	// +optional
+	Ending *RunEnding `json:"ending,omitempty"`
+
 	// Items has one entry for each volume and each database the run backs up.
 	// +optional
 	Items []BackupItem `json:"items,omitempty"`
@@ -136,6 +142,10 @@ type BackupItem struct {
 	// Snapshot is the short ID of the restic snapshot the mover wrote.
 	// +optional
 	Snapshot string `json:"snapshot,omitempty"`
+	// SnapshotID is the full ID of that snapshot, as the run found it in the
+	// repository. Snapshot keeps the short form for display.
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
 	// SnapshotTime is the time recorded on that snapshot. restic records the
 	// moment the backup of the volume's clone started. When the run stopped
 	// workloads, it then rewrites the snapshot to carry the run's restartedAt
@@ -151,6 +161,17 @@ type BackupItem struct {
 	// database.
 	// +optional
 	Backup string `json:"backup,omitempty"`
+	// Reason is a one-word cause for the item's phase, one of the reasons
+	// listed in docs/api.md. It is empty when the path that ended the item
+	// records none.
+	// +optional
+	Reason ItemReason `json:"reason,omitempty"`
+	// LastStartError is the error of the item's last failed attempt to
+	// start, while the item stays Pending and the run tries again. A start
+	// that succeeds clears it, and the run adds it to the item's message when
+	// it gives the item up.
+	// +optional
+	LastStartError string `json:"lastStartError,omitempty"`
 }
 
 // ItemPhase is the state of one item in a run.

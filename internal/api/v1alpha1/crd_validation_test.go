@@ -18,11 +18,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -270,4 +274,147 @@ func TestCRDRoundTrip(t *testing.T) {
 	if got := readBack.Spec.MoverPodLabels["kueue.x-k8s.io/queue-name"]; got != "backup" {
 		t.Errorf("moverPodLabels read back as %v, want the queue-name label intact", readBack.Spec.MoverPodLabels)
 	}
+}
+
+// TestRunStatusFieldsRoundTrip writes the typed status fields of v0.9.0 onto a
+// BackupRun and a RestoreRun through the status subresource, reads each run
+// back, and checks that every field survives.
+//
+// The status is written as unstructured JSON, so the test sees what the
+// installed CRD keeps and what the API server prunes. A field the schema lacks
+// is dropped silently, and a run would then lose the state its later passes
+// decide on: the ending a failed restart must repeat, the last start error, a
+// Cluster left deleted, the full snapshot ID, the restore Job and the item's
+// reason. The stored run is then decoded into the Go type and encoded again,
+// so a JSON name in the Go type that differs from the CRD's fails as well.
+func TestRunStatusFieldsRoundTrip(t *testing.T) {
+	ending := map[string]any{"reason": "TimedOut", "message": "the run timed out after 6h0m0s"}
+	runs := []struct {
+		kind  string
+		typed any
+		spec  map[string]any
+		item  map[string]any
+	}{
+		{
+			kind:  "BackupRun",
+			typed: &BackupRun{},
+			spec:  map[string]any{"source": "notes-data"},
+			item: map[string]any{
+				"kind": "ReplicationSource", "name": "notes-data", "phase": "Pending",
+				"snapshotID":     "4f3c2b1a0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a",
+				"reason":         "TimedOut",
+				"lastStartError": "the claim notes-data is not bound yet",
+			},
+		},
+		{
+			kind:  "RestoreRun",
+			typed: &RestoreRun{},
+			spec:  map[string]any{"claim": "notes-data"},
+			item: map[string]any{
+				"kind": "Cluster", "name": "notes-pg", "phase": "Failed",
+				"snapshotID":         "4f3c2b1a0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a",
+				"job":                "notes-data-restore",
+				"reason":             "RestoreJobFailed",
+				"clusterLeftDeleted": true,
+			},
+		},
+	}
+	for _, run := range runs {
+		t.Run(run.kind, func(t *testing.T) {
+			status := map[string]any{"phase": "Failed", "ending": ending, "items": []any{run.item}}
+			stored := writeRunStatus(t, run.kind, run.spec, status)
+			for _, got := range []*unstructured.Unstructured{stored, throughGoType(t, stored, run.typed)} {
+				assertField(t, got, ending, "status", "ending")
+				for field, want := range run.item {
+					assertField(t, got, want, "status", "items", "0", field)
+				}
+			}
+		})
+	}
+}
+
+// writeRunStatus creates a run and writes a status onto it through the status
+// subresource, and returns the run as the API server stores it.
+//
+// Parameters:
+//   - t is the calling test, failed when the API server refuses a step.
+//   - kind is BackupRun or RestoreRun, the kind of run to create.
+//   - spec is a spec the CRD accepts, since the run has to exist first.
+//   - status is the status to write, as the JSON the controller would send.
+//
+// It returns the stored object read back from the API server, so the caller
+// sees the status after the CRD's structural schema has pruned it.
+func writeRunStatus(t *testing.T, kind string, spec, status map[string]any) *unstructured.Unstructured {
+	t.Helper()
+	ctx := context.Background()
+	run := &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
+	run.SetGroupVersionKind(GroupVersion.WithKind(kind))
+	run.SetNamespace("default")
+	run.SetGenerateName("status-round-trip-")
+	if err := k8sClient.Create(ctx, run); err != nil {
+		t.Fatalf("create the %s: %v", kind, err)
+	}
+	run.Object["status"] = status
+	if err := k8sClient.Status().Update(ctx, run); err != nil {
+		t.Fatalf("write the %s status: %v", kind, err)
+	}
+	stored := &unstructured.Unstructured{}
+	stored.SetGroupVersionKind(run.GroupVersionKind())
+	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatalf("read the %s back: %v", kind, err)
+	}
+	return stored
+}
+
+// assertField fails the test when the stored object lacks a field or holds
+// another value in it.
+//
+// Parameters:
+//   - t is the calling test.
+//   - stored is the object read back from the API server.
+//   - want is the value the test wrote into the field.
+//   - path names the field from the object's root. A numeric step indexes a
+//     list, so "items", "0" is the first item.
+func assertField(t *testing.T, stored *unstructured.Unstructured, want any, path ...string) {
+	t.Helper()
+	var node any = stored.Object
+	for _, step := range path {
+		switch value := node.(type) {
+		case map[string]any:
+			node = value[step]
+		case []any:
+			index, err := strconv.Atoi(step)
+			if err != nil || index >= len(value) {
+				t.Fatalf("%s: no list entry %s in %v", strings.Join(path, "."), step, value)
+			}
+			node = value[index]
+		}
+	}
+	if !reflect.DeepEqual(node, want) {
+		t.Errorf("%s read back as %v, want %v: the CRD pruned or changed it", strings.Join(path, "."), node, want)
+	}
+}
+
+// throughGoType decodes a stored object into its Go type and encodes it again,
+// so that a field survives only when the Go type carries it under the same
+// JSON name as the CRD.
+//
+// Parameters:
+//   - t is the calling test, failed when either conversion fails.
+//   - stored is the object read back from the API server.
+//   - typed is a pointer to an empty value of the object's Go type, such as
+//     &BackupRun{}, which the function fills.
+//
+// It returns the object as the Go type encodes it.
+func throughGoType(t *testing.T, stored *unstructured.Unstructured, typed any) *unstructured.Unstructured {
+	t.Helper()
+	converter := runtime.DefaultUnstructuredConverter
+	if err := converter.FromUnstructured(stored.Object, typed); err != nil {
+		t.Fatalf("decode the stored %s into its Go type: %v", stored.GetKind(), err)
+	}
+	encoded, err := converter.ToUnstructured(typed)
+	if err != nil {
+		t.Fatalf("encode the %s from its Go type: %v", stored.GetKind(), err)
+	}
+	return &unstructured.Unstructured{Object: encoded}
 }

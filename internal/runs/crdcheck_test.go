@@ -49,26 +49,43 @@ func readCRD(t *testing.T, path string) *unstructured.Unstructured {
 	return crd
 }
 
+// v081CRDDir holds the CRDs of v0.8.1, the release before the run's ending and
+// the items' typed state (snapshotID, job, reason, lastStartError and
+// clusterLeftDeleted).
+const v081CRDDir = crdDir + "backup-controller/v0.8.1/"
+
 // The CRDs make manifests generates declare every field of their Go types,
-// and the v0.7.2 CRDs lack exactly the fields v0.8 and v0.9 added. This is
-// also the guard against the generated CRDs drifting from the types.
+// and each released CRD lacks exactly the fields the releases after it added.
+// This is also the guard against the generated CRDs drifting from the types.
 func TestSchemaGapsNamesTheFieldsAnOldCRDLacks(t *testing.T) {
+	v09Backup := []string{"status.ending", "status.items[].lastStartError", "status.items[].reason", "status.items[].snapshotID"}
+	v09Restore := []string{"status.ending", "status.items[].clusterLeftDeleted", "status.items[].job", "status.items[].reason", "status.items[].snapshotID"}
 	for _, tc := range []struct {
 		file   string
 		sample any
-		old    []string
+		v072   []string
+		v081   []string
 	}{
-		{"backup.wlz.li_backupruns.yaml", backupv1alpha1.BackupRun{}, []string{"status.restartPending"}},
-		{"backup.wlz.li_restoreruns.yaml", backupv1alpha1.RestoreRun{}, []string{"status.items[].clusterUID", "status.items[].snapshotTime"}},
-		{"backup.wlz.li_volumerestores.yaml", backupv1alpha1.VolumeRestore{}, nil},
+		{
+			"backup.wlz.li_backupruns.yaml", backupv1alpha1.BackupRun{},
+			[]string{"status.ending", "status.items[].lastStartError", "status.items[].reason", "status.items[].snapshotID", "status.restartPending"},
+			v09Backup,
+		},
+		{
+			"backup.wlz.li_restoreruns.yaml", backupv1alpha1.RestoreRun{},
+			[]string{"status.ending", "status.items[].clusterLeftDeleted", "status.items[].clusterUID", "status.items[].job", "status.items[].reason", "status.items[].snapshotID", "status.items[].snapshotTime"},
+			v09Restore,
+		},
+		{"backup.wlz.li_volumerestores.yaml", backupv1alpha1.VolumeRestore{}, nil, nil},
 	} {
-		gaps, err := schemaGaps(readCRD(t, ownCRDDir+tc.file), tc.sample)
-		if err != nil || len(gaps) != 0 {
-			t.Errorf("%s: gaps = %v, %v; want none", tc.file, gaps, err)
-		}
-		gaps, err = schemaGaps(readCRD(t, oldCRDDir+tc.file), tc.sample)
-		if err != nil || !reflect.DeepEqual(gaps, tc.old) {
-			t.Errorf("v0.7.2 %s: gaps = %v, %v; want %v", tc.file, gaps, err, tc.old)
+		for _, crd := range []struct {
+			dir  string
+			want []string
+		}{{ownCRDDir, nil}, {oldCRDDir, tc.v072}, {v081CRDDir, tc.v081}} {
+			gaps, err := schemaGaps(readCRD(t, crd.dir+tc.file), tc.sample)
+			if err != nil || !reflect.DeepEqual(gaps, crd.want) {
+				t.Errorf("%s%s: gaps = %v, %v; want %v", crd.dir, tc.file, gaps, err, crd.want)
+			}
 		}
 	}
 }
