@@ -162,3 +162,110 @@ func TestAStaleCachedRestoreRunNeverRestartsTheApp(t *testing.T) {
 		})
 	}
 }
+
+// A BackupRun pass that reads its run from a cache that lags behind never
+// stops the app again once the stored run shows the stop and the restart
+// done. The cached copy still shows the recorded plan without
+// status.quiescedAt, and a stop from it would leave the app at 0 with no run
+// left to give it back: the run has finished, and the pass's own status write
+// conflicts with the stored run. A stored run that is newer and still owes
+// the stop, with the plan and no status.quiescedAt, is stopped as before.
+func TestAStaleCachedBackupRunNeverStopsTheAppAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		store   func(*backupv1alpha1.BackupRun)
+		stopped bool
+	}{
+		{"restarted and finished", func(b *backupv1alpha1.BackupRun) {
+			b.Status.Phase = backupv1alpha1.RunPhaseSucceeded
+			b.Status.QuiescedAt, b.Status.RestartedAt = atFrozen(0), atFrozen(0)
+			b.Status.Items[0].Phase = backupv1alpha1.ItemSucceeded
+		}, false},
+		{"restarted and still running", func(b *backupv1alpha1.BackupRun) {
+			b.Status.QuiescedAt, b.Status.RestartedAt = atFrozen(0), atFrozen(0)
+		}, false},
+		{"finished with the plan and no stop recorded", func(b *backupv1alpha1.BackupRun) {
+			b.Status.Phase = backupv1alpha1.RunPhaseFailed
+		}, false},
+		{"still owing the stop", func(b *backupv1alpha1.BackupRun) {
+			b.Status.Items[0].Message = "noted"
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newClient(t, quiescedBackup(func(b *backupv1alpha1.BackupRun) {
+				b.Finalizers = []string{Finalizer}
+				b.Status.StartedAt = atFrozen(-time.Minute)
+				b.Status.QuiescedAt = nil
+				b.Status.SuspendedKustomizations = []string{"flux-system/" + appN}
+			}), claim(), volume(), volumeRestore(), repository(), idleSource(), deployment(), kustomization(false))
+			seedQuiesceLease(t, c, "BackupRun", readBackupRun(t, c))
+
+			stale := readBackupRun(t, c)
+			stored := stale.DeepCopy()
+			tc.store(stored)
+			if err := c.Status().Update(context.Background(), stored); err != nil {
+				t.Fatal(err)
+			}
+
+			br := &BackupRunReconciler{Client: laggingCache(c, stale), Reader: c, Snapshots: snapshots{sunday, monday},
+				Retimer: &retimer{}, Now: func() time.Time { return frozen }}
+			_ = tryStep(br)
+
+			if got := replicasOf(t, c); (got == 0) != tc.stopped || suspended(t, c) != tc.stopped {
+				t.Errorf("replicas = %d, suspended = %t; want stopped = %t", got, suspended(t, c), tc.stopped)
+			}
+		})
+	}
+}
+
+// A RestoreRun pass that reads its run from a cache that lags behind never
+// stops the app again once the stored run shows the stop and the restart
+// done, for the same reason as a BackupRun (see
+// TestAStaleCachedBackupRunNeverStopsTheAppAgain).
+func TestAStaleCachedRestoreRunNeverStopsTheAppAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		store   func(*backupv1alpha1.RestoreRun)
+		stopped bool
+	}{
+		{"restarted and finished", func(r *backupv1alpha1.RestoreRun) {
+			r.Status.Phase = backupv1alpha1.RunPhaseSucceeded
+			r.Status.QuiescedAt, r.Status.RestartedAt = atFrozen(0), atFrozen(0)
+			r.Status.Items[0].Phase = backupv1alpha1.ItemSucceeded
+		}, false},
+		{"restarted and still running", func(r *backupv1alpha1.RestoreRun) {
+			r.Status.QuiescedAt, r.Status.RestartedAt = atFrozen(0), atFrozen(0)
+		}, false},
+		{"finished with the plan and no stop recorded", func(r *backupv1alpha1.RestoreRun) {
+			r.Status.Phase = backupv1alpha1.RunPhaseFailed
+		}, false},
+		{"still owing the stop", func(r *backupv1alpha1.RestoreRun) {
+			r.Status.Items[0].Message = "noted"
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := checkedRestore(func(r *backupv1alpha1.RestoreRun) {
+				r.Finalizers = []string{Finalizer}
+				r.Spec.Claim = claimN
+				r.Spec.Quiesce = []backupv1alpha1.WorkloadRef{{Kind: "Deployment", Name: appN}}
+				r.Status.Quiesced = []backupv1alpha1.QuiescedWorkload{{Kind: "Deployment", Name: appN, Replicas: 2}}
+				r.Status.SuspendedKustomizations = []string{"flux-system/" + appN}
+			})
+			r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(), deployment(), kustomization(false))
+			seedQuiesceLease(t, c, "RestoreRun", readRestoreRun(t, c))
+
+			stale := readRestoreRun(t, c)
+			stored := stale.DeepCopy()
+			tc.store(stored)
+			if err := c.Status().Update(context.Background(), stored); err != nil {
+				t.Fatal(err)
+			}
+			r.Client, r.Reader = laggingCache(c, stale), c
+			_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
+
+			if got := replicasOf(t, c); (got == 0) != tc.stopped || suspended(t, c) != tc.stopped {
+				t.Errorf("replicas = %d, suspended = %t; want stopped = %t", got, suspended(t, c), tc.stopped)
+			}
+		})
+	}
+}

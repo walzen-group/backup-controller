@@ -1975,11 +1975,13 @@ func clusterLeftDeleted(cluster string) string {
 // writes the status. Only then does applyStop suspend the Kustomizations and
 // scale the workloads to zero. A pass that finds a plan in the status reuses
 // it, so a retry after a lost status write still gives back the counts the
-// workloads had before the run touched them. quiesce then writes
-// status.quiescedAt. After a failed stop, it narrows the plan with
-// appliedPart to what is stopped now, and aborts the run with reason Failed,
-// which starts those workloads again and resumes the Kustomizations, the
-// same as a BackupRun does.
+// workloads had before the run touched them. Before it stops from such a
+// plan, quiesce reads the run again through the uncached Reader (see
+// stopOwed), and stops nothing when the stored run has recorded the stop,
+// given the app back or ended. quiesce then writes status.quiescedAt. After
+// a failed stop, it narrows the plan with appliedPart to what is stopped
+// now, and aborts the run with reason Failed, which starts those workloads
+// again and resumes the Kustomizations, the same as a BackupRun does.
 func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if len(run.Status.Quiesced) == 0 {
 		targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
@@ -2059,6 +2061,18 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		if err := r.writeStatus(ctx, run); err != nil {
 			return ctrl.Result{}, err
 		}
+	} else {
+		// The plan came from the run as the pass read it, and that copy may
+		// lag behind a pass that has since stopped the app, given it back
+		// and ended the run. The stored run decides (see stopOwed); a run
+		// that no longer owes the stop changes nothing and looks again.
+		owed, err := stopOwed(ctx, r.Reader, run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !owed {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
 	}
 	stopErr := applyStop(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	if stopErr != nil {
@@ -2127,7 +2141,7 @@ func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *bac
 // nothing and returns nil: another run may have stopped the app since. A
 // failed read, and a failed restart, come back as the error.
 func (r *RestoreRunReconciler) restart(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
-	if err := readStop(ctx, r.Reader, run); err != nil {
+	if _, err := readStop(ctx, r.Reader, run); err != nil {
 		return err
 	}
 	if !stopped(run) {

@@ -190,7 +190,8 @@ func durablyRestarted(run client.Object) bool {
 // readStop reads a run again straight from the API server and puts the
 // stored record of its stop and restart on the copy the caller holds. A
 // caller that is about to start the workloads again calls it first, so that
-// it decides on what the API server holds.
+// it decides on what the API server holds. stopOwed calls it before a stop
+// for the same reason.
 //
 // Parameters:
 //   - reader is the uncached Reader. The reconcilers read their run through
@@ -203,14 +204,17 @@ func durablyRestarted(run client.Object) bool {
 //     status.restartedAt and, on a BackupRun, status.restartPending are
 //     replaced with the stored ones when the stored run is newer.
 //
-// It returns an error, and changes nothing, when the read fails, when the
-// run is gone, or when the stored run with that name is another object (a
-// different UID). The caller then starts nothing and the pass runs again.
+// It returns the stored run's status.phase, which is the phase of run when
+// run is as new as the stored one. It returns an error, and changes nothing,
+// when the read fails, when the run is gone, or when the stored run with
+// that name is another object (a different UID). The caller then changes no
+// workload and the pass runs again.
+//
 // A copy whose resourceVersion matches the stored one is left as it is. A
 // newer stored run changes only the fields above, so the caller's later
 // status write still carries the old resourceVersion and fails with a
 // conflict, and the next pass works from the stored run.
-func readStop(ctx context.Context, reader client.Reader, run client.Object) error {
+func readStop(ctx context.Context, reader client.Reader, run client.Object) (backupv1alpha1.RunPhase, error) {
 	var stored client.Object
 	kind := ""
 	switch run.(type) {
@@ -219,29 +223,63 @@ func readStop(ctx context.Context, reader client.Reader, run client.Object) erro
 	case *backupv1alpha1.RestoreRun:
 		stored, kind = &backupv1alpha1.RestoreRun{}, "RestoreRun"
 	default:
-		return fmt.Errorf("read the stop of %T: not a run", run)
+		return "", fmt.Errorf("read the stop of %T: not a run", run)
 	}
 	if err := reader.Get(ctx, client.ObjectKeyFromObject(run), stored); err != nil {
-		return fmt.Errorf("read %s %s/%s again before starting its workloads: %w", kind, run.GetNamespace(), run.GetName(), err)
+		return "", fmt.Errorf("read %s %s/%s again before changing its workloads: %w", kind, run.GetNamespace(), run.GetName(), err)
 	}
 	if stored.GetUID() != run.GetUID() {
-		return fmt.Errorf("%s %s/%s is now another object (UID %s, was %s); nothing is started for the old one",
+		return "", fmt.Errorf("%s %s/%s is now another object (UID %s, was %s); no workload is changed for the old one",
 			kind, run.GetNamespace(), run.GetName(), stored.GetUID(), run.GetUID())
-	}
-	if stored.GetResourceVersion() == run.GetResourceVersion() {
-		return nil
 	}
 	switch r := run.(type) {
 	case *backupv1alpha1.BackupRun:
 		s := stored.(*backupv1alpha1.BackupRun)
-		r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
-		r.Status.RestartedAt, r.Status.RestartPending = s.Status.RestartedAt, s.Status.RestartPending
+		if s.ResourceVersion != r.ResourceVersion {
+			r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
+			r.Status.RestartedAt, r.Status.RestartPending = s.Status.RestartedAt, s.Status.RestartPending
+		}
+		return s.Status.Phase, nil
 	case *backupv1alpha1.RestoreRun:
 		s := stored.(*backupv1alpha1.RestoreRun)
-		r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
-		r.Status.RestartedAt = s.Status.RestartedAt
+		if s.ResourceVersion != r.ResourceVersion {
+			r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
+			r.Status.RestartedAt = s.Status.RestartedAt
+		}
+		return s.Status.Phase, nil
 	}
-	return nil
+	return "", nil
+}
+
+// stopOwed reports whether a run whose cached copy shows a recorded plan
+// without status.quiescedAt still owes the stop, as the API server holds the
+// run. quiesce calls it before applyStop when it took the plan from the
+// run's status.
+//
+// Parameters:
+//   - reader is the uncached Reader. A cached copy can lag behind the pass
+//     that stopped the workloads, recorded status.quiescedAt, gave the
+//     workloads back and ended the run; a stop from that copy would leave the
+//     app at 0 with no run left to start it again.
+//   - run is the BackupRun or RestoreRun as the pass read it. readStop puts
+//     the stored record of its stop and restart on it.
+//
+// It returns true when the stored run is not finished and still shows the
+// plan with neither status.quiescedAt nor status.restartedAt set. A failed
+// read comes back as the error from readStop, and the caller stops nothing.
+func stopOwed(ctx context.Context, reader client.Reader, run client.Object) (bool, error) {
+	phase, err := readStop(ctx, reader, run)
+	if err != nil {
+		return false, err
+	}
+	plan, quiescedAt, restartedAt := 0, (*metav1.Time)(nil), (*metav1.Time)(nil)
+	switch r := run.(type) {
+	case *backupv1alpha1.BackupRun:
+		plan, quiescedAt, restartedAt = len(r.Status.Quiesced), r.Status.QuiescedAt, r.Status.RestartedAt
+	case *backupv1alpha1.RestoreRun:
+		plan, quiescedAt, restartedAt = len(r.Status.Quiesced), r.Status.QuiescedAt, r.Status.RestartedAt
+	}
+	return !phase.Finished() && plan > 0 && quiescedAt == nil && restartedAt == nil, nil
 }
 
 // waitingOn returns a message naming another run in the run's namespace that
