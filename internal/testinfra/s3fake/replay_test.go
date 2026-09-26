@@ -1,6 +1,7 @@
 package s3fake_test
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
@@ -15,8 +16,9 @@ import (
 )
 
 // TestReplayRustFSBehaviour replays rustfs-behaviour.json, RustFS 1.0.0's
-// answers to paging, delimiter, start-after, range, HEAD and error requests,
-// against the fake loaded with the same objects.
+// answers to paging, delimiter, start-after, range, HEAD, PUT, DELETE and
+// error requests, against the fake loaded with the same objects. It also
+// checks that the fake computes the ETag RustFS recorded for each object.
 func TestReplayRustFSBehaviour(t *testing.T) {
 	b, err := barmanstore.RustFSBehaviour()
 	if err != nil {
@@ -74,14 +76,24 @@ func TestReplayRecordedStoreTranscripts(t *testing.T) {
 // continuation tokens RustFS gave (the fake takes them), and compares the
 // answer: the status and the headers the recording kept, and the body, field
 // by field for a listing and byte for byte otherwise. A listing's
-// Content-Length is left out, since the fake escapes the quotes in an ETag.
+// Content-Length is left out, since the fake escapes the quotes in an ETag,
+// and so is the Last-Modified of an object the replay itself wrote. A
+// listing's elements must also come in RustFS's order.
 func replay(t *testing.T, srv *s3fake.Server, exchanges []barmanstore.Exchange) {
+	written := map[string]bool{}
 	for i, ex := range exchanges {
+		if ex.Method == http.MethodPut {
+			written[ex.Path] = true
+		}
 		target := srv.URL + ex.Path
 		if ex.Query != "" {
 			target += "?" + ex.Query
 		}
-		req, err := http.NewRequest(ex.Method, target, nil)
+		var body io.Reader
+		if ex.RequestBody != "" {
+			body = strings.NewReader(ex.RequestBody)
+		}
+		req, err := http.NewRequest(ex.Method, target, body)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -98,7 +110,7 @@ func replay(t *testing.T, srv *s3fake.Server, exchanges []barmanstore.Exchange) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		body, err := io.ReadAll(resp.Body)
+		answer, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if err != nil {
 			t.Fatal(err)
@@ -112,19 +124,25 @@ func replay(t *testing.T, srv *s3fake.Server, exchanges []barmanstore.Exchange) 
 			if listing && name == "Content-Length" {
 				continue
 			}
+			if name == "Last-Modified" && written[ex.Path] {
+				continue
+			}
 			if got := resp.Header.Get(name); got != want {
 				t.Errorf("%s: header %s %q, RustFS %q", where(), name, got, want)
 			}
 		}
 		if listing {
-			got, want := parseListing(t, body), parseListing(t, []byte(ex.Body))
+			got, want := parseListing(t, answer), parseListing(t, []byte(ex.Body))
 			if !reflect.DeepEqual(got, want) {
 				t.Errorf("%s: listing differs\nfake:   %+v\nRustFS: %+v", where(), got, want)
 			}
+			if got, want := elementOrder(t, answer), elementOrder(t, []byte(ex.Body)); !reflect.DeepEqual(got, want) {
+				t.Errorf("%s: element order\nfake:   %v\nRustFS: %v", where(), got, want)
+			}
 			continue
 		}
-		if string(body) != ex.Body {
-			t.Errorf("%s: body\nfake:   %q\nRustFS: %q", where(), body, ex.Body)
+		if string(answer) != ex.Body {
+			t.Errorf("%s: body\nfake:   %q\nRustFS: %q", where(), answer, ex.Body)
 		}
 	}
 }
@@ -174,7 +192,8 @@ func parseListing(t *testing.T, body []byte) listing {
 }
 
 // tokenKey returns the key a continuation token resumes after: the decoded
-// token up to its bracketed marker.
+// token up to its bracketed marker, or the whole decoded token when it has
+// none, as RustFS 1.0.0 reads one.
 func tokenKey(t *testing.T, token string) string {
 	t.Helper()
 	if token == "" {
@@ -188,6 +207,38 @@ func tokenKey(t *testing.T, token string) string {
 	if i := strings.LastIndex(s, "["); i >= 0 && strings.HasSuffix(s, "]") {
 		return s[:i]
 	}
-	t.Fatalf("token %q has no bracketed marker", s)
-	return ""
+	return s
+}
+
+// elementOrder returns the names of a document's elements two levels below
+// its root, in the order they appear, such as ListBucketResult/Name or
+// Contents/ETag, with a run of the same name counted once.
+func elementOrder(t *testing.T, body []byte) []string {
+	t.Helper()
+	var (
+		order []string
+		path  []string
+	)
+	d := xml.NewDecoder(bytes.NewReader(body))
+	for {
+		tok, err := d.Token()
+		if err == io.EOF {
+			return order
+		}
+		if err != nil {
+			t.Fatalf("decode %q: %v", body, err)
+		}
+		switch e := tok.(type) {
+		case xml.StartElement:
+			path = append(path, e.Name.Local)
+			if len(path) == 2 || len(path) == 3 {
+				name := strings.Join(path[len(path)-2:], "/")
+				if len(order) == 0 || order[len(order)-1] != name {
+					order = append(order, name)
+				}
+			}
+		case xml.EndElement:
+			path = path[:len(path)-1]
+		}
+	}
 }

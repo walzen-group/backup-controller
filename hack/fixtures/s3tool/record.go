@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -107,13 +109,14 @@ func startRecorder(endpoint string) (*recorder, error) {
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		req := resp.Request
 		ex := barmanstore.Exchange{
-			Method:  req.Method,
-			Path:    req.URL.EscapedPath(),
-			Query:   req.URL.RawQuery,
-			Range:   req.Header.Get("Range"),
-			Status:  resp.StatusCode,
-			Headers: map[string]string{},
-			Body:    string(body),
+			Method:      req.Method,
+			Path:        req.URL.EscapedPath(),
+			Query:       req.URL.RawQuery,
+			Range:       req.Header.Get("Range"),
+			RequestBody: requestBody(req),
+			Status:      resp.StatusCode,
+			Headers:     map[string]string{},
+			Body:        string(body),
 		}
 		ex.WrongKey = strings.Contains(req.Header.Get("Authorization"), "Credential=wrong-key/")
 		for _, h := range keptHeaders {
@@ -131,7 +134,16 @@ func startRecorder(endpoint string) (*recorder, error) {
 	if err != nil {
 		return nil, err
 	}
-	server := &http.Server{Handler: forward} //nolint:gosec // a local recorder on loopback.
+	keepBody := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		forward.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), bodyKey{}, string(body))))
+	})
+	server := &http.Server{Handler: keepBody} //nolint:gosec // a local recorder on loopback.
 	go func() { _ = server.Serve(listener) }()
 	rec.addr = listener.Addr().String()
 	rec.stop = func() { _ = server.Close() }
@@ -176,11 +188,15 @@ func writeTranscript(ctx context.Context, endpoint, bucket, prefix, server, out 
 
 // writeBehaviour writes 1005 small objects and the odd keys under behaviour/
 // in the bucket, and records how RustFS answers the requests a reader makes
-// over them: listings in pages of 1000 and of 7, a delimited listing, a
-// listing after a start key, raw listings over keys with a space, "+", "="
-// and "&" (with and without encoding-type=url and fetch-owner=true), a byte
-// range, a HEAD, a missing key, a missing bucket and an unknown access key.
-// It writes rustfs-behaviour.json to out.
+// over them: listings in pages of 1000 and of 7, a delimited listing in one
+// page and in pages of 2, a listing after a start key, raw listings over keys
+// with a space, "+", "=" and "&" (with and without encoding-type=url and
+// fetch-owner=true), closed, open, suffix and unsatisfiable byte ranges, a
+// HEAD of a present and a missing key, a GET of a missing key, a missing
+// bucket (its location and a listing), an unknown access key, a bad and a
+// negative max-keys, a continuation token that is not base64 and one without
+// RustFS's marker, and a PUT, GET and two DELETEs of one key. It keeps each
+// request's body. It writes rustfs-behaviour.json to out.
 func writeBehaviour(ctx context.Context, endpoint, bucket, out string) error {
 	direct, err := client(endpoint, os.Getenv("AWS_ACCESS_KEY_ID"))
 	if err != nil {
@@ -264,8 +280,14 @@ func writeBehaviour(ctx context.Context, endpoint, bucket, out string) error {
 			_ = o.Close()
 			return expectError(err)
 		}},
-		{"list-missing-bucket", func() error {
+		// minio-go asks for the bucket's location before it lists, so this
+		// step records a GET ?location on a missing bucket; the raw step
+		// after it records the listing itself.
+		{"location-missing-bucket", func() error {
 			return expectError(drain2(ctx, c, "no-such-bucket"))
+		}},
+		{"list-missing-bucket", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/no-such-bucket", "list-type=2&prefix=behaviour%2F", "", "", http.StatusNotFound)
 		}},
 		{"list-wrong-key", func() error {
 			wrong, err := client(rec.addr, "wrong-key")
@@ -273,6 +295,50 @@ func writeBehaviour(ctx context.Context, endpoint, bucket, out string) error {
 				return err
 			}
 			return expectError(drain2(ctx, wrong, bucket))
+		}},
+		// A delimited listing in pages of 2, so that rolled-up prefixes
+		// are split across pages and resumed by a continuation token.
+		{"list-delimited-pages-of-2", func() error { return drain(minio.ListObjectsOptions{Prefix: "behaviour/", MaxKeys: 2}) }},
+		{"head-missing-key", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodHead, "/"+bucket+"/behaviour/missing", "", "", "", http.StatusNotFound)
+		}},
+		{"get-range-open", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/"+bucket+"/behaviour/dir-0/object-0000.txt", "", "bytes=3-", "", http.StatusPartialContent)
+		}},
+		{"get-range-suffix", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/"+bucket+"/behaviour/dir-0/object-0000.txt", "", "bytes=-4", "", http.StatusPartialContent)
+		}},
+		{"get-range-past-end", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/"+bucket+"/behaviour/dir-0/object-0000.txt", "", "bytes=100-200", "", 0)
+		}},
+		{"list-bad-max-keys", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/"+bucket, "list-type=2&max-keys=abc&prefix=behaviour%2F", "", "", 0)
+		}},
+		{"list-negative-max-keys", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/"+bucket, "list-type=2&max-keys=-1&prefix=behaviour%2F", "", "", 0)
+		}},
+		// A token that is not base64, and one that is the base64 of a key
+		// without RustFS's bracketed marker.
+		{"list-bad-token", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/"+bucket, "continuation-token=not%20base64%21&list-type=2&prefix=behaviour%2F", "", "", 0)
+		}},
+		{"list-token-without-marker", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/"+bucket, "continuation-token=YmVoYXZpb3VyL2Rpci0yL29iamVjdC0xMDAwLnR4dA%3D%3D&list-type=2&prefix=behaviour%2Fdir-2%2F", "", "", 0)
+		}},
+		{"put", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodPut, "/"+bucket+"/behaviour/put-probe.txt", "", "", "put probe\n", http.StatusOK)
+		}},
+		{"get-put", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/"+bucket+"/behaviour/put-probe.txt", "", "", "", http.StatusOK)
+		}},
+		{"delete", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodDelete, "/"+bucket+"/behaviour/put-probe.txt", "", "", "", http.StatusNoContent)
+		}},
+		{"delete-missing-key", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodDelete, "/"+bucket+"/behaviour/put-probe.txt", "", "", "", http.StatusNoContent)
+		}},
+		{"get-deleted", func() error {
+			return rawRequest(ctx, rec.addr, http.MethodGet, "/"+bucket+"/behaviour/put-probe.txt", "", "", "", http.StatusNotFound)
 		}},
 	}
 	for _, s := range steps {
@@ -383,3 +449,57 @@ func rawList(ctx context.Context, endpoint, bucket, query string) error {
 
 // emptySHA256 is the hex SHA-256 of an empty body, the payload hash of a GET.
 const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// bodyKey is the context key under which the recorder keeps a request's body.
+type bodyKey struct{}
+
+// requestBody returns the body the recorder kept for a request, or "" when it
+// had none.
+func requestBody(r *http.Request) string {
+	s, _ := r.Context().Value(bodyKey{}).(string)
+	return s
+}
+
+// rawRequest sends one request with exactly the given method, path and query,
+// an optional Range header and body, signed with the environment's
+// credentials, to endpoint. The recorder uses it for requests whose answer a
+// client would turn into an error, so the answer is recorded as RustFS sent
+// it.
+//
+// Parameters:
+//   - path: the escaped path, such as /bucket/key.
+//   - rangeHeader: the Range header to send, or "" for none.
+//   - body: the request body, or "" for none.
+//   - want: the status the answer must have, or 0 for any.
+//
+// It returns an error when the request fails or the status differs from want.
+func rawRequest(ctx context.Context, endpoint, method, path, query, rangeHeader, body string, want int) error {
+	target := "http://" + endpoint + path
+	if query != "" {
+		target += "?" + query
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(body))
+	req.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(sum[:]))
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+	req.ContentLength = int64(len(body))
+	req = signer.SignV4(*req, os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"), "", "us-east-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	answer, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if want != 0 && resp.StatusCode != want {
+		return fmt.Errorf("%s %s?%s: status %d, want %d: %s", method, path, query, resp.StatusCode, want, answer)
+	}
+	return nil
+}

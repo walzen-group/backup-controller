@@ -6,12 +6,21 @@
 //
 // It models the calls those readers make, as RustFS answers them: the bucket
 // location, ListObjectsV2 with prefix, delimiter, start-after, a page of at
-// most 1000 keys and continuation tokens, and URL encoding of the keys when
-// the client asks for it; GetObject with byte ranges, HeadObject, PutObject
-// (plain and aws-chunked bodies) and DeleteObject; and RustFS's error
-// documents for a missing bucket, a missing key and an unknown access key.
-// The recordings in the barmanstore package hold RustFS's own answers to the
-// same requests, and this package's tests replay them against the fake.
+// most 1000 keys and continuation tokens (also across rolled-up prefixes),
+// URL encoding of the keys when the client asks for it, and the elements of
+// a listing in RustFS's order; GetObject with a closed, open or suffix byte
+// range and a 416 past the end, HeadObject, PutObject with the Content-Type
+// RustFS stores, and DeleteObject of a present or missing key; and RustFS's
+// error documents for a missing bucket (on GET ?location and on a listing), a
+// missing key (on GET and HEAD), an unknown access key (on GET ?location), a
+// bad or negative max-keys and a continuation token that is not base64. The
+// recordings in the barmanstore package hold RustFS's own answers to these
+// requests, and this package's tests replay them against the fake.
+//
+// PutObject also decodes an aws-chunked body, the way minio-go sends one over
+// plain HTTP. The recordings hold only a plain PUT, so no RustFS answer
+// checks that decoding; the tests that write through minio-go, such as the
+// s3fault package's, use it.
 //
 // It deliberately does not model: signature verification (only the access
 // key in the Authorization header is checked), multipart uploads, versioning,
@@ -30,9 +39,11 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	pathpkg "path"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,6 +65,9 @@ type Object struct {
 	LastModified time.Time
 	// ETag is the quoted entity tag. It defaults to the MD5 of the body.
 	ETag string
+	// ContentType is the Content-Type a GET or HEAD answers with. It
+	// defaults to application/octet-stream.
+	ContentType string
 }
 
 // Server is a running fake S3 server. Its URL field is the endpoint to give
@@ -250,13 +264,14 @@ type errorDocument struct {
 
 // fail writes an S3 error response. The bucket and key name the resource
 // for a reader of the code; RustFS leaves them out of the document. A HEAD
-// request gets the status alone, as S3 sends no body with a HEAD.
+// request gets the status and the Content-Type alone, as RustFS sends no body
+// with a HEAD.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, status int, code, message, _, _ string) {
+	w.Header().Set("Content-Type", "application/xml")
 	if r.Method == http.MethodHead {
 		w.WriteHeader(status)
 		return
 	}
-	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, xmlHeader)
 	_ = xml.NewEncoder(w).Encode(errorDocument{
@@ -319,18 +334,19 @@ func encodeToken(key string) string {
 }
 
 // decodeToken returns the key a continuation token resumes after: the
-// decoded token without its bracketed marker. It returns false when the token
-// is not base64 or carries no marker.
+// decoded token without its bracketed marker. A token without a marker names
+// the key itself, as RustFS 1.0.0 takes one. It returns false when the token
+// is not base64.
 func decodeToken(token string) (string, bool) {
 	raw, err := base64.StdEncoding.DecodeString(token)
-	if err != nil || !strings.HasSuffix(string(raw), "]") {
+	if err != nil {
 		return "", false
 	}
-	i := strings.LastIndex(string(raw), "[")
-	if i < 0 {
-		return "", false
+	s := string(raw)
+	if i := strings.LastIndex(s, "["); i >= 0 && strings.HasSuffix(s, "]") {
+		return s[:i], true
 	}
-	return string(raw[:i]), true
+	return s, true
 }
 
 // urlEncode encodes a key for a listing asked for with encoding-type=url, as
@@ -356,8 +372,12 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, bucket string, obj
 	maxKeys := maxPage
 	if raw := query.Get("max-keys"); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err != nil || n < 0 {
-			s.fail(w, r, http.StatusBadRequest, "InvalidArgument", "max-keys must be a non-negative integer", bucket, "")
+		switch {
+		case err != nil:
+			s.fail(w, r, http.StatusBadRequest, "InvalidArgument", "invalid query: max-keys: "+raw, bucket, "")
+			return
+		case n < 0:
+			s.fail(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid max keys", bucket, "")
 			return
 		}
 		maxKeys = min(n, maxPage)
@@ -367,7 +387,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, bucket string, obj
 	if token != "" {
 		key, ok := decodeToken(token)
 		if !ok {
-			s.fail(w, r, http.StatusBadRequest, "InvalidArgument", "The continuation token provided is incorrect", bucket, "")
+			s.fail(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid continuation token", bucket, "")
 			return
 		}
 		after = key
@@ -462,7 +482,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request, bucket, key string)
 		status = http.StatusPartialContent
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Type", o.contentType())
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Header().Set("ETag", o.ETag)
 	w.Header().Set("Last-Modified", o.LastModified.UTC().Format(http.TimeFormat))
@@ -516,7 +536,10 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request, bucket, key string)
 			return
 		}
 	}
-	o := Object{Body: body}
+	o := Object{Body: body, ContentType: r.Header.Get("Content-Type")}
+	if o.ContentType == "" {
+		o.ContentType = typeByExtension(key)
+	}
 	s.Put(bucket, key, o)
 	stored, _ := s.Get(bucket, key)
 	w.Header().Set("ETag", stored.ETag)
@@ -549,4 +572,23 @@ func decodeChunked(raw []byte) ([]byte, error) {
 			return nil, fmt.Errorf("read chunk end: %w", err)
 		}
 	}
+}
+
+// contentType returns the Content-Type the object is served with.
+func (o Object) contentType() string {
+	if o.ContentType != "" {
+		return o.ContentType
+	}
+	return "application/octet-stream"
+}
+
+// typeByExtension returns the media type RustFS 1.0.0 stores for an object
+// written without a Content-Type: the type of the key's extension without
+// parameters, such as text/plain for a .txt key, and application/octet-stream
+// when the extension has none.
+func typeByExtension(key string) string {
+	if t, _, err := mime.ParseMediaType(mime.TypeByExtension(pathpkg.Ext(key))); err == nil {
+		return t
+	}
+	return "application/octet-stream"
 }

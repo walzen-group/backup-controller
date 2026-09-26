@@ -183,6 +183,8 @@ type Exchange struct {
 	WrongKey bool `json:"wrongKey,omitempty"`
 	// Range is the request's Range header, when it had one.
 	Range string `json:"range,omitempty"`
+	// RequestBody is the body the request carried, for a PUT.
+	RequestBody string `json:"requestBody,omitempty"`
 	// Status, Headers and Body are RustFS's answer. Headers keeps the ones a
 	// client reads: Content-Type, Content-Length, Content-Range, ETag,
 	// Last-Modified and Accept-Ranges.
