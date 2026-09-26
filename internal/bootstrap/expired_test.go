@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -120,7 +119,7 @@ func TestAReadThatEndsAtTheDeadlineNeverAdmitsInitdbOverAnArchive(t *testing.T) 
 				t.Fatalf("marshal the cluster: %v", err)
 			}
 			kind := tc.kind
-			c := fake.NewClientBuilder().WithScheme(scheme(t)).
+			c := newBuilder(t).
 				WithObjects(secret()).
 				WithRuntimeObjects(storeAt(server.URL)).
 				WithInterceptorFuncs(interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {

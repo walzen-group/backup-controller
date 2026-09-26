@@ -11,7 +11,9 @@ import (
 
 	"github.com/go-logr/logr"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/served"
 	admissionv1 "k8s.io/api/admission/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -67,6 +69,14 @@ type Decider struct {
 	// list and watch on every Secret in the cluster and would hold them all
 	// in memory.
 	Client client.Reader
+	// Mapper looks up the versions at which the API server serves Cluster and
+	// ObjectStore (see served.Kind). cmd/backup-controller passes the
+	// manager's RESTMapper, which caches each lookup, so a request costs a
+	// discovery call only when the mapper has not seen the group yet or
+	// has just forgotten it (see served.VersionGone). Nil means the
+	// RESTMapper of Client, when Client has one; with neither, Handle refuses
+	// every create.
+	Mapper meta.RESTMapper
 	// Prober asks the object store what the database's prefix holds and
 	// which base backups exist. cmd/backup-controller passes S3Prober, and
 	// the tests pass a stub.
@@ -179,7 +189,12 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Allowed("no archiving plugin")
 	}
 
-	at, err := ResolveLocation(ctx, d.Client, req.Namespace, store, serverName)
+	mapper := d.mapper()
+	if mapper == nil {
+		return admission.Errored(http.StatusInternalServerError, errors.New("the webhook has no RESTMapper to look up the served versions of Cluster and ObjectStore"))
+	}
+
+	at, err := ResolveLocation(ctx, d.Client, mapper, req.Namespace, store, serverName)
 	if err != nil {
 		// The store is named and unreadable. Refusing is the failure that gets
 		// noticed; allowing would create an empty database beside a full
@@ -192,7 +207,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	// cluster can see this coming: each Cluster is valid on its own, and the
 	// pair is the problem. Where a Cluster archives does not depend on how it
 	// bootstraps, so a Cluster declaring its own bootstrap is checked too.
-	holder, err := archiveHolder(ctx, d.Client, req.Namespace, req.Name, at)
+	holder, err := archiveHolder(ctx, d.Client, mapper, req.Namespace, req.Name, at)
 	if err != nil {
 		return readFailed(ctx, logger, budget, "listing the Clusters and their ObjectStores", err)
 	}
@@ -467,6 +482,9 @@ func keepRecovery(req admission.Request) admission.Response {
 // the archive unrestorable.
 //
 // Parameters:
+//   - c lists the Clusters and the ObjectStores.
+//   - mapper looks up the versions at which the API server serves them.
+//     Both lists go out at those versions (see served.List).
 //   - namespace and name identify the Cluster being admitted. A Cluster with
 //     the same namespace and name is skipped, so a recreate of the same
 //     database doesn't collide with its own record.
@@ -493,12 +511,12 @@ func keepRecovery(req admission.Request) admission.Response {
 func archiveHolder(
 	ctx context.Context,
 	c client.Reader,
+	mapper meta.RESTMapper,
 	namespace, name string,
 	at Location,
 ) (string, error) {
-	clusters := &unstructured.UnstructuredList{}
-	clusters.SetGroupVersionKind(ClusterListGVK)
-	if err := c.List(ctx, clusters); err != nil {
+	clusters, err := served.List(ctx, c, mapper, clusterKind)
+	if err != nil {
 		return "", fmt.Errorf("list the Clusters: %w", err)
 	}
 
@@ -516,7 +534,7 @@ func archiveHolder(
 		}
 		if stores == nil {
 			var err error
-			if stores, err = objectStores(ctx, c); err != nil {
+			if stores, err = objectStores(ctx, c, mapper); err != nil {
 				return "", err
 			}
 		}
@@ -547,10 +565,11 @@ func archiveHolder(
 // the caller can tell a list made from one not made yet. It returns an error
 // when the list fails for any reason, NotFound included: without the list the
 // check can't know where the other Clusters archive, so the caller refuses.
-func objectStores(ctx context.Context, c client.Reader) (map[types.NamespacedName]*unstructured.Unstructured, error) {
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(ObjectStoreListGVK)
-	if err := c.List(ctx, list); err != nil {
+// It lists at the version mapper looks up (see served.List); a list at a
+// version the API server has stopped serving fails the same way.
+func objectStores(ctx context.Context, c client.Reader, mapper meta.RESTMapper) (map[types.NamespacedName]*unstructured.Unstructured, error) {
+	list, err := served.List(ctx, c, mapper, objectStoreKind)
+	if err != nil {
 		return nil, fmt.Errorf("list the ObjectStores: %w", err)
 	}
 	stores := make(map[types.NamespacedName]*unstructured.Unstructured, len(list.Items))
@@ -766,4 +785,17 @@ func noDoneBackup(at Location, serverName string, backups int) string {
 		"%s holds an archive with no completed base backup %s. A database started empty here could never archive its WAL, because CloudNativePG refuses a prefix that already holds WAL, and a recovery has nothing to start from. If that archive is worth nothing, delete everything under %s and create the Cluster again. Otherwise give this Cluster a serverName that is not %q.",
 		prefix, what, prefix, serverName,
 	)
+}
+
+// mapper returns the RESTMapper the handler looks versions up with: Mapper,
+// or else the RESTMapper of Client when Client has one. It returns nil when
+// there is neither, and Handle then refuses the create.
+func (d *Decider) mapper() meta.RESTMapper {
+	if d.Mapper != nil {
+		return d.Mapper
+	}
+	if withMapper, ok := d.Client.(interface{ RESTMapper() meta.RESTMapper }); ok {
+		return withMapper.RESTMapper()
+	}
+	return nil
 }

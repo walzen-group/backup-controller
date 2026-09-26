@@ -194,7 +194,7 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 		return []backupv1alpha1.BackupItem{pending("ReplicationSource", claim.Name)}, nil
 
 	case run.Spec.Database != "":
-		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, run.Spec.Database)
+		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Spec.Database)
 		if err != nil {
 			if meta.IsNoMatchError(err) {
 				return nil, refuse("no Cluster %s in this namespace; the cluster has no CloudNativePG CRDs", run.Spec.Database)
@@ -214,7 +214,7 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 		if err != nil {
 			return nil, err
 		}
-		clusters, err := enabledClusters(ctx, r.Reader, run.Namespace)
+		clusters, err := enabledClusters(ctx, r.Reader, r.RESTMapper(), run.Namespace)
 		if err != nil {
 			return nil, err
 		}
@@ -843,7 +843,7 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 		item.Phase, item.Trigger = backupv1alpha1.ItemRunning, tag
 
 	case "Cluster":
-		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
+		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 		switch {
 		case err != nil:
 			return "", err
@@ -1089,7 +1089,7 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 		}
 
 	case "Cluster":
-		done, ok, message, err := backupResult(ctx, r.Reader, run.Namespace, item.Backup)
+		done, ok, message, err := backupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
 		switch {
 		case err != nil || !done:
 		case ok:

@@ -15,7 +15,6 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -36,7 +35,7 @@ func decideWithin(t *testing.T, c *unstructured.Unstructured, endpoint string, b
 	if err != nil {
 		t.Fatalf("marshal the cluster: %v", err)
 	}
-	client := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(secret()).
+	client := newBuilder(t).WithObjects(secret()).
 		WithRuntimeObjects(storeAt(endpoint)).Build()
 	decider := &Decider{Client: client, Prober: S3Prober{}, Budget: budget}
 	return decider.Handle(context.Background(), admission.Request{

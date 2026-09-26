@@ -173,6 +173,7 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 		// process.
 		decider := &bootstrap.Decider{
 			Client: manager.GetAPIReader(),
+			Mapper: manager.GetRESTMapper(),
 			Prober: bootstrap.S3Prober{},
 		}
 		manager.GetWebhookServer().Register(

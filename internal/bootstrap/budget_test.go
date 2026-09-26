@@ -13,7 +13,6 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -34,7 +33,7 @@ func decideStalled(t *testing.T, funcs interceptor.Funcs) admission.Response {
 	if err != nil {
 		t.Fatalf("marshal the cluster: %v", err)
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme(t)).
+	c := newBuilder(t).
 		WithObjects(secret()).
 		WithRuntimeObjects(store()).
 		WithInterceptorFuncs(funcs).Build()

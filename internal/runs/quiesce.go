@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/served"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,126 +20,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
 // KustomizationGVK is the kind of a Flux Kustomization, the object that
 // applies a workload. A run suspends the Kustomization while the workload is
 // stopped, so that Flux doesn't scale the workload back up. The run reads
 // and writes Kustomizations at the version the API server serves, which
-// servedKind looks up; v1 is the version this code was written against.
+// served.Kind looks up; v1 is the version this code was written against.
 var KustomizationGVK = schema.GroupVersionKind{Group: "kustomize.toolkit.fluxcd.io", Version: "v1", Kind: "Kustomization"}
 
-// servedKind returns the group, version and kind at which the API server
-// serves the kind gk, as the client's RESTMapper looks it up by group and
-// kind with no version. A Flux or Kueue release that moves its kinds to a
-// new version therefore keeps working.
-//
-// Parameters:
-//   - mapper is the client's RESTMapper, from client.Client.RESTMapper. The
-//     manager's mapper asks the API server's discovery when it has not seen
-//     the group yet.
-//   - gk is the kind to look up.
-//
-// It returns an error for which apierrors.IsNotFound is true when the API
-// server serves no version of the kind. That means the kind's CRD is not
-// installed, and deleting a CRD deletes its objects, so no object of the
-// kind exists: callers treat it like an object that is gone. A discovery
-// call that failed, even one that failed for only some versions, returns
-// any other error, which the caller retries with nothing skipped.
-func servedKind(mapper meta.RESTMapper, gk schema.GroupKind) (schema.GroupVersionKind, error) {
-	mapping, err := mapper.RESTMapping(gk)
-	if err == nil {
-		return mapping.GroupVersionKind, nil
-	}
-	var partial *apiutil.ErrResourceDiscoveryFailed
-	if meta.IsNoMatchError(err) && !errors.As(err, &partial) {
-		return schema.GroupVersionKind{}, &apierrors.StatusError{ErrStatus: metav1.Status{
-			Status:  metav1.StatusFailure,
-			Code:    http.StatusNotFound,
-			Reason:  metav1.StatusReasonNotFound,
-			Message: fmt.Sprintf("the API server serves no version of %s", gk),
-		}}
-	}
-	return schema.GroupVersionKind{}, fmt.Errorf("look up the served version of %s: %w", gk, err)
-}
-
-// versionGone tells a request the API server refused because it no longer
-// serves the version the request was sent at apart from a request for an
-// object that doesn't exist. Both come back as NotFound, and only the second
-// means the object is gone.
-//
-// Parameters:
-//   - mapper is the RESTMapper the version came from. The manager's mapper
-//     caches every version it has looked up and keeps serving it after a
-//     Flux or Kueue upgrade stops serving it.
-//   - gvk is the group, version and kind the request was sent at.
-//   - err is the request's error.
-//
-// kube-apiserver answers a request for an object that doesn't exist with a
-// NotFound Status of its own, and a request at a version it doesn't serve
-// with a plain-text "404 page not found" from its not-found handler.
-// client-go turns the text answer into a NotFound whose details carry an
-// UnexpectedServerResponse cause, which apierrors.IsUnexpectedServerError
-// reports. This was checked against Kubernetes 1.36.4, and
-// TestEnvtestAVersionNoLongerServedIsNotAMissingObject checks it against the
-// kube-apiserver versions.json pins on every envtest run. For that error
-// versionGone makes mapper look the kind's versions up again (see
-// rediscover) and returns a *versionGoneError, for which apierrors.IsNotFound
-// is false, so the caller retries with nothing skipped. It returns any other
-// error, and nil, as it is.
-func versionGone(mapper meta.RESTMapper, gvk schema.GroupVersionKind, err error) error {
-	if !apierrors.IsNotFound(err) || !apierrors.IsUnexpectedServerError(err) {
-		return err
-	}
-	rediscover(mapper, gvk.Group)
-	return &versionGoneError{gvk: gvk, err: err}
-}
-
-// versionGoneError is a request the API server refused because it no longer
-// serves the version the request was sent at. It deliberately has no Unwrap
-// method, so that apierrors.IsNotFound doesn't take it for an object that is
-// gone.
-type versionGoneError struct {
-	// gvk is the group, version and kind the request was sent at.
-	gvk schema.GroupVersionKind
-
-	// err is the NotFound client-go returned for it.
-	err error
-}
-
-// Error names the version and says that the controller looks it up again.
-func (e *versionGoneError) Error() string {
-	return fmt.Sprintf("the API server no longer serves %s at %s (%v); the controller looks up the served version again and retries, "+
-		"and a restart of the controller also clears the versions it has cached", e.gvk.Kind, e.gvk.GroupVersion(), e.err)
-}
-
-// noSuchKind is a kind name no API group serves. rediscover looks it up to
-// make controller-runtime's mapper read a group's discovery again.
-const noSuchKind = "BackupControllerNoSuchKind"
-
-// rediscover makes mapper forget the versions of group it has cached, so its
-// next lookup asks the API server's discovery again.
-//
-// A mapper that implements meta.ResettableRESTMapper is reset. The manager's
-// mapper from controller-runtime v0.24 has no Reset. For it, rediscover looks
-// up a kind the group doesn't have: the mapper answers a kind it can't find
-// by reading the discovery of every version of the group it has cached, and
-// drops the group from its cache when one of those versions answers 404
-// (controller-runtime pkg/client/apiutil/restmapper.go,
-// fetchGroupVersionResourcesLocked). The lookup's own error is ignored; a
-// failed discovery call leaves the cache as it was, and the caller's retry
-// comes back here.
-func rediscover(mapper meta.RESTMapper, group string) {
-	if resettable, ok := mapper.(meta.ResettableRESTMapper); ok {
-		resettable.Reset()
-		return
-	}
-	_, _ = mapper.RESTMapping(schema.GroupKind{Group: group, Kind: noSuchKind})
-}
-
 // getKustomization reads one Kustomization at the version the API server
-// serves (see servedKind).
+// serves (see served.Kind).
 //
 // Parameters:
 //   - reader reads the Kustomization.
@@ -149,17 +40,17 @@ func rediscover(mapper meta.RESTMapper, group string) {
 // It returns an error for which apierrors.IsNotFound is true when the
 // Kustomization doesn't exist or no version of the kind is served. A read at
 // a version the API server has stopped serving since mapper cached it
-// returns a *versionGoneError (see versionGone). Any other failed lookup or
+// returns a *served.VersionGoneError (see served.VersionGone). Any other failed lookup or
 // read is returned as it is.
 func getKustomization(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, namespace, name string) (*unstructured.Unstructured, error) {
-	gvk, err := servedKind(mapper, KustomizationGVK.GroupKind())
+	gvk, err := served.Kind(mapper, KustomizationGVK.GroupKind())
 	if err != nil {
 		return nil, err
 	}
 	kustomization := &unstructured.Unstructured{}
 	kustomization.SetGroupVersionKind(gvk)
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, kustomization); err != nil {
-		return nil, versionGone(mapper, gvk, err)
+		return nil, served.VersionGone(mapper, gvk, err)
 	}
 	return kustomization, nil
 }
@@ -503,7 +394,7 @@ func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 // Parameters:
 //   - reader reads each Kustomization's spec.suspend and inventory.
 //   - mapper looks up the version at which the API server serves
-//     Kustomizations (see servedKind).
+//     Kustomizations (see served.Kind).
 //   - runNamespace is the run's namespace, which holds the targets.
 //   - targets are the workloads to stop, from quiesceTargets or namedTargets.
 //
@@ -677,7 +568,7 @@ func applyStop(ctx context.Context, c client.Client, namespace string, stop []ba
 // Parameters:
 //   - reader reads each workload and Kustomization as it stands.
 //   - mapper looks up the version at which the API server serves
-//     Kustomizations (see servedKind).
+//     Kustomizations (see served.Kind).
 //   - namespace is the run's namespace, which holds the workloads.
 //   - stop and suspend are the plan, from the run's status.quiesced and
 //     status.suspendedKustomizations.
@@ -792,7 +683,7 @@ func podsGone(ctx context.Context, c client.Reader, namespace string, targets []
 // A workload or Kustomization that has been deleted since is skipped, so a
 // second call after a partial failure is safe. So is every Kustomization
 // when the API server serves no version of the kind, because Flux's CRDs
-// have been removed (see servedKind). A workload that already stands at its
+// have been removed (see served.Kind). A workload that already stands at its
 // recorded count, and a Kustomization that is no longer suspended, are
 // skipped as well, so a person who puts the app back by hand while the API
 // server refuses the run's own patches lets the run go on. A read that fails
@@ -1045,15 +936,15 @@ func scale(ctx context.Context, c client.Client, object client.Object, replicas 
 }
 
 // setSuspend sets spec.suspend on one Kustomization with a merge patch, at
-// the version the API server serves (see servedKind).
+// the version the API server serves (see served.Kind).
 //
 // It returns an error for which apierrors.IsNotFound is true when the
 // Kustomization doesn't exist or no version of the kind is served. A patch
 // at a version the API server has stopped serving since the client's mapper
-// cached it returns a *versionGoneError (see versionGone). Any other failed
+// cached it returns a *served.VersionGoneError (see served.VersionGone). Any other failed
 // lookup or patch is returned as it is.
 func setSuspend(ctx context.Context, c client.Client, namespace, name string, suspend bool) error {
-	gvk, err := servedKind(c.RESTMapper(), KustomizationGVK.GroupKind())
+	gvk, err := served.Kind(c.RESTMapper(), KustomizationGVK.GroupKind())
 	if err != nil {
 		return fmt.Errorf("set suspend %t on Kustomization %s/%s: %w", suspend, namespace, name, err)
 	}
@@ -1063,7 +954,7 @@ func setSuspend(ctx context.Context, c client.Client, namespace, name string, su
 	kustomization.SetName(name)
 	body := fmt.Sprintf(`{"spec":{"suspend":%t}}`, suspend)
 	if err := c.Patch(ctx, kustomization, client.RawPatch(types.MergePatchType, []byte(body)), FieldOwner); err != nil {
-		return fmt.Errorf("set suspend %t on Kustomization %s/%s: %w", suspend, namespace, name, versionGone(c.RESTMapper(), gvk, err))
+		return fmt.Errorf("set suspend %t on Kustomization %s/%s: %w", suspend, namespace, name, served.VersionGone(c.RESTMapper(), gvk, err))
 	}
 	return nil
 }

@@ -9,10 +9,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/robfig/cron/v3"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/served"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -192,7 +192,7 @@ func (s *Scheduler) anythingEnabled(ctx context.Context, namespace string) (bool
 	if err != nil || len(claims) > 0 {
 		return len(claims) > 0, err
 	}
-	clusters, err := enabledClusters(ctx, s.Reader, namespace)
+	clusters, err := enabledClusters(ctx, s.Reader, s.RESTMapper(), namespace)
 	return len(clusters) > 0, err
 }
 
@@ -243,7 +243,8 @@ func (s *Scheduler) exportSchedule(namespace *corev1.Namespace, schedule cron.Sc
 // in the namespace that carries backup.wlz.li/restore-as-of. It first deletes
 // all of the namespace's restore-pinned series, so an object that has lost
 // the annotation loses its series. It returns an error when the claims or the
-// Clusters can't be listed.
+// Clusters can't be listed. It lists the Clusters at the version the API
+// server serves (see served.List).
 func (s *Scheduler) exportPinned(ctx context.Context, namespace string) error {
 	restorePinned.DeletePartialMatch(prometheus.Labels{"namespace": namespace})
 
@@ -257,9 +258,8 @@ func (s *Scheduler) exportPinned(ctx context.Context, namespace string) error {
 		}
 	}
 
-	clusters := &unstructured.UnstructuredList{}
-	clusters.SetGroupVersionKind(clusterListGV)
-	if err := s.Reader.List(ctx, clusters, client.InNamespace(namespace)); err != nil {
+	clusters, err := served.List(ctx, s.Reader, s.RESTMapper(), ClusterGVK.GroupKind(), client.InNamespace(namespace))
+	if err != nil {
 		return err
 	}
 	for _, cluster := range clusters.Items {

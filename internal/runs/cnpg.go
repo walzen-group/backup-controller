@@ -7,6 +7,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/served"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -17,13 +18,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// ClusterGVK, BackupGVK and clusterListGV are the CloudNativePG kinds a run
-// reads and writes. The controller reads them as unstructured objects, so
-// it doesn't depend on CloudNativePG's Go module.
+// ClusterGVK and BackupGVK are the CloudNativePG kinds a run reads and
+// writes. The controller reads them as unstructured objects, so it doesn't
+// depend on CloudNativePG's Go module. v1 is the version this code was
+// written against; every request goes out at the version the API server
+// serves, which served.Kind looks up by group and kind, so a CloudNativePG
+// release that moves the kinds to a new version with the same fields keeps
+// working.
 var (
-	ClusterGVK    = schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Cluster"}
-	BackupGVK     = schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Backup"}
-	clusterListGV = bootstrap.ClusterListGVK
+	ClusterGVK = schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Cluster"}
+	BackupGVK  = schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Backup"}
 )
 
 // hibernationAnnotation is the annotation that tells CloudNativePG to stop a
@@ -83,13 +87,23 @@ func instanceLeft(ctx context.Context, c client.Reader, namespace, name string) 
 	return "", nil
 }
 
-// getCluster reads one Cluster. It returns false, with no error, when the
-// Cluster doesn't exist.
-func getCluster(ctx context.Context, c client.Reader, namespace, name string) (*unstructured.Unstructured, bool, error) {
-	cluster := &unstructured.Unstructured{}
-	cluster.SetGroupVersionKind(ClusterGVK)
-	err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, cluster)
-	if apierrors.IsNotFound(err) {
+// getCluster reads one Cluster at the version the API server serves (see
+// served.Kind).
+//
+// Parameters:
+//   - c reads the Cluster. The reconcilers pass their uncached Reader.
+//   - mapper looks up the served version, from the client's RESTMapper.
+//   - namespace and name name the Cluster.
+//
+// It returns false, with no error, when the Cluster doesn't exist. When the
+// API server serves no version of Cluster, it returns an error for which
+// meta.IsNoMatchError is true, so a caller can say the cluster has no
+// CloudNativePG CRDs. A read at a version the API server has stopped serving
+// returns a *served.VersionGoneError, which never reads as a missing
+// Cluster. Any other failed lookup or read is returned wrapped.
+func getCluster(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace, name string) (*unstructured.Unstructured, bool, error) {
+	cluster, err := served.Get(ctx, c, mapper, ClusterGVK.GroupKind(), types.NamespacedName{Namespace: namespace, Name: name})
+	if apierrors.IsNotFound(err) && !served.IsNotServed(err) {
 		return nil, false, nil
 	}
 	if err != nil {
@@ -100,16 +114,24 @@ func getCluster(ctx context.Context, c client.Reader, namespace, name string) (*
 
 // enabledClusters lists the Clusters in a namespace that carry the annotation
 // backup.wlz.li/enabled: "true", sorted by name. A Cluster that is being
-// deleted is left out. A cluster without the CloudNativePG CRDs has no
-// Clusters, so the no-match error the API server answers with there gives an
-// empty list.
-func enabledClusters(ctx context.Context, c client.Reader, namespace string) ([]unstructured.Unstructured, error) {
-	clusters := &unstructured.UnstructuredList{}
-	clusters.SetGroupVersionKind(clusterListGV)
-	if err := c.List(ctx, clusters, client.InNamespace(namespace)); err != nil {
-		if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
-			return nil, nil
-		}
+// deleted is left out.
+//
+// Parameters:
+//   - c lists the Clusters.
+//   - mapper looks up the version at which the API server serves Cluster.
+//   - namespace is the namespace to list.
+//
+// A cluster that serves no version of Cluster has no CloudNativePG CRDs and
+// so no Clusters, which gives an empty list. A list at a version the API
+// server has stopped serving is an error (see served.VersionGone): taking it
+// for an empty namespace would plan a run without its databases. Every other
+// failed lookup or list is an error too.
+func enabledClusters(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace string) ([]unstructured.Unstructured, error) {
+	clusters, err := served.List(ctx, c, mapper, ClusterGVK.GroupKind(), client.InNamespace(namespace))
+	if served.IsNotServed(err) {
+		return nil, nil
+	}
+	if err != nil {
 		return nil, fmt.Errorf("list the Clusters in %s: %w", namespace, err)
 	}
 	var enabled []unstructured.Unstructured
@@ -159,8 +181,16 @@ func backupName(cluster string, uid types.UID) string {
 //
 // It returns the Backup's name. A Backup of that name that already exists
 // counts as created, so a second call for the same run is safe. The Backup
-// carries the label app.kubernetes.io/managed-by: backup-controller.
+// carries the label app.kubernetes.io/managed-by: backup-controller. It is
+// created at the version the API server serves Backup at (see served.Kind),
+// from c's RESTMapper. A failed lookup, and a create at a version the API
+// server has stopped serving (see served.VersionGone), return an error and
+// the caller tries again.
 func ensureBackup(ctx context.Context, c client.Client, namespace, cluster string, uid types.UID) (string, error) {
+	gvk, err := served.Kind(c.RESTMapper(), BackupGVK.GroupKind())
+	if err != nil {
+		return "", fmt.Errorf("create the Backup of Cluster %s/%s: %w", namespace, cluster, err)
+	}
 	backup := &unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{
 			"method":              "plugin",
@@ -168,11 +198,11 @@ func ensureBackup(ctx context.Context, c client.Client, namespace, cluster strin
 			"cluster":             map[string]any{"name": cluster},
 		},
 	}}
-	backup.SetGroupVersionKind(BackupGVK)
+	backup.SetGroupVersionKind(gvk)
 	backup.SetNamespace(namespace)
 	backup.SetName(backupName(cluster, uid))
 	backup.SetLabels(map[string]string{backupv1alpha1.LabelManagedBy: backupv1alpha1.ManagedByValue})
-	if err := c.Create(ctx, backup); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := served.VersionGone(c.RESTMapper(), gvk, c.Create(ctx, backup)); err != nil && !apierrors.IsAlreadyExists(err) {
 		return "", fmt.Errorf("create Backup %s/%s: %w", namespace, backup.GetName(), err)
 	}
 	return backup.GetName(), nil
@@ -182,11 +212,13 @@ func ensureBackup(ctx context.Context, c client.Client, namespace, cluster strin
 //
 // The result done is true once the phase is completed or failed, and ok is
 // true when it completed. For a failed Backup, message holds CloudNativePG's
-// error from status.error. It returns an error when the Backup can't be read.
-func backupResult(ctx context.Context, c client.Reader, namespace, name string) (done, ok bool, message string, err error) {
-	backup := &unstructured.Unstructured{}
-	backup.SetGroupVersionKind(BackupGVK)
-	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, backup); err != nil {
+// error from status.error. It reads the Backup at the version the API server
+// serves (see served.Get), with the version mapper looks up. It returns an
+// error when the Backup can't be read, a read at a version the API server
+// has stopped serving included.
+func backupResult(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace, name string) (done, ok bool, message string, err error) {
+	backup, err := served.Get(ctx, c, mapper, BackupGVK.GroupKind(), types.NamespacedName{Namespace: namespace, Name: name})
+	if err != nil {
 		return false, false, "", fmt.Errorf("get Backup %s/%s: %w", namespace, name, err)
 	}
 	phase, _, _ := unstructured.NestedString(backup.Object, "status", "phase")

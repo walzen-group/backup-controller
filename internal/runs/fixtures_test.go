@@ -55,6 +55,11 @@ var unstructuredKinds = []schema.GroupVersionKind{
 	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "LocalQueue"},
 	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "Workload"},
 	bootstrap.ObjectStoreGVK, crdGVK,
+	// The CloudNativePG and barman-cloud kinds at the version the version
+	// tests serve them at alone (see crdsServedAtNext).
+	{Group: "postgresql.cnpg.io", Version: "v2", Kind: "Cluster"},
+	{Group: "postgresql.cnpg.io", Version: "v2", Kind: "Backup"},
+	{Group: "barmancloud.cnpg.io", Version: "v2", Kind: "ObjectStore"},
 }
 
 // scheme returns a scheme that holds the typed kinds the package uses and the

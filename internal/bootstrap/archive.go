@@ -20,7 +20,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/walzen-group/backup-controller/internal/served"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,8 +30,10 @@ import (
 )
 
 // ClusterListGVK is the GroupVersionKind of CloudNativePG's ClusterList. The
-// webhook lists every Cluster with it to find out whether another database
-// already archives to the prefix a new Cluster is about to use.
+// webhook lists every Cluster to find out whether another database already
+// archives to the prefix a new Cluster is about to use. v1 is the version
+// this code was written against; the list goes out at the version the API
+// server serves (see served.List).
 var ClusterListGVK = schema.GroupVersionKind{
 	Group:   "postgresql.cnpg.io",
 	Version: "v1",
@@ -38,7 +42,9 @@ var ClusterListGVK = schema.GroupVersionKind{
 
 // ObjectStoreGVK is the GroupVersionKind of the Barman Cloud plugin's
 // ObjectStore. An ObjectStore holds the bucket, the endpoint and the Secret
-// references that a Cluster archives through. ResolveLocation reads it.
+// references that a Cluster archives through. ResolveLocation reads it, at
+// the version the API server serves (see served.Get); v1 is the version this
+// code was written against.
 var ObjectStoreGVK = schema.GroupVersionKind{
 	Group:   "barmancloud.cnpg.io",
 	Version: "v1",
@@ -47,12 +53,20 @@ var ObjectStoreGVK = schema.GroupVersionKind{
 
 // ObjectStoreListGVK is the GroupVersionKind of the Barman Cloud plugin's
 // ObjectStoreList. The webhook's collision check lists every ObjectStore with
-// it once, instead of reading each other Cluster's store in turn.
+// it once, instead of reading each other Cluster's store in turn, at the
+// version the API server serves (see served.List).
 var ObjectStoreListGVK = schema.GroupVersionKind{
 	Group:   "barmancloud.cnpg.io",
 	Version: "v1",
 	Kind:    "ObjectStoreList",
 }
+
+// clusterKind and objectStoreKind are the group and kind of a Cluster and an
+// ObjectStore, which served.Get and served.List look up with no version.
+var (
+	clusterKind     = schema.GroupKind{Group: ClusterListGVK.Group, Kind: "Cluster"}
+	objectStoreKind = ObjectStoreGVK.GroupKind()
+)
 
 // Location holds everything needed to ask an object store which base backups
 // one database has. ResolveLocation builds it from a Cluster's ObjectStore and
@@ -119,6 +133,11 @@ func (l Location) ServerPrefix() string {
 // Parameters:
 //   - c reads the ObjectStore and the Secrets. The webhook and the RestoreRun
 //     controller both pass the manager's uncached API reader.
+//   - mapper looks up the version at which the API server serves
+//     ObjectStore (see served.Kind). The webhook and the RestoreRun
+//     controller pass the manager's RESTMapper, which caches the lookup, so
+//     a webhook call costs a discovery call only when the mapper has not
+//     seen the group yet.
 //   - namespace is the Cluster's namespace. The ObjectStore and its Secrets
 //     are read from the same namespace.
 //   - objectStore is the ObjectStore's name, taken from the barmanObjectName
@@ -131,7 +150,9 @@ func (l Location) ServerPrefix() string {
 // spec.configuration.destinationPath is missing or isn't an s3:// URL with a
 // bucket, when a Secret or key named under s3Credentials or endpointCA is
 // missing, or when endpointCA names a Secret with no key. The error says which
-// object or field was missing.
+// object or field was missing. A read of the ObjectStore at a version the API
+// server has stopped serving returns a *served.VersionGoneError (see
+// served.VersionGone), which is never a missing store; the caller retries.
 //
 // A Cluster that names a store that doesn't exist is a configuration mistake.
 // The webhook refuses such a Cluster with this error, so nobody gets an empty
@@ -139,9 +160,10 @@ func (l Location) ServerPrefix() string {
 func ResolveLocation(
 	ctx context.Context,
 	c client.Reader,
+	mapper meta.RESTMapper,
 	namespace, objectStore, serverName string,
 ) (Location, error) {
-	at, store, err := archiveAt(ctx, c, namespace, objectStore, serverName)
+	at, store, err := archiveAt(ctx, c, mapper, namespace, objectStore, serverName)
 	if err != nil {
 		return Location{}, err
 	}
@@ -178,12 +200,12 @@ func ResolveLocation(
 func archiveAt(
 	ctx context.Context,
 	c client.Reader,
+	mapper meta.RESTMapper,
 	namespace, objectStore, serverName string,
 ) (Location, *unstructured.Unstructured, error) {
-	store := &unstructured.Unstructured{}
-	store.SetGroupVersionKind(ObjectStoreGVK)
 	key := types.NamespacedName{Namespace: namespace, Name: objectStore}
-	if err := c.Get(ctx, key, store); err != nil {
+	store, err := served.Get(ctx, c, mapper, objectStoreKind, key)
+	if err != nil {
 		return Location{}, nil, fmt.Errorf("read ObjectStore %s/%s: %w", namespace, objectStore, err)
 	}
 

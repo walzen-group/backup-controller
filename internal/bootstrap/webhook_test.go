@@ -24,6 +24,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -79,6 +80,22 @@ func scheme(t *testing.T) *runtime.Scheme {
 	s.AddKnownTypeWithName(ClusterListGVK, &unstructured.UnstructuredList{})
 	s.AddKnownTypeWithName(ClusterListGVK.GroupVersion().WithKind("Cluster"), &unstructured.Unstructured{})
 	return s
+}
+
+// newBuilder returns a fake client builder with scheme(t) and a RESTMapper
+// that serves every kind of that scheme at the version registered there, as
+// the API server's discovery would. The handler looks the versions of
+// Cluster and ObjectStore up in it (see served.Kind).
+func newBuilder(t *testing.T) *fake.ClientBuilder {
+	t.Helper()
+	s := scheme(t)
+	mapper := meta.NewDefaultRESTMapper(s.PrioritizedVersionsAllGroups())
+	for gvk := range s.AllKnownTypes() {
+		if !strings.HasSuffix(gvk.Kind, "List") {
+			mapper.Add(gvk, meta.RESTScopeNamespace)
+		}
+	}
+	return fake.NewClientBuilder().WithScheme(s).WithRESTMapper(mapper)
 }
 
 // cluster builds the Cluster app/app-pg, bootstrapped with initdb and archiving
@@ -162,7 +179,7 @@ func decideWith(t *testing.T, c *unstructured.Unstructured, prober ArchiveProber
 		t.Fatalf("marshal the cluster: %v", err)
 	}
 
-	builder := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(secret())
+	builder := newBuilder(t).WithObjects(secret())
 	objects := append([]runtime.Object{objectStore}, existing...)
 	builder = builder.WithRuntimeObjects(objects...)
 
@@ -240,7 +257,7 @@ func TestAClusterIsRefusedWhenAnotherArchivesThere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal the cluster: %v", err)
 	}
-	builder := fake.NewClientBuilder().WithScheme(scheme(t)).
+	builder := newBuilder(t).
 		WithObjects(secret(), otherSecret).
 		WithRuntimeObjects(store(), otherStore, other)
 
@@ -303,7 +320,7 @@ func TestTheCollisionCheckReadsNoSecretOfAnotherCluster(t *testing.T) {
 		t.Fatalf("marshal the cluster: %v", err)
 	}
 	reads := 0
-	c := fake.NewClientBuilder().WithScheme(scheme(t)).
+	c := newBuilder(t).
 		WithObjects(secret(), otherSecret).
 		WithRuntimeObjects(store(), otherStore, other).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -360,7 +377,7 @@ func TestTheCollisionCheckListsTheObjectStoresOnce(t *testing.T) {
 		t.Fatalf("marshal the cluster: %v", err)
 	}
 	gets, lists := 0, 0
-	c := fake.NewClientBuilder().WithScheme(scheme(t)).
+	c := newBuilder(t).
 		WithObjects(secret()).
 		WithRuntimeObjects(objects...).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -519,7 +536,7 @@ func TestAnUnreadableHolderStoreRefusesTheCluster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal the cluster: %v", err)
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme(t)).
+	c := newBuilder(t).
 		WithObjects(secret()).
 		WithRuntimeObjects(store(), otherStore, other).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -1093,7 +1110,7 @@ func TestADryRunIsAllowedWithoutReadingTheStore(t *testing.T) {
 	dryRun := true
 	decider := &Decider{
 		// No objects, so a read fails the way a missing ObjectStore does.
-		Client: fake.NewClientBuilder().WithScheme(scheme(t)).Build(),
+		Client: newBuilder(t).Build(),
 		Prober: stubProber{err: errors.New("the prober must not run on a dry run")},
 	}
 
@@ -1130,7 +1147,7 @@ func update(t *testing.T, old, new *unstructured.Unstructured, dryRun bool) admi
 		t.Fatalf("marshal the new cluster: %v", err)
 	}
 	decider := &Decider{
-		Client: fake.NewClientBuilder().WithScheme(scheme(t)).Build(),
+		Client: newBuilder(t).Build(),
 		Prober: stubProber{err: errors.New("the prober must not run on an update")},
 	}
 	return decider.Handle(context.Background(), admission.Request{

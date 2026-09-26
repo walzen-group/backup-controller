@@ -12,6 +12,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	"github.com/walzen-group/backup-controller/internal/served"
 	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -442,7 +443,7 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 		return nil, refuse("spec.repository alone restores into a new claim, so spec.into is required, and it must name a claim that does not exist yet. " +
 			"To overwrite an existing claim from this repository, set spec.claim to it as well; the run then restores it in place once no pod mounts it.")
 	case run.Spec.Database != "":
-		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, run.Spec.Database)
+		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Spec.Database)
 		if err != nil {
 			return nil, err
 		}
@@ -462,7 +463,7 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	if err != nil {
 		return nil, err
 	}
-	clusters, err := enabledClusters(ctx, r.Reader, run.Namespace)
+	clusters, err := enabledClusters(ctx, r.Reader, r.RESTMapper(), run.Namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -745,7 +746,7 @@ func nothingWritten(claim string) string {
 // the store or its Secrets fails in a way a retry may fix, and when listing
 // the base backups fails.
 func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, name string, at *time.Time) (string, string, error) {
-	cluster, found, err := getCluster(ctx, r.Reader, namespace, name)
+	cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), namespace, name)
 	if err != nil {
 		return "", "", err
 	}
@@ -756,7 +757,7 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 	if !archives {
 		return "", "the Cluster archives nowhere, so it has no backup to restore", nil
 	}
-	location, err := bootstrap.ResolveLocation(ctx, r.Reader, namespace, store, serverName)
+	location, err := bootstrap.ResolveLocation(ctx, r.Reader, r.RESTMapper(), namespace, store, serverName)
 	if err != nil {
 		if retryable(err) {
 			return "", "", err
@@ -1363,7 +1364,7 @@ func (r *RestoreRunReconciler) claimWriter(ctx context.Context, run *backupv1alp
 func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
-		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
+		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 		if err != nil {
 			return err
 		}
@@ -1398,7 +1399,7 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		return r.deleteCluster(ctx, cluster)
 
 	case backupv1alpha1.ItemDeleted:
-		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
+		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 		switch {
 		case err != nil:
 			return err
@@ -1420,7 +1421,7 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		}
 
 	case backupv1alpha1.ItemRecovering:
-		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
+		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 		switch {
 		case err != nil:
 			return err
@@ -1504,10 +1505,14 @@ func archives(cluster *unstructured.Unstructured) bool {
 // deleteCluster deletes the Cluster the run read. The delete carries the
 // Cluster's UID as a precondition, so it never reaches a Cluster of the same
 // name created since the read. A Cluster that is already gone is not an
-// error.
-func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster client.Object) error {
+// error. The delete goes out at the version the Cluster was read at, which
+// getCluster looked up; a delete the API server refuses because it has
+// stopped serving that version since is an error (see served.VersionGone),
+// never a Cluster that is gone.
+func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster *unstructured.Unstructured) error {
 	uid := cluster.GetUID()
-	if err := r.Delete(ctx, cluster, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+	err := served.VersionGone(r.RESTMapper(), cluster.GroupVersionKind(), r.Delete(ctx, cluster, client.Preconditions{UID: &uid}))
+	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete Cluster %s/%s: %w", cluster.GetNamespace(), cluster.GetName(), err)
 	}
 	return nil
@@ -2353,7 +2358,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 			}
 			// A Cluster its owner has created again is back, and the note
 			// about its next creation would be wrong.
-			cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
+			cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 			if err != nil {
 				return ctrl.Result{}, err
 			}

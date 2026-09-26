@@ -1,7 +1,7 @@
 //go:build envtest
 
 // The version-gone envtest checks, against envtest's kube-apiserver (the
-// Kubernetes version versions.json pins), the answers versionGone tells
+// Kubernetes version versions.json pins), the answers served.VersionGone tells
 // apart: a request at a Kustomization version the API server no longer
 // serves, and a request for a Kustomization that doesn't exist at a version
 // it serves. It also drives setSuspend through controller-runtime's lazy
@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/walzen-group/backup-controller/internal/served"
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -69,12 +70,12 @@ func kustomizationAt(version, name string) *unstructured.Unstructured {
 }
 
 // TestEnvtestAVersionNoLongerServedIsNotAMissingObject checks the assumption
-// versionGone rests on, on a real kube-apiserver. After the API server stops
+// served.VersionGone rests on, on a real kube-apiserver. After the API server stops
 // serving a Kustomization version, a get and a patch at that version fail
 // with a NotFound that apierrors.IsUnexpectedServerError reports, while a get
 // of a Kustomization that doesn't exist, at a version it serves, fails with
 // a NotFound that it does not report. setSuspend through the lazy RESTMapper
-// that cached the old version then fails once with a *versionGoneError, for
+// that cached the old version then fails once with a *served.VersionGoneError, for
 // which apierrors.IsNotFound is false, and the next call suspends the
 // Kustomization at the version the API server serves.
 func TestEnvtestAVersionNoLongerServedIsNotAMissingObject(t *testing.T) {
@@ -118,9 +119,9 @@ func TestEnvtestAVersionNoLongerServedIsNotAMissingObject(t *testing.T) {
 		t.Fatalf("create the Kustomization: %v", err)
 	}
 
-	gvk, err := servedKind(c.RESTMapper(), KustomizationGVK.GroupKind())
+	gvk, err := served.Kind(c.RESTMapper(), KustomizationGVK.GroupKind())
 	if err != nil || gvk.Version != "v2" {
-		t.Fatalf("servedKind = %v, %v; want v2, the version the API server prefers", gvk, err)
+		t.Fatalf("served.Kind = %v, %v; want v2, the version the API server prefers", gvk, err)
 	}
 	if err := setSuspend(ctx, c, ns, appN, true); err != nil {
 		t.Fatalf("suspend at v2 while it is served: %v", err)
@@ -170,9 +171,9 @@ func TestEnvtestAVersionNoLongerServedIsNotAMissingObject(t *testing.T) {
 	}
 
 	err = setSuspend(ctx, c, ns, appN, false)
-	var gone *versionGoneError
+	var gone *served.VersionGoneError
 	if !errors.As(err, &gone) || apierrors.IsNotFound(err) {
-		t.Fatalf("resume at the cached v2 = %v; want a *versionGoneError that is not NotFound", err)
+		t.Fatalf("resume at the cached v2 = %v; want a *served.VersionGoneError that is not NotFound", err)
 	}
 	if err := setSuspend(ctx, c, ns, appN, false); err != nil {
 		t.Fatalf("resume on the next pass: %v; want it done at v1", err)

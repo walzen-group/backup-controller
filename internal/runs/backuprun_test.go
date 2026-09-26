@@ -15,7 +15,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -1527,19 +1526,11 @@ func TestReadyNamesARetryAndABusySourceTogether(t *testing.T) {
 }
 
 // A namespace run in a cluster without the CloudNativePG CRDs backs up the
-// volumes. The API server answers a list of Clusters there with a no-match
-// error, which means there are no Clusters.
+// volumes. The API server's discovery serves no version of Cluster there,
+// which means there are no Clusters.
 func TestANamespaceRunWithoutCloudNativePGBacksUpTheVolumes(t *testing.T) {
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+	r, c, _ := servedBackupReconciler(t, []string{ClusterGVK.Group}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository())
-	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind().Group == ClusterGVK.Group {
-				return &meta.NoKindMatchError{GroupKind: ClusterGVK.GroupKind(), SearchedVersions: []string{"v1"}}
-			}
-			return cl.List(ctx, list, opts...)
-		},
-	})
 	step(t, r)
 
 	run := readBackupRun(t, c)

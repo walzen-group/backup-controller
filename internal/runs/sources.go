@@ -13,6 +13,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/served"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -62,12 +63,18 @@ func isRefusal(err error) bool {
 // tried again. That is a failed call to the API server, other than one that
 // found nothing, and a request that never reached it. A missing object, a kind
 // the cluster doesn't serve, and an error the caller built from what it read
-// are not retryable.
+// are not retryable. A failed lookup of a served version and a request at a
+// version the API server has stopped serving are retryable (see
+// served.Transient); the second comes back as NotFound and never means
+// the object is missing.
 //
 // It sorts the errors of a function that doesn't return refusals, such as
 // bootstrap.ResolveLocation, which wraps each failed read and describes a
 // missing field in an error of its own.
 func retryable(err error) bool {
+	if served.Transient(err) {
+		return true
+	}
 	if err == nil || apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 		return false
 	}

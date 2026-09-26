@@ -8,6 +8,7 @@ import (
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/served"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -294,9 +295,9 @@ func TestOnlyAKindNoVersionOfWhichIsServedIsGone(t *testing.T) {
 		{"discovery failed for some versions", &partial, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := servedKind(failingMapper{err: tc.err}, gk)
+			_, err := served.Kind(failingMapper{err: tc.err}, gk)
 			if err == nil || apierrors.IsNotFound(err) != tc.gone {
-				t.Fatalf("servedKind error = %v, want gone = %t", err, tc.gone)
+				t.Fatalf("served.Kind error = %v, want gone = %t", err, tc.gone)
 			}
 			c := servingOnly(strictclient.Build(fake.NewClientBuilder().WithRESTMapper(failingMapper{err: tc.err}), runtime.NewScheme(), strictclient.Options{Clock: func() time.Time { return frozen }}))
 			if err := deleteWorkload(context.Background(), c, ns, runUID); (err == nil) != tc.gone {
