@@ -2094,6 +2094,16 @@ func leftDeletedNotes(items []backupv1alpha1.RestoreItem, message string) string
 	return message
 }
 
+// leftDeleted reports whether an item is a Cluster the run deleted and has
+// not seen created again: one still in phase Deleted, or one a run that
+// ended early failed and marked with status.items[].clusterLeftDeleted.
+//
+// Parameters:
+//   - item is one of the run's items, as its status records it.
+func leftDeleted(item backupv1alpha1.RestoreItem) bool {
+	return item.Kind == "Cluster" && (item.Phase == backupv1alpha1.ItemDeleted || item.ClusterLeftDeleted)
+}
+
 // clusterLeftDeleted returns the note for a Cluster the run deleted and
 // ended without: no run waits for the Cluster any more, so the bootstrap
 // webhook recovers its next creation to the end of its archive, or to the
@@ -2460,13 +2470,15 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 // while this run repeats its restart.
 //
 // Right before it drops the finalizer, finalize records a Warning event with
-// reason ClusterLeftDeleted for each Cluster item still in phase Deleted,
-// with the note from clusterLeftDeleted. The run is about to go, so the
-// event is the only place that note can appear. It reads the Cluster first:
-// one its owner has created again, with a UID other than the item's
-// clusterUID, gets no event, since the note speaks of a creation still to
-// come. A failed read comes back as an error, and the finalizer stays until
-// a retry gets past it.
+// reason ClusterLeftDeleted, with the note from clusterLeftDeleted, for
+// each Cluster item still in phase Deleted and each one that records
+// status.items[].clusterLeftDeleted, which a run that timed out or aborted
+// set when it failed the item (see leftDeleted). The run is about to go,
+// so the event is the only place that note can appear. It reads the
+// Cluster first: one its owner has created again, with a UID other than the
+// item's clusterUID, gets no event, since the note speaks of a creation
+// still to come. A failed read comes back as an error, and the finalizer
+// stays until a retry gets past it.
 func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
@@ -2489,7 +2501,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	}
 	if r.Recorder != nil {
 		for _, item := range run.Status.Items {
-			if item.Kind != "Cluster" || item.Phase != backupv1alpha1.ItemDeleted {
+			if !leftDeleted(item) {
 				continue
 			}
 			// A Cluster its owner has created again is back, and the note

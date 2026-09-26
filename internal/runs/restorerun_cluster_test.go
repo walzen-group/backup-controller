@@ -532,6 +532,46 @@ func TestADeletedRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
 	}
 }
 
+// A run that timed out with its Cluster deleted, and is deleted before it
+// could finish, records the ClusterLeftDeleted event too. Its item is Failed
+// by then and records clusterLeftDeleted, and the run's Ready message, which
+// carries the note, goes with the run.
+func TestARunDeletedAfterItsTimeoutSaysHowItsDeletedClusterComesBack(t *testing.T) {
+	c := newClient(t, restoreRun(deletedDatabaseRun), objectStore(), storeSecret())
+	failList := true
+	reader := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*coordinationv1.LeaseList); ok && failList {
+				return apierrors.NewInternalError(errors.New("the API server cannot list the Leases"))
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+	recorder := events.NewFakeRecorder(10)
+	r := &RestoreRunReconciler{Client: c, Reader: reader, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday},
+		Recorder: recorder, Now: func() time.Time { return frozen.Add(5 * time.Hour) }}
+
+	if err := tryRestoreStep(r); err == nil {
+		t.Fatal("the pass whose release failed returned no error")
+	}
+	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !item.ClusterLeftDeleted {
+		t.Fatalf("item = %+v after the failed release, want it Failed with clusterLeftDeleted", item)
+	}
+	failList = false
+	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	var found bool
+	for _, event := range recorded(recorder) {
+		found = found || (strings.Contains(event, "ClusterLeftDeleted") && strings.Contains(event, endedBeforeRecreate))
+	}
+	if !found {
+		t.Errorf("events = %q, want a ClusterLeftDeleted event saying %q", recorded(recorder), endedBeforeRecreate)
+	}
+}
+
 // A run deleted after its owner created the deleted Cluster again records no
 // ClusterLeftDeleted event: the Cluster is back, and a note about its next
 // creation would be wrong. A Cluster that is still the one the run deleted,
