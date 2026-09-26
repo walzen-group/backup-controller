@@ -213,9 +213,10 @@ func restoredSnapshots(logs string) (ids []string, noneEligible bool) {
 // only when the log names the recorded snapshot, names no other, and does not
 // say the mover found none. It fails when the log says the mover found no
 // snapshot (the mover exits 0 then), when it names another snapshot, when it
-// says both, and when it names none: VolSync leaves the log empty when it can't read the
-// pod's logs, and keeps only its last MOVER_LOG_MAX_BYTES bytes (1024 by
-// default, utils/podlogs.go:40, :186, :213-227), which can cut the line. A
+// says both, and when it names none: VolSync leaves the log empty when it
+// can't read the pod's logs, and keeps only its last MOVER_LOG_MAX_BYTES
+// bytes (1024 by default, utils/podlogs.go:40, :186, :213-227), which can
+// cut the line. A
 // restic that prints the line in another form fails the same way. An item
 // whose recorded short ID is empty or shorter than restic's eight characters
 // fails too, since no log can confirm it.

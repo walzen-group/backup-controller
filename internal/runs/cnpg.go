@@ -51,9 +51,12 @@ const clusterLabel = "cnpg.io/cluster"
 //   - namespace is the Cluster's namespace.
 //   - name is the Cluster's name, matched against the cnpg.io/cluster label.
 //
-// It returns a description of the first one it finds, such as
-// "pod notes-pg-1" or "PVC notes-pg-1", or an empty string once none is left.
-// A pod in phase Succeeded or Failed doesn't count.
+// It returns a description of the first one it finds, pods before PVCs, such
+// as "pod notes-pg-1" or "PVC notes-pg-1", and an empty string once none is
+// left. A pod in phase Succeeded or Failed doesn't count, and a PVC counts
+// while it exists, being deleted or not. It returns an error naming the
+// Cluster when the list of the pods or of the PVCs fails, and the caller
+// retries with nothing given back.
 //
 // An instance pod outlives its deleted Cluster until Postgres has shut down,
 // which takes up to the Cluster's smartShutdownTimeout. Until then the

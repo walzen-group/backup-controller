@@ -226,8 +226,11 @@ func acquireLease(ctx context.Context, c client.Client, reader client.Reader, ho
 //   - lease is the Lease as stored, whose labels and annotations name the
 //     holder.
 //
-// The message names the holder, and for a quiesce Lease also the workloads
-// the holder stopped.
+// It returns the message. It names the holder's kind and name and the
+// Lease. For a claim or repository Lease it also names the items the Lease
+// is held for; for a quiesce Lease it says the holder has stopped the
+// namespace's workloads, without naming them, since the Lease records the
+// holder only.
 func leaseBusyMessage(lease *coordinationv1.Lease) string {
 	kind := lease.Labels[labelLeaseHolderKind]
 	name := lease.Annotations[annotationLeaseHolderName]

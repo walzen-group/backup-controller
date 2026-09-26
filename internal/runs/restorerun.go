@@ -258,23 +258,36 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 	return &t, nil
 }
 
-// plan lists the run's items and checks, before it changes anything, that a
-// backup reaches the run's moment for every one of them. When every item
-// passes, plan moves the run to Running and records status.startedAt.
+// plan checks, before the run changes anything, that a backup reaches the
+// run's moment for every item of an in-place run, and starts the run when
+// every item passes.
+//
+// Parameters:
+//   - run is the RestoreRun with an empty phase and no spec.into. plan
+//     records its items, the selected snapshots and base backups, and
+//     status.syncedTo in its status.
+//
+// It returns the result of the pass. A run whose checks passed is moved to
+// Running with status.startedAt set and requeued after a second; a run that
+// ends here returns what finish returns. plan returns an error, and writes
+// nothing, when listing the snapshots or the base backups fails, and when a
+// read fails in a way a retry may fix, such as a timeout from the API
+// server; Reconcile hands such an error to planFailed.
 //
 // For a volume, the check selects the snapshot the restore would use and
-// records its ID on the item. For a database, it selects the base backup the
-// recovery would start from and records its ID. An item with nothing in reach,
-// or whose snapshot VolSync's mover would not restore when pinned to its
-// second (see selectSnapshot), is marked Failed with the reason. If any item
-// fails, plan marks every other Pending item Skipped and ends the run as
-// Failed with reason NoBackupInReach, naming each item it cannot reach.
-// Nothing has been deleted or overwritten at that point.
+// records its ID and time on the item (see checkVolume). For a database, it
+// selects the base backup the recovery would start from and records its ID
+// (see checkDatabase). An item with nothing in reach, or whose snapshot
+// VolSync's mover would not restore when pinned to its second (see
+// selectSnapshot), is marked Failed with the reason. If any item fails, plan
+// marks every other Pending item Skipped and ends the run as Failed with
+// reason NoBackupInReach, naming each item it cannot reach. Nothing has been
+// deleted or overwritten at that point.
 //
 // A backup's mover runs restic forget after it saves, and a quiesced
 // BackupRun retimes its snapshot after the mover, so a snapshot selected
-// during a backup may be gone by the time the restore's mover starts. So
-// before it checks a volume, plan looks for a backup of the claim or its
+// during a backup may be gone by the time the restore's mover starts. Before
+// it checks a volume, plan therefore looks for a backup of the claim or its
 // repository in progress (see volumeBackedUp), and while there is one it
 // waits with reason SourceBusy and leaves the run unplanned (see
 // waitAtChecks), until spec.timeout from the run's creation ends it TimedOut.
@@ -286,11 +299,9 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 //
 // A spec that can't work ends the run as Failed with reason Invalid: a
 // restoreAsOf that doesn't parse, a spec.quiesce entry the namespace does not
-// hold, a synced run with no claim to take the moment from, or a Cluster that
-// another unfinished RestoreRun is restoring (see items). plan returns
-// an error, and writes nothing, when listing the snapshots or the base
-// backups fails, and when a read fails in a way a retry may fix, such as a
-// timeout from the API server. Reconcile hands such an error to planFailed.
+// hold, a synced run with no claim to take the moment from, or any refusal
+// from items, such as a Cluster that another unfinished RestoreRun is
+// restoring.
 func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	items, err := r.items(ctx, run)
 	if err != nil {
@@ -396,22 +407,30 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 	return after(time.Second, r.writeStatus(ctx, run))
 }
 
-// items returns one Pending item for each thing the run's spec names.
-// spec.claim names one claim and spec.database names one Cluster. A run with
-// neither takes every claim and every Cluster in the namespace marked
-// backup.wlz.li/enabled: "true", claims first. A Cluster that archives nowhere
-// has no backup to restore, so its item starts out Skipped. So does a Cluster
-// that opts out of the bootstrap webhook, or whose owner declares its own
-// bootstrap method (see leftAlone).
+// items returns one Pending item for each claim and Cluster the run's spec
+// names.
 //
-// items returns a refusal when spec.repository is set and spec.claim is not,
-// because a restore in place needs a claim to write into; the refusal sends
-// the user to spec.into with a name no claim has, or to spec.claim to
-// overwrite an existing claim in place. It also returns a refusal when
-// nothing in the namespace is marked, when spec.database names a Cluster
-// that opts out of the bootstrap webhook, and when another unfinished
-// RestoreRun is restoring a Cluster the run would restore (see
-// clustersRestoredElsewhere). A failed read comes back as a plain error.
+// Parameters:
+//   - run is the RestoreRun being planned. Its spec.claim, spec.repository,
+//     spec.database and spec.all choose the items, and its namespace is where
+//     they are looked up.
+//
+// It returns the items, claims first. spec.claim names one claim and
+// spec.database names one Cluster. A run with neither takes every claim and
+// every Cluster in the namespace marked backup.wlz.li/enabled: "true". A
+// Cluster that archives nowhere has no backup to restore, so its item starts
+// out Skipped. So does a Cluster that opts out of the bootstrap webhook, or
+// whose owner declares its own bootstrap method (see leftAlone).
+//
+// It returns a refusal (see isRefusal), which plan turns into reason Invalid:
+// when spec.repository is set and spec.claim is not, since a restore in
+// place needs a claim to write into, and the refusal sends the user to
+// spec.into with a name no claim has, or to spec.claim to overwrite an
+// existing claim in place; when nothing in the namespace is marked; when
+// spec.database names a Cluster that opts out of the bootstrap webhook or
+// declares its own bootstrap; and when another unfinished RestoreRun is
+// restoring a Cluster the run would restore (see clustersRestoredElsewhere).
+// A failed read comes back as a plain error, and the caller retries.
 func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	pending := func(kind, name string) backupv1alpha1.RestoreItem {
 		return backupv1alpha1.RestoreItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
@@ -762,24 +781,39 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 	return backup.ID, "", nil
 }
 
-// work makes one pass over a run that plan has checked, and returns when to
-// look again. It restores the volumes first, then deletes the databases and
-// follows them until they are recovered.
+// work makes one pass over an in-place run that plan has checked, and
+// returns when to look again.
 //
-// With spec.quiesce set, the first pass calls quiesce to stop the listed
-// workloads, and later passes restore nothing until every pod of those
-// workloads is gone. The databases wait until every volume item is done. When
-// a volume restore failed, the databases still Pending are skipped and left
-// running.
+// Parameters:
+//   - run is the RestoreRun, in phase Running or Waiting with its items
+//     planned. work updates its status in place and writes it.
 //
-// After a Cluster is deleted, work waits with reason WaitingForShutdown until
-// the old Cluster's instance pods and PVCs are gone. Only then does it start
-// the stopped workloads again and resume the Kustomizations it suspended. It
-// then waits with reason WaitingForRecreate, whose message asks for the
-// Cluster to be created again. The run finishes once every item is
+// It returns a result that requeues the run while it has work left, and an
+// empty result once the run has ended (see finish). A failed read, write or
+// delete comes back as an error, and controller-runtime retries the pass.
+//
+// A run past spec.timeout is aborted with reason TimedOut (see abort and
+// restoreTimedOut). With spec.quiesce set, the first passes call quiesce to
+// stop the listed workloads, and later passes restore nothing until every
+// pod of those workloads is gone. work then moves each volume item a step
+// further (see restoreVolume), and deletes the ReplicationDestination of each
+// item that has finished once its end is in the status (see
+// removeDestinations). The databases wait until every volume item is done;
+// when a volume restore failed, the databases still Pending are skipped and
+// left running, and otherwise each is moved a step further (see
+// restoreDatabase).
+//
+// While a mover the run stopped is not gone yet, the run waits with reason
+// WaitingForShutdown and gives nothing back (rule X2). After a Cluster is
+// deleted, work also waits with reason WaitingForShutdown until the old
+// Cluster's instance pods and PVCs are gone (see instanceLeft). Only then does
+// it start the stopped workloads again and resume the Kustomizations it
+// suspended, and it waits with reason WaitingForRecreate, whose message asks
+// for the Cluster to be created again. The run finishes once every item is
 // Succeeded, Failed or Skipped: Failed when an item failed, Failed with
 // reason NoBackupInReach when every item was Skipped (see nothingRestored),
-// and Succeeded otherwise. A run past spec.timeout is aborted.
+// and Succeeded otherwise. At the start of each pass work releases the Leases
+// of the items that finished in an earlier pass and whose movers are gone.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if deadline, over := r.overdue(run); over {
 		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, restoreTimedOut(run, deadline))
@@ -1228,31 +1262,38 @@ func (r *RestoreRunReconciler) claimWriter(ctx context.Context, run *backupv1alp
 	return "", nil
 }
 
-// restoreDatabase moves one database restore a step further. A Pending item
-// has its Cluster deleted. A Deleted item waits until Flux or tofu creates the
-// Cluster again and the bootstrap webhook marks it as this run's recovery,
-// which moves the item to Recovering. A Recovering item succeeds once the
-// Cluster is healthy and still carries the run's mark, and fails if the
-// recovered Cluster is deleted or replaced.
+// restoreDatabase moves one database item a step further: it deletes the
+// Cluster of a Pending item, and follows a Deleted or Recovering item until
+// the Cluster is recovered.
+//
+// Parameters:
+//   - run is the RestoreRun the item belongs to. Its name is the mark the
+//     bootstrap webhook sets on a Cluster it recovers for the run, and its
+//     status is written before a delete.
+//   - item is the Cluster item, which restoreDatabase updates in place.
+//
+// It returns an error when a read of the Cluster, the list of the
+// RestoreRuns, the status write or the delete fails, and the caller retries.
+// It returns nil otherwise, with the item's new phase and message set.
 //
 // A Pending item whose Cluster opts out of the bootstrap webhook, or whose
 // owner declares its own bootstrap method (see leftAlone), moves to Skipped,
-// and the run never deletes that Cluster.
-//
-// Right before it marks a Pending item Deleted, restoreDatabase checks
-// again that no other unfinished run is restoring the Cluster (see
-// clustersRestoredElsewhere), because two runs that planned in the same
-// instant both passed the check at their plan. When another run holds the
-// Cluster, the item fails with the refusal, naming that run, and the run
-// deletes nothing.
+// and the run never deletes that Cluster. Right before it marks any other
+// Pending item Deleted, restoreDatabase checks again that no other unfinished
+// run is restoring the Cluster (see clustersRestoredElsewhere), because two
+// runs that planned in the same instant both passed the check at their plan.
+// When another run holds the Cluster, the item fails with the refusal,
+// naming that run, and the run deletes nothing.
 //
 // The item is marked Deleted, and the status written, before the Cluster is
 // deleted. The bootstrap webhook recovers a Cluster only for a run whose item
 // says Deleted, so the mark has to be in place before anything can create the
 // Cluster again. The same write records the old Cluster's UID in
-// status.items[].clusterUID.
+// status.items[].clusterUID. A run that found no Cluster to delete leaves its
+// item Deleted without a UID.
 //
-// A Deleted item sorts the live Cluster of its name into one of three kinds:
+// A Deleted item waits while no Cluster of its name exists, or while one is
+// being deleted, and otherwise sorts the live Cluster into one of three kinds:
 //
 //   - The old Cluster, whose UID is the recorded one: the delete failed, or
 //     the controller stopped after the mark was written. The run deletes it
@@ -1261,15 +1302,18 @@ func (r *RestoreRunReconciler) claimWriter(ctx context.Context, run *backupv1alp
 //     stays on a recovered Cluster for good, so it says nothing on the old
 //     Cluster.
 //   - This run's recovery: another UID and the annotation naming this run.
+//     The item moves to Recovering.
 //   - Any other Cluster: one created again empty by the owner's choice, with
 //     its own bootstrap, archiving nowhere, recovered for another run, or not
 //     seen by the webhook. The item fails with a message saying so (see
 //     notRecovered), and the run leaves the Cluster alone. It did not create
 //     that Cluster, and deleting it would only loop as Flux creates it again.
+//     An item without a recorded UID has no old Cluster, so any live Cluster
+//     that is not the run's recovery lands here.
 //
-// A run that found no Cluster to delete leaves its item Deleted without a
-// UID. Such an item has no old Cluster, so a live Cluster that is not the
-// run's recovery fails the item.
+// A Recovering item succeeds once the Cluster reports the healthy phase and
+// still carries the run's mark, and fails when the recovered Cluster is
+// deleted or replaced by one without the mark.
 func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
@@ -1423,29 +1467,38 @@ func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster client
 	return nil
 }
 
-// planIntoNewClaim checks an into restore before it creates anything. It
-// selects the snapshot the restore would use, records it on the run's single
-// item, and moves the run to Running with status.startedAt set. The check has
-// to come first, because VolSync's mover restores nothing and still reports
-// success when no snapshot matches. The item also names the
-// ReplicationDestination that restoreIntoEmptyClaim creates, for a restore
-// from spec.claim and from spec.repository alike.
+// planIntoNewClaim checks an into restore before it creates anything, and
+// starts the run when the check passes.
+//
+// Parameters:
+//   - run is the RestoreRun with an empty phase and spec.into set. It
+//     restores from the backups of spec.claim, or from spec.repository.
+//
+// It returns the result of the pass: a run whose check passed is moved to
+// Running, with status.startedAt set and its single item Running on the
+// selected snapshot, and requeued after a second; a run that ends here
+// returns what finish returns; a run that waits for a backup returns what
+// waitAtChecks returns. A failed read, and a failed listing of the
+// repository, come back as an error for a retry (see planFailed).
+//
+// The check selects the snapshot the restore would use and records its ID
+// and time on the item, which also names the ReplicationDestination that
+// restoreIntoEmptyClaim creates (see destinationName). The check has to come
+// first, because VolSync's mover restores nothing and still reports success
+// when no snapshot matches. Before it selects the snapshot, planIntoNewClaim
+// waits, as plan does, while a backup of the source claim or the repository
+// is in progress (see otherMover and waitAtChecks).
 //
 // A spec that can't work ends the run as Failed with reason Invalid: a claim
 // named spec.into that exists and that the run did not create (see
-// notCreatedByRun), for a restore from spec.claim a VolumeRestore of that
-// name, which describes the backups of a claim of that name, a source claim
-// or VolumeRestore that is missing, a restoreAsOf that doesn't parse, or a
+// notCreatedByRun); for a restore from spec.claim, a VolumeRestore of that
+// name, which describes the backups of a claim of that name; a source claim
+// or VolumeRestore that is missing; a restoreAsOf that doesn't parse; or a
 // restore from spec.repository alone without spec.intoSize. The run writes
 // only into a claim it creates itself, so it never overwrites or takes over
 // one it finds. A run with no snapshot in reach, or whose snapshot VolSync's
 // mover would not restore when pinned to its second, ends with reason
-// NoBackupInReach. Any other failed read, and a failed listing of the
-// repository, is returned for a retry.
-//
-// Before it selects the snapshot, planIntoNewClaim waits, as plan does, while
-// a backup of the source claim or the repository is in progress (see
-// otherMover and waitAtChecks).
+// NoBackupInReach.
 func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	run.Status.Target = run.Spec.Into
 	refusal, err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim")
@@ -1503,51 +1556,59 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 	return after(time.Second, r.writeStatus(ctx, run))
 }
 
-// restoreIntoEmptyClaim restores into the new claim spec.into names, from
-// the backups of the claim spec.claim names or from the repository
-// spec.repository names.
+// restoreIntoEmptyClaim makes one pass over an into restore that
+// planIntoNewClaim has checked: it creates the new claim spec.into names and
+// the ReplicationDestination that fills it, and follows the mover to the end.
 //
-// The run creates a plain claim, with no data source, and a
-// ReplicationDestination in the run's namespace whose mover writes the
-// selected snapshot into it (see directDestination), so the mover's log
-// confirms the snapshot as it does in place. The claim takes the source
-// claim's size and class, or spec.intoSize, and the node the source claim's
-// volume is on (see scratchClaim). On a WaitForFirstConsumer class, which is
-// every class on the walzen cluster, that node lets the provisioner create
-// the volume at once, and the scheduler places the mover pod with it. A
-// restore from spec.repository alone has no source claim and no node to
-// copy, and picking one here would have to repeat the scheduler's checks of
-// topology, capacity and taints. Its mover pod is the claim's first
-// consumer, so the scheduler places the claim where the mover runs, the way
-// VolSync places a destination claim it creates itself.
+// Parameters:
+//   - run is the RestoreRun, Running or Waiting, whose single item names the
+//     claim and the destination. The source is the backups of the claim
+//     spec.claim names, or the repository spec.repository names.
 //
-// The run fails with the mover's logs when the mover fails. Once the
-// destination has completed the run's trigger, the run succeeds only when the
-// mover's log names the snapshot the checks recorded, and fails otherwise
-// (see unconfirmedRestore). It records the item's end in the status before
-// finish deletes the destination, for the reason work gives, and a pass that
-// finds the item's end recorded only finishes the run. It is aborted with
-// reason TimedOut when the restore has not finished by spec.timeout, and the
-// deadline is checked before anything is created. A source claim that is
-// gone before anything was created, or whose VolumeRestore or repository
-// Secret is gone by then, aborts the run with reason Failed.
+// It returns a result that requeues the run while the restore goes on, and
+// what finish or abort returns once the run ends. A failed read, create or
+// status write comes back as an error, and the pass is retried.
 //
-// While a backup of the source claim or the repository is in progress (see
-// otherMover), the run waits with reason SourceBusy before it creates
-// anything. Right before the claim is created, the repository is listed
-// again (see recheckSnapshot), and a snapshot the mover would no longer
-// restore aborts the run with reason Failed.
+// The run creates a plain claim, with no data source, and a destination in
+// the run's namespace whose mover writes the selected snapshot into it (see
+// directDestination), so the mover's log confirms the snapshot as it does in
+// place. The claim takes the source claim's size and class, or spec.intoSize,
+// and the node the source claim's volume is on (see scratchClaim). On a
+// WaitForFirstConsumer class, which is every class on the walzen cluster,
+// that node lets the provisioner create the volume at once, and the scheduler
+// places the mover pod with it. A restore from spec.repository alone has no
+// source claim and no node to copy, and picking one here would have to repeat
+// the scheduler's checks of topology, capacity and taints. Its mover pod is
+// the claim's first consumer, so the scheduler places the claim where the
+// mover runs, the way VolSync places a destination claim it creates itself.
+//
+// Before it creates anything, the run checks its deadline, reads the source
+// again, refuses a claim named spec.into that appeared since the checks,
+// takes the Leases and waits with reason SourceBusy while a backup of the
+// source claim or the repository is in progress (see waitForBackup), and
+// lists the repository again (see recheckSnapshot). A source claim,
+// VolumeRestore or repository Secret that is gone by then, or a snapshot the
+// mover would no longer restore, aborts the run with reason Failed, and the
+// message says nothing was written.
 //
 // The run writes only into a claim it created and only through a
 // destination it created. A claim named spec.into that the run did not
 // create (see notCreatedByRun), found before the create or at it, aborts the
-// run with reason Failed before any destination exists; the checks refuse
-// one that existed before them. A destination with the item's name that the
-// run did not create (see ownsDestination) aborts it too, and is left alone.
-// Once the destination exists, every pass reads the claim again, and a claim
-// that is gone, being deleted or replaced fails the run (see claimLost), so
-// a mover that completed never counts as a restore into a claim that is no
-// longer the run's.
+// run with reason Failed before any destination exists. A destination with
+// the item's name that the run did not create (see ownsDestination) aborts
+// it too, and is left alone. Once the destination exists, every pass reads
+// the claim again, and a claim that is gone, being deleted or replaced fails
+// the run (see claimLost), so a mover that completed never counts as a
+// restore into a claim that is no longer the run's.
+//
+// The run fails with the mover's logs when the mover fails. Once the
+// destination has completed the run's trigger, the run succeeds only when
+// the mover's log names the snapshot the checks recorded, and fails otherwise
+// (see unconfirmedRestore). It records the item's end in the status before
+// finish deletes the destination, for the reason work gives, and a pass that
+// finds the item's end recorded only finishes the run. A restore not finished
+// by spec.timeout is aborted with reason TimedOut and the message from
+// intoTimedOut.
 func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	item := &run.Status.Items[0]
 	done := fmt.Sprintf("claim %s holds the restored data", run.Spec.Into)
@@ -1746,12 +1807,22 @@ func (r *RestoreRunReconciler) createOwned(ctx context.Context, run *backupv1alp
 	return notCreatedByRun(run, kind, existing), nil
 }
 
-// createDestination creates the run's ReplicationDestination, and returns
-// "" once a destination of that name exists that the run owns (see
-// ownsDestination). A destination of that name with another trigger belongs
-// to something else; createDestination returns a refusal naming it, and the
-// caller must not record it on the item, because finish deletes the
-// destination an item names. A failed create or read comes back as an error.
+// createDestination creates the run's ReplicationDestination, and makes sure
+// the destination of that name is one the run owns.
+//
+// Parameters:
+//   - run is the RestoreRun. A destination is its own when it carries the
+//     run's trigger (see ownsDestination).
+//   - destination is the destination to create, from directDestination.
+//
+// It returns "" once a destination of that name exists that the run owns,
+// whether this create made it or an earlier pass whose answer was lost did.
+// A destination of that name with another trigger belongs to something
+// else, and createDestination returns a refusal naming it (see
+// takenDestination); the caller must not record that destination on the
+// item, because finish deletes the destination an item names. A failed
+// create, or a failed read after AlreadyExists, comes back as an error, and
+// the caller retries.
 func (r *RestoreRunReconciler) createDestination(ctx context.Context, run *backupv1alpha1.RestoreRun, destination *volsyncv1alpha1.ReplicationDestination) (string, error) {
 	err := r.Create(ctx, destination)
 	if err == nil {
@@ -1783,12 +1854,21 @@ func replacedDestination(name string) string {
 	return fmt.Sprintf("ReplicationDestination %s was replaced by one that does not carry this run's trigger; the run leaves it alone", name)
 }
 
-// claimLost returns a message when the claim spec.into names is gone, is
-// being deleted, or is not the one the run created (see notCreatedByRun),
-// and "" while the run's own claim is there. An into restore checks it on
-// every pass after its destination exists, so a mover that finished never
-// counts as a restore into a claim that is no longer the run's. A failed
-// read comes back as an error.
+// claimLost reports whether the claim an into restore writes into is still
+// the run's own.
+//
+// Parameters:
+//   - run is the RestoreRun. spec.into names the claim, and the claim is the
+//     run's own when the run is its controller (see notCreatedByRun).
+//
+// It returns a message for the item when the claim is gone, is being
+// deleted, or is controlled by something other than the run, and "" while
+// the run's own claim is there. A failed read that is not NotFound comes
+// back as an error, and the caller leaves the item as it was.
+//
+// An into restore checks it on every pass once its destination exists, so a
+// mover that finished never counts as a restore into a claim that is no
+// longer the run's. inPlaceClaimLost does the same for an in-place item.
 func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha1.RestoreRun) (string, error) {
 	lost := fmt.Sprintf("claim %s was deleted (or replaced) while the mover wrote into it", run.Spec.Into)
 	claim := &corev1.PersistentVolumeClaim{}
@@ -1857,10 +1937,35 @@ func clusterLeftDeleted(cluster string) string {
 		"the moment this run chose no longer applies", cluster, backupv1alpha1.AnnotationRestoreAsOf)
 }
 
-// quiesce stops the workloads spec.quiesce lists, before the run does
-// anything else.
+// quiesce stops the workloads spec.quiesce lists, before the run restores
+// anything.
 //
-// It first records the plan from planStop in status.quiesced and
+// Parameters:
+//   - run is the RestoreRun, Running with its items planned and no
+//     status.quiescedAt yet. quiesce records its plan and the stop in the
+//     run's status.
+//
+// It returns a result that requeues the run: after pollInterval while it
+// waits, after a second or two once the stop is recorded. A run it ends
+// returns what finish or abort returns. A failed read of an entry or a
+// Kustomization, a failed Lease call and a failed status write come back as
+// an error, and the pass is retried with nothing stopped that the status
+// does not record.
+//
+// Before it records a plan, with nothing stopped, quiesce fails a Pending
+// volume item whose repository Secret is gone, and then waits with reason
+// SourceBusy while a backup holds one of the run's claims or repositories
+// (see backupHeldElsewhere), while another run is in the way (see
+// waitingOn), and while another run holds the namespace's quiesce Lease (see
+// acquireQuiesceLease). A run left with no Pending item, by that or because
+// the plan Skipped every item, stops nothing: quiesce records
+// status.quiescedAt and status.restartedAt at the same moment, and work then
+// finishes the run. A spec.quiesce entry the namespace does not hold ends the
+// run as Failed with reason Invalid before anything is stopped, and a
+// Kustomization that also applies workloads of another namespace aborts it
+// with reason Invalid (see planStop).
+//
+// quiesce then records the plan from planStop in status.quiesced and
 // status.suspendedKustomizations, with each workload's replica count, and
 // writes the status. Only then does applyStop suspend the Kustomizations and
 // scale the workloads to zero. A pass that finds a plan in the status reuses
@@ -1869,18 +1974,7 @@ func clusterLeftDeleted(cluster string) string {
 // status.quiescedAt. After a failed stop, it narrows the plan with
 // appliedPart to what is stopped now, and aborts the run with reason Failed,
 // which starts those workloads again and resumes the Kustomizations, the
-// same as a BackupRun does. A spec.quiesce entry the namespace does not hold
-// ends the run as Failed with reason Invalid before anything is stopped, and
-// a failed read of an entry or a Kustomization is returned for a retry.
-//
-// Before it records a plan, with nothing stopped, quiesce waits with reason
-// SourceBusy while a backup holds one of the run's claims or repositories,
-// while another run is in the way (see waitingOn), and while another run
-// holds the namespace's quiesce Lease. Before those waits, it fails a
-// Pending volume item whose repository Secret is gone. A run left with no
-// Pending item, by that or because the plan Skipped every item, stops
-// nothing: quiesce records status.quiescedAt and status.restartedAt at the
-// same moment, and work then finishes the run.
+// same as a BackupRun does.
 func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if len(run.Status.Quiesced) == 0 {
 		targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
@@ -2514,14 +2608,21 @@ func (r *RestoreRunReconciler) writeStatus(ctx context.Context, run *backupv1alp
 	return nil
 }
 
-// claimHolder returns the name of a pod in the namespace that mounts the
-// claim, or an empty string when none does. Pods that have Succeeded or
-// Failed don't count.
+// claimHolder returns the name of a pod that mounts a claim.
 //
-// The run reads the pods through its uncached Reader. Without spec.quiesce
-// this check is the only thing that keeps a second writer off the volume, and
-// an informer cache that has not yet seen a new pod would report the claim
-// free.
+// Parameters:
+//   - c lists the pods. The run passes its uncached Reader: without
+//     spec.quiesce this check is the only thing that keeps a second writer
+//     off the volume, and an informer cache that has not yet seen a new pod
+//     would report the claim free.
+//   - namespace is the run's namespace, which holds the claim and its pods.
+//   - claim is the name of the claim an in-place restore is about to write
+//     into.
+//
+// It returns the name of the first pod in the namespace, in the order the
+// list gives, whose volumes name the claim, and "" when none does. A pod in
+// phase Succeeded or Failed has no container left and doesn't count. A
+// failed list comes back as an error.
 func claimHolder(ctx context.Context, c client.Reader, namespace, claim string) (string, error) {
 	pods := &corev1.PodList{}
 	if err := c.List(ctx, pods, client.InNamespace(namespace)); err != nil {
