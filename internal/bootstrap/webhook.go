@@ -76,6 +76,8 @@ type Decider struct {
 	// has just forgotten it (see served.VersionGone). Nil means the
 	// RESTMapper of Client, when Client has one; with neither, Handle refuses
 	// every create.
+	// Handle bounds every lookup by its budget (see boundedMapper), and
+	// cmd/backup-controller warms the mapper at startup (see Warm).
 	Mapper meta.RESTMapper
 	// Prober asks the object store what the database's prefix holds and
 	// which base backups exist. cmd/backup-controller passes S3Prober, and
@@ -193,6 +195,8 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	if mapper == nil {
 		return admission.Errored(http.StatusInternalServerError, errors.New("the webhook has no RESTMapper to look up the served versions of Cluster and ObjectStore"))
 	}
+	// A lookup that runs discovery ends with the budget too.
+	mapper = boundedMapper{RESTMapper: mapper, ctx: ctx}
 
 	at, err := ResolveLocation(ctx, d.Client, mapper, req.Namespace, store, serverName)
 	if err != nil {

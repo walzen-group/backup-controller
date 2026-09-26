@@ -16,6 +16,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -205,14 +206,11 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 	// objects with reason VolSyncUnsupported, and a Cluster the bootstrap
 	// webhook would not see created again ends or holds every restore of a
 	// database with reason ClusterVersionUnsupported. Both checks also run
-	// once when the manager starts, so the log says it before any run does.
+	// once when the manager starts, so the log says it before any run does, and
+	// the startup warms the mapper for the bootstrap webhook (see
+	// bootstrap.Warm).
 	if err := manager.Add(ctrlmanager.RunnableFunc(func(context.Context) error {
-		if message := runs.VolSyncUnsupported(manager.GetRESTMapper()); message != "" {
-			klog.Errorf("VolSync is not served at the version this controller uses: %s", message)
-		}
-		if message := runs.ClusterWebhookBlind(manager.GetRESTMapper()); message != "" {
-			klog.Errorf("the bootstrap webhook would not see a Cluster created: %s", message)
-		}
+		checkServedVersions(manager.GetRESTMapper())
 		return nil
 	})); err != nil {
 		return fmt.Errorf("add the served version checks: %w", err)
@@ -259,4 +257,29 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 
 	klog.Infof("starting backup-controller: reconciling %s BackupRun and RestoreRun, scheduling namespaces", backupv1alpha1.GroupVersion.String())
 	return nil
+}
+
+// checkServedVersions logs, once at startup, each served version the
+// controller can't work with, and warms mapper for the bootstrap webhook.
+//
+// Parameters:
+//   - mapper is the manager's RESTMapper, which the reconcilers and the
+//     webhook share.
+//
+// It logs the message of runs.VolSyncUnsupported and of
+// runs.ClusterWebhookBlind when either reports, so the log says it before
+// any run does. It then calls bootstrap.Warm, so the webhook's first request
+// finds postgresql.cnpg.io and barmancloud.cnpg.io cached, and logs a lookup
+// that failed; the webhook then looks the group up on its first request,
+// within its budget.
+func checkServedVersions(mapper meta.RESTMapper) {
+	if message := runs.VolSyncUnsupported(mapper); message != "" {
+		klog.Errorf("VolSync is not served at the version this controller uses: %s", message)
+	}
+	if message := runs.ClusterWebhookBlind(mapper); message != "" {
+		klog.Errorf("the bootstrap webhook would not see a Cluster created: %s", message)
+	}
+	if err := bootstrap.Warm(mapper); err != nil {
+		klog.Errorf("could not look up the served versions the bootstrap webhook reads; its first request looks them up again: %v", err)
+	}
 }

@@ -566,6 +566,13 @@ counted from the moment it starts deciding, so its Kubernetes reads and the
 object store reads share it. The other 5 leave room for TLS and the API
 server's own work.
 
+The budget also bounds the webhook's lookup of the versions at which the API
+server serves Cluster and ObjectStore. The controller looks both up when it
+starts, so a create normally reads them from its cache; a create that finds
+them missing reads the API server's discovery, and a discovery call that
+stalls ends with the budget: `the webhook ran out of its 10s budget while
+reading the ObjectStore <namespace>/<name>`.
+
 Within that budget it reads the backup.info files newest first, eight at a
 time, and stops at the first DONE backup, or the first one that finished by
 the moment a run or the annotation asks for. barman names each directory by
