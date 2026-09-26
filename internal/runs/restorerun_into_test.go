@@ -176,7 +176,10 @@ func expectUnchanged(t *testing.T, c client.Client, versions map[client.Object]s
 
 // expectPopulatorRunFailed checks that the run ended Failed with reason
 // Failed, its item Failed, and that the item's and the Ready message hold
-// every string in want. It also checks that the run's finalizer is gone.
+// every string in want. A caller that also cares whether the run kept its
+// finalizer checks that itself: the finalizer stays exactly while the run
+// controls a VolumeRestore that still carries populator.Finalizer (see
+// releaseVolumeRestore).
 func expectPopulatorRunFailed(t *testing.T, c client.Client, want ...string) {
 	t.Helper()
 	run := readRestoreRun(t, c)
@@ -189,9 +192,6 @@ func expectPopulatorRunFailed(t *testing.T, c client.Client, want ...string) {
 		if !strings.Contains(run.Status.Items[0].Message, w) || !strings.Contains(readyMessage(run.Status.Conditions), w) {
 			t.Errorf("item message = %q, Ready message = %q; want both to hold %q", run.Status.Items[0].Message, readyMessage(run.Status.Conditions), w)
 		}
-	}
-	if slices.Contains(run.Finalizers, Finalizer) {
-		t.Errorf("finalizers = %v, want %s dropped", run.Finalizers, Finalizer)
 	}
 }
 
@@ -212,6 +212,11 @@ func TestAPopulatorRestoreWhoseClaimIsBoundEndsFailed(t *testing.T) {
 		"cannot confirm which snapshot", "The checks selected snapshot 6e473100",
 		"Claim notes-data-monday is Bound", "leaves it and VolumeRestore notes-data-monday in place",
 		"a new RestoreRun", "delete this RestoreRun first")
+	// The VolumeRestore carries no populator.Finalizer, so nothing holds the
+	// run's own finalizer.
+	if run := readRestoreRun(t, c); slices.Contains(run.Finalizers, Finalizer) {
+		t.Errorf("finalizers = %v, want %s dropped: the VolumeRestore carries no %s", run.Finalizers, Finalizer, populator.Finalizer)
+	}
 	expectUnchanged(t, c, left)
 	if names := destinations(t, c); len(names) != 0 {
 		t.Errorf("destinations = %v, want none", names)
@@ -248,7 +253,18 @@ func TestAPopulatorRestoreWaitsForItsClaimAndCreatesNothing(t *testing.T) {
 	restoreStep(t, r)
 
 	expectPopulatorRunFailed(t, c, "cannot confirm which snapshot", "Claim notes-data-monday is Bound")
-	get(t, c, ns, "notes-data-monday", &backupv1alpha1.VolumeRestore{})
+	// The VolumeRestore carries the populator's finalizer and its claim is
+	// there, so the release waits for the claim and the run keeps its own
+	// finalizer: deleting the run releases it (see releaseVolumeRestore).
+	claimed := readRestoreRun(t, c)
+	if !slices.Contains(claimed.Finalizers, Finalizer) {
+		t.Errorf("finalizers = %v, want %s kept while the VolumeRestore is held", claimed.Finalizers, Finalizer)
+	}
+	vr := &backupv1alpha1.VolumeRestore{}
+	get(t, c, ns, "notes-data-monday", vr)
+	if !slices.Contains(vr.Finalizers, populator.Finalizer) {
+		t.Errorf("VolumeRestore finalizers = %v, want %s kept while its claim is still there", vr.Finalizers, populator.Finalizer)
+	}
 }
 
 // A run on the populator path whose claim has not bound by spec.timeout ends
@@ -288,12 +304,26 @@ func TestAPopulatorRestoreWithoutItsClaimFails(t *testing.T) {
 	if names := destinations(t, c); len(names) != 0 {
 		t.Errorf("destinations = %v, want none", names)
 	}
-	// The populator never took the VolumeRestore on, so the run releases it
-	// and the garbage collector can delete it with the run.
+	// The populator never took the VolumeRestore on, so the release waits
+	// only for the claim, which is gone here. The run keeps its finalizer
+	// until it is deleted, and that deletion releases the VolumeRestore, so
+	// the garbage collector can delete it with the run.
+	held := readRestoreRun(t, c)
+	if !slices.Contains(held.Finalizers, Finalizer) {
+		t.Errorf("finalizers = %v, want %s kept until the run is deleted", held.Finalizers, Finalizer)
+	}
+	if err := c.Delete(context.Background(), held); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
 	vr := &backupv1alpha1.VolumeRestore{}
 	get(t, c, ns, "notes-data-monday", vr)
 	if slices.Contains(vr.Finalizers, populator.Finalizer) {
 		t.Errorf("VolumeRestore finalizers = %v, want %s released", vr.Finalizers, populator.Finalizer)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{}); !apierrors.IsNotFound(err) {
+		t.Errorf("RestoreRun: %v, want it gone once its VolumeRestore is released", err)
 	}
 }
 
@@ -351,31 +381,117 @@ func stepUntil(t *testing.T, r *RestoreRunReconciler, c client.Client, n int, do
 }
 
 // A run on the populator path deleted before the populator started on its
-// claim takes the populator's finalizer off its VolumeRestore, so the
-// VolumeRestore does not hang in deletion once the run is gone. It deletes
-// neither the claim nor the VolumeRestore itself; the garbage collector does
-// that after the run is gone.
-func TestADeletedPopulatorRestoreReleasesItsVolumeRestore(t *testing.T) {
+// claim takes the populator's finalizer off its VolumeRestore only once its
+// claim is gone. While the claim is there the library can still start on it,
+// so the VolumeRestore has to stay: the run deletes the claim it created,
+// waits for the library to let it go, and only then releases the
+// VolumeRestore and drops its own finalizer.
+func TestADeletedPopulatorRestoreReleasesItsVolumeRestoreAfterItsClaim(t *testing.T) {
 	run := populatorRun()
 	r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(),
-		populatorRestore(run, populator.Finalizer), populatorClaim(run, corev1.ClaimPending))
+		populatorRestore(run, populator.Finalizer), populatorClaim(run, corev1.ClaimPending, populator.ClaimFinalizer))
 	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreStep(t, r) // the claim goes first
+
+	claim := &corev1.PersistentVolumeClaim{}
+	get(t, c, ns, "notes-data-monday", claim)
+	if claim.DeletionTimestamp == nil {
+		t.Fatal("the run did not delete the claim it created")
+	}
+	if !slices.Contains(claim.Finalizers, populator.ClaimFinalizer) {
+		t.Error("the run removed the populator's finalizer from the claim")
+	}
+	vr := &backupv1alpha1.VolumeRestore{}
+	get(t, c, ns, "notes-data-monday", vr)
+	if !slices.Contains(vr.Finalizers, populator.Finalizer) {
+		t.Error("the VolumeRestore was released while its claim was still there")
+	}
+	deleting := readRestoreRun(t, c)
+	if len(deleting.Finalizers) == 0 {
+		t.Error("the run dropped its finalizer while its VolumeRestore was still held")
+	}
+	if msg := readyMessage(deleting.Status.Conditions); !strings.Contains(msg, "notes-data-monday") || !strings.Contains(msg, "VolumeRestore") {
+		t.Errorf("ready message = %q, want it to name the claim its VolumeRestore waits for", msg)
+	}
+
+	// The library's cleanup removes its finalizer from the claim, which lets
+	// the claim go.
+	claim.Finalizers = slices.DeleteFunc(claim.Finalizers, func(f string) bool { return f == populator.ClaimFinalizer })
+	if err := c.Update(context.Background(), claim); err != nil {
 		t.Fatal(err)
 	}
 	restoreStep(t, r)
 
-	vr := &backupv1alpha1.VolumeRestore{}
 	get(t, c, ns, "notes-data-monday", vr)
 	if slices.Contains(vr.Finalizers, populator.Finalizer) || vr.DeletionTimestamp != nil {
 		t.Errorf("VolumeRestore finalizers = %v, deletion %v; want %s released and the object left to the garbage collector",
 			vr.Finalizers, vr.DeletionTimestamp, populator.Finalizer)
 	}
-	scratch := &corev1.PersistentVolumeClaim{}
-	get(t, c, ns, "notes-data-monday", scratch)
-	if scratch.DeletionTimestamp != nil {
-		t.Error("the run deleted its claim itself")
-	}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{}); !apierrors.IsNotFound(err) {
 		t.Errorf("RestoreRun: %v, want it gone once its finalizer is dropped", err)
+	}
+}
+
+// A timed-out run on the populator path ends Failed and keeps its finalizer:
+// its claim is still there, the library may still start filling it, and only
+// the finalizer keeps the VolumeRestore alive for that cleanup. The claim is
+// left for the deletion, which releases the VolumeRestore once it is gone.
+func TestATimedOutPopulatorRestoreKeepsItsVolumeRestoreUntilItsClaimIsGone(t *testing.T) {
+	run := populatorRun()
+	r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(),
+		populatorRestore(run, populator.Finalizer), populatorClaim(run, corev1.ClaimPending))
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	restoreStep(t, r)
+
+	after := readRestoreRun(t, c)
+	if after.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(after.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+		t.Fatalf("phase = %q, reason = %q; want Failed, %s", after.Status.Phase, readyReason(after.Status.Conditions), backupv1alpha1.ReasonTimedOut)
+	}
+	if len(after.Finalizers) == 0 {
+		t.Error("the run dropped its finalizer while the claim the library may fill was still there")
+	}
+	vr := &backupv1alpha1.VolumeRestore{}
+	get(t, c, ns, "notes-data-monday", vr)
+	if !slices.Contains(vr.Finalizers, populator.Finalizer) {
+		t.Error("the VolumeRestore was released while its claim was still there")
+	}
+	claim := &corev1.PersistentVolumeClaim{}
+	get(t, c, ns, "notes-data-monday", claim)
+	if claim.DeletionTimestamp != nil {
+		t.Error("the run deleted the claim before its own deletion")
+	}
+}
+
+// The populator library's finalizer on a claim has one exact name, and a
+// claim whose finalizer merely ends the same way belongs to something else.
+// It must not hold the run's VolumeRestore: a match on the ending alone kept
+// the VolumeRestore and the run in deletion for good.
+func TestAStrangersFinalizerOnTheClaimDoesNotHoldTheRunsVolumeRestore(t *testing.T) {
+	stranger := "example.com/populate-target-protection"
+	run := populatorRun()
+	r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(),
+		populatorRestore(run, populator.Finalizer), populatorClaim(run, corev1.ClaimPending, stranger))
+	claim := &corev1.PersistentVolumeClaim{}
+	get(t, c, ns, "notes-data-monday", claim)
+	if err := c.Delete(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreStep(t, r)
+
+	vr := &backupv1alpha1.VolumeRestore{}
+	get(t, c, ns, "notes-data-monday", vr)
+	if slices.Contains(vr.Finalizers, populator.Finalizer) {
+		t.Errorf("VolumeRestore finalizers = %v, want %s released: claim finalizer %s is not the library's",
+			vr.Finalizers, populator.Finalizer, stranger)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{}); !apierrors.IsNotFound(err) {
+		t.Errorf("RestoreRun: %v, want it gone once its VolumeRestore is released", err)
 	}
 }

@@ -61,9 +61,11 @@ const (
 	// be created again, by Flux or by a terragrunt apply.
 	ReasonRecreate = "WaitingForRecreate"
 
-	// ReasonShutdown reports a restore waiting for a deleted Cluster's instance
-	// pods and PVCs to be gone. Until they are, the app stays stopped and any
-	// Kustomization the run suspended stays suspended.
+	// ReasonShutdown reports a restore waiting for something it deleted to be
+	// gone: a deleted Cluster's instance pods and PVCs, the pod of a mover it
+	// stopped, or the claim whose VolumeRestore it holds. Until they are gone
+	// the app stays stopped, any Kustomization the run suspended stays
+	// suspended, and the run holds its Leases and its finalizer.
 	ReasonShutdown = "WaitingForShutdown"
 
 	// ReasonClaimInUse reports an in-place restore waiting for a pod to stop

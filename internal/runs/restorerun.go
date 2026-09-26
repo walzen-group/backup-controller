@@ -40,6 +40,11 @@ import (
 // in Direct mode writes the selected snapshot into that claim, from the
 // backups of spec.claim or from spec.repository, so its mover's log confirms
 // the snapshot the same way as in place.
+//
+// When the run stops a mover, which is when it ends or is deleted, it deletes
+// the mover's ReplicationDestination and waits until that mover's pod is gone
+// before it gives the app back, releases its Leases or finishes (rule X2,
+// see stoppedMovers).
 type RestoreRunReconciler struct {
 	client.Client
 
@@ -820,7 +825,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	if left, err := r.stoppedMovers(ctx, run, finished); err != nil {
 		return ctrl.Result{}, err
 	} else if message := left.message(); message != "" {
-		return r.waitForStoppedMover(ctx, run, message)
+		return r.waitForStopped(ctx, run, message)
 	}
 
 	// A database comes back only when its owner creates it again, and a
@@ -1848,9 +1853,9 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // releaseLeases), starts any workload it still holds stopped, and records the
 // terminal phase: Succeeded when reason is ReasonSucceeded and Failed for any
 // other reason. It sets the Ready condition to reason and message, records
-// status.completedAt, and removes the finalizer. For a run that did not
-// succeed, it first releases the VolumeRestore that a v0.8.1 or older
-// controller created for an into restore, with releaseVolumeRestore.
+// status.completedAt, and removes the finalizer, unless the run holds a
+// VolumeRestore an older controller created for an into restore, whose
+// release waits for the claim (see releaseVolumeRestore).
 //
 // A stopped mover whose pod is still there holds the run: finish reports the
 // wait and returns, so the app is not given back and the Leases are not
@@ -1864,12 +1869,7 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 		return ctrl.Result{}, err
 	}
 	if waiting := left.message(); waiting != "" {
-		return r.waitForStoppedMover(ctx, run, waiting)
-	}
-	if reason != backupv1alpha1.ReasonSucceeded {
-		if err := r.releaseVolumeRestore(ctx, run); err != nil {
-			return ctrl.Result{}, err
-		}
+		return r.waitForStopped(ctx, run, waiting)
 	}
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return ctrl.Result{}, err
@@ -1900,6 +1900,18 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
 			"namespace", run.Namespace, "name", run.Name)
 	}
+	// A run whose VolumeRestore an older controller created keeps its
+	// finalizer: that VolumeRestore goes only once the claim the populator
+	// library fills is gone, and finalize does that (see
+	// releaseVolumeRestore). The run's TTL or a person deletes it, and the
+	// deletion then releases the VolumeRestore.
+	held, err := r.holdsVolumeRestore(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if held {
+		return ctrl.Result{}, nil
+	}
 	return ctrl.Result{}, dropFinalizer(ctx, r.Client, run)
 }
 
@@ -1929,10 +1941,12 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 		return ctrl.Result{}, err
 	}
 	if waiting := left.message(); waiting != "" {
-		return r.waitForStoppedMover(ctx, run, waiting)
+		return r.waitForStopped(ctx, run, waiting)
 	}
-	if err := r.releaseVolumeRestore(ctx, run); err != nil {
+	if waiting, err := r.releaseVolumeRestore(ctx, run); err != nil {
 		return ctrl.Result{}, err
+	} else if waiting != "" {
+		return r.waitForStopped(ctx, run, waiting)
 	}
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return ctrl.Result{}, err
@@ -2087,16 +2101,21 @@ func moverPodLeft(ctx context.Context, c client.Reader, namespace, destination s
 	return "", nil
 }
 
-// waitForStoppedMover reports on a run that may not yet give the app back,
-// release its Leases or finish, because a stopped mover's pod is still there
-// (rule X2, see stoppedMovers). It moves the run to Waiting and sets its
-// Ready condition to False with reason WaitingForShutdown and message, and
-// writes the status when that condition changed. It returns the result the
-// reconcile hands back, which looks again after pollInterval.
+// waitForStopped reports on a run that may not yet give the app back, release
+// its Leases, release its VolumeRestore or finish, because something it
+// stopped is still there: the pod of a mover it stopped (see stoppedMovers)
+// or the claim it must delete before it releases the VolumeRestore (see
+// releaseVolumeRestore). Rule X2 and designs/restorerun.md D1.
+//
+// It moves the run to Waiting and sets its Ready condition to False with
+// reason WaitingForShutdown and message, and writes the status when that
+// condition changed. It returns the result the reconcile hands back, which
+// looks again after pollInterval.
 //
 // The run keeps its finalizer and its Leases meanwhile, so nothing takes the
-// claim or the repository over while the mover may still write.
-func (r *RestoreRunReconciler) waitForStoppedMover(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
+// claim or the repository over while the mover may still write, and nothing
+// starts the populator on a claim the run is releasing.
+func (r *RestoreRunReconciler) waitForStopped(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
 	run.Status.Phase = backupv1alpha1.RunPhaseWaiting
 	if !readyChanged(run, backupv1alpha1.ReasonShutdown, message) {
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
@@ -2309,53 +2328,94 @@ func finishedWithDestination(items []backupv1alpha1.RestoreItem) bool {
 	return false
 }
 
-// populatorClaimFinalizer is the end of the finalizer name the volume populator
-// library puts on a claim while it fills it. The name starts with the
-// populator's prefix, which the binary sets.
-const populatorClaimFinalizer = "/populate-target-protection"
-
-// releaseVolumeRestore takes populator.Finalizer off the VolumeRestore named
-// spec.into that a v0.8.1 or older controller created for an into restore
-// from a claim (see followPopulator), when the populator never took that
-// VolumeRestore on. finish calls it for a run that did not succeed, and
-// finalize for one deleted before it finished. A run this version planned
-// creates no VolumeRestore, so for it there is nothing to release.
+// releaseVolumeRestore releases the VolumeRestore named spec.into that a
+// v0.8.1 or older controller created for an into restore from a claim (see
+// followPopulator), once the populator library can no longer start on the
+// claim it fills. finalize calls it for a run being deleted. A run this
+// version planned creates no VolumeRestore, so for it there is nothing to
+// release.
 //
-// The older controller created the VolumeRestore with the finalizer, and the
-// populator's Cleanup removes it once the claim is filled or deleted. The
-// library calls Cleanup only for a claim it has started on, so a claim it
-// never reached, such as one still waiting for a node, would leave the
-// VolumeRestore hanging in deletion after the run is gone.
+// The older controller created the VolumeRestore with populator.Finalizer,
+// and the populator's Cleanup removes that once the claim is filled or
+// deleted. The library calls Cleanup only for a claim it has started on, so a
+// claim it never reached, such as one still waiting for a node, would leave
+// the VolumeRestore hanging in deletion after the run is gone.
 //
-// It leaves the finalizer while the VolumeRestore's status lists a claim, or
-// while the scratch claim carries the library's finalizer, because the
-// populator is then at work and its Cleanup will remove it. If the populator
-// starts after the release, its Populate adds the finalizer again. A
-// VolumeRestore the run does not control is left alone. It returns an error
-// when a read or the write fails.
-func (r *RestoreRunReconciler) releaseVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+// The library starts on a claim that exists, and adding
+// populator.ClaimFinalizer to it is the first thing it does, so the finalizer
+// goes only once the claim can no longer be written to:
+//
+//   - The claim is gone: release.
+//   - The claim exists, is not being deleted, and is the run's own: delete it
+//     with the UID it was read at, and wait. The run owns it, so its restored
+//     data goes with it, and the library's cleanup runs with the VolumeRestore
+//     still there.
+//   - The claim is being deleted and carries populator.ClaimFinalizer: the
+//     library's cleanup is at work on it. Wait, and the claim goes with that
+//     cleanup.
+//   - Otherwise the claim is not the run's, or it is being deleted without
+//     the library's finalizer, which the API server refuses to add to a
+//     deleting object. Either way the library cannot start on it: release.
+//
+// Nothing is released on an unknown state: a failed read comes back as an
+// error, and the next pass looks again. A VolumeRestore the run does not
+// control, one that carries no populator.Finalizer, and one whose status
+// lists a claim are left alone: the library then either cannot reach it or
+// removes the finalizer itself.
+//
+// It returns a message while the run waits for the claim, and "" once
+// nothing holds the VolumeRestore, or there is none to release.
+func (r *RestoreRunReconciler) releaseVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun) (string, error) {
 	if run.Spec.Into == "" {
-		return nil
+		return "", nil
 	}
 	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
 	vr := &backupv1alpha1.VolumeRestore{}
 	if err := r.Reader.Get(ctx, key, vr); err != nil {
-		return client.IgnoreNotFound(err)
+		return "", client.IgnoreNotFound(err)
 	}
 	if !metav1.IsControlledBy(vr, run) || !controllerutil.ContainsFinalizer(vr, populator.Finalizer) || len(vr.Status.Claims) > 0 {
-		return nil
+		return "", nil
 	}
+	waiting := fmt.Sprintf("waiting for claim %s to be deleted before its VolumeRestore is released", key.Name)
 	claim := &corev1.PersistentVolumeClaim{}
 	err := r.Reader.Get(ctx, key, claim)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
-	}
-	if err == nil && slices.ContainsFunc(claim.Finalizers, func(f string) bool { return strings.HasSuffix(f, populatorClaimFinalizer) }) {
-		return nil
+	switch {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		return "", fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
+	case claim.DeletionTimestamp == nil && metav1.IsControlledBy(claim, run):
+		uid := claim.UID
+		if err := r.Delete(ctx, claim, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("delete PersistentVolumeClaim %s: %w", key, err)
+		}
+		return waiting, nil
+	case claim.DeletionTimestamp != nil && slices.Contains(claim.Finalizers, populator.ClaimFinalizer):
+		return waiting, nil
 	}
 	controllerutil.RemoveFinalizer(vr, populator.Finalizer)
 	if err := r.Update(ctx, vr); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("remove finalizer %s from VolumeRestore %s: %w", populator.Finalizer, key, err)
+		return "", fmt.Errorf("remove finalizer %s from VolumeRestore %s: %w", populator.Finalizer, key, err)
 	}
-	return nil
+	return "", nil
+}
+
+// holdsVolumeRestore reports whether the run controls a VolumeRestore named
+// spec.into whose populator.Finalizer releaseVolumeRestore has yet to
+// release. finish keeps the run's finalizer while it does, because that
+// release happens only once the claim the library fills is gone, and finalize
+// waits for the claim.
+func (r *RestoreRunReconciler) holdsVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun) (bool, error) {
+	if run.Spec.Into == "" {
+		return false, nil
+	}
+	vr := &backupv1alpha1.VolumeRestore{}
+	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
+	if err := r.Reader.Get(ctx, key, vr); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get VolumeRestore %s: %w", key, err)
+	}
+	return metav1.IsControlledBy(vr, run) && controllerutil.ContainsFinalizer(vr, populator.Finalizer), nil
 }
