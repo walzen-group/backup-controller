@@ -305,3 +305,34 @@ func TestAStrangersFinalizerOnTheClaimDoesNotHoldTheRunsVolumeRestore(t *testing
 		t.Errorf("RestoreRun: %v, want it gone once its VolumeRestore is released", err)
 	}
 }
+
+// A finished run that is deleted while it still holds its VolumeRestore keeps
+// the phase it finished with while finalize waits for its claim. The run's
+// end is its record of how the restore went, and a wait during the deletion
+// does not change it.
+func TestADeletedFinishedRunKeepsItsPhaseWhileItWaits(t *testing.T) {
+	run := populatorRun()
+	r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(),
+		populatorRestore(run, populator.Finalizer), populatorClaim(run, corev1.ClaimPending, populator.ClaimFinalizer))
+	restoreStep(t, r)
+	ended := readRestoreRun(t, c)
+	if ended.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Fatalf("phase = %q, want the run ended Failed before it is deleted", ended.Status.Phase)
+	}
+	if err := c.Delete(context.Background(), ended); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreStep(t, r)
+
+	deleting := readRestoreRun(t, c)
+	if len(deleting.Finalizers) == 0 {
+		t.Fatal("the run dropped its finalizer while its VolumeRestore was still held")
+	}
+	if deleting.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Errorf("phase = %q while the deletion waits, want the Failed it finished with", deleting.Status.Phase)
+	}
+	if deleting.Status.CompletedAt == nil {
+		t.Error("completedAt was cleared while the deletion waits")
+	}
+}

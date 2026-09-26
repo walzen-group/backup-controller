@@ -2027,16 +2027,19 @@ func moverPodLeft(ctx context.Context, c client.Reader, namespace, destination s
 // or the claim it must delete before it releases the VolumeRestore (see
 // releaseVolumeRestore). Rule X2 and designs/restorerun.md D1.
 //
-// It moves the run to Waiting and sets its Ready condition to False with
-// reason WaitingForShutdown and message, and writes the status when that
-// condition changed. It returns the result the reconcile hands back, which
-// looks again after pollInterval.
+// It moves an unfinished run to Waiting and sets its Ready condition to False
+// with reason WaitingForShutdown and message, and writes the status when that
+// condition changed. A finished run that finalize holds keeps the phase it
+// finished with, which is the record of how its restore went. It returns the
+// result the reconcile hands back, which looks again after pollInterval.
 //
 // The run keeps its finalizer and its Leases meanwhile, so nothing takes the
 // claim or the repository over while the mover may still write, and nothing
 // starts the populator on a claim the run is releasing.
 func (r *RestoreRunReconciler) waitForStopped(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
-	run.Status.Phase = backupv1alpha1.RunPhaseWaiting
+	if !run.Status.Phase.Finished() {
+		run.Status.Phase = backupv1alpha1.RunPhaseWaiting
+	}
 	if !readyChanged(run, backupv1alpha1.ReasonShutdown, message) {
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
 	}
