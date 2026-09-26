@@ -138,12 +138,19 @@ is the one moment the choice can be made.
 | a namespace run, scheduled or on demand | a CloudNativePG Backup through the barman-cloud plugin for each Cluster marked `backup.wlz.li/enabled`, skipping a hibernated one |
 | a RestoreRun with `database:` or `all: true` | the run checks a base backup reaches the moment, deletes the Cluster, and waits; the webhook recovers the Cluster Flux or tofu creates again. A Cluster carrying `backup.wlz.li/bootstrap: initdb` is left alone |
 
-The webhook refuses a Cluster in three cases, and each refusal names what it
-found: another database already archives to the same bucket and prefix on the
-same S3 service, the moment asked for comes before the oldest base backup, or
-the object store cannot be read. The last one matters most during a rebuild, when the controller may
-still be starting: letting the Cluster through would create the empty database
-this page exists to prevent.
+The webhook refuses a Cluster when admitting it would lose data or leave the
+database unable to archive, and each refusal names what it found:
+
+- another database already archives to the same bucket and prefix;
+- the prefix holds WAL or failed base backups but no completed one, so a new
+  database there could never archive;
+- the moment asked for comes before the oldest base backup;
+- the object store fails to answer, or answers too slowly for the webhook's
+  budget.
+
+The last refusal matters most during a rebuild, when the controller may still
+be starting: letting the Cluster through would create the empty database this
+page exists to prevent.
 
 ```mermaid
 flowchart LR
@@ -164,7 +171,7 @@ flowchart LR
 | a rebuilt cluster comes back with its databases | no | yes |
 | restore to a moment | a git commit swapping the bootstrap, reverted afterwards | a RestoreRun with `restoreAsOf` |
 | WAL archiving and base backup storage | the barman-cloud plugin | the same plugin, unchanged |
-| start a database empty on purpose | the default | the annotation `backup.wlz.li/bootstrap: initdb` |
+| start a database empty on purpose | the default | the annotation `backup.wlz.li/bootstrap: initdb`, over an empty prefix: delete the old archive or give the Cluster a new `serverName` first |
 
 [restores.md](restores.md) has every case the webhook decides, and
 [architecture.md](architecture.md#databases) how the controller resolves a
@@ -202,9 +209,10 @@ both choices.
 
 For a database, the controller creates CloudNativePG Backup objects, deletes a
 Cluster for a restore, and patches a Cluster's bootstrap as it is created. It
-reads the ObjectStore, the Secret holding its keys and the archive's
-`backup.info` files, and writes nothing to the bucket. The barman-cloud plugin
-archives every WAL segment, writes every base backup and replays every recovery;
+reads the ObjectStore and the Secret holding its keys, lists the archive's
+prefix and reads its `backup.info` files, and writes nothing to the bucket.
+The barman-cloud plugin archives every WAL segment, writes every base backup
+and replays every recovery;
 a failed base backup or recovery is reported on the plugin's and
 CloudNativePG's own objects.
 

@@ -210,6 +210,97 @@ method, such as `pg_basebackup` or a `recovery` with a source other than
 it, so a run that deleted it would keep the database down until its timeout
 and restore nothing.
 
+## Refuse a new database over an archive it could never archive into
+
+From v0.9.0 the webhook refuses a Cluster that would start empty when
+anything already exists under its prefix. That covers a Cluster with no
+completed base backup to recover from and nothing asking for a recovery, and a
+Cluster carrying `backup.wlz.li/bootstrap: initdb`. The refusal tells the owner
+to delete the old archive or pick a new `serverName`.
+
+v0.8.x admitted such a Cluster as written. CloudNativePG started it with
+`initdb`, and the barman-cloud plugin's empty-archive check then failed every
+`archive_command`, because barman fails that check on any WAL file under
+`<prefix>/wals/`. The database served traffic while its ContinuousArchiving
+condition read False and `pg_wal` filled the volume. Nothing refused or failed
+loudly until that volume was full.
+The opt-out did this every time: its documented purpose is discarding a
+database, which is exactly when its prefix still holds the old WAL.
+
+Refusing only when a WAL file exists would mirror barman's check exactly. The
+webhook would have to copy barman's filter for WAL file names and list
+`wals/` until the first match. A future barman that counts one more kind of
+file as WAL would make the two disagree, and the webhook would admit a Cluster
+that never archives, which is the failure this decision prevents. Refusing on
+any object needs one listing call and no knowledge of barman's file names.
+
+It refuses one prefix that barman would accept: one holding only failed base
+backups and no WAL. That store arises only when a base backup started while
+the archive held no WAL, or when someone deleted the WAL by hand. It holds
+nothing a recovery can use, so deleting it discards nothing, and the refusal
+says to do that.
+
+Recovering whenever anything is under `base/`, as v0.7.x did, fails loudly in
+the bootstrap Job when no backup is DONE. It still starts a WAL-only prefix
+and an opted-out Cluster empty, and those two never archive.
+
+Starting the database with `initdb` and adding
+`cnpg.io/skipEmptyWalArchiveCheck` lets it archive, and destroys the old
+archive. barman uploads each segment by its name, and a new database on
+timeline 1 writes the same names, so the old base backups lose the WAL they
+need. They still read DONE, and the next create of the Cluster would recover
+from the mixed archive.
+
+An opted-out Cluster now needs its ObjectStore, its Secrets and the object
+store to answer, where v0.8.x admitted it without reading anything. An outage
+refuses the create, which Flux retries, and a Cluster that cannot archive is
+never created.
+
+## Compare bucket and prefix, and never the endpoint, for a shared archive
+
+From v0.9.0 the webhook's shared-archive check calls two Clusters' archives
+the same when the bucket matches, ignoring letter case, and the prefix matches
+exactly, whatever endpointURL either ObjectStore names. v0.8.x also required
+the same endpoint host, and v0.7.x compared bucket and prefix as this release
+does.
+
+Comparing endpoints cannot tell two names for one service apart from two
+services. v0.8.x lowercased the host and dropped the scheme, and called each
+of these pairs different although both names reach one store:
+
+| Endpoint A | Endpoint B |
+| --- | --- |
+| `https://s3.example.com` | `https://s3.example.com:443` |
+| `http://minio.minio.svc:9000` | `http://minio.minio.svc.cluster.local:9000` |
+| an empty endpointURL, the AWS default | `https://s3.amazonaws.com` |
+| `https://s3.amazonaws.com` | `https://s3.eu-central-1.amazonaws.com`, for a bucket in that region |
+| `https://s3.example.com` | `https://s3.example.com.` |
+
+An Ingress host and the in-cluster Service of one MinIO, an IP and a DNS name,
+or a CNAME and its target reach one store too. For each such pair v0.8.x
+admitted the second Cluster, and both databases archived into one prefix.
+barman writes each segment by its name, so the two databases' WAL overwrote
+each other and every base backup behind them lost the segments it needed.
+Nothing reported it until a restore failed.
+
+Canonicalizing endpoints would need a list of aliases that keeps growing (AWS
+alone has regional, dual-stack, FIPS, virtual-hosted and VPC endpoint names),
+and it would still call an Ingress host and a Service name different.
+Resolving both names in DNS would add a DNS dependency to every Cluster
+create. It would also admit the Ingress and Service pair, since they resolve to
+different addresses for one store.
+
+An annotation naming the other Cluster, declaring the two archives separate,
+would trust the owner's claim. A manifest copied to a new app carries the
+claim with it, to a pair it was never about. No deployment of this controller
+is known to need two S3 services with the same bucket name and prefix, so the
+webhook has no override.
+
+Two genuinely different services that share a bucket name and prefix are
+refused, as they were under v0.7.x. The refusal says why and tells the owner
+to give one of the two its own prefix in `destinationPath`, which for a
+Cluster being created changes nothing else.
+
 ## Read namespace settings from annotations, and treat an empty one as absent
 
 The timeout and the prune interval live beside the schedule, as

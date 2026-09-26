@@ -134,7 +134,7 @@ caller in the controller:
 | `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
 | `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |
 | `clusters.postgresql.cnpg.io` | get, list, delete | the webhook's shared-archive check, a database run, and a database restore deleting its Cluster |
-| `objectstores.barmancloud.cnpg.io` | get | the webhook and the restore checks, reading where a Cluster archives |
+| `objectstores.barmancloud.cnpg.io` | get, list | the webhook and the restore checks reading where a Cluster archives, and the webhook's shared-archive check listing every ObjectStore once per create. Without list, every Cluster create is refused with an HTTP 500 while any other Cluster archives |
 | `deployments`, `statefulsets` | get, list, patch | quiesce |
 | `kustomizations.kustomize.toolkit.fluxcd.io` | get, patch | suspending and resuming a quiesced workload's Kustomization |
 | `workloads.kueue.x-k8s.io` | get, create, delete | admitting a run as one Workload |

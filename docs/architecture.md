@@ -81,15 +81,31 @@ database operation leaves it alone.
 | `s3Credentials.accessKeyId`, `secretAccessKey` | the Secret and keys they name | the key pair |
 | `endpointCA`, when present | the Secret and key it names | a PEM bundle added to the image's public roots |
 
-`bootstrap.S3Prober` answers two questions at that location with the minio
-client. HasBaseBackup walks `<prefix>/base/` in key order, reads each
-`backup.info` it meets, and stops at the first whose `status` is `DONE`. barman
-names each backup's directory by its start time, so the oldest is read first,
-and in a store that keeps its backups the oldest is usually done. A store whose
-only base backups failed or never finished answers false. BaseBackups lists
-the whole of `base/`, reads every `backup.info`, keeps the ones whose `status`
-is `DONE`, and orders them by `end_time`. barman-cloud writes no `backup_id` into backup.info, so the ID is the
-directory's name, such as `20260924T221544`.
+`bootstrap.S3Prober` reads that location with the minio client, in two ways:
+
+| Method | Caller | Reads |
+| --- | --- | --- |
+| Survey | the webhook | lists `<prefix>/base/` with the `/` delimiter, one entry per backup directory, and reads the `backup.info` files newest first with eight GETs in flight, stopping at the first DONE backup, or the first that finished by the target when there is one. When `base/` holds no directory, it lists one key under `<prefix>/` to learn whether the prefix is empty |
+| BaseBackups | the RestoreRun checks | the same listing and parallel reads without the early stop; it keeps every backup whose `status` is `DONE` and orders them by `end_time` |
+
+Both count a directory with no `backup.info` as not DONE, as barman does.
+barman names each backup's directory by its start time, so sorting the IDs as
+strings sorts them by time, and in a healthy store the newest backup is DONE,
+or STARTED while a backup runs. barman-cloud writes no `backup_id` into
+backup.info, so the ID is the directory's name, such as `20260924T221544`.
+
+Survey returns an error that carries its counts when its context ends before
+it has an answer, during a listing too. minio-go ends a listing without an
+error item when the context ends, so Survey checks the context after each
+listing, and an expired budget never reads as an empty prefix.
+
+The S3 credential in the ObjectStore's Secret needs `s3:ListBucket` on
+`<prefix>/`, the whole server prefix, and `s3:GetObject` on
+`<prefix>/base/*/backup.info`. The barman-cloud plugin already lists
+`<prefix>/wals/` with the same credential for its empty-archive check, so a
+store that archives has the permission unless a policy allows the listing on
+narrower prefixes only. A refused listing ends the webhook's answer in
+`(HTTP 403 AccessDenied)`.
 
 ### A base backup
 
@@ -157,14 +173,35 @@ turns healthy fails the item.
 
 ### A Cluster being created
 
-The webhook's checks run in this order: dry-run requests pass unchanged, then
-the `backup.wlz.li/bootstrap: initdb` opt-out, then a Cluster that archives
-nowhere, then ResolveLocation, whose failure refuses the Cluster. Next come the
-shared-archive check across every Cluster on the cluster, which reads each
-other Cluster's ObjectStore and none of their Secrets, the waiting RestoreRun
-and a bootstrap method other than `initdb` the Cluster declares itself, the
-target from the run or from `backup.wlz.li/restore-as-of`, HasBaseBackup, and
-BaseBackups when there is a target. [restores.md](restores.md) has what each outcome does.
+The webhook's checks run in this order:
+
+1. An update goes to the recovered-Cluster handler below, and any other
+   operation but a create passes. A dry-run create passes unchanged.
+2. The webhook gives the rest of the create a 10-second budget.
+3. A Cluster that archives nowhere passes unchanged.
+4. ResolveLocation reads the ObjectStore and its Secrets; a failure refuses
+   the Cluster.
+5. The shared-archive check lists every Cluster and every ObjectStore once,
+   reads none of their Secrets, and refuses the Cluster when another one
+   archives to the same bucket and prefix. A failed list refuses it too.
+6. A Cluster carrying `backup.wlz.li/bootstrap: initdb` and declaring no other
+   bootstrap method gets a Survey without a target. It passes unchanged when
+   its prefix is empty, and is refused when anything is there.
+7. The webhook looks for a RestoreRun waiting for this Cluster. A Cluster that
+   declares a bootstrap method other than `initdb` passes unchanged, or is
+   refused when a run waits.
+8. The target comes from the run or from `backup.wlz.li/restore-as-of`; one
+   that does not parse refuses the Cluster.
+9. Survey reads the store. A DONE backup, by the target when there is one,
+   leads to the recovery patch below. Without one, the Cluster is refused when
+   a run or the annotation asks for a recovery (naming the oldest DONE backup
+   when one exists but finished too late), refused when anything is under
+   its prefix, and passes unchanged, to start empty, when the prefix is empty.
+
+A budget that ends during a Kubernetes read in steps 4, 5 or 7 answers HTTP 500
+naming the step; one that ends during a Survey refuses the Cluster with the
+counts read. [restores.md](restores.md) has what each outcome does and the
+text of each refusal.
 
 A Cluster it recovers gets, in one patch:
 
@@ -220,11 +257,13 @@ a rollout stops the old pod before it starts the new one, where the default
 RollingUpdate would run both for a while.
 
 The run manager's client and the populator callbacks' client carry no
-client-side rate limit. client-go's default of 5 requests a second, with a
-burst of 10, would make every Cluster create time out on a cluster with a few
-dozen databases: the webhook reads an ObjectStore for every archiving Cluster within
-its 15-second timeout, and fails closed. The API server's priority and
-fairness shares out the requests.
+client-side rate limit. Each Cluster create makes several reads: the
+ObjectStore and its Secrets, one list of every Cluster, one list of every
+ObjectStore and the RestoreRun list. A cluster rebuild creates every Cluster at
+once, and at client-go's default of 5 requests a second, with a burst of 10, a
+few dozen creates would queue past the webhook's 10-second budget and each
+would fail closed. The API server's priority and fairness shares out the
+requests.
 
 The ClusterRole the process runs under is listed in
 [packaging.md](packaging.md#rbac-the-controller-needs), rule by rule.

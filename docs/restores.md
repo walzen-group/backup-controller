@@ -242,23 +242,112 @@ store the Cluster archives through:
 
 | What it finds | What it does |
 | --- | --- |
-| no completed base backup | nothing; the Cluster bootstraps as written |
+| nothing at all under the Cluster's prefix | nothing; the Cluster bootstraps as written, which is `initdb` |
 | a completed base backup | rewrites the Cluster to recover from it, to the end of the archive |
 | a completed base backup, and a RestoreRun that deleted this Cluster | rewrites it to recover to the run's `restoreAsOf`, and names the run in `backup.wlz.li/restore-run` |
 | a completed base backup, and `backup.wlz.li/restore-as-of` on the Cluster | rewrites it to recover to that moment |
+| objects under the prefix, such as WAL or failed base backups, and no completed base backup | refuses the Cluster: `s3://<bucket>/<prefix>/ holds an archive with no completed base backup ...` (the full text is below) |
 | no completed base backup, and a RestoreRun or the annotation asks for a recovery | refuses the Cluster: `... holds no completed base backup to recover from.` |
 | no base backup finished by the moment a run or the annotation asks for | refuses the Cluster, naming the oldest base backup |
 | the Cluster declares a bootstrap method other than `initdb`, such as `recovery` or `pg_basebackup` | nothing, unless a RestoreRun waits for this Cluster; then it refuses it with `declares its own spec.bootstrap.<method>. Remove the declared bootstrap ..., or delete the RestoreRun.`, so two sources cannot race |
-| `backup.wlz.li/bootstrap: initdb` | nothing; an empty database was asked for on purpose |
+| `backup.wlz.li/bootstrap: initdb`, and nothing under the prefix | nothing; an empty database was asked for on purpose |
+| `backup.wlz.li/bootstrap: initdb`, and anything under the prefix | refuses the Cluster: `The Cluster asks for an empty database (backup.wlz.li/bootstrap: initdb), and s3://<bucket>/<prefix>/ still holds the archive of an earlier one. ...` ([Starting a database empty](#starting-a-database-empty) has the full text) |
+| the store takes longer than the webhook's 10-second budget to answer | refuses the Cluster with what it read so far ([How long the webhook reads](#how-long-the-webhook-reads)) |
 
 A completed base backup is one whose backup.info says `status: DONE`. barman
-writes a backup's directory under base/ when the backup starts, so a store
-whose only base backups failed or never finished holds objects there and
-nothing a recovery can start from. The webhook reads each backup.info in key
-order and stops at the first DONE one. When it finds none, it admits the
-Cluster as written and logs the reason `no completed base backup in the store`.
-A RestoreRun's checks against such a store fail before the run deletes
-anything, for the same reason.
+writes a backup's directory under base/ when the backup starts, marks it
+STARTED, and later marks it DONE or FAILED. It never deletes a failed or
+unfinished backup on its own: its retention deletes only DONE backups that
+have become obsolete. A RestoreRun's checks against a store with no DONE
+backup fail before the run deletes anything.
+
+The webhook lists base/ with the `/` delimiter, which gives one entry per
+backup directory, the way barman's own catalog reads it. When base/ holds no
+directory, the webhook lists one key under `<prefix>/` to learn whether
+anything at all is there. The trailing slash keeps `app/app-pg` from matching
+`app/app-pg-old/`.
+
+### A database that could never archive
+
+With no completed base backup and nothing asking for a recovery, the webhook
+admits a Cluster only when its prefix is empty. Anything under the prefix makes
+it refuse:
+
+```text
+s3://backups/app/app-pg/ holds an archive with no completed base backup (3
+base backups under base/, none DONE). A database started empty here could
+never archive its WAL, because CloudNativePG refuses a prefix that already
+holds WAL, and a recovery has nothing to start from. If that archive is worth
+nothing, delete everything under s3://backups/app/app-pg/ and create the
+Cluster again. Otherwise give this Cluster a serverName that is not "app-pg".
+```
+
+When base/ is empty and something else is under the prefix, the parenthesis
+reads `(no base backup under base/, but other objects, such as WAL, under the
+prefix)`.
+
+A Cluster started with `initdb` over such a prefix would come up, serve
+traffic, and never back anything up. CloudNativePG creates the marker file
+`.check-empty-wal-archive` after `initdb`, and while it exists the barman-cloud
+plugin runs `barman-cloud-check-wal-archive` before it archives each segment.
+That check lists `<prefix>/wals/` and fails with `Expected empty archive` on any
+WAL file there. Every `archive_command` then fails, the Cluster's
+ContinuousArchiving condition turns False with reason
+ContinuousArchivingFailing, and `pg_wal` grows until the volume is full.
+[compatibility.md](compatibility.md#cloudnativepg-1300) has the source lines.
+v0.8.x admitted such a Cluster as written; [upgrading.md](upgrading.md#v090)
+says how to find one it admitted.
+
+The webhook refuses a prefix holding only failed base backups and no WAL too,
+although barman's check would pass there.
+[decisions.md](decisions.md#refuse-a-new-database-over-an-archive-it-could-never-archive-into)
+records why.
+
+### How long the webhook reads
+
+The API server waits 15 seconds for the webhook (`timeoutSeconds` in
+deploy/webhook.yaml). The webhook gives each create a budget of 10 of them,
+counted from the moment it starts deciding, so its Kubernetes reads and the
+object store reads share it. The other 5 leave room for TLS and the API
+server's own work.
+
+Within that budget it reads the backup.info files newest first, eight at a
+time, and stops at the first DONE backup, or the first one that finished by
+the moment a run or the annotation asks for. barman names each directory by
+the backup's start time, so the IDs sort by time. In a healthy store the
+newest backup is DONE, or STARTED while a backup runs, and the answer needs one
+listing and one or two reads. A directory with no backup.info counts as not
+DONE, as it does for barman.
+
+A store whose failed backups pile up ahead of the newest DONE one can outlast
+the budget. The webhook then refuses the Cluster and names what it read:
+
+```text
+Checking s3://backups/app/app-pg/base/ ran out of time: 412 base backups are
+there, and the newest 400 read were none of them completed. barman never
+deletes failed or unfinished backups. Delete the base/<id>/ directories whose
+backup.info does not say status=DONE (barman-cloud-backup-delete --backup-id
+<id> deletes one), then create the Cluster again.
+```
+
+When one backup.info failed to read along the way, the message names the error
+and says that file might be the completed backup. When the budget ran out
+before the store listed base/ at all, the message reads `ran out of time before
+the object store listed its base backups`. A budget that runs out always
+refuses the Cluster. The webhook never reads a listing it could not finish as
+an empty prefix, because an empty prefix is the one answer that starts the
+database empty.
+
+To clear a failed backup, run barman's own tool with the ObjectStore's
+destinationPath and endpointURL, the Cluster's serverName, and the store's key
+pair in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+
+```
+barman-cloud-backup-delete --cloud-provider aws-s3 --endpoint-url <endpointURL> --backup-id <id> --dry-run s3://<bucket>/<path> <serverName>
+```
+
+Drop `--dry-run` once the objects it lists are the ones to delete.
+`--backup-id` deletes the named backup whatever its status.
 
 The webhook leaves every bootstrap method but `initdb` alone because it can
 only replace `initdb`. Adding a `recovery` beside a `pg_basebackup` would give
@@ -299,13 +388,16 @@ and blocks no update to any other Cluster.
 ### Refusing a shared archive
 
 Before admitting a Cluster, the webhook checks that no other database already
-archives to the same bucket and prefix on the same S3 service, and refuses it if
-one does:
+archives to the same bucket and prefix, whatever endpoint either one names, and
+refuses it if one does:
 
 ```text
 other/app-pg already archives to backups/app/app-pg. Two databases writing one
 archive interleave their WAL and leave it unrestorable. Give this Cluster an
-archive of its own, or a serverName that is not "app-pg".
+archive of its own, or a serverName that is not "app-pg". The check compares
+bucket and prefix whatever the endpointURL says, because two endpoints can name
+one service; if other/app-pg really archives to a different S3 service, give
+one of the two its own prefix in destinationPath.
 ```
 
 This is the one failure nothing else on the cluster can see. Each Cluster is
@@ -314,32 +406,57 @@ WAL filenames are timeline plus position and nothing else, so the second
 database overwrites the first's segments, and a base backup whose WAL range is
 gone can never reach consistency again.
 
-A Cluster that declares its own recovery is checked like any other: where a
-Cluster archives does not depend on how it bootstraps.
+A Cluster that declares its own recovery is checked like any other, and so is
+one carrying `backup.wlz.li/bootstrap: initdb`: where a Cluster archives does
+not depend on how it bootstraps.
 
-For every other archiving Cluster on the cluster, the webhook reads the
-ObjectStore it names and compares three values with the new Cluster's:
+The webhook compares two values of every other archiving Cluster with the new
+Cluster's:
 
 | Value | From | Compared |
 | --- | --- | --- |
-| endpoint | `spec.configuration.endpointURL` | host and port, ignoring letter case, so `https://s3.example.com` and `S3.example.com` match |
-| bucket | `spec.configuration.destinationPath` | exactly |
+| bucket | the host part of `spec.configuration.destinationPath` | ignoring letter case, so `Backups` and `backups` match |
 | prefix | the rest of `destinationPath`, plus the server name | exactly |
 
-A holder matches only when all three do, so the same bucket and prefix on
-another S3 service is admitted. Two Clusters can reach one prefix through
-differently named ObjectStores, which is why the webhook compares these values
-and never the store names. The Cluster being admitted is skipped by namespace
-and name, so recreating a database is not a collision with the record of
-itself, which is what makes restores work.
+The endpoint is not compared. `https://s3.example.com` and its `:443` form, a
+Service name with and without `.cluster.local`, an empty endpointURL and
+`https://s3.amazonaws.com`, or an Ingress host and the Service behind it all
+reach one store, and no comparison of the two names can prove they are
+different services. Two different S3 services that each hold a bucket of the
+same name, with the same prefix in it, are refused too. Give one of the two its
+own prefix: put the environment or the namespace in its `destinationPath`
+(`s3://backups/staging/`), or set a `serverName`. There is no annotation to
+override the check;
+[decisions.md](decisions.md#compare-bucket-and-prefix-and-never-the-endpoint-for-a-shared-archive)
+records why.
+
+Move the Cluster being created, never the one that already archives there. A
+running database whose `destinationPath` changes starts a new archive at the
+new prefix, holding none of the old one's base backups or WAL. Created again
+before its first base backup there, the Cluster finds no completed base backup
+and is refused; created again after it, the Cluster recovers only to moments
+after that backup. To move an existing database anyway, copy its archive to the
+new prefix before you switch.
+
+For each create, the webhook lists every Cluster on the cluster and, once it
+meets another archiving Cluster, every ObjectStore. It looks each archiving
+Cluster's store up in that list by the Cluster's namespace and the store's
+name. That makes two list calls however many databases the cluster holds, so a
+cluster rebuild that creates every Cluster at once stays inside the webhook's
+budget. Two Clusters can reach one prefix through differently named
+ObjectStores, which is why the webhook compares locations and never store
+names. The Cluster being admitted is skipped by namespace and name, so
+recreating a database is not a collision with the record of itself, which is
+what makes restores work.
 
 The check reads no Secret of any other Cluster. Where a database archives is
 written in its ObjectStore, so a holder whose credentials Secret is missing
-still counts. Each other Cluster needs one read, which keeps a create inside the
-webhook's timeout on a cluster with many databases. A Cluster whose ObjectStore
-cannot be read, or names no s3:// destination, is skipped: refusing a new
-database because an unrelated one is misconfigured would block work this check
-has no business blocking.
+still counts. A Cluster whose ObjectStore is missing from the list, or names no
+s3:// destination, archives nowhere and is skipped. When either list fails,
+for a timeout or any other error, the webhook refuses the create with an HTTP
+500: without the lists it cannot rule out a collision. The API server's caller
+retries (Flux on its next reconcile), and the create goes through once the
+lists answer.
 
 ### Reaching an object store over TLS
 
@@ -368,11 +485,25 @@ beside a full archive, reported as success. That failure arrives during a
 cluster rebuild, when this controller is most likely to be starting up and an
 admin is least likely to be reading Cluster events.
 
+| Case | Answer |
+| --- | --- |
+| the controller is down, or its webhook does not answer within 15 seconds | the API server refuses the create |
+| the Cluster's ObjectStore or one of its Secrets cannot be read | HTTP 500 with the read's error |
+| the Cluster list or the ObjectStore list of the shared-archive check fails | HTTP 500, `list the Clusters: ...` or `list the ObjectStores: ...` |
+| a Kubernetes read is still running when the 10-second budget ends | HTTP 500, `the webhook ran out of its 10s budget while <step>: <error>`, where the step is, for example, `listing the Clusters and their ObjectStores` |
+| the object store answers a listing or a read with an error | HTTP 500 ending in the store's answer, such as `(HTTP 403 AccessDenied)` |
+| a backup.info fails to read and no DONE backup turns up elsewhere | HTTP 500, since the unread file might be the completed backup |
+| the object store is still being read when the budget ends | refused with the counts read so far ([How long the webhook reads](#how-long-the-webhook-reads)) |
+
+The API server treats an HTTP 500 as a refusal and passes its text on. A DONE
+backup found before a failed read still recovers the Cluster, since it proves
+a recovery can start.
+
 ### Starting a database empty
 
 With the webhook installed, deleting a Cluster brings its data back, which
-leaves no way to discard a database. The opt-out is an annotation the webhook
-honours and leaves alone:
+leaves no way to discard a database. The opt-out is an annotation that asks
+the webhook for an empty database:
 
 ```yaml
 metadata:
@@ -382,6 +513,49 @@ metadata:
 
 Any other value is ignored, so a typo does not silently wipe a database.
 
+An empty database can archive only into an empty prefix, for the reason in
+[A database that could never archive](#a-database-that-could-never-archive).
+The webhook therefore reads the store for an opted-out Cluster too. It admits
+the Cluster unchanged when nothing exists under its prefix, and refuses it
+when anything does:
+
+```text
+The Cluster asks for an empty database (backup.wlz.li/bootstrap: initdb), and
+s3://backups/app/app-pg/ still holds the archive of an earlier one.
+CloudNativePG will not archive a new database into a prefix that holds WAL, so
+this one would never be backed up. To discard the old archive, delete
+everything under s3://backups/app/app-pg/ and create the Cluster again. To keep
+it, give this Cluster a serverName that is not "app-pg".
+```
+
+Reading the store means an opted-out Cluster needs its ObjectStore, that
+store's Secrets and the object store itself to answer, and a failure refuses
+it like any other create. It goes through the shared-archive check as well. An
+opted-out Cluster that declares a bootstrap method other than `initdb` is
+treated as one declaring its own bootstrap: the annotation asks for what only
+`initdb` gives, so it changes nothing there.
+
+To discard a database, give its new Cluster an empty prefix before you create
+it, in one of two ways:
+
+| The old archive | Do this |
+| --- | --- |
+| is worth nothing | delete everything under `s3://<bucket>/<prefix>/`, with the trailing slash so a sibling such as `<prefix>-old/` stays, then create the Cluster |
+| should stay | set a `serverName` in the Cluster's barman-cloud plugin parameters that no archive uses yet, then create the Cluster |
+
+With the AWS CLI, the first way is:
+
+```
+aws s3 rm --recursive --endpoint-url <endpointURL> s3://<bucket>/<prefix>/
+```
+
+Never add `cnpg.io/skipEmptyWalArchiveCheck` to get a new database past the
+refusal. barman uploads each segment to `<prefix>/wals/` by its name, and a new
+database on timeline 1 writes the same names as the old one, so it overwrites
+the old archive's WAL. The old base backups then lack the WAL they need, yet
+still read DONE, and the next create of the Cluster recovers from the mixed
+archive.
+
 A RestoreRun leaves an opted-out Cluster alone too:
 
 | Run | What happens to the opted-out Cluster |
@@ -390,9 +564,10 @@ A RestoreRun leaves an opted-out Cluster alone too:
 | `database: <cluster>` | the run ends Invalid before it touches anything |
 | a Cluster that gains the annotation after the run marked it Deleted, or is created again with it | its item is Skipped, and the run never deletes it again |
 
-The webhook admits an opted-out Cluster empty and never marks it as a run's
-recovery. A run that deleted one would find it back empty, delete it again, and
-repeat until its timeout. [decisions.md](decisions.md#leave-an-opted-out-cluster-out-of-a-restorerun)
+The webhook never recovers an opted-out Cluster and never marks it as a run's
+recovery. A run that deleted one would find it refused over its old archive,
+or back empty, and in the second case delete it again and repeat until its
+timeout. [decisions.md](decisions.md#leave-an-opted-out-cluster-out-of-a-restorerun)
 has the decision.
 
 From v0.8.1 a RestoreRun treats a Cluster whose owner declares its own

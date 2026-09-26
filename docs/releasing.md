@@ -168,4 +168,8 @@ Expected result: both jobs pass, and the job summary shows the image digest.
 
 ### Step 3: Record the release
 
-Add the tag and its change to the Releases table in README.md.
+Add the tag and its change to the Releases table in README.md. When the
+release needs anything from the person upgrading, such as RBAC to apply with
+the image, a check to run first, or objects the new code does not repair, the
+steps go in a section for the release in [upgrading.md](upgrading.md), and the
+table row links it.
