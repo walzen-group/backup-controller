@@ -288,3 +288,38 @@ func TestUpdateWithAnotherUIDConflicts(t *testing.T) {
 		t.Fatalf("update with the stored uid: %v", err)
 	}
 }
+
+// TestBuildTakesKindsRegisteredAsUnstructured registers BackupRun as
+// unstructured, as tests do for kinds without Go types (CNPG, Flux, Kueue),
+// and checks Build gives it the status subresource its CRD declares.
+func TestBuildTakesKindsRegisteredAsUnstructured(t *testing.T) {
+	ctx := context.Background()
+	gvk := backupv1alpha1.GroupVersion.WithKind("BackupRun")
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(gvk.GroupVersion().WithKind("BackupRunList"), &unstructured.UnstructuredList{})
+	c := strictclient.Build(fake.NewClientBuilder(), scheme, strictclient.Options{
+		Clock: func() time.Time { return serverTime },
+		CRDs:  crdFiles(t, "v0.8.1"),
+	})
+
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	obj.SetNamespace("app")
+	obj.SetName("r")
+	if err := unstructured.SetNestedField(obj.Object, "data", "spec", "source"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, obj); err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedField(obj.Object, "Running", "status", "phase"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(ctx, obj); err != nil {
+		t.Fatal(err)
+	}
+	if phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase"); phase != "" {
+		t.Errorf("a plain update stored status.phase %q, want it dropped by the status subresource", phase)
+	}
+}

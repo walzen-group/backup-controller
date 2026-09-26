@@ -135,6 +135,11 @@ func Build(b *fake.ClientBuilder, scheme *runtime.Scheme, opts Options) *Client 
 				panic(err)
 			}
 			obj = o.(client.Object)
+			// A kind registered as unstructured comes back without its
+			// kind, which the fake builder needs.
+			if u, ok := obj.(*unstructured.Unstructured); ok {
+				u.SetGroupVersionKind(gvk)
+			}
 		} else {
 			u := &unstructured.Unstructured{}
 			u.SetGroupVersionKind(gvk)
