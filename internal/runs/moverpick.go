@@ -2,10 +2,12 @@ package runs
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 
+	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
 )
@@ -160,4 +162,104 @@ func changedSince(all []restic.Snapshot, item backupv1alpha1.RestoreItem, quiesc
 	// item's time points at another second.
 	return recorded, fmt.Sprintf("snapshot %s is from %s, and the item pins the mover to %s, where it would not restore it",
 		id, recorded.Time.UTC().Format(time.RFC3339), pin.UTC().Format(time.RFC3339))
+}
+
+// restoringSnapshot matches the line restic restore prints as it starts,
+// such as "restoring snapshot 6526a2ff of [/data] at 2026-09-26
+// 09:03:53.753460659 +0000 UTC by root@volsync to .", and captures the
+// snapshot's ID. restic 0.18.1 prints it at cmd/restic/cmd_restore.go:243
+// through the snapshot's String (internal/restic/snapshot.go:118-120), which
+// gives the short ID. The "restoring <Snapshot 1a2b3c4d of ...>" form of
+// restic before 0.17 matches too. VolSync 0.16.0 keeps the line in a
+// successful mover's log (mover/restic/logfilter.go:34), and the e2e test
+// TestRestoreMoverLogNamesTheSnapshot recorded it from a real mover.
+var restoringSnapshot = regexp.MustCompile(`(?m)^\s*restoring <?[Ss]napshot ([0-9a-f]{8,64}) of`)
+
+// noEligibleSnapshots matches the line VolSync's restore mover prints when
+// no snapshot is at or before its restoreAsOf (mover-restic/entry.sh:339-341
+// at v0.16.0). The mover then restores nothing and exits 0, and VolSync
+// completes the trigger. The log filter keeps the line (logfilter.go:29).
+var noEligibleSnapshots = regexp.MustCompile(`(?m)^\s*No eligible snapshots found`)
+
+// restoredSnapshots reads the filtered log of a restore mover, as VolSync
+// writes it to status.latestMoverStatus.logs.
+//
+// It returns the ID of every snapshot the log says restic restored, in the
+// order of the lines, and reports whether the log says the mover found no
+// snapshot to restore.
+func restoredSnapshots(logs string) (ids []string, noneEligible bool) {
+	for _, match := range restoringSnapshot.FindAllStringSubmatch(logs, -1) {
+		ids = append(ids, match[1])
+	}
+	return ids, noEligibleSnapshots.MatchString(logs)
+}
+
+// unconfirmedRestore checks the log of a restore mover that completed the
+// run's trigger against the snapshot the run's checks recorded.
+//
+// Parameters:
+//   - destination is the item's ReplicationDestination. VolSync writes the
+//     mover's filtered log to status.latestMoverStatus in the same status
+//     update that sets lastManualSync (mover/restic/mover.go:648-650), so the
+//     log belongs to the sync that completed the trigger.
+//   - recorded is the item's snapshot, the short ID the checks recorded.
+//   - claim is the claim the mover wrote into, for the message.
+//   - created says the run created that claim empty for this restore, which
+//     changes what the message says the claim holds after a mover that
+//     restored nothing.
+//
+// It returns "" when the log names the recorded snapshot, and otherwise the
+// item's failure message.
+//
+// VolSync completes the trigger whatever the mover restored, so the log is
+// the only evidence of what the claim holds. The item counts as restored
+// only when the log names the recorded snapshot, names no other, and does not
+// say the mover found none. It fails when the log says the mover found no
+// snapshot (the mover exits 0 then), when it names another snapshot, when it
+// says both, and when it names none: VolSync leaves the log empty when it can't read the
+// pod's logs, and keeps only its last MOVER_LOG_MAX_BYTES bytes (1024 by
+// default, utils/podlogs.go:40, :186, :213-227), which can cut the line. A
+// restic that prints the line in another form fails the same way. An item
+// whose recorded short ID is empty or shorter than restic's eight characters
+// fails too, since no log can confirm it.
+func unconfirmedRestore(destination *volsyncv1alpha1.ReplicationDestination, recorded, claim string, created bool) string {
+	logs := ""
+	if destination.Status != nil && destination.Status.LatestMoverStatus != nil {
+		logs = destination.Status.LatestMoverStatus.Logs
+	}
+	if len(recorded) < 8 {
+		return fmt.Sprintf("the item records no snapshot to compare the mover's log with, so the run cannot confirm what claim %s holds. Logs: %s",
+			claim, logs)
+	}
+	ids, noneEligible := restoredSnapshots(logs)
+	var others []string
+	for _, id := range ids {
+		same := strings.HasPrefix(id, recorded) || strings.HasPrefix(recorded, id)
+		if !same && !slices.Contains(others, id) {
+			others = append(others, id)
+		}
+	}
+	switch {
+	case len(others) > 0:
+		other := strings.Join(others, " and ")
+		return fmt.Sprintf("the mover restored snapshot %s, not %s, which the checks selected; claim %s now holds %s",
+			other, recorded, claim, other)
+	case len(ids) > 0 && !noneEligible:
+		return ""
+	case len(ids) > 0:
+		return fmt.Sprintf("the mover's logs name snapshot %s and also say it found no snapshot, so the run cannot confirm what claim %s holds. Logs: %s",
+			ids[0], claim, logs)
+	case noneEligible:
+		pin := "in the repository"
+		if destination.Spec.Restic != nil && destination.Spec.Restic.RestoreAsOf != nil {
+			pin = "at or before " + *destination.Spec.Restic.RestoreAsOf
+		}
+		holds := "holds what it held before"
+		if created {
+			holds = "is empty"
+		}
+		return fmt.Sprintf("the mover found no snapshot %s and wrote nothing; claim %s %s", pin, claim, holds)
+	}
+	return fmt.Sprintf("the mover finished, but its logs name no snapshot, so the run cannot confirm what claim %s holds. "+
+		"VolSync keeps only the last MOVER_LOG_MAX_BYTES bytes (1024 by default) of the filtered log. Logs: %s", claim, logs)
 }

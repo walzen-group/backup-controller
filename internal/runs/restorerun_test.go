@@ -127,7 +127,7 @@ func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 		t.Errorf("destination = %+v", rd.Spec.Restic)
 	}
 
-	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	rd.Status = restoredStatus(item.Snapshot)
 	if err := c.Status().Update(context.Background(), rd); err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +346,7 @@ func TestAQuiescedRestoreStopsTheAppUntilTheDatabaseIsDeleted(t *testing.T) {
 	run = readRestoreRun(t, c)
 	rd := &volsyncv1alpha1.ReplicationDestination{}
 	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	rd.Status = restoredStatus(run.Status.Items[0].Snapshot)
 	if err := c.Status().Update(context.Background(), rd); err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +401,7 @@ func TestAQuiescedRestoreWaitsForTheOldInstanceToShutDown(t *testing.T) {
 	run := readRestoreRun(t, c)
 	rd := &volsyncv1alpha1.ReplicationDestination{}
 	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	rd.Status = restoredStatus(run.Status.Items[0].Snapshot)
 	if err := c.Status().Update(context.Background(), rd); err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +743,7 @@ func TestADatabaseRestoreSeesAnInstanceTheCacheHasNotSeenYet(t *testing.T) {
 	run := readRestoreRun(t, c)
 	rd := &volsyncv1alpha1.ReplicationDestination{}
 	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	rd.Status = restoredStatus(run.Status.Items[0].Snapshot)
 	if err := c.Status().Update(context.Background(), rd); err != nil {
 		t.Fatal(err)
 	}
@@ -945,12 +945,14 @@ func optedOut(u *unstructured.Unstructured) {
 }
 
 // completeVolume marks the ReplicationDestination of the run's first item as
-// having completed the run's trigger.
+// having completed the run's trigger, with a mover log that names the
+// item's snapshot (see restoredStatus).
 func completeVolume(t *testing.T, c client.Client) {
 	t.Helper()
+	item := readRestoreRun(t, c).Status.Items[0]
 	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, readRestoreRun(t, c).Status.Items[0].Destination, rd)
-	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	get(t, c, ns, item.Destination, rd)
+	rd.Status = restoredStatus(item.Snapshot)
 	if err := c.Status().Update(context.Background(), rd); err != nil {
 		t.Fatal(err)
 	}

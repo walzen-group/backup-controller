@@ -196,7 +196,7 @@ func TestARestoreReleasesItsLeasesWhenItFinishes(t *testing.T) {
 	run := readRestoreRun(t, c)
 	rd := &volsyncv1alpha1.ReplicationDestination{}
 	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: string(restoreUID)}
+	rd.Status = restoredStatus(run.Status.Items[0].Snapshot)
 	if err := c.Status().Update(context.Background(), rd); err != nil {
 		t.Fatal(err)
 	}
@@ -259,5 +259,51 @@ func TestLeasesAreTakenClaimFirstSoNoTwoRunsDeadlock(t *testing.T) {
 	if leaseHolderOf(t, c, claimLease) != string(runUID) || leaseHolderOf(t, c, repoLease) != string(runUID) {
 		t.Errorf("claim Lease holder = %q, repository Lease holder = %q; want the backup to hold both",
 			leaseHolderOf(t, c, claimLease), leaseHolderOf(t, c, repoLease))
+	}
+}
+
+// A Lease names its holder's items by name alone, and only a volume item
+// takes one: a BackupRun's ReplicationSource item and a RestoreRun's
+// PersistentVolumeClaim item. A Cluster item that shares the claim's name
+// does not keep the claim's Lease live once the volume item has finished.
+func TestALeaseIsLiveOnlyForTheVolumeItemThatTookIt(t *testing.T) {
+	backupWith := func(volume backupv1alpha1.ItemPhase) *backupv1alpha1.BackupRun {
+		run := otherRun()
+		run.Spec.Source, run.Spec.All = "", true
+		run.Status.Items = []backupv1alpha1.BackupItem{
+			{Kind: "ReplicationSource", Name: claimN, Phase: volume, Trigger: TriggerFor(otherRunUID)},
+			{Kind: "Cluster", Name: claimN, Phase: backupv1alpha1.ItemRunning},
+		}
+		return run
+	}
+	restoreWith := func(volume backupv1alpha1.ItemPhase) *backupv1alpha1.RestoreRun {
+		return restoreRun(func(r *backupv1alpha1.RestoreRun) {
+			r.Spec.All = true
+			r.Status.Phase = backupv1alpha1.RunPhaseRunning
+			r.Status.Items = []backupv1alpha1.RestoreItem{
+				{Kind: "PersistentVolumeClaim", Name: claimN, Phase: volume},
+				{Kind: "Cluster", Name: claimN, Phase: backupv1alpha1.ItemRunning},
+			}
+		})
+	}
+	for name, tc := range map[string]struct {
+		holder metav1.Object
+		kind   string
+		live   bool
+	}{
+		"BackupRun with its volume item done":     {backupWith(backupv1alpha1.ItemSucceeded), "BackupRun", false},
+		"BackupRun with its volume item running":  {backupWith(backupv1alpha1.ItemRunning), "BackupRun", true},
+		"RestoreRun with its volume item done":    {restoreWith(backupv1alpha1.ItemSucceeded), "RestoreRun", false},
+		"RestoreRun with its volume item running": {restoreWith(backupv1alpha1.ItemRunning), "RestoreRun", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newClient(t, tc.holder.(client.Object))
+			lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: claimLeaseName("claim-uid"), Namespace: ns}}
+			stamp(lease, leaseHolder{kind: tc.kind, run: tc.holder, item: claimN}, []string{claimN})
+			live, err := holderLive(context.Background(), c, lease)
+			if err != nil || live != tc.live {
+				t.Errorf("holderLive = %t, %v; want %t", live, err, tc.live)
+			}
+		})
 	}
 }

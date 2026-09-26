@@ -826,8 +826,10 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // its second since the checks, fails the item before the destination exists;
 // a destination an earlier pass created and lost the record of is named on
 // the item then, so work deletes it.
-// A Running item succeeds once the destination has completed the run's
-// trigger, or fails with the mover's logs. It also fails when its destination
+// A Running item fails with the mover's logs when the mover failed. Once the
+// destination has completed the run's trigger, the item succeeds only when
+// the mover's log names the snapshot the checks recorded, and fails
+// otherwise (see unconfirmedRestore). It also fails when its destination
 // is gone. restoreVolume leaves the destination in place, and work deletes it
 // once the item's end is in the status. A claim that is gone, or whose
 // VolumeRestore is missing, fails the item. So does a destination with the
@@ -939,7 +941,12 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 		if reason, failed := failedMover(destination); failed {
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, reason
 		} else if destination.Status != nil && destination.Status.LastManualSync == string(run.UID) {
+			// A completed trigger says only that the mover exited 0; its
+			// log says which snapshot, if any, it restored.
 			item.Phase = backupv1alpha1.ItemSucceeded
+			if why := unconfirmedRestore(destination, item.Snapshot, item.Name, false); why != "" {
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, why
+			}
 		}
 	}
 	return "", "", nil
@@ -1306,11 +1313,14 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 // the scheduler places the claim where the mover runs, the way VolSync places
 // a destination claim it creates itself.
 //
-// The run succeeds once the destination has completed the run's trigger, and
-// fails with the mover's logs when the mover fails. It records the item's end
-// in the status before finish deletes the destination, for the reason work
-// gives. It is aborted with reason TimedOut when the restore has not finished
-// by spec.timeout, and the deadline is checked before anything is created.
+// The run fails with the mover's logs when the mover fails. Once the
+// destination has completed the run's trigger, the run succeeds only when the
+// mover's log names the snapshot the checks recorded, and fails otherwise
+// (see unconfirmedRestore). It records the item's end in the status before
+// finish deletes the destination, for the reason work gives, and a pass that
+// finds the item's end recorded only finishes the run. It is aborted with
+// reason TimedOut when the restore has not finished by spec.timeout, and the
+// deadline is checked before anything is created.
 // While a backup of the repository is in progress (see otherMover), the run
 // waits with reason SourceBusy before it creates anything. Right before the
 // claim is created, the repository is listed again (see recheckSnapshot),
@@ -1330,8 +1340,14 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	item := &run.Status.Items[0]
 	done := fmt.Sprintf("claim %s holds the restored data", run.Spec.Into)
-	if item.Phase == backupv1alpha1.ItemSucceeded {
+	switch item.Phase {
+	case backupv1alpha1.ItemSucceeded:
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, done)
+	case backupv1alpha1.ItemFailed:
+		// An earlier pass recorded the end and lost finish's write, maybe
+		// after the destination was deleted. Without this, a pass that finds
+		// no destination would create one again.
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
 	}
 
 	destination := &volsyncv1alpha1.ReplicationDestination{}
@@ -1355,9 +1371,19 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
 		}
 		if destination.Status != nil && destination.Status.LastManualSync == string(run.UID) {
+			// A completed trigger says only that the mover exited 0; its
+			// log says which snapshot, if any, it restored. The item's end
+			// goes into the status before finish deletes the destination,
+			// either way.
 			item.Phase = backupv1alpha1.ItemSucceeded
+			if why := unconfirmedRestore(destination, item.Snapshot, run.Spec.Into, true); why != "" {
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, why
+			}
 			if err := r.writeStatus(ctx, run); err != nil {
 				return ctrl.Result{}, err
+			}
+			if item.Phase == backupv1alpha1.ItemFailed {
+				return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
 			}
 			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, done)
 		}
