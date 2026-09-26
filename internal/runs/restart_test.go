@@ -502,12 +502,13 @@ func TestAKustomizationVersionFluxStopsServingIsNotTakenForGone(t *testing.T) {
 func TestAQuiesceAfterFluxMovesVersionStillSuspends(t *testing.T) {
 	r, c, d := staleFluxReconciler(t, true, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	step(t, r) // plan
+	step(t, r) // admit, no queue; the lookup of LocalQueue reads discovery
+	// The mapper caches v1 now, and Flux then moves to v2.
 	if _, err := r.RESTMapper().RESTMapping(KustomizationGVK.GroupKind()); err != nil {
 		t.Fatal(err)
 	}
 	d.serve("v2")
-	step(t, r) // plan
-	step(t, r) // admit, no queue
 	if err := tryStep(r); err == nil {
 		t.Fatal("the quiesce pass returned no error, want the read at the unserved version retried")
 	}

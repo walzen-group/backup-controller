@@ -241,7 +241,7 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 // so that Kueue's waitForPodsReady does not evict it. While the Workload
 // waits, admit requeues after pollInterval.
 func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
-	queue, err := localQueue(ctx, r.Reader, run.Namespace)
+	queue, err := localQueue(ctx, r.Reader, r.RESTMapper(), run.Namespace)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

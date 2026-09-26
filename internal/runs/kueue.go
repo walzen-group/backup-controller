@@ -14,12 +14,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// WorkloadGVK and LocalQueueListGVK are the Kueue kinds a run uses. The
+// WorkloadGVK and LocalQueueGVK name the Kueue kinds a run uses. The
 // controller reads and writes them as unstructured objects, so it doesn't
-// depend on Kueue's Go module, and it runs in a cluster without Kueue.
+// depend on Kueue's Go module, and it runs in a cluster without Kueue. The
+// version is the one Kueue 0.19 prefers; a run sends every request at the
+// version the API server serves instead (see servedKind).
 var (
-	WorkloadGVK       = schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"}
-	LocalQueueListGVK = schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueueList"}
+	WorkloadGVK   = schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"}
+	LocalQueueGVK = schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueue"}
 )
 
 // admissionImage is the image named in the pod template of a run's Workload.
@@ -28,19 +30,36 @@ var (
 const admissionImage = "registry.k8s.io/pause:3.10"
 
 // localQueue returns the name of the LocalQueue that admits a namespace's
-// runs. It returns an empty name when the namespace has no LocalQueue, or
-// when the cluster has no Kueue, and the run then starts without admission.
+// runs, or an empty name when the namespace has none, and the run then starts
+// without admission.
+//
+// Parameters:
+//   - c lists the LocalQueues. Callers pass the uncached Reader.
+//   - mapper looks up the version at which the API server serves
+//     LocalQueues (see servedKind).
+//   - namespace is the run's namespace.
+//
+// A cluster that serves no version of LocalQueue has no Kueue, and gives an
+// empty name. Every other failure is an error, and the caller retries with
+// the run still queued: a failed lookup, and a list the API server refuses,
+// including one at a version it has stopped serving since the mapper cached
+// it (see versionGone). Taking any of those for a cluster without Kueue
+// would start the run past its queue.
 //
 // A namespace normally holds one LocalQueue. When it holds several, the one
 // named backups is used, or else the first by name, so the choice stays the
 // same from one reconcile to the next.
-func localQueue(ctx context.Context, c client.Reader, namespace string) (string, error) {
+func localQueue(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace string) (string, error) {
+	gvk, err := servedKind(mapper, LocalQueueGVK.GroupKind())
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("list the LocalQueues in %s: %w", namespace, err)
+	}
 	queues := &unstructured.UnstructuredList{}
-	queues.SetGroupVersionKind(LocalQueueListGVK)
-	if err := c.List(ctx, queues, client.InNamespace(namespace)); err != nil {
-		if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
-			return "", nil
-		}
+	queues.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+	if err := versionGone(mapper, gvk, c.List(ctx, queues, client.InNamespace(namespace))); err != nil {
 		return "", fmt.Errorf("list the LocalQueues in %s: %w", namespace, err)
 	}
 	var names []string
@@ -68,6 +87,8 @@ func workloadName(uid types.UID) string {
 // admission, and returns the Workload as it stands.
 //
 // Parameters:
+//   - c reads and creates the Workload. Its RESTMapper gives the version at
+//     which the API server serves Workloads (see servedKind).
 //   - owner is the run. The Workload is named after its UID and carries a
 //     controller reference to it.
 //   - ownerKind is the run's kind. A typed object read through the client
@@ -77,11 +98,21 @@ func workloadName(uid types.UID) string {
 // The Workload has one pod set with a count of 1, so Kueue counts the run as
 // one pod against the queue's quota. A Workload that already exists is
 // returned unchanged, so calling this on every reconcile is safe.
+//
+// It returns an error when the lookup of the served version fails, even
+// when the cluster serves no version of Workload at all: the namespace has a
+// LocalQueue, so the run must go through Kueue. A get at a version the API
+// server has stopped serving is an error as well (see versionGone), and no
+// Workload is created then, since one may exist at another version.
 func ensureWorkload(ctx context.Context, c client.Client, owner client.Object, ownerKind schema.GroupVersionKind, queue string) (*unstructured.Unstructured, error) {
 	name := workloadName(owner.GetUID())
+	gvk, err := servedKind(c.RESTMapper(), WorkloadGVK.GroupKind())
+	if err != nil {
+		return nil, fmt.Errorf("get Workload %s: %w", name, err)
+	}
 	workload := &unstructured.Unstructured{}
-	workload.SetGroupVersionKind(WorkloadGVK)
-	err := c.Get(ctx, types.NamespacedName{Namespace: owner.GetNamespace(), Name: name}, workload)
+	workload.SetGroupVersionKind(gvk)
+	err = versionGone(c.RESTMapper(), gvk, c.Get(ctx, types.NamespacedName{Namespace: owner.GetNamespace(), Name: name}, workload))
 	if err == nil {
 		return workload, nil
 	}
@@ -107,11 +138,11 @@ func ensureWorkload(ctx context.Context, c client.Client, owner client.Object, o
 			}},
 		},
 	}}
-	workload.SetGroupVersionKind(WorkloadGVK)
+	workload.SetGroupVersionKind(gvk)
 	workload.SetName(name)
 	workload.SetNamespace(owner.GetNamespace())
 	workload.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(owner, ownerKind)})
-	if err := c.Create(ctx, workload); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := versionGone(c.RESTMapper(), gvk, c.Create(ctx, workload)); err != nil && !apierrors.IsAlreadyExists(err) {
 		return nil, fmt.Errorf("create Workload %s: %w", name, err)
 	}
 	return workload, nil
@@ -131,6 +162,11 @@ func admitted(workload *unstructured.Unstructured) bool {
 // Kueue's waitForPodsReady evicts an admitted Workload whose PodsReady
 // condition stays false past its timeout. Kueue's job integrations set that
 // condition from their pods. This Workload has no pods, so the run sets it.
+//
+// The status is written at the Workload's own version, the one
+// ensureWorkload read or created it at. A write the API server refuses, one
+// at a version it has stopped serving included (see versionGone), comes back
+// as an error.
 func markPodsReady(ctx context.Context, c client.Client, workload *unstructured.Unstructured, now metav1.Time) error {
 	if conditionTrue(workload, "PodsReady") {
 		return nil
@@ -146,7 +182,7 @@ func markPodsReady(ctx context.Context, c client.Client, workload *unstructured.
 	if err := unstructured.SetNestedSlice(workload.Object, conditions, "status", "conditions"); err != nil {
 		return err
 	}
-	if err := c.Status().Update(ctx, workload); err != nil {
+	if err := versionGone(c.RESTMapper(), workload.GroupVersionKind(), c.Status().Update(ctx, workload)); err != nil {
 		return fmt.Errorf("mark Workload %s ready: %w", workload.GetName(), err)
 	}
 	return nil

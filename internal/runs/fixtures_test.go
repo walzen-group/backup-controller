@@ -52,6 +52,8 @@ const (
 var unstructuredKinds = []schema.GroupVersionKind{
 	ClusterGVK, BackupGVK, KustomizationGVK, WorkloadGVK,
 	{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueue"},
+	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "LocalQueue"},
+	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "Workload"},
 	bootstrap.ObjectStoreGVK, crdGVK,
 }
 
