@@ -9,6 +9,7 @@
 | [restores.md](restores.md) | what fills a claim, what overwrites one, how a database restores, and which to reach for |
 | [packaging.md](packaging.md) | the release assets, the repository layout, the RBAC, and the workflow |
 | [integration.md](integration.md) | how the infrastructure repository installs the release and declares backups |
+| [compatibility.md](compatibility.md) | the dependency versions the controller is tested against, each behaviour it relies on with the source line, and what to do when infra bumps one |
 | [decisions.md](decisions.md) | what was chosen, what was rejected, and what would have gone wrong |
 | [implementation-plan.md](implementation-plan.md) | the original v0.1 build plan, kept as a record |
 
