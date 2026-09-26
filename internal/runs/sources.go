@@ -300,7 +300,7 @@ func holder(ctx context.Context, reader client.Reader, source *volsyncv1alpha1.R
 			break
 		}
 		for _, item := range run.Status.Items {
-			if item.Kind == "ReplicationSource" && item.Name == source.Name &&
+			if item.Kind == backupv1alpha1.ItemKindSource && item.Name == source.Name &&
 				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
 				return &sourceHeldError{message: fmt.Sprintf("ReplicationSource %s is still completing the backup of BackupRun %s", source.Name, run.Name)}
 			}
