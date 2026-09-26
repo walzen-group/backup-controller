@@ -1699,6 +1699,22 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		if stopped != "" {
 			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, stopped))
 		}
+		// A Kustomization that applies a target may also apply workloads of
+		// another namespace, whose run would resume it while this run's
+		// workloads stand at zero. The run holds a Lease per such
+		// Kustomization, and waits for the run that holds one, before it
+		// decides what to suspend under those Leases.
+		applying, err := kustomizationsApplying(ctx, r.Reader, r.RESTMapper(), targets)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		busy, err = acquireKustomizationLeases(ctx, r.Client, r.Reader, run, "RestoreRun", applying)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if busy != "" {
+			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy))
+		}
 		stop, suspend, err := planStop(ctx, r.Reader, r.RESTMapper(), targets)
 		if err != nil {
 			return ctrl.Result{}, err

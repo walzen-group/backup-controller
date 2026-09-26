@@ -42,6 +42,9 @@ const (
 	// quiesceLeaseName is the Lease one run at a time takes in a namespace
 	// before it stops that namespace's workloads.
 	quiesceLeaseName = "backup-controller-quiesce"
+	// kustomizationLeasePrefix starts the name of the Lease that guards a
+	// Kustomization a run suspends (see kustomizationLeaseName).
+	kustomizationLeasePrefix = "backup-controller-kustomization-"
 )
 
 // leaseHolder is a run's item that takes the Leases of a claim and its
@@ -71,7 +74,7 @@ func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-
 // kustomizationLeaseName returns the name of the Lease that guards the
 // Kustomization with the given UID.
 func kustomizationLeaseName(uid types.UID) string {
-	return "backup-controller-kustomization-" + string(uid)
+	return kustomizationLeasePrefix + string(uid)
 }
 
 // acquireLeases takes the Leases that let one run at a time start a mover

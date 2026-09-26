@@ -12,6 +12,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -363,6 +364,140 @@ func deletedCluster(run *backupv1alpha1.RestoreRun) string {
 		}
 	}
 	return ""
+}
+
+// plannedKustomization is one Flux Kustomization a run's stop plan needs: the
+// Kustomization that a target's labels name, when its inventory lists the
+// target. The run leases it before it records the plan, so no other run
+// suspends or resumes it while this run's plan needs it suspended.
+type plannedKustomization struct {
+	// namespace and name are the Kustomization's own namespace and name.
+	namespace, name string
+	// uid names the Lease that guards the Kustomization.
+	uid types.UID
+	// target names the workload that needs the Kustomization, such as
+	// "Deployment notes", for the message a waiting run reports.
+	target string
+}
+
+// kustomizationsApplying returns the Kustomizations that apply any of the
+// targets, each with its UID, sorted by namespace and name.
+//
+// Parameters:
+//   - reader reads each Kustomization.
+//   - mapper looks up the version at which the API server serves
+//     Kustomizations (see servedKind).
+//   - targets are the workloads a run is about to stop, from quiesceTargets
+//     or namedTargets.
+//
+// A target without the kustomize-controller labels names no Kustomization,
+// and one whose Kustomization is missing or does not list it is left out, the
+// same way planStop leaves it out. A Kustomization that applies several
+// targets appears once. Any other failed read comes back as an error, and
+// nothing is stopped.
+//
+// A Kustomization that is suspended already is included: another run may hold
+// its Lease, and this run must wait rather than plan a stop under a
+// Kustomization that run will resume (see acquireKustomizationLeases).
+func kustomizationsApplying(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, targets []workload) ([]plannedKustomization, error) {
+	seen := map[string]bool{}
+	var planned []plannedKustomization
+	for _, t := range targets {
+		name := t.object.GetLabels()[fluxNameLabel]
+		namespace := t.object.GetLabels()[fluxNamespaceLabel]
+		if name == "" || namespace == "" {
+			continue
+		}
+		key := namespace + "/" + name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		kustomization, err := getKustomization(ctx, reader, mapper, namespace, name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("get Kustomization %s: %w", key, err)
+		}
+		if !inventoryLists(kustomization, t) {
+			continue
+		}
+		planned = append(planned, plannedKustomization{
+			namespace: namespace, name: name, uid: kustomization.GetUID(),
+			target: t.kind + " " + t.object.GetName(),
+		})
+	}
+	sort.Slice(planned, func(i, j int) bool {
+		return planned[i].namespace+"/"+planned[i].name < planned[j].namespace+"/"+planned[j].name
+	})
+	return planned, nil
+}
+
+// acquireKustomizationLeases takes one Lease per Kustomization in planned, in
+// the order kustomizationsApplying sorted them, and releases the Kustomization
+// Leases the run holds that the set no longer names.
+//
+// Parameters:
+//   - kind is BackupRun or RestoreRun.
+//   - run is the run that takes the Leases. Its namespace goes into the
+//     Leases' holder annotation, so holderLive finds it from the
+//     Kustomization's namespace.
+//   - planned is the set of Kustomizations the run's plan needs, from
+//     kustomizationsApplying.
+//
+// It returns "" once the run holds every Lease, a message for the Ready
+// condition naming the run that has suspended the Kustomization when another
+// live run does, and an error for a failed API call. The caller waits with
+// reason SourceBusy and tries again on a later pass, with nothing stopped.
+//
+// The set is taken in sorted order, and the Leases outside it go first, so a
+// run that waits holds only a prefix of its own set and never a Lease it does
+// not need. Runs of different namespaces compete for the same Kustomization
+// Lease, which is totally ordered by the Kustomization's namespace and name,
+// and a run takes claim and repository Leases only after the stop, so no two
+// runs wait for each other.
+func acquireKustomizationLeases(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object, kind string, planned []plannedKustomization) (string, error) {
+	held := &coordinationv1.LeaseList{}
+	if err := reader.List(ctx, held, client.MatchingLabels{
+		labelLeaseHolderUID: string(run.GetUID()),
+		labelLeaseScope:     scopeQuiesce,
+	}); err != nil {
+		return "", fmt.Errorf("list the quiesce Leases of %s: %w", run.GetName(), err)
+	}
+	wanted := make(map[string]bool, len(planned))
+	for _, k := range planned {
+		wanted[kustomizationLeaseName(k.uid)] = true
+	}
+	for i := range held.Items {
+		lease := &held.Items[i]
+		if !strings.HasPrefix(lease.Name, kustomizationLeasePrefix) || wanted[lease.Name] || holderUID(lease) != string(run.GetUID()) {
+			continue
+		}
+		uid, version := lease.UID, lease.ResourceVersion
+		if err := c.Delete(ctx, lease, client.Preconditions{UID: &uid, ResourceVersion: &version}); err != nil &&
+			!apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			return "", fmt.Errorf("delete Lease %s/%s: %w", lease.Namespace, lease.Name, err)
+		}
+	}
+	holder := leaseHolder{kind: kind, run: run, scope: scopeQuiesce}
+	for _, k := range planned {
+		busy, err := acquireLease(ctx, c, reader, holder, k.namespace, kustomizationLeaseName(k.uid), func(lease *coordinationv1.Lease) string {
+			return kustomizationBusyMessage(lease, k)
+		})
+		if err != nil || busy != "" {
+			return busy, err
+		}
+	}
+	return "", nil
+}
+
+// kustomizationBusyMessage returns the Ready message of a run that waits
+// while another live run holds the Lease of a Kustomization its plan needs.
+func kustomizationBusyMessage(lease *coordinationv1.Lease, k plannedKustomization) string {
+	return fmt.Sprintf("%s %s/%s has suspended Kustomization %s, which also applies %s; this run stops its workloads once that run has resumed it",
+		lease.Labels[labelLeaseHolderKind], lease.Annotations[annotationLeaseHolderNamespace],
+		lease.Annotations[annotationLeaseHolderName], k.namespace+"/"+k.name, k.target)
 }
 
 // acquireQuiesceLease takes the namespace's quiesce Lease for the run, so
