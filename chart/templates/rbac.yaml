@@ -20,7 +20,10 @@ metadata:
   labels:
     {{- include "backup-controller.labels" . | nindent 4 }}
 rules:
-  # The app claim, the prime claim and the restored volume.
+  # The app claim, the prime claim and the restored volume. The populator
+  # orphan reconciler (internal/populator/orphans.go) also watches claims,
+  # deletes the prime of a claim whose VolumeRestore is gone, and patches the
+  # library's finalizer off that claim.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
@@ -34,14 +37,17 @@ rules:
   # and waits for its cache to sync before the controller runs at all
   # (populator-machinery/controller.go:289 and :542). Without this rule the
   # reflector fails every few seconds, the cache never syncs, and every claim
-  # stays Pending with nothing on it saying why.
+  # stays Pending with nothing on it saying why. The populator orphan
+  # reconciler lists the pods of a destination's mover Job, and waits while
+  # one is still there.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
   # The data source the claim names. create is for a RestoreRun writing the
   # point-in-time VolumeRestore its scratch claim is filled from. update is
   # for the populator adding and removing its backup.wlz.li/volume-populator
-  # finalizer.
+  # finalizer. The populator orphan reconciler watches VolumeRestores and
+  # reads one by name to learn that it is gone.
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores"]
     verbs: ["get", "list", "watch", "create", "update"]
@@ -106,12 +112,14 @@ rules:
     resources: ["localqueues"]
     verbs: ["list"]
   # One destination per restore, created and removed by the callbacks and by a
-  # RestoreRun.
+  # RestoreRun. The populator orphan reconciler deletes the destination of a
+  # claim whose VolumeRestore is gone.
   - apiGroups: ["volsync.backube"]
     resources: ["replicationdestinations"]
     verbs: ["get", "list", "watch", "create", "delete"]
   # The repository Secret copy the populator writes for the length of a
-  # restore.
+  # restore. The populator orphan reconciler deletes the copy of a claim whose
+  # VolumeRestore is gone.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "create", "delete"]
@@ -120,7 +128,9 @@ rules:
     resources: ["events"]
     verbs: ["create", "patch"]
   # The run controllers' recorder, which writes an event on a BackupRun or
-  # RestoreRun each time its Ready reason changes.
+  # RestoreRun each time its Ready reason changes. The populator orphan
+  # reconciler writes its WaitingForMover and DataSourceGone events on a claim
+  # through the same recorder.
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
