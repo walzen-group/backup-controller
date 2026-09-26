@@ -32,8 +32,9 @@ hack/e2e/<component>/pins.json names a different version.
 | RustFS | 1.0.0 | the S3 store behind shared-secrets/backup/backup.yaml |
 
 The controller also builds against Go modules that go.mod pins:
-k8s.io/api v0.36.0, controller-runtime v0.24.1, lib-volume-populator v3.3.0
-and github.com/backube/volsync v0.16.0.
+k8s.io/api v0.36.0, k8s.io/apimachinery v0.36.0, k8s.io/client-go v0.36.0,
+k8s.io/apiextensions-apiserver v0.36.0, controller-runtime v0.24.1,
+lib-volume-populator v3.3.0 and github.com/backube/volsync v0.16.0.
 
 ## Behaviours the controller relies on
 
@@ -41,6 +42,17 @@ Each row names the file and line where the behaviour was read, in the source
 of the version in the table above. Paths are relative to that project's
 repository; the populator library's paths are relative to
 populator-machinery/controller.go in lib-volume-populator v3.3.0.
+
+The line numbers below were re-checked on 2026-09-26 against the release tag
+each table names: Flux v2.9.5 (dd233c4), restic v0.18.1 (7d0aa7f) and v0.19.1
+(6aa3a51), barman release/3.20.0 (ce7aa25), plugin-barman-cloud v0.15.0
+(f94016f), CloudNativePG v1.30.0 (4b5e244), VolSync v0.16.0 (22b97b0),
+kustomize-controller v1.9.5 (d5d5d2b), Kueue v0.19.5 (8e60d76), cert-manager
+v1.21.2 (922a06a), and the module versions go.mod pins (k8s.io/apimachinery
+v0.36.0, k8s.io/client-go v0.36.0, k8s.io/apiextensions-apiserver v0.36.0,
+controller-runtime v0.24.1, fluxcd/pkg/ssa v0.76.2, fluxcd/cli-utils v1.2.3).
+Kubernetes 1.36.3's kube-apiserver is read from k8s.io/apiserver v0.36.3, the
+module published at that release.
 
 ### Kubernetes
 
@@ -51,7 +63,8 @@ populator-machinery/controller.go in lib-volume-populator v3.3.0.
 | With background cascading deletion, the owner goes first and the garbage collector deletes its dependents afterwards. | kubernetes.io/docs/concepts/architecture/garbage-collection, "Background cascading deletion" |
 | The API server drops status fields its CRD does not declare, and controller-runtime decodes the response into the object it sent. After Status().Update, an undeclared field reads back as its zero value. | envtest 1.36.3, internal/testinfra/strictclient |
 | Listing a kind whose CRD is absent returns a no-match error (meta.IsNoMatchError). localQueue treats that error like NotFound, so a cluster without Kueue runs without admission. | envtest 1.36.3; internal/runs/kueue.go:30-45 |
-| The admission call carries the API server's deadline in the timeout query parameter. The bootstrap webhook answers inside that budget. | k8s.io/apiserver v0.36.3 (the module of Kubernetes 1.36.3; go.mod does not pin it) pkg/admission/plugin/webhook/mutating/dispatcher.go:276-295 |
+| The admission call carries the API server's deadline in the timeout query parameter. The bootstrap webhook answers inside that budget. | k8s.io/apiserver v0.36.3 (the module of Kubernetes 1.36.3; go.mod does not pin it, and the build graph selects v0.36.0, where this range is the same) pkg/admission/plugin/webhook/mutating/dispatcher.go:276-295 |
+| The API server answers a request at a version it does not serve, a discovery read or an object request, with a plain-text "404 page not found" body from its not-found handler. client-go turns that answer into a NotFound whose details carry an UnexpectedServerResponse cause, which apierrors.IsUnexpectedServerError reports. controller-runtime v0.24.1's mapper has no Reset: a lookup of a kind its group does not have makes it read the discovery of every version of the group it has cached, and it drops the group from its cache when one of those versions answers 404. internal/runs/quiesce.go's versionGone and rediscover rely on both. | k8s.io/apiextensions-apiserver v0.36.0 pkg/apiserver/customresource_handler.go:313-316 and pkg/apiserver/customresource_discovery.go:36-47 (an unserved version goes to the delegate), pkg/apiserver/apiserver.go:172-175 (the delegate is Go's http.NotFoundHandler when the CRD server has none, whose body is "404 page not found": go1.26.7 net/http/server.go:2322); k8s.io/apiserver v0.36.3 pkg/server/config.go:823 and pkg/server/handler.go:73-77, 121-154; k8s.io/client-go v0.36.0 rest/request.go:1242-1255, 1326-1361 (a text body goes through newUnstructuredResponseError); apimachinery v0.36.0 pkg/api/errors/errors.go:448-450, 501-507, 761-771; controller-runtime v0.24.1 pkg/client/apiutil/restmapper.go:55, 122-132, 158-216, 309-331; internal/runs/quiesce.go:66-138; internal/runs/versiongone_envtest_test.go |
 
 ### Flux 2.9.5
 
@@ -61,9 +74,9 @@ the rows below cite those modules where the behaviour lives in them.
 
 | Behaviour | Source |
 | --- | --- |
-| kustomize-controller labels every object it applies with kustomize.toolkit.fluxcd.io/name and kustomize.toolkit.fluxcd.io/namespace. | kustomize-controller internal/controller/kustomization_controller.go:458-462; fluxcd/pkg ssa/manager.go:66-78; internal/runs/quiesce.go:26-33 |
-| A Kustomization's status.inventory.entries holds one entry per applied object, with id "<namespace>_<name>_<group>_<kind>" (for a Deployment, notes_notes_apps_Deployment). A quiesce suspends a Kustomization only when that list holds the workload. | kustomize-controller internal/controller/kustomization_controller.go:482 and internal/inventory/inventory.go:39-50 (the id is ObjMetadata.String()); fluxcd/cli-utils pkg/object/objmetadata.go:32, 118-128; internal/runs/quiesce.go:226-240 |
-| spec.suspend: true stops kustomize-controller from scaling a stopped workload back up. | internal/runs/quiesce.go:22-25 |
+| kustomize-controller labels every object it applies with kustomize.toolkit.fluxcd.io/name and kustomize.toolkit.fluxcd.io/namespace. | kustomize-controller internal/controller/kustomization_controller.go:458-462; fluxcd/pkg ssa/manager.go:66-78; internal/runs/quiesce.go:166-173 |
+| A Kustomization's status.inventory.entries holds one entry per applied object, with id "<namespace>_<name>_<group>_<kind>" (for a Deployment, notes_notes_apps_Deployment). A quiesce suspends a Kustomization only when that list holds the workload. | kustomize-controller internal/controller/kustomization_controller.go:482 and internal/inventory/inventory.go:39-50 (the id is ObjMetadata.String()); fluxcd/cli-utils pkg/object/objmetadata.go:32, 118-128; internal/runs/quiesce.go:352, 368-381 |
+| spec.suspend: true stops kustomize-controller from scaling a stopped workload back up. | kustomize-controller internal/controller/kustomization_controller.go:183-187; internal/runs/quiesce.go:25-30 |
 
 ### VolSync 0.16.0
 
@@ -76,7 +89,7 @@ the VolSync module.
 | When a sync completes, VolSync copies whatever spec.trigger.manual holds at that moment into status.lastManualSync. It writes lastManualSync only then, and starts a new sync only when the manual tag differs from it. | statemachine/machine.go:213-214, 225-242 |
 | VolSync writes latestMoverStatus and lastManualSync in the same status update. | mover/restic/mover.go:648-650; statemachine/machine.go:103-118, 185-215 |
 | The mover Job has backoffLimit 8. At 8 failed pods VolSync writes the logs into status.latestMoverStatus with result Failed, deletes the Job with background propagation, and creates a new Job on the next reconcile. A failing mover is retried forever. | mover/restic/mover.go:355-356, 609-618; utils/podlogs.go:166-169, 186-191 |
-| VolSync creates the clone volsync-<source>-src once per sync, and every Job and pod of that sync reuses it. Of VolSync's own steps, only Cleanup after a completed sync deletes the clone. The ReplicationSource is also the clone's controller owner, so deleting the source deletes the clone through garbage collection. | mover/restic/mover.go:171-188, 270-294; volumehandler/volumehandler.go:336-358; utils/cleanup.go:36-39, 50-58 |
+| VolSync creates the clone volsync-<source>-src once per sync, and every Job and pod of that sync reuses it. Of VolSync's own steps, only Cleanup after a completed sync deletes the clone. The ReplicationSource is also the clone's controller owner, so deleting the source deletes the clone through garbage collection. | mover/restic/mover.go:171-188, 270-294; mover/mover.go:29 (the volsync- prefix); volumehandler/volumehandler.go:336-358; utils/cleanup.go:36-39, 50-58 |
 | The ReplicationSource is the controller owner of its Job, so deleting the source deletes the running mover pod. | mover/restic/mover.go:347 |
 | Each reconcile rebuilds the Job; a change to spec.restic.unlock, the retention or the affinity alters the pod template and kills a running mover. VolSync sets the affinity only when the copy method is Direct. | mover/restic/mover.go:346, 362, 373-380, 404, 523-531 |
 | A prune falls due pruneIntervalDays after lastPruned, or after the source's creation when lastPruned is empty. | mover/restic/mover.go:378, 656-667 |
@@ -119,7 +132,7 @@ cited code is identical in both.
 
 | Behaviour | Source |
 | --- | --- |
-| The chart's pod webhook mpod.kb.io has failurePolicy Fail when the pod integration is on (prod turns it on), and its namespaceSelector is managedJobsNamespaceSelector (kueue-managed: "true" in prod). While Kueue's webhook is down, the API server refuses every pod create in those namespaces, mover pods included. | chart templates/webhook/manifests.yaml:19-20, 307-341 |
+| The chart's pod webhook mpod.kb.io has failurePolicy Fail when the pod integration is on (prod turns it on), and its namespaceSelector is managedJobsNamespaceSelector (kueue-managed: "true" in prod). While Kueue's webhook is down, the API server refuses every pod create in those namespaces, mover pods included. | charts/kueue/templates/webhook/manifests.yaml:19-20, 307-341 |
 | With manageJobsWithoutQueueName false, Kueue gates only objects that carry the kueue.x-k8s.io/queue-name label. A managed namespace that holds a LocalQueue named default is the exception: there Kueue's webhooks write queue-name: default onto an unlabelled Job or pod whose owner Kueue does not already manage, and Kueue then gates it. | Kueue v0.19.5 source pkg/controller/jobs/pod/pod_webhook.go:145-162; pkg/controller/jobframework/defaults.go:59-89; pkg/controller/jobframework/reconciler.go:368-379; pkg/controller/constants/constants.go:27; hack/e2e/kueue/values.yaml (prod's settings) |
 | A BackupRun's Workload in kueue.x-k8s.io/v1beta2 is admitted against its LocalQueue; Kueue reads the pod template to count quota and never runs its image. | internal/runs/kueue.go:21-28 |
 
@@ -128,7 +141,7 @@ cited code is identical in both.
 | Behaviour | Source |
 | --- | --- |
 | After initdb, the instance creates the marker file .check-empty-wal-archive, and removes it only once the ContinuousArchiving condition is True. | pkg/management/postgres/initdb.go:355-360; internal/management/controller/instance_controller.go:1100-1110 |
-| When a Cluster enables a WAL archive plugin, the instance manager hands every segment to the plugin and skips its own empty-archive check. It sends the plugin no CheckEmptyWalArchive decision, so the plugin reads the marker and the cnpg.io/skipEmptyWalArchiveCheck annotation itself (next section). | pkg/management/postgres/archiver/archiver.go:165-176; pkg/utils/labels_annotations.go:203-205, 539-544 |
+| When a Cluster enables a WAL archive plugin, the instance manager hands every segment to the plugin and skips its own empty-archive check. It sends the plugin no CheckEmptyWalArchive decision, so the plugin reads the marker and the cnpg.io/skipEmptyWalArchiveCheck annotation itself (next section). | pkg/management/postgres/archiver/archiver.go:165-176; pkg/utils/labels_annotations.go:203-205, 539-544; internal/cnpi/plugin/client/wal.go:66-69, 122-126 (neither request sets CheckEmptyWalArchive) |
 | A pg_basebackup bootstrap creates the same marker after cloning. | internal/cmd/manager/instance/pgbasebackup/cmd.go:151-156 |
 | A failing archive_command sets ContinuousArchiving False with reason ContinuousArchivingFailing, and pg_wal grows until the volume is full. | pkg/management/postgres/webserver/local.go:246-262 |
 
