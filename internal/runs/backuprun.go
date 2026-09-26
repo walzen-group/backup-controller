@@ -1044,28 +1044,40 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 // not have started the workloads yet. release starts them and keeps that
 // moment.
 //
-// It returns the first error it meets and does nothing after it: a
-// *restartError from restartWorkloads, which names the workload or
-// Kustomization, or a *releaseError that names the Leases or the Workload it
-// could not delete. Every step is safe to repeat.
+// The Leases are released even when the restart fails: the run's items are
+// done, and otherMover still keeps another run's mover off a claim whose
+// mover runs. The Workload is deleted only once the restart and the Leases
+// went through, so the run keeps its place in the queue while it still owes
+// the app its replicas.
+//
+// It returns nil when everything is put back. A failed restart comes back as
+// a *restartError from restartWorkloads, which names the workload or
+// Kustomization; a failed Lease release or Workload delete as a
+// *releaseError that names what it could not delete. When both the restart
+// and the Lease release fail, it returns both, joined with errors.Join.
+// Every step is safe to repeat.
 func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.BackupRun) error {
+	var restartErr error
 	holding := (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil
 	if holding || run.Status.RestartPending {
-		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
-			return err
+		restartErr = restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+		if restartErr == nil {
+			if run.Status.RestartedAt == nil {
+				run.Status.RestartedAt = newTime(metav1.NewTime(r.Now()).Rfc3339Copy())
+			}
+			run.Status.RestartPending = false
 		}
-		if run.Status.RestartedAt == nil {
-			run.Status.RestartedAt = newTime(metav1.NewTime(r.Now()).Rfc3339Copy())
-		}
-		run.Status.RestartPending = false
 	}
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
-		return &releaseError{
+		return errors.Join(restartErr, &releaseError{
 			action: "release the Leases it holds on its claims and repositories",
 			advice: fmt.Sprintf("Fix the cause, or delete the Leases labelled %s=%s yourself; either way the run then finishes by itself.",
 				labelLeaseHolderUID, run.UID),
 			err: err,
-		}
+		})
+	}
+	if restartErr != nil {
+		return restartErr
 	}
 	if err := deleteWorkload(ctx, r.Client, run.Namespace, run.UID); err != nil {
 		return &releaseError{
@@ -1136,7 +1148,8 @@ func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.
 // for a workload or Kustomization it could not put back (a *restartError),
 // how to put it back by hand and let the run go; for a Lease or the Kueue
 // Workload it could not delete (a *releaseError), how to delete it by hand.
-// Announce turns the new reason into a Warning event. The status write is
+// When err holds both, as release returns them, the message names both
+// failures and gives both pieces of advice. Announce turns the new reason into a Warning event. The status write is
 // best effort: a write that fails is made again by the next pass that fails.
 //
 // The run never gives up. A run that finished while it still owed a restart
@@ -1144,23 +1157,28 @@ func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.
 // namespace run would record the stopped workload's 0 as the count to give
 // back.
 func (r *BackupRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.BackupRun, err error) error {
-	message, advice := "could not put back what the run changed: "+err.Error(), "Fixing the cause lets the run finish by itself."
+	var failed, advice []string
 	var restart *restartError
 	var step *releaseError
-	switch {
-	case errors.As(err, &restart):
-		message = restart.Error()
-		advice = "Fix the cause, or scale the workloads in status.quiesced to their replicas and resume the" +
-			" Kustomizations in status.suspendedKustomizations yourself, then delete this BackupRun and remove its finalizer " +
-			Finalizer + "."
-	case errors.As(err, &step):
-		message, advice = step.Error(), step.advice
+	if errors.As(err, &restart) {
+		failed = append(failed, restart.Error())
+		advice = append(advice, "Fix the cause, or scale the workloads in status.quiesced to their replicas and resume the"+
+			" Kustomizations in status.suspendedKustomizations yourself, then delete this BackupRun and remove its finalizer "+
+			Finalizer+".")
 	}
-	message += ". The run retries until it can"
+	if errors.As(err, &step) {
+		failed = append(failed, step.Error())
+		advice = append(advice, step.advice)
+	}
+	if len(failed) == 0 {
+		failed = []string{"could not put back what the run changed: " + err.Error()}
+		advice = []string{"Fixing the cause lets the run finish by itself."}
+	}
+	message := strings.Join(failed, "; it also ") + ". The run retries until it can"
 	if run.Spec.All {
 		message += ", and this namespace's schedule waits for it"
 	}
-	message += ". " + advice
+	message += ". " + strings.Join(advice, " ")
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestartFailed, message)
 	_ = r.writeStatus(ctx, run)
 	return err

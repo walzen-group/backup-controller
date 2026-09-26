@@ -516,3 +516,64 @@ func TestAQuiesceAfterFluxMovesVersionStillSuspends(t *testing.T) {
 		t.Fatalf("suspended = %v, want the Kustomization suspended at the new version", run.Status.SuspendedKustomizations)
 	}
 }
+
+// A run whose restart the API server refuses still releases its Leases, so
+// a restore of the claim need not wait for the app to come back; otherMover
+// still keeps a restore off a claim whose mover runs. When the Lease delete
+// fails as well, the Ready message names both failures.
+func TestARefusedRestartStillReleasesTheLeases(t *testing.T) {
+	for name, refuseLeases := range map[string]bool{"Leases deleted": false, "Lease delete refused too": true} {
+		t.Run(name, func(t *testing.T) {
+			r, c, _ := servedBackupReconciler(t, nil, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+				claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+			refuse := false
+			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+				Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if _, ok := obj.(*appsv1.Deployment); ok && refuse {
+						if data, _ := patch.Data(obj); !strings.Contains(string(data), `"replicas":0`) {
+							return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, obj.GetName(), errors.New("a policy refuses the change"))
+						}
+					}
+					return cl.Patch(ctx, obj, patch, opts...)
+				},
+				Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if _, ok := obj.(*coordinationv1.Lease); ok && refuse && refuseLeases {
+						return apierrors.NewForbidden(schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"}, obj.GetName(), errors.New("a policy refuses the delete"))
+					}
+					return cl.Delete(ctx, obj, opts...)
+				},
+			})
+			step(t, r) // plan
+			step(t, r) // admit, no queue
+			step(t, r) // quiesce
+			step(t, r) // start: the run takes the Leases
+			claimLease, repoLease := leaseNames(t, c)
+			if leaseHolderOf(t, c, claimLease) != string(runUID) || leaseHolderOf(t, c, repoLease) != string(runUID) {
+				t.Fatal("the run does not hold the claim and repository Leases after the start pass")
+			}
+
+			refuse = true
+			r.Now = func() time.Time { return frozen.Add(2 * time.Hour) } // past the one-hour timeout
+			if err := tryStep(r); err == nil {
+				t.Fatal("the reconcile returned no error, want the refused restart retried")
+			}
+			run := readBackupRun(t, c)
+			if run.Status.Phase.Finished() || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonRestartFailed {
+				t.Fatalf("phase = %q, reason = %q, want the run unfinished with %s", run.Status.Phase, readyReason(run.Status.Conditions), backupv1alpha1.ReasonRestartFailed)
+			}
+			message := readyMessage(run.Status.Conditions)
+			if !strings.Contains(message, "a policy refuses the change") {
+				t.Errorf("message %q does not name the refused restart", message)
+			}
+			if refuseLeases {
+				if !strings.Contains(message, "a policy refuses the delete") || !strings.Contains(message, labelLeaseHolderUID) {
+					t.Errorf("message %q does not name the refused Lease delete as well", message)
+				}
+				return
+			}
+			if holder := leaseHolderOf(t, c, claimLease) + leaseHolderOf(t, c, repoLease); holder != "" {
+				t.Errorf("a Lease is still held by %q after the refused restart, want both released", holder)
+			}
+		})
+	}
+}
