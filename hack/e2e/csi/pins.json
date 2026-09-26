@@ -1,0 +1,35 @@
+{
+  "component": "csi",
+  "namespace": "e2e-csi",
+  "versions": {
+    "csi-driver-host-path": "v1.18.0",
+    "external-snapshotter": "v8.6.0"
+  },
+  "manifests": [
+    {"file": "crd-volumesnapshotclasses.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml", "sha256": "75e6565aac2c0f2949ed13ea884bbaa388cb7be576b558b709cf1168e011828d"},
+    {"file": "crd-volumesnapshotcontents.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml", "sha256": "895a3c1e73b60f06a0deb566dd123d01bdf1b2efc5d5ff5231ff8bbcf42dafc7"},
+    {"file": "crd-volumesnapshots.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml", "sha256": "b032116e987fb1d7d93cec7d942833adeb9d95c9bdc7e00c10b280c2fe4a6c33"},
+    {"file": "snapshot-controller-rbac.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml", "sha256": "99c4ac480b6c9563be0d85599e29cc7b68b25a82d250b0e789726727551e8d38"},
+    {"file": "snapshot-controller.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml", "sha256": "920166ff9001203e9def2504903eb196cd1da55d520f022807cc6ac82ef8eeba"},
+    {"file": "rbac-csi-attacher.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-attacher/v4.12.0/deploy/kubernetes/rbac.yaml", "sha256": "3a38b5198b0496927c0ce26c63e71d43e2263e2dbbb93a83acdec71d7c90a766"},
+    {"file": "rbac-csi-provisioner.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-provisioner/v6.3.0/deploy/kubernetes/rbac.yaml", "sha256": "0ee8427b746a1d3b695705b74c2d7fb165121110b1a10c0b6e204918d93e814f"},
+    {"file": "rbac-csi-resizer.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-resizer/v2.2.1/deploy/kubernetes/rbac.yaml", "sha256": "3615af0d007d51e02e53cd6f7415ff7b418c3a21d33bb6ce506639223619cd82"},
+    {"file": "rbac-csi-snapshotter.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0/deploy/kubernetes/csi-snapshotter/rbac-csi-snapshotter.yaml", "sha256": "de67f66412f17fab9868494f657fed4319d4c13777b921045afc04100bdc9c98"},
+    {"file": "rbac-csi-health-monitor.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/external-health-monitor/v0.18.0/deploy/kubernetes/external-health-monitor-controller/rbac.yaml", "sha256": "3205599eda9a252e2737acabe22591afd8da373c1aab5275ce54223adfe2d127"},
+    {"file": "hostpath-driverinfo.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/csi-driver-host-path/v1.18.0/deploy/kubernetes-1.34/hostpath/csi-hostpath-driverinfo.yaml", "sha256": "464307265464b77189bd4b339774cd2de69589458a62a740028b248f248c7e9a"},
+    {"file": "hostpath-plugin.yaml", "url": "https://raw.githubusercontent.com/kubernetes-csi/csi-driver-host-path/v1.18.0/deploy/kubernetes-1.34/hostpath/csi-hostpath-plugin.yaml", "sha256": "886f526c4ec17289e300efd933f295c42ac82e6cac28b839a057b7c5539e9221"}
+  ],
+  "images": [
+    {"upstream": "registry.k8s.io/sig-storage/hostpathplugin:v1.17.1", "ref": "registry.k8s.io/sig-storage/hostpathplugin:v1.17.1@sha256:ec6ded2430d4c5c6251e8d3a6ca55c675d6bd1b1ee8c012eab13aaa81be9c967"},
+    {"upstream": "registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0", "ref": "registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0@sha256:430c1f2267152ce6e4547ebbad225a2b399d03e5894f2f39ba233a38e4750a47"},
+    {"upstream": "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0", "ref": "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0@sha256:f9de845b170155199f2a2a3f9531cf13d78e31235e9db6b6582a8b0db0a50dad"},
+    {"upstream": "registry.k8s.io/sig-storage/livenessprobe:v2.19.0", "ref": "registry.k8s.io/sig-storage/livenessprobe:v2.19.0@sha256:06da0d5b8908072f2e4522692aee8dc119fba7247a9658497e1153992cd777e9"},
+    {"upstream": "registry.k8s.io/sig-storage/csi-attacher:v4.12.0", "ref": "registry.k8s.io/sig-storage/csi-attacher:v4.12.0@sha256:b9dc9a714a484ccdeeb6f86d88d4db9b7a5ecfc5a55da6db3a60bb3fa33c278a"},
+    {"upstream": "registry.k8s.io/sig-storage/csi-provisioner:v6.3.0", "ref": "registry.k8s.io/sig-storage/csi-provisioner:v6.3.0@sha256:a4b0b1a37605b7b04a293e136edf7006ec1786a8eb3f4e5a945f81d667dcc371"},
+    {"upstream": "registry.k8s.io/sig-storage/csi-resizer:v2.2.1", "ref": "registry.k8s.io/sig-storage/csi-resizer:v2.2.1@sha256:ea1d25e23479000c7e8eeb92d827df66258df4e482ca054c5e7ce3fc0f5c41a5"},
+    {"upstream": "registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0", "ref": "registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0@sha256:42af0929bcd60a43499825c078a60ff0534e08af8fbeb283aa391be40feb9f3e"},
+    {"upstream": "registry.k8s.io/sig-storage/snapshot-controller:v8.5.0", "ref": "registry.k8s.io/sig-storage/snapshot-controller:v8.6.0@sha256:81e79f205083f105e573ba2ebfe5964ede7f69a154e8627f53ebbbccd3ed9f70", "note": "the v8.6.0 manifest still names v8.5.0; install uses v8.6.0 to match the CRDs and csi-snapshotter"},
+    {"upstream": "busybox:1.37.0", "ref": "busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e", "note": "check pods only"}
+  ],
+  "capacity": {"total": "5Gi", "maxVolumeSize": "1Gi", "storageClassKind": "e2e"}
+}
