@@ -19,6 +19,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // backupRunKind is the group, version and kind that the owner reference on a
@@ -295,6 +296,10 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // work makes one pass over a run that the queue has admitted, and returns when
 // to look again.
 //
+// Each pass first releases the Leases of the items that finished in an
+// earlier pass. That release is best effort: a failure is logged and the
+// pass goes on, so it never keeps the workloads down past the limit below.
+//
 // On a run with spec.all set, the first pass calls quiesce to stop the
 // workloads marked backup.wlz.li/quiesce and does nothing else. Later passes
 // start no item until every pod of those workloads is gone. work then starts
@@ -341,9 +346,13 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
-	// restore of that claim need not wait for the rest of the run.
+	// restore of that claim need not wait for the rest of the run. This is
+	// best effort: an error here must not keep the workloads down past the
+	// limit below. A Lease left behind is taken over once its item is done
+	// (see holderLive), and finish releases it again.
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(name string) bool { return backupItemDone(run, name) }); err != nil {
-		return ctrl.Result{}, err
+		log.FromContext(ctx).Error(err, "could not release the Leases of the run's finished items; the run goes on",
+			"namespace", run.Namespace, "name", run.Name)
 	}
 
 	if run.Spec.All && run.Status.QuiescedAt == nil {

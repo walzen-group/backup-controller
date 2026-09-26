@@ -10,6 +10,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -276,5 +277,29 @@ func TestALostWriteAtTheLimitKeepsTheRestartAfterTheMoment(t *testing.T) {
 	}
 	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed {
 		t.Errorf("item = %+v, want it Failed at the limit", item)
+	}
+}
+
+// A Lease list the API server keeps failing does not hold the app past the
+// limit. The pass lets the Leases of finished items go before it checks the
+// limit, and that release is best effort: a Lease left behind is taken over
+// once its item is done.
+func TestALeaseReleaseThatKeepsFailingDoesNotHoldTheAppPastTheLimit(t *testing.T) {
+	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
+	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*coordinationv1.LeaseList); ok {
+				return apierrors.NewServiceUnavailable("etcd leader changed")
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+	r.Now = func() time.Time { return frozen.Add(10 * time.Minute) }
+	_ = tryStep(r)
+	if got := replicasOf(t, c); got != 2 {
+		t.Fatalf("replicas = %d at the limit with the Lease list failing, want 2 back", got)
+	}
+	if run := readBackupRun(t, c); run.Status.RestartedAt == nil {
+		t.Error("restartedAt is unset after the app came back")
 	}
 }
