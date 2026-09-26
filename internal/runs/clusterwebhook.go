@@ -45,52 +45,82 @@ func servedElsewhere(mapper meta.RESTMapper, gvk schema.GroupVersionKind) []stri
 	return versions
 }
 
-// clusterWebhookBlind reports whether the API server serves CloudNativePG's
+// webhookBlind is what clusterWebhookBlind found: the versions at which the
+// API server serves CloudNativePG's Cluster while it no longer serves v1,
+// the version the bootstrap webhook's rules name.
+type webhookBlind struct {
+	// versions are the served versions, such as postgresql.cnpg.io/v2. They
+	// are empty while v1 is served or when the lookup can't tell.
+	versions []string
+}
+
+// blind reports whether the API server would create a Cluster without
+// calling the bootstrap webhook.
+func (b webhookBlind) blind() bool {
+	return len(b.versions) > 0
+}
+
+// message names the versions served and v1, and says what follows, for a
+// Ready condition, an item or the log. It is rendered only for status and
+// logs; no decision reads it.
+func (b webhookBlind) message() string {
+	return fmt.Sprintf("the API server serves CloudNativePG's Cluster at %s and no longer at %s, the version the bootstrap "+
+		"webhook's rules name, so it creates a Cluster without calling the webhook, and the Cluster starts as an empty database; "+
+		"no restore deletes a Cluster until %s is served again or a backup-controller release that registers the new version is "+
+		"installed (see docs/compatibility.md)",
+		strings.Join(b.versions, ", "), webhookClusterKind.GroupVersion(), webhookClusterKind.GroupVersion())
+}
+
+// clusterWebhookBlind looks up whether the API server serves CloudNativePG's
 // Cluster at another version and no longer at v1, the version the bootstrap
 // webhook's rules name.
 //
 // Parameters:
 //   - mapper is the client's RESTMapper.
 //
-// It returns a message that names the versions served and v1, and says what
-// follows, or "" while v1 is served or when it can't tell (see
-// servedElsewhere). While the message is non-empty, the API server creates
-// a Cluster without calling the webhook, so a Cluster a restore deleted
-// comes back as an empty database; a RestoreRun deletes no Cluster then.
-func clusterWebhookBlind(mapper meta.RESTMapper) string {
-	versions := servedElsewhere(mapper, webhookClusterKind)
-	if len(versions) == 0 {
-		return ""
-	}
-	return fmt.Sprintf("the API server serves CloudNativePG's Cluster at %s and no longer at %s, the version the bootstrap "+
-		"webhook's rules name, so it creates a Cluster without calling the webhook, and the Cluster starts as an empty database; "+
-		"no restore deletes a Cluster until %s is served again or a backup-controller release that registers the new version is "+
-		"installed (see docs/compatibility.md)",
-		strings.Join(versions, ", "), webhookClusterKind.GroupVersion(), webhookClusterKind.GroupVersion())
+// It returns the versions served in a webhookBlind, which is blind only
+// then. It is not blind while v1 is served or when the lookup can't tell
+// (see servedElsewhere). While it is blind, the API server creates a
+// Cluster without calling the webhook, so a Cluster a restore deleted comes
+// back as an empty database; a RestoreRun deletes no Cluster then.
+func clusterWebhookBlind(mapper meta.RESTMapper) webhookBlind {
+	return webhookBlind{versions: servedElsewhere(mapper, webhookClusterKind)}
 }
 
 // ClusterWebhookBlind is clusterWebhookBlind for cmd/backup-controller,
 // which logs the message once at startup, so the controller's log says it
-// before any restore does.
+// before any restore does. It returns "" while the webhook sees every
+// creation.
 func ClusterWebhookBlind(mapper meta.RESTMapper) string {
-	return clusterWebhookBlind(mapper)
+	b := clusterWebhookBlind(mapper)
+	if !b.blind() {
+		return ""
+	}
+	return b.message()
 }
 
-// failBlindClusters fails every Pending Cluster item with the message of
-// clusterWebhookBlind and reports whether there was one.
+// failBlindClusters fails every Pending Cluster item while b is blind.
 //
 // Parameters:
 //   - items are the run's items, changed in place.
-//   - message is clusterWebhookBlind's message.
+//   - b is what clusterWebhookBlind found in this pass. Its message becomes
+//     each failed item's message.
 //
-// Each such item's message says that the run deleted nothing, since plan and
-// restoreDatabase call it before the Cluster is deleted.
-func failBlindClusters(items []backupv1alpha1.RestoreItem, message string) bool {
-	failed := false
+// It returns the names of the items it failed, and none when b is not
+// blind. The caller picks the run's reason from that list alone, so an item
+// that failed for another reason is never blamed on the webhook.
+//
+// Each failed item's message says that the run deleted nothing, since plan
+// and work call it before the Cluster is deleted.
+func failBlindClusters(items []backupv1alpha1.RestoreItem, b webhookBlind) []string {
+	if !b.blind() {
+		return nil
+	}
+	var failed []string
 	for i := range items {
 		if items[i].Kind == "Cluster" && items[i].Phase == backupv1alpha1.ItemPending {
-			items[i].Phase, items[i].Message = backupv1alpha1.ItemFailed, message+". The run deleted nothing"
-			failed = true
+			items[i].Phase, items[i].Message = backupv1alpha1.ItemFailed, b.message()+". The run deleted nothing"
+			failed = append(failed, items[i].Name)
 		}
 	}
 	return failed
@@ -100,20 +130,15 @@ func failBlindClusters(items []backupv1alpha1.RestoreItem, message string) bool 
 // items ends with.
 //
 // Parameters:
-//   - items are the run's items.
-//   - blind is clusterWebhookBlind's message for this pass.
+//   - blindFailed are the items failBlindClusters failed in this pass.
 //
-// It returns ReasonClusterVersionUnsupported while blind is non-empty and a
-// Cluster item failed, since failBlindClusters then failed it, and
-// ReasonFailed otherwise.
-func failedReason(items []backupv1alpha1.RestoreItem, blind string) string {
-	if blind == "" {
-		return backupv1alpha1.ReasonFailed
-	}
-	for _, item := range items {
-		if item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemFailed {
-			return backupv1alpha1.ReasonClusterVersionUnsupported
-		}
+// It returns ReasonClusterVersionUnsupported when failBlindClusters failed
+// an item, and ReasonFailed otherwise. An item it failed in an earlier pass
+// of a run that ends later counts under ReasonFailed; that item's message
+// still names the unserved version.
+func failedReason(blindFailed []string) string {
+	if len(blindFailed) > 0 {
+		return backupv1alpha1.ReasonClusterVersionUnsupported
 	}
 	return backupv1alpha1.ReasonFailed
 }

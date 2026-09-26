@@ -166,3 +166,69 @@ func TestARestoreWaitingForAClusterTheWebhookCannotSeeSaysSo(t *testing.T) {
 		t.Errorf("phase = %q, want the run still waiting for the Cluster", after.Status.Phase)
 	}
 }
+
+// A run whose Cluster item failed for another reason before CloudNativePG
+// stopped serving v1 ends with reason Failed: the check deleted nothing and
+// failed no item of it, so ClusterVersionUnsupported would blame the wrong
+// cause.
+func TestARestoreWhoseClusterFailedEarlierEndsFailedWhileTheWebhookCannotSee(t *testing.T) {
+	started := metav1.NewTime(frozen)
+	run := restoreRun(func(r *backupv1alpha1.RestoreRun) {
+		r.Spec.All = true
+		r.Finalizers = []string{Finalizer}
+		r.Status.Phase, r.Status.StartedAt = backupv1alpha1.RunPhaseRunning, &started
+		r.Status.RestartedAt = &started
+		r.Status.Items = []backupv1alpha1.RestoreItem{
+			{Kind: "Cluster", Name: pgN, Phase: backupv1alpha1.ItemFailed, BaseBackup: saturday.ID, ClusterUID: "old-cluster-uid",
+				Message: "came back without this run's recovery"},
+			{Kind: "Cluster", Name: "other-db", Phase: backupv1alpha1.ItemSucceeded, BaseBackup: saturday.ID, ClusterUID: "other-uid"},
+		}
+	}, asOf("2026-09-22T00:00:00Z"))
+	c := newClientWithCRDs(t, crdsServedAtNext(t), run, atNext(objectStore()), storeSecret())
+	served := servingOnly(c)
+	r := &RestoreRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday}, Now: frozenNow}
+
+	restoreStep(t, r)
+
+	after := readRestoreRun(t, c)
+	if after.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(after.Status.Conditions) != backupv1alpha1.ReasonFailed {
+		t.Errorf("phase = %q, reason = %q (%s); want Failed with %s", after.Status.Phase, readyReason(after.Status.Conditions),
+			readyMessage(after.Status.Conditions), backupv1alpha1.ReasonFailed)
+	}
+}
+
+// A quiesced namespace restore planned while CloudNativePG no longer serves
+// Cluster at v1 ends at its first step, before anything is stopped or
+// suspended: the Cluster item fails, and the volume item, still Pending, is
+// Skipped with the app left running.
+func TestAPlannedNamespaceRestoreStopsNothingWhileTheWebhookCannotSee(t *testing.T) {
+	c := newClientWithCRDs(t, crdsServedAtNext(t), restoreRun(quiescedInPlace, asOf("2026-09-22T00:00:00Z")),
+		claim(), volumeRestore(), repository(), atNext(cluster()), atNext(objectStore()), storeSecret(),
+		deployment(), kustomization(false))
+	served := servingOnly(c)
+	r := &RestoreRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday}, Now: frozenNow}
+
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonClusterVersionUnsupported {
+		t.Fatalf("phase = %q, reason = %q (%s); want Failed with %s after the first step", run.Status.Phase,
+			readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), backupv1alpha1.ReasonClusterVersionUnsupported)
+	}
+	if len(run.Status.Quiesced) != 0 || run.Status.QuiescedAt != nil || replicasOf(t, c) != 2 || suspended(t, c) {
+		t.Errorf("quiesced = %v, replicas = %d, suspended = %v; want nothing stopped or suspended",
+			run.Status.Quiesced, replicasOf(t, c), suspended(t, c))
+	}
+	if len(run.Status.Items) != 2 {
+		t.Fatalf("items = %+v, want the claim and the Cluster", run.Status.Items)
+	}
+	for _, item := range run.Status.Items {
+		want := backupv1alpha1.ItemSkipped
+		if item.Kind == "Cluster" {
+			want = backupv1alpha1.ItemFailed
+		}
+		if item.Phase != want {
+			t.Errorf("item %s %s = %q (%s), want %s", item.Kind, item.Name, item.Phase, item.Message, want)
+		}
+	}
+}

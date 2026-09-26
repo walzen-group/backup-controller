@@ -338,8 +338,8 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 
 	// A Cluster the run would delete comes back empty while the webhook
 	// can't see its creation, so the run ends before it changes anything.
-	if blind := clusterWebhookBlind(r.RESTMapper()); blind != "" && failBlindClusters(items, blind) {
-		log.FromContext(ctx).Error(errors.New(blind), "deleting no Cluster: the bootstrap webhook would not see it created again",
+	if blind := clusterWebhookBlind(r.RESTMapper()); len(failBlindClusters(items, blind)) > 0 {
+		log.FromContext(ctx).Error(errors.New(blind.message()), "deleting no Cluster: the bootstrap webhook would not see it created again",
 			"namespace", run.Namespace, "name", run.Name)
 		for i := range items {
 			if items[i].Phase == backupv1alpha1.ItemPending {
@@ -348,7 +348,7 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 			}
 		}
 		run.Status.Items = items
-		return r.finish(ctx, run, backupv1alpha1.ReasonClusterVersionUnsupported, blind)
+		return r.finish(ctx, run, backupv1alpha1.ReasonClusterVersionUnsupported, blind.message())
 	}
 
 	// A synced run takes its databases' moment from the volumes' quiesced
@@ -847,10 +847,10 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 //
 // While clusterWebhookBlind reports that the bootstrap webhook would not see
 // a Cluster created again, work deletes no Cluster: it fails every Pending
-// Cluster item (see failBlindClusters), a run that ends with such an item
-// ends with reason ClusterVersionUnsupported, and a run that waits for a
-// deleted Cluster waits with that reason, its message asking to hold the
-// creation back.
+// Cluster item (see failBlindClusters), a run that ends in the pass that
+// failed such an item ends with reason ClusterVersionUnsupported (see
+// failedReason), and a run that waits for a deleted Cluster waits with that
+// reason, its message asking to hold the creation back.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if deadline, over := r.overdue(run); over {
 		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, restoreTimedOut(run, deadline))
@@ -942,8 +942,9 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	// A Cluster the webhook would not see created again comes back empty,
 	// so no Cluster is deleted while that holds (see clusterWebhookBlind).
 	blind := clusterWebhookBlind(r.RESTMapper())
-	if blind != "" && failBlindClusters(run.Status.Items, blind) {
-		log.FromContext(ctx).Error(errors.New(blind), "deleting no Cluster: the bootstrap webhook would not see it created again",
+	blindFailed := failBlindClusters(run.Status.Items, blind)
+	if len(blindFailed) > 0 {
+		log.FromContext(ctx).Error(errors.New(blind.message()), "deleting no Cluster: the bootstrap webhook would not see it created again",
 			"namespace", run.Namespace, "name", run.Name)
 	}
 
@@ -998,7 +999,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 
 	if restoreDone(run.Status.Items) {
 		if failed := restoreFailures(run.Status.Items); failed != "" {
-			return r.finish(ctx, run, failedReason(run.Status.Items, blind), failed)
+			return r.finish(ctx, run, failedReason(blindFailed), failed)
 		}
 		if skipped := nothingRestored(run.Status.Items); skipped != "" {
 			return r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, skipped)
@@ -1010,9 +1011,9 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	case len(shuttingDown) > 0:
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonShutdown,
 			fmt.Sprintf("waiting for %s of the deleted Cluster to be gone before anything creates it again", strings.Join(shuttingDown, ", "))))
-	case len(recreate) > 0 && blind != "":
+	case len(recreate) > 0 && blind.blind():
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonClusterVersionUnsupported,
-			fmt.Sprintf("%s. Hold back the creation of %s: the webhook would not recover it", blind, strings.Join(recreate, ", "))))
+			fmt.Sprintf("%s. Hold back the creation of %s: the webhook would not recover it", blind.message(), strings.Join(recreate, ", "))))
 	case len(recreate) > 0:
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonRecreate,
 			fmt.Sprintf("recreate %s to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it", strings.Join(recreate, ", "))))
