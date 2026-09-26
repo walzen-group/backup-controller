@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -256,6 +257,66 @@ func TestStopOfAFinishedJobDeletesItWithoutSuspending(t *testing.T) {
 				t.Errorf("second Stop = %+v, want stopped", again)
 			}
 		})
+	}
+}
+
+func TestStopOfAFinishedJobWaitsForAPodThatMayStillWrite(t *testing.T) {
+	for _, typ := range []batchv1.JobConditionType{batchv1.JobComplete, batchv1.JobFailed} {
+		t.Run(string(typ), func(t *testing.T) {
+			k := newCluster(t)
+			job := k.createJob(typ)
+			// A pod left running on a node, as a Job controller older than
+			// Kubernetes 1.31 could leave one past the terminal condition.
+			pod := k.createPod("p", job, job.UID, "node-a", corev1.PodRunning)
+			state := k.stop(job)
+			if state.Stopped || !slices.Equal(state.Pods, []string{"p"}) {
+				t.Fatalf("state = %+v, want not stopped with pod p left", state)
+			}
+			if k.foregroundDeleted(job) {
+				t.Fatal("Stop deleted a finished Job while its pod may still write")
+			}
+			k.setPhase(pod, corev1.PodSucceeded)
+			if state := k.stop(k.read(job)); !state.Stopped {
+				t.Fatalf("state = %+v, want stopped once the pod ended", state)
+			}
+		})
+	}
+}
+
+func TestStopDoesNotPassTheGateInTheCallThatSuspends(t *testing.T) {
+	k := newCluster(t)
+	job := k.suspended()
+	// Someone resumes the Job. The read still shows Suspended=True, since
+	// the Job controller writes JobResumed only after it created the pods.
+	job.Spec.Suspend = ptr.To(false)
+	if err := k.c.Update(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	job = k.read(job)
+	state := k.stop(job)
+	if state.Stopped || !state.Suspending {
+		t.Fatalf("state = %+v, want Suspending after the suspend patch", state)
+	}
+	if k.foregroundDeleted(job) {
+		t.Fatal("Stop deleted the Job in the call that suspended it")
+	}
+	job = k.read(job)
+	if job.Spec.Suspend == nil || !*job.Spec.Suspend {
+		t.Fatalf("spec.suspend = %v, want true", job.Spec.Suspend)
+	}
+	if state := k.stop(job); !state.Stopped {
+		t.Fatalf("state = %+v, want stopped once a read shows the Job suspended", state)
+	}
+}
+
+func TestStopStateNamesNoEmptyPodList(t *testing.T) {
+	got := restorejob.StopState{Job: "j"}.String()
+	if strings.Contains(got, "pods") || strings.Contains(got, "  ") {
+		t.Errorf("String() = %q, want no pod list when no pod is named", got)
+	}
+	got = restorejob.StopState{Job: "j", Pods: []string{"a", "b"}}.String()
+	if !strings.Contains(got, "a, b") {
+		t.Errorf("String() = %q, want the pods named", got)
 	}
 }
 
