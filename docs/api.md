@@ -272,7 +272,9 @@ A volume item succeeds only when the destination's `status.latestMoverStatus`
 names the recorded snapshot in its log. A mover that restored another snapshot,
 that found none, or whose log names none, fails the item and the message says
 what the claim holds;
-[restores.md](restores.md#what-the-mover-restored) lists the messages. A run
+[restores.md](restores.md#what-the-mover-restored) lists the messages. An
+in-place item also fails when its claim was deleted or replaced while the
+mover wrote, and that section lists those messages too. A run
 writes only into a claim it created itself: a claim named `spec.into`, or a
 ReplicationDestination named restore-<first 8 characters of the run's UID>-<item
 index>, that the run does not control fails the run, and the message says what
@@ -298,7 +300,12 @@ to do instead.
 | Failed | an item failed; the message names each failed item and its message |
 
 A RestoreRun records an event at each new Ready reason, the same way a
-[BackupRun](#backuprun) does.
+[BackupRun](#backuprun) does. A run deleted after it deleted a Cluster, and before
+the Cluster was created again, also records a Warning event with reason
+ClusterLeftDeleted for each such Cluster, right before it drops its finalizer;
+the note says the webhook now recovers that Cluster to the end of its archive,
+or to the time in its own `backup.wlz.li/restore-as-of` annotation.
+[restores.md](restores.md#databases-restore-themselves) quotes it.
 
 Six CEL rules on the CRD: exactly one of `claim` or `repository`, `database`
 and `all`; `previous` only with one volume; `into` only with `claim` or

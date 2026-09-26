@@ -355,7 +355,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, err
 	}
 	if over {
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, timedOutMessage(deadline, run.Status.Conditions))
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, backupTimedOut(run, deadline))
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
 	// restore of that claim need not wait for the rest of the run. This is
@@ -736,6 +736,46 @@ func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1al
 		return restoring, nil
 	}
 	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, vr.Spec.Repository)
+}
+
+// backupTimedOut returns the Ready message of a run that work aborts because
+// its deadline passed.
+//
+// Parameters:
+//   - run is the BackupRun. Its items and its Ready condition are read.
+//   - deadline is the run's deadline as overdue returns it.
+//
+// The first pass past the deadline builds the message with timedOutMessage,
+// which adds the SourceBusy wait the run was in, and abort puts it on every
+// unfinished item. When that pass cannot give the app back, releaseFailed
+// replaces the SourceBusy condition with RestartFailed or ReleaseFailed, and
+// a later pass would build the message without the wait. So when an item
+// already failed with a message for this deadline, backupTimedOut returns
+// that message without the parts abort added for the item alone: the last
+// start error of a Pending item ("; last error: ") and the sentence
+// syncGoesOn adds for a Running one. Of several such items it returns the
+// shortest result, and with none it builds the message afresh.
+func backupTimedOut(run *backupv1alpha1.BackupRun, deadline time.Time) string {
+	base := timedOutMessage(deadline, nil)
+	found := ""
+	for _, item := range run.Status.Items {
+		if item.Phase != backupv1alpha1.ItemFailed || !strings.HasPrefix(item.Message, base) {
+			continue
+		}
+		message := item.Message
+		for _, tail := range []string{"; last error: ", ". VolSync keeps retrying the sync ", ". VolSync goes on with the sync "} {
+			if at := strings.Index(message[len(base):], tail); at >= 0 {
+				message = message[:len(base)+at]
+			}
+		}
+		if found == "" || len(message) < len(found) {
+			found = message
+		}
+	}
+	if found != "" {
+		return found
+	}
+	return timedOutMessage(deadline, run.Status.Conditions)
 }
 
 // startItem starts the backup of one Pending item and sets the item's phase.

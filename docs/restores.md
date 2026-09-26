@@ -393,6 +393,24 @@ bytes (1024 by default) of the filtered log. Logs: ...`. A VolSync installed
 with `MOVER_LOG_MAX_BYTES` set to 0 or a very small value therefore leaves every
 restore unconfirmed, and each one fails.
 
+An in-place item also succeeds only into the claim its mover wrote. Right
+before it creates the item's ReplicationDestination, the run creates or
+updates the claim's Lease, whose name holds the claim's UID. When the mover's
+log checks out, the run reads the claim again and fails the item if the claim
+is gone, is being deleted, or has a UID that none of the run's claim Leases
+for the item holds. The message says which:
+
+```text
+claim notes-data was deleted while the mover wrote into it, and the restored data went with it
+claim notes-data was deleted while the mover wrote into it, and the restored data goes with it once the claim is released
+claim notes-data was replaced while the mover wrote into it: the claim there now (UID <new>) is not the one the mover wrote into (UID <old>), and nothing was restored into it
+the run holds no claim Lease for claim notes-data, so it can't tell whether the mover wrote into the claim that is there now. Check the claim's data, and create a new RestoreRun to restore it
+```
+
+The second message appears when someone deletes the claim while the mover's
+pod mounts it: Kubernetes keeps the claim, Terminating, until that pod is gone
+(pvc-protection), so the mover can finish into a claim that is about to go.
+
 ## Databases restore themselves
 
 Everything above is about volumes. A CloudNativePG database has the same gap
