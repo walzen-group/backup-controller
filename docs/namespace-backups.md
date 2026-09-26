@@ -198,7 +198,10 @@ and only a Lease or the Workload is left: `could not release the Leases it holds
 on its claims and repositories: ... Fix the cause, or delete the Leases labelled
 backup.wlz.li/lease-holder-uid=<uid> yourself; either way the run then finishes
 by itself.` The Leases go before the Workload, so the run keeps its place in the
-queue while it still owes the app its replicas. A run being deleted says that
+queue while it still owes the app its replicas. A Workload that resists
+deletion is reported the same way: `could not delete its Kueue Workload
+backuprun-<uid>, which holds the run's place in the queue: ...`, with the same
+offer to delete it by hand. A run being deleted says that
 the deletion completes by itself, and that a person can remove the finalizer
 `backup.wlz.li/run-cleanup` if it does not once the app runs again. The canary's
 writer was down 34 seconds, most of it
@@ -530,7 +533,12 @@ A RestoreRun that started before the Leases existed is found through its mover
 object instead, and a BackupRun reports that hold as well: `RestoreRun
 notes-back-to-friday is restoring claim notes-data from repository
 notes-restic-data with ReplicationDestination restore-3f2a1c7e; this run starts
-once that restore has finished`. A namespace run checks every claim this way
+once that restore has finished`. An `into` restore still on the populator path,
+one a v0.8.1 controller planned, is found through its VolumeRestore instead:
+`RestoreRun notes-back-to-friday is restoring the backups of claim notes-data
+from repository notes-restic-data into claim notes-back-to-friday through
+VolumeRestore notes-back-to-friday; this run starts once that restore has
+finished`. A namespace run checks every claim this way
 before it stops anything, so an app is never stopped for a backup that then
 waits.
 
