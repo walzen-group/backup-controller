@@ -1581,3 +1581,101 @@ func TestAKustomizationThatDoesNotListTheWorkloadIsNotSuspended(t *testing.T) {
 		t.Errorf("suspended = %v, want none", run.Status.SuspendedKustomizations)
 	}
 }
+
+// syncStarted stands in for VolSync starting the sync of the run's trigger
+// at the given time: it records status.lastSyncStartTime on the claim's
+// source, with no mover result yet.
+func syncStarted(t *testing.T, c client.Client, started time.Time) {
+	t.Helper()
+	source := &volsyncv1alpha1.ReplicationSource{}
+	get(t, c, ns, claimN, source)
+	at := metav1.NewTime(started)
+	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{LastSyncStartTime: &at}
+	if err := c.Status().Update(context.Background(), source); err != nil {
+		t.Fatalf("start the sync: %v", err)
+	}
+}
+
+// An item the run fails while VolSync goes on with its sync says what data a
+// snapshot of that sync holds. VolSync retries the sync with the clone it
+// cut when the sync started, and restic stamps a retry's snapshot with the
+// retry's own time, so that snapshot holds data older than its time.
+func TestAFailedItemNamesTheDataALaterSnapshotHolds(t *testing.T) {
+	started := frozen.Add(10 * time.Second)
+	at := started.UTC().Format(time.RFC3339)
+	cut := "a snapshot this sync saves later holds the data of " + at
+	for name, tc := range map[string]struct {
+		run  func(t *testing.T) (*BackupRunReconciler, client.Client)
+		fail func(t *testing.T, r *BackupRunReconciler, c client.Client)
+		want string
+	}{
+		"a failed mover": {
+			run: sourceRun,
+			fail: func(t *testing.T, r *BackupRunReconciler, c client.Client) {
+				cloneAt(t, c, started)
+				failMover(t, c, started)
+				step(t, r)
+			},
+			want: cut,
+		},
+		"the run's timeout": {
+			run: sourceRun,
+			fail: func(t *testing.T, r *BackupRunReconciler, c client.Client) {
+				cloneAt(t, c, started)
+				syncStarted(t, c, started)
+				r.Now = func() time.Time { return frozen.Add(time.Hour) }
+				step(t, r)
+			},
+			want: cut,
+		},
+		"the quiesce limit with the clone not cut": {
+			run: func(t *testing.T) (*BackupRunReconciler, client.Client) {
+				return quiescedVolumeRun(t, annotatedNamespace(nil))
+			},
+			fail: func(t *testing.T, r *BackupRunReconciler, c client.Client) {
+				syncStarted(t, c, started)
+				replicasAt(t, r, c, 10*time.Minute)
+			},
+			want: "has not cut its clone yet, so a snapshot this sync saves later holds the data of the moment it cuts the clone",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, c := tc.run(t)
+			tc.fail(t, r, c)
+			item := readBackupRun(t, c).Status.Items[0]
+			if item.Phase != backupv1alpha1.ItemFailed {
+				t.Fatalf("item = %+v, want it Failed", item)
+			}
+			if !strings.Contains(item.Message, tc.want) || !strings.Contains(item.Message, "started at "+at) {
+				t.Errorf("item message %q does not say %q and when the sync started", item.Message, tc.want)
+			}
+		})
+	}
+}
+
+// An item whose sync VolSync has not started says nothing of a later
+// snapshot: the sync that starts later cuts a fresh clone.
+func TestAFailedItemWithNoSyncSaysNothingOfALaterSnapshot(t *testing.T) {
+	r, c := sourceRun(t)
+	r.Now = func() time.Time { return frozen.Add(time.Hour) }
+	step(t, r)
+	item := readBackupRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemFailed || strings.Contains(item.Message, "later") {
+		t.Errorf("item = %+v, want it Failed with no word of a later snapshot", item)
+	}
+}
+
+// sourceRun creates a BackupRun of the test claim with a one-hour timeout
+// and reconciles it until the claim's source carries the run's trigger.
+func sourceRun(t *testing.T) (*BackupRunReconciler, client.Client) {
+	t.Helper()
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore(), repository())
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // start
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
+		t.Fatalf("item = %+v after the start pass, want it Running", item)
+	}
+	return r, c
+}

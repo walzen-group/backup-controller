@@ -718,7 +718,9 @@ func cloneName(claim string) string { return "volsync-" + claim + "-src" }
 // A Pending item fails with a message that says it never started, with the
 // error of its last start attempt when it has one. A Running item whose clone
 // is not cut fails with a message that names the missing clone. A Running
-// item whose clone is cut goes on. Afterwards clonesCut is true, so the
+// item whose clone is cut goes on. A Running item's message also says what
+// data a snapshot of the sync VolSync goes on with holds (see syncGoesOn).
+// Afterwards clonesCut is true, so the
 // caller's restart path records status.restartedAt and starts the workloads.
 // The check reads only the clones; a failed read counts as no clone, so an
 // API outage never keeps the workloads down past the limit.
@@ -741,11 +743,61 @@ func (r *BackupRunReconciler) giveUpUncut(ctx context.Context, run *backupv1alph
 			if r.cloneCut(ctx, run, *item) {
 				continue
 			}
-			item.Phase, item.Message = backupv1alpha1.ItemFailed,
-				fmt.Sprintf("VolSync had not cut the clone %s by %s, when the %s limit of %s ran out and the workloads were given back",
-					cloneName(item.Name), at, backupv1alpha1.AnnotationMaxQuiesce, limit)
+			message := fmt.Sprintf("VolSync had not cut the clone %s by %s, when the %s limit of %s ran out and the workloads were given back",
+				cloneName(item.Name), at, backupv1alpha1.AnnotationMaxQuiesce, limit)
+			if note := r.syncGoesOn(ctx, run, *item, nil); note != "" {
+				message += ". " + note
+			}
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 		}
 	}
+}
+
+// syncGoesOn returns a sentence for the message of a Running volume item the
+// run fails while VolSync goes on with the item's sync, and "" when VolSync
+// has no sync of the item's trigger open.
+//
+// Parameters:
+//   - item is the volume item, with the trigger tag the run wrote.
+//   - source is the claim's ReplicationSource as the caller read it, or nil
+//     for syncGoesOn to read it.
+//
+// VolSync keeps a sync open until a mover Job succeeds, and every Job of the
+// sync reads the clone it cut when the sync started (the status's
+// lastSyncStartTime). restic stamps a snapshot with the time its mover ran,
+// so a snapshot a retry saves after the run gave the item up carries a later
+// time than the data it holds. The sentence names the data such a snapshot
+// holds: that of the sync's start when the clone is cut, and that of the
+// moment VolSync cuts the clone otherwise. The clone counts as cut when the
+// claim volsync-<claim>-src is Bound, is not being deleted, and was created
+// no earlier than the sync started. A failed read gives "", since the
+// sentence only explains the item's failure.
+func (r *BackupRunReconciler) syncGoesOn(ctx context.Context, run *backupv1alpha1.BackupRun, item backupv1alpha1.BackupItem, source *volsyncv1alpha1.ReplicationSource) string {
+	if item.Kind != "ReplicationSource" || item.Trigger == "" {
+		return ""
+	}
+	if source == nil {
+		source = &volsyncv1alpha1.ReplicationSource{}
+		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source); err != nil {
+			return ""
+		}
+	}
+	if manualTag(source) != item.Trigger || lastManual(source) == item.Trigger || source.Status == nil || source.Status.LastSyncStartTime == nil {
+		return ""
+	}
+	start := source.Status.LastSyncStartTime
+	at := start.UTC().Format(time.RFC3339)
+	clone := &corev1.PersistentVolumeClaim{}
+	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: cloneName(item.Name)}, clone)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return ""
+	}
+	if err == nil && clone.Status.Phase == corev1.ClaimBound && clone.DeletionTimestamp.IsZero() && !clone.CreationTimestamp.Before(start) {
+		return fmt.Sprintf("VolSync keeps retrying the sync it started at %s with the clone it cut then, so a snapshot this sync saves later "+
+			"holds the data of %s, whatever time restic stamps on it.", at, at)
+	}
+	return fmt.Sprintf("VolSync goes on with the sync it started at %s and has not cut its clone yet, so a snapshot this sync saves later "+
+		"holds the data of the moment it cuts the clone, whatever time restic stamps on it.", at)
 }
 
 // collectItem records the result of a Running item once it has one, and
@@ -762,8 +814,9 @@ func (r *BackupRunReconciler) giveUpUncut(ctx context.Context, run *backupv1alph
 // has already started the next mover Job by then, and deleting the source
 // would kill that mover mid-backup and leave restic's lock in the
 // repository. VolSync keeps retrying, and a later run fails its item for the
-// claim at once while this run's tag is still open (see holder). A volume
-// with no files succeeds with Empty set,
+// claim at once while this run's tag is still open (see holder). The
+// message also says what data a snapshot of that sync saves later holds
+// (see syncGoesOn). A volume with no files succeeds with Empty set,
 // since VolSync takes no snapshot of it. Otherwise the item records the snapshot ID
 // the mover logged and the time restic stamped on it. On a quiesced run, the
 // snapshot is first moved to status.restartedAt and tagged quiesced, and the
@@ -783,7 +836,14 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 				// it has already started a new mover Job, and deleting the
 				// source would kill that mover mid-backup and leave restic's
 				// lock in the repository.
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, moverFailure(source, logs)
+				message := moverFailure(source, logs)
+				if note := r.syncGoesOn(ctx, run, *item, source); note != "" {
+					if !strings.Contains(logs, alreadyLocked) {
+						message = "Mover logs: " + message
+					}
+					message = note + " " + message
+				}
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 			}
 			return
 		}
@@ -911,7 +971,9 @@ func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claim
 // Failed with the given message, then calls finish, which starts the stopped
 // workloads again and deletes the run's Workload so the queue gets its slot
 // back. A Pending item whose last start attempt failed keeps that error: its
-// message becomes the given message, "; last error: " and the error.
+// message becomes the given message, "; last error: " and the error. A
+// Running volume item's message also says what data a snapshot of the sync
+// VolSync goes on with holds (see syncGoesOn).
 func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, message string) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
@@ -921,6 +983,11 @@ func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Bac
 		failed := message
 		if last, ok := strings.CutPrefix(item.Message, notStartedYet); ok && item.Phase == backupv1alpha1.ItemPending {
 			failed += "; last error: " + last
+		}
+		if item.Phase == backupv1alpha1.ItemRunning {
+			if note := r.syncGoesOn(ctx, run, *item, nil); note != "" {
+				failed += ". " + note
+			}
 		}
 		item.Phase, item.Message = backupv1alpha1.ItemFailed, failed
 	}
