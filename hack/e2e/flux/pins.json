@@ -1,0 +1,37 @@
+{
+  "flux": {
+    "version": "v2.9.5",
+    "installManifest": {
+      "url": "https://github.com/fluxcd/flux2/releases/download/v2.9.5/install.yaml",
+      "sha256": "cc3dcd743af16215838b6937e1fce83745bf24c0dcc6c59737c59df15429caaf"
+    },
+    "components": ["source-controller", "kustomize-controller"],
+    "images": {
+      "source-controller": {
+        "image": "ghcr.io/fluxcd/source-controller",
+        "tag": "v1.9.5",
+        "digest": "sha256:6f20d232d596a758c923d2861f23511718fc303b8a2e36a1434a7c736b9f4268"
+      },
+      "kustomize-controller": {
+        "image": "ghcr.io/fluxcd/kustomize-controller",
+        "tag": "v1.9.5",
+        "digest": "sha256:a3a955eb2bc432c2eaa94d2d3714e3beae7fdf17586fd23aadf71ab597ac3339"
+      },
+      "flux-cli": {
+        "image": "ghcr.io/fluxcd/flux-cli",
+        "tag": "v2.9.5",
+        "digest": "sha256:704d5529535570a495249b643159c93a9aa88ffca07813c974a54b7ba6edbd86"
+      },
+      "registry": {
+        "image": "registry",
+        "tag": "3.0.0",
+        "digest": "sha256:6c5666b861f3505b116bb9aa9b25175e71210414bd010d92035ff64018f9457e"
+      },
+      "busybox": {
+        "image": "busybox",
+        "tag": "1.37.0",
+        "digest": "sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+      }
+    }
+  }
+}
