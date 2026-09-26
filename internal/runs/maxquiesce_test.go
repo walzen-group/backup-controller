@@ -1,13 +1,22 @@
 package runs
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // quiescedVolumeRun creates a BackupRun with spec.all set in the given
@@ -130,5 +139,142 @@ func TestACloneCutJustBeforeTheQuiesceLimitGoesOn(t *testing.T) {
 	}
 	if run.Status.RestartedAt == nil {
 		t.Error("restartedAt is unset after the app came back")
+	}
+}
+
+// A claim whose ReplicationSource the API server refuses to write every time,
+// as RBAC or a policy webhook does with Forbidden, keeps the app down only
+// until the limit. The pass at the limit fails the Pending item with a
+// message that names the limit and the Forbidden error, and gives the app its
+// replicas back.
+func TestASourceThatCannotBeWrittenReleasesTheAppAtTheLimit(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		annotatedNamespace(nil), claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	forbidden := func(obj client.Object) error {
+		if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); ok {
+			return apierrors.NewForbidden(volsyncv1alpha1.GroupVersion.WithResource("replicationsources").GroupResource(), obj.GetName(),
+				errors.New(`admission webhook "policy.example" denied the request`))
+		}
+		return nil
+	}
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if err := forbidden(obj); err != nil {
+				return err
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if err := forbidden(obj); err != nil {
+				return err
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if err := forbidden(obj); err != nil {
+				return err
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // the source write is refused
+
+	if replicas := replicasAt(t, r, c, 10*time.Minute-time.Second); replicas != 0 {
+		t.Fatalf("replicas = %d a second before the limit, want the app still down", replicas)
+	}
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemPending || !strings.Contains(item.Message, "forbidden") {
+		t.Fatalf("item = %+v before the limit, want it Pending with the Forbidden error", item)
+	}
+
+	if replicas := replicasAt(t, r, c, 10*time.Minute); replicas != 2 {
+		t.Fatalf("replicas = %d at the limit, want 2 back", replicas)
+	}
+	run := readBackupRun(t, c)
+	if run.Status.RestartedAt == nil || !run.Status.RestartedAt.Time.Equal(frozen.Add(10*time.Minute)) {
+		t.Errorf("restartedAt = %v, want the moment of the limit pass", run.Status.RestartedAt)
+	}
+	item := run.Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, backupv1alpha1.AnnotationMaxQuiesce) ||
+		!strings.Contains(item.Message, "forbidden") || !strings.Contains(item.Message, "policy.example") {
+		t.Errorf("item = %+v, want it Failed naming %s and the Forbidden error", item, backupv1alpha1.AnnotationMaxQuiesce)
+	}
+}
+
+// A pod of a stopped workload that never goes away, as on a node that stopped
+// answering, keeps the app down only until the limit. Before it the run
+// waits for the pod; the pass at the limit fails the volume item, which
+// never started, and gives the app its replicas back.
+func TestAPodThatNeverStopsReleasesTheAppAtTheLimit(t *testing.T) {
+	stuck := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "notes-5d9f", Namespace: ns, Labels: map[string]string{"app": appN}},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		annotatedNamespace(nil), claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false), stuck)
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+
+	if replicas := replicasAt(t, r, c, 10*time.Minute-time.Second); replicas != 0 {
+		t.Fatalf("replicas = %d a second before the limit, want the app still down", replicas)
+	}
+	run := readBackupRun(t, c)
+	if message := readyMessage(run.Status.Conditions); !strings.Contains(message, stuck.Name) || run.Status.Items[0].Phase != backupv1alpha1.ItemPending {
+		t.Fatalf("Ready = %q, item = %+v before the limit, want the run waiting for pod %s", message, run.Status.Items[0], stuck.Name)
+	}
+
+	if replicas := replicasAt(t, r, c, 10*time.Minute); replicas != 2 {
+		t.Fatalf("replicas = %d at the limit, want 2 back", replicas)
+	}
+	run = readBackupRun(t, c)
+	if run.Status.RestartedAt == nil {
+		t.Error("restartedAt is unset after the app came back")
+	}
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "not started before") {
+		t.Errorf("item = %+v, want it Failed saying it never started", item)
+	}
+	source := &volsyncv1alpha1.ReplicationSource{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: claimN}, source); !apierrors.IsNotFound(err) {
+		t.Errorf("get the source = %v, want no source written while the pod ran", err)
+	}
+}
+
+// A pass at the limit whose status write is lost leaves the app down, since
+// it records status.restartedAt before it starts anything. The next pass is
+// past the limit too, restarts the app, and records its own moment, so
+// restartedAt is never later than the restart.
+func TestALostWriteAtTheLimitKeepsTheRestartAfterTheMoment(t *testing.T) {
+	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
+	healthy := r.Client
+
+	r.Client = loseStatusWriteAt(c, 0)
+	r.Now = func() time.Time { return frozen.Add(10 * time.Minute) }
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err == nil {
+		t.Fatal("the limit pass succeeded, want its lost status write returned")
+	}
+	if got := replicasOf(t, c); got != 0 {
+		t.Fatalf("replicas = %d after the lost limit pass, want the app still down", got)
+	}
+	if run := readBackupRun(t, c); run.Status.RestartedAt != nil {
+		t.Fatalf("restartedAt = %v after the lost write, want it unset", run.Status.RestartedAt)
+	}
+
+	r.Client = healthy
+	restart := frozen.Add(10*time.Minute + 30*time.Second)
+	if replicas := replicasAt(t, r, c, restart.Sub(frozen)); replicas != 2 {
+		t.Fatalf("replicas = %d on the pass after the lost write, want 2 back", replicas)
+	}
+	run := readBackupRun(t, c)
+	if run.Status.RestartedAt == nil || run.Status.RestartedAt.Time.After(restart) {
+		t.Errorf("restartedAt = %v, want a moment no later than the restart at %s", run.Status.RestartedAt, restart)
+	}
+	if run.Status.RestartPending {
+		t.Error("restartPending is still set after the restart")
+	}
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed {
+		t.Errorf("item = %+v, want it Failed at the limit", item)
 	}
 }
