@@ -77,8 +77,10 @@ type Decider struct {
 }
 
 // DefaultBudget is how long Handle spends on one create before it refuses
-// with what it read so far. deploy/webhook.yaml gives the API server's call
-// 15 s; the other 5 s cover TLS, the API server and the Kubernetes reads.
+// with what it read so far. The budget starts after the dry-run check and
+// covers every Kubernetes read and S3 request Handle makes. deploy/webhook.yaml
+// gives the API server's call 15 s; the other 5 s cover TLS, the API server's
+// own work and the answer's way back.
 const DefaultBudget = 10 * time.Second
 
 // Handle answers one admission request for a Cluster. For a new Cluster whose
