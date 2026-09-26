@@ -1324,9 +1324,14 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	case backupv1alpha1.ItemSucceeded:
 		return r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, done)
 	case backupv1alpha1.ItemFailed:
-		// An earlier pass recorded the end and lost finish's write, maybe
-		// after the destination was deleted. Without this, a pass that finds
-		// no destination would create one again.
+		// An earlier pass recorded the end, and finish either lost its write
+		// or waited for the stopped mover's pod. Without this, a pass that
+		// finds no destination would create one again. An item the timeout
+		// failed carries the timeout's message, and the run then ends with
+		// the reason the timeout gave it.
+		if deadline, over := r.overdue(run); over && item.Message == intoTimedOut(run.Spec.Into, deadline) {
+			return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, item.Message)
+		}
 		return r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
 	}
 
@@ -1379,7 +1384,7 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 		}
 	}
 	if deadline, over := r.overdue(run); over {
-		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, fmt.Sprintf("claim %s had not been restored by %s", run.Spec.Into, deadline.Format(time.RFC3339)))
+		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, intoTimedOut(run.Spec.Into, deadline))
 	}
 	switch {
 	case readErr == nil:
@@ -1442,6 +1447,23 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 		return r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
 	}
 	return after(pollInterval, r.resume(ctx, run))
+}
+
+// intoTimedOut returns the message of an into restore that ran past its
+// deadline.
+//
+// Parameters:
+//   - into is the claim the run restores into, spec.into, which the message
+//     names.
+//   - deadline is the run's deadline as overdue returns it, which the
+//     message gives.
+//
+// abort puts the message on the run and on its item. A later pass compares
+// the item's message with it to tell an item the timeout failed from one
+// that failed on its own, so the text depends on nothing but these two
+// values.
+func intoTimedOut(into string, deadline time.Time) string {
+	return fmt.Sprintf("claim %s had not been restored by %s", into, deadline.Format(time.RFC3339))
 }
 
 // intoTaken reads the object named spec.into into object, and returns the

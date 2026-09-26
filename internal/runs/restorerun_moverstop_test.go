@@ -405,3 +405,63 @@ func TestAnIntoRestoreWhoseClaimIsLostWaitsForItsStoppedMoversPod(t *testing.T) 
 		t.Errorf("get the claim Lease = %v, want it released once the mover pod was gone", err)
 	}
 }
+
+// An into restore past its timeout stops its mover and waits for that mover's
+// pod. The pass that finds the pod gone ends the run with reason TimedOut,
+// the reason the timeout gave it, and not with the Failed of an item that
+// failed on its own.
+func TestATimedOutIntoRestoreEndsTimedOutAfterItsMoverWait(t *testing.T) {
+	run, destination := intoRestoring()
+	started := metav1.NewTime(frozen)
+	run.Status.StartedAt = &started
+	pod := moverPod(destination.Name, corev1.PodRunning)
+	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), destination, pod)
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+
+	restoreStep(t, r)
+
+	waiting := readRestoreRun(t, c)
+	if waiting.Status.Phase.Finished() {
+		t.Fatalf("phase = %q with the mover pod still there, want the run unfinished", waiting.Status.Phase)
+	}
+
+	if err := c.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	done := readRestoreRun(t, c)
+	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+		t.Errorf("phase = %q, reason = %q, message = %q; want Failed, %s",
+			done.Status.Phase, readyReason(done.Status.Conditions), readyMessage(done.Status.Conditions), backupv1alpha1.ReasonTimedOut)
+	}
+}
+
+// An into restore whose mover failed before the timeout keeps reason Failed
+// when its mover's pod outlives the deadline: the item failed on its own.
+func TestAnIntoRestoreWhoseMoverFailedKeepsFailedPastTheTimeout(t *testing.T) {
+	run, destination := intoRestoring()
+	started := metav1.NewTime(frozen)
+	run.Status.StartedAt = &started
+	destination.Status = &volsyncv1alpha1.ReplicationDestinationStatus{
+		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "restic: repository is already locked"},
+	}
+	pod := moverPod(destination.Name, corev1.PodRunning)
+	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), destination, pod)
+
+	restoreStep(t, r)
+	if readRestoreRun(t, c).Status.Phase.Finished() {
+		t.Fatal("the run finished with the mover pod still there, want it waiting")
+	}
+
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	if err := c.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	done := readRestoreRun(t, c)
+	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonFailed {
+		t.Errorf("phase = %q, reason = %q; want Failed, %s", done.Status.Phase, readyReason(done.Status.Conditions), backupv1alpha1.ReasonFailed)
+	}
+}
