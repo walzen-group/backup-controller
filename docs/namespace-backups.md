@@ -166,10 +166,9 @@ restartedAt: "2026-09-24T22:15:45Z"
 2. It writes its plan into the status before it changes anything: every
    workload marked `backup.wlz.li/quiesce` in `status.quiesced`, with the
    replicas it has now, and the Flux Kustomizations to suspend in
-   `status.suspendedKustomizations`. Before that write it takes the
-   namespace's quiesce Lease and one Lease per planned Kustomization, and waits
-   with reason SourceBusy while another run holds one, or while another
-   unfinished run still owes this namespace's workloads their replicas
+   `status.suspendedKustomizations`. Before that write it acquires the
+   namespace's quiesce Lease, and waits with reason SourceBusy while another
+   run holds it and has not yet given this namespace's workloads back
    ([One quiesce at a time](#one-quiesce-at-a-time)). Then it suspends those
    Kustomizations and scales the workloads to zero, and waits until none of
    their pods is left, terminating ones included: a pod shutting down can
@@ -420,8 +419,8 @@ A run that finds a
 source still completing another run's tag waits for it, with reason SourceBusy
 and a message naming that run: `ReplicationSource
 canary-namespace-backup-data is still completing the backup of BackupRun
-scheduled-20260924-2245`. A source VolSync started syncing with no tag at all,
-which a run from an older version can leave behind, waits the same way with
+scheduled-20260924-2245`. A source VolSync started syncing with no open tag
+makes the run wait the same way, with
 `ReplicationSource canary-namespace-backup-data is still syncing; VolSync has
 not recorded the end of its last sync`. A
 source of the same name the controller did not write is left alone, and the
@@ -548,14 +547,20 @@ A run that finds another run holding either Lease waits with reason SourceBusy:
 BackupRun scheduled-20260926-0900 holds Lease backup-controller-claim-3f2a1c7e-9d2b for notes-data; this run starts once that run has finished with it
 ```
 
-A RestoreRun that started before the Leases existed is found through its mover
-object instead, and a BackupRun reports that hold as well: `RestoreRun
-notes-back-to-friday is restoring claim notes-data from repository
-notes-restic-data with ReplicationDestination restore-3f2a1c7e; this run starts
-once that restore has finished`. A namespace run checks every claim this way, and for the Lease of the
-claim and its repository, before it stops anything, and a read that fails there
-comes back as an error and stops nothing: an app is never stopped for a backup
-that then waits, or on a read that could not be made.
+Right before it creates its mover object, a run also looks for the other
+kind's mover object on the claim or its repository: a BackupRun for a
+ReplicationDestination of an unfinished RestoreRun, and a RestoreRun for a
+ReplicationSource whose backup is in progress. It waits for one with reason
+SourceBusy as well:
+
+```text
+RestoreRun notes-back-to-friday is restoring claim notes-data from repository notes-restic-data with ReplicationDestination restore-3f2a1c7e; this run starts once that restore has finished
+```
+
+A namespace BackupRun makes both checks, the Leases and the mover objects, for
+every claim before it stops anything. A read that fails there comes back as an
+error and stops nothing, so the run never stops an app for a backup that then
+waits, or on a read it could not make.
 
 No Lease guards a claim that does not exist, and the item reports it: a backup
 fails the item with `the claim <name> no longer exists`. A repository Secret

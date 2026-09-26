@@ -102,7 +102,7 @@ Stopping the workload is what prevents it. A RestoreRun with `quiesce` stops the
 workloads that list names itself, as
 [namespace-backups.md](namespace-backups.md#restore-a-whole-namespace-to-one-moment)
 shows; while a pod of one of them is still terminating, the run waits in phase
-Waiting with Ready reason Running and `waiting for pod <namespace>/<pod> to stop
+Waiting with Ready reason Running and `waiting for pod <pod> to stop
 before anything is restored`, because a pod shutting down can still write.
 Without that list the run stops nothing: it waits in phase Waiting,
 reason ClaimInUse, until no pod mounts the claim. It lists the pods straight
@@ -270,6 +270,21 @@ its lock in the repository. The message names what is left:
 ```text
 waiting for the mover of ReplicationDestination restore-9b7d4e21-0, which the run stopped while it restored scratch, to go: its Job volsync-dst-restore-9b7d4e21-0 is still there. The run gives the app back and lets other runs at the claim only after that
 ```
+
+When the run fails to delete the destination, or to read the Job and its pods,
+it stays unfinished and tries again on every pass. It reports RestartFailed while a
+workload it stopped is still down, and ReleaseFailed once the app is back or
+when it stopped none. The message names the step and the error, and ends with
+what a person can delete by hand:
+
+```text
+could not stop the mover of its ReplicationDestination restore-9b7d4e21-0: <error>. The run retries until it can. Fix the cause, or delete ReplicationDestination restore-9b7d4e21-0, its mover's Job volsync-dst-restore-9b7d4e21-0 and that Job's pods yourself; either way the run then finishes by itself.
+```
+
+A run with `quiesce` that reports RestartFailed for this step adds the
+workloads to scale back once no mover of the run still writes to its claims.
+[api.md](api.md#ready-reasons-of-a-restorerun) lists every reason a RestoreRun
+reports.
 
 ### Which snapshot a run restores
 
@@ -568,7 +583,7 @@ same name, with the same prefix in it, are refused too. Give one of the two its
 own prefix: put the environment or the namespace in its `destinationPath`
 (`s3://backups/staging/`), or set a `serverName`. There is no annotation to
 override the check;
-[decisions.md](decisions.md#compare-bucket-and-prefix-and-never-the-endpoint-for-a-shared-archive)
+[decisions.md](decisions.md#compare-only-bucket-and-prefix-for-a-shared-archive)
 records why.
 
 Move the Cluster being created, never the one that already archives there. A

@@ -9,8 +9,9 @@ what to do during and after the upgrade. The Releases table in the
 ### Step 1: Upgrade only while no run is active
 
 Move the image only while no BackupRun or RestoreRun is active
-([decisions.md](decisions.md#upgrade-only-while-no-run-is-active)). A run lasts
-minutes, so wait for the running ones to finish.
+([decisions.md](decisions.md#upgrade-only-while-no-run-is-active)). A backup
+lasts minutes, and a restore that recovers a Cluster or writes a large volume
+can last hours, so wait for the running ones to finish.
 
 List the runs that have not finished:
 
@@ -32,17 +33,24 @@ the Kustomizations it suspended and deletes the objects it created, and the
 deletion completes once it has. Run the listing again until it prints nothing,
 then move the image while the old controller's pod is still the one running.
 A namespace schedule can start a new run in the meantime, so move the image
-between two ticks of the schedules you know about.
+between two ticks of the schedules you know about. The Deployment's Recreate
+strategy stops the old pod before the new one starts, so the two versions never
+reconcile a run at the same moment.
 
-v0.9.0 carries on a run that was still active at the upgrade as if it had
-planned that run itself, and does not check what the older version wrote into
-its status.
+v0.9.0 has no code for a run an older version started. It carries on a run that
+was still active at the upgrade as if it had planned that run itself, and it
+does not check what the older version wrote into that run's status. The older
+version took no Leases and ran an `into` restore from a claim through the
+populator, so such a run can leave an app at zero replicas, or have a claim
+written by two movers. Delete a run you find active after the upgrade, and then
+run the zero-replica listing in
+[step 4](#step-4-apply-the-crds-the-rbac-and-the-image-together).
 
 ### Step 2: Check that no two Clusters share an archive
 
 From v0.9.0 the webhook compares only bucket and prefix when it looks for a
 shared archive, whatever endpointURL each ObjectStore names
-([decisions.md](decisions.md#compare-bucket-and-prefix-and-never-the-endpoint-for-a-shared-archive)).
+([decisions.md](decisions.md#compare-only-bucket-and-prefix-for-a-shared-archive)).
 v0.8.x also compared the endpoint, so it may have admitted two Clusters that
 write one archive through two spellings of one endpoint. The check runs on
 every Cluster create, a disaster-recovery rebuild included, and it refuses the
@@ -95,17 +103,29 @@ permissions.
 
 ### Step 4: Apply the CRDs, the RBAC and the image together
 
-Three rules are added, and one of them refuses work until it is applied:
+The ClusterRole gains four rules, and the first of them refuses work until it
+is applied:
 
-- the ClusterRole gains `list` on `objectstores.barmancloud.cnpg.io`;
-- it gains `get` on `customresourcedefinitions.apiextensions.k8s.io`, named
+- `list` on `objectstores.barmancloud.cnpg.io`, which the webhook's
+  shared-archive check uses to read every ObjectStore in one call;
+- `get` on `customresourcedefinitions.apiextensions.k8s.io`, named
   `backupruns.backup.wlz.li`, `restoreruns.backup.wlz.li` and
-  `volumerestores.backup.wlz.li`;
-- it gains get, list, create, update and delete on `leases` in
-  `coordination.k8s.io`, which the runs take before they start a mover.
+  `volumerestores.backup.wlz.li`, for the CRD check below;
+- get, list, create, update and delete on `leases` in `coordination.k8s.io`,
+  for the Lease a run acquires on a claim and its repository before it starts a
+  mover, and the Lease `backup-controller-quiesce` it acquires before it stops
+  a namespace's workloads;
+- `get` on `jobs` in `batch`, which a RestoreRun and the orphan reconciler use
+  to wait until the Job of a mover they stopped is gone.
 
 One rule loses a verb: `create` on `volumerestores.backup.wlz.li` goes, because
-v0.9.0 creates no VolumeRestore.
+a RestoreRun with `into:` no longer creates a VolumeRestore. The VolumeRestores
+a claim names in `dataSourceRef`, such as the one a Flux template writes for
+each backed-up claim, keep working unchanged: the populator fills a new claim
+from them, and every run reads a claim's repository from its VolumeRestore, as
+before.
+[packaging.md](packaging.md#rbac-the-controller-needs) lists every rule and its
+caller.
 
 Apply deploy/rbac.yaml, or upgrade the chart, in the same change that moves the
 image. A v0.9.0 image running under the v0.8.x ClusterRole refuses every
@@ -124,11 +144,20 @@ kubectl apply --server-side -f https://github.com/walzen-group/backup-controller
 Helm upgrades no CRD on its own, so an install moved with `helm upgrade` alone
 keeps the CRDs of its first install.
 
-A cluster that ran v0.8.0 or v0.8.1 under the v0.7.2 BackupRun CRDs needs a look
-before the upgrade: that schema has no `status.restartPending`, so a status
-write there drops the field, and a run that stopped workloads could finish
-while the app was still at zero replicas. Before and after the upgrade, list
-the workloads that are marked for quiesce and stand at zero:
+Two behaviours of v0.8.x could leave an app at zero replicas with its run
+Succeeded:
+
+- A namespace backup and a RestoreRun with `quiesce`, or two namespace backups,
+  could stop the same workload. The second run recorded the zero replicas the
+  first had stopped it at, and whichever run restarted last decided whether the
+  app came back.
+- Under the v0.7.2 BackupRun CRD, whose schema has no `status.restartPending`,
+  a status write dropped that field, and a run whose restart failed could
+  finish while the app was still at zero replicas.
+
+v0.9.0 gives back only what its own runs record as stopped, so it does not
+repair either case. Before and after the upgrade, list the workloads that are
+marked for quiesce and stand at zero:
 
 ```
 kubectl get deployments,statefulsets -A -o json | jq -r '.items[] | select((.metadata.annotations? // {})["backup.wlz.li/quiesce"] == "true" and ((.spec.replicas? // 1) == 0)) | "\(.metadata.namespace)/\(.kind)/\(.metadata.name)"'
@@ -141,9 +170,11 @@ kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o json | jq -r '.item
 ```
 
 Expected result: only workloads and Kustomizations you stopped by hand. Scale
-each one back up and resume each Kustomization. v0.9.0 gives back only what
-its own runs record as stopped, so this listing is where an app that a failed
-restart under the old CRD left at zero shows up.
+each other workload back to the replicas its app runs with, and resume each
+other Kustomization. A workload that a RestoreRun's `quiesce` lists and that
+carries no `backup.wlz.li/quiesce` annotation does not appear in the first
+listing; compare those with the `status.quiesced` of the RestoreRuns that list
+them.
 
 ### Step 5: Check how long an app may stay down
 
@@ -352,3 +383,22 @@ spec.configuration.serverName: Forbidden: use the 'serverName' plugin parameter 
 hack/e2e/cnpg/empty-archive-repair.sh starts a Cluster over an old archive on
 the e2e cluster, repairs it either way step 9 gives, runs step 10, and recovers
 a second Cluster from the repaired archive to count its rows.
+
+### Ready reasons that are new or mean more
+
+A dashboard or an alert that reads a run's Ready reason sees three new reasons
+and six that cover more cases than before. api.md has the full table for a
+[BackupRun](api.md#ready-reasons) and for a
+[RestoreRun](api.md#ready-reasons-of-a-restorerun).
+
+| Reason | From v0.9.0 |
+| --- | --- |
+| CRDOutdated | new: the run ended before it changed anything, because the installed CRD of its kind lacks a field the controller writes, or the controller may not read that CRD |
+| RestartFailed | new: the run could not give its app back, and stays unfinished until it can; the app is still down |
+| ReleaseFailed | new: the app is back, and the run stays unfinished until it can release its Leases, its Kueue Workload or a restore mover it stopped |
+| SourceBusy | also a backup and a restore of the same claim or repository, a Lease another run holds on either, another run that has stopped this namespace's workloads, and a RestoreRun that has deleted a Cluster and waits for it to be created again |
+| NoBackupInReach | also a snapshot VolSync's mover would not restore when pinned to its second, and a RestoreRun whose every item was Skipped |
+| ClaimInUse | also another ReplicationDestination writing into the claim of an in-place restore |
+| WaitingForShutdown | also a RestoreRun waiting for the Job and pods of a restore mover it stopped |
+| TimedOut | also an `into` restore whose mover had not finished by `spec.timeout` |
+| Retrying | also on a BackupRun, for an item whose start failed with an error a retry may fix |

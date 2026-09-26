@@ -197,7 +197,7 @@ doing it.
 | Ready reason | When |
 | --- | --- |
 | Queued | the run waits for Kueue to admit it |
-| Running | work is under way; the message is `backing up` |
+| Running | work is under way; the message is `backing up`, or `waiting for pod <pod> to stop before the clones are cut` while a pod of a workload the run stopped is still terminating |
 | SourceBusy | another run holds the run's claim or repository, holds this namespace's quiesce Lease, or has deleted a Cluster this run waits to see created again; the message names that run, what it holds, and every wait |
 | Retrying | an item could not start with an error a retry may fix, such as a Backup a CloudNativePG webhook refuses; the message names every such item and its error |
 | RestartFailed | the run could not give a stopped workload its replicas back or resume a Kustomization it suspended, so the app is still down; when the Lease release or the Workload delete failed as well, the reason stays RestartFailed and the message names both |
@@ -233,7 +233,7 @@ spec:
 | --- | --- | --- |
 | `claim` | one of `claim`/`repository`, `database` and `all` | the claim whose repository to restore from, and the claim to write into unless `into` names another |
 | `repository` | the same | the restic Secret in this namespace, for a repository no claim here owns; needs `into` and `intoSize` |
-| `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository`. No claim of that name may exist yet, and the run creates no VolumeRestore for it. The run creates it empty and writes the selected snapshot into it through its own ReplicationDestination with `copyMethod: Direct`, so the mover's log confirms what the claim holds. With `claim` the run copies the source claim's size and the node its volume is on, and the scheduler places the mover pod with that volume; with `repository` there is no source node, and the mover pod is the claim's first consumer |
+| `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository`. No claim of that name may exist yet, and with `claim` no VolumeRestore of that name either, since a VolumeRestore describes the backups of the claim of its name; the run creates no VolumeRestore for it. The run creates it empty and writes the selected snapshot into it through its own ReplicationDestination with `copyMethod: Direct`, so the mover's log confirms what the claim holds. With `claim` the run copies the source claim's size and the node its volume is on, and the scheduler places the mover pod with that volume; with `repository` there is no source node, and the mover pod is the claim's first consumer |
 | `intoSize` | with `repository` and `into` | the size of that claim; omitted with `claim`, the source claim's request |
 | `database` | one of the three | the Cluster to restore; the run deletes it and it recovers when it is created again. A Cluster carrying `backup.wlz.li/bootstrap: initdb`, or declaring its own bootstrap method such as `pg_basebackup`, ends the run Invalid, and so does a Cluster another unfinished RestoreRun is restoring |
 | `all` | one of the three | every enabled claim in place, then every enabled Cluster; a Cluster carrying `backup.wlz.li/bootstrap: initdb`, or declaring its own bootstrap method, gets a Skipped item. A Cluster another unfinished RestoreRun is restoring ends the run Invalid, and a run whose every item is Skipped ends Failed with reason NoBackupInReach |
@@ -253,7 +253,7 @@ spec:
 | `syncedTo` | the moment a `syncDatabaseToVolume` run restores the volumes and recovers the databases to |
 | `quiescedAt`, `restartedAt`, `quiesced[]`, `suspendedKustomizations[]` | when the run stopped and gave back the workloads `quiesce` lists, the replicas it gave each back, and the Flux Kustomizations it suspended and resumed |
 | `items[]` | one per volume and per database: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message, the `destination` while it exists, the `snapshot` and `snapshotTime` a volume restores, the `baseBackup` a recovery starts from, and the `clusterUID` of the Cluster a database item deletes |
-| `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, SourceBusy, ClaimInUse (a pod mounts the claim, or `ReplicationDestination <name> is restoring into claim <claim>`), Retrying, TimedOut, or `recreate <cluster> to finish the restore`; a run that ran out of time while waiting for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |
+| `conditions[type=Ready]` | the reason and message, kstatus-compatible; [Ready reasons of a RestoreRun](#ready-reasons-of-a-restorerun) lists them |
 
 `items[].snapshotTime` is the time of the snapshot the run's checks selected,
 and the mover gets it as `restoreAsOf`;
@@ -276,6 +276,25 @@ what the claim holds;
 writes only into a claim it created itself: a claim or ReplicationDestination
 of the name `spec.into` that the run does not control fails the run, and the
 message says what to do instead.
+
+### Ready reasons of a RestoreRun
+
+| Ready reason | When |
+| --- | --- |
+| Retrying | the checks failed with an error a retry may fix, such as a repository with the wrong password; the phase stays empty and the message holds the error |
+| Running | work is under way; the message is `restoring`, `restoring into claim <into>` for an `into` restore, or `waiting for pod <pod> to stop before anything is restored` while a pod of a workload the run stopped is still terminating |
+| SourceBusy | a backup of the run's claim or repository is in progress, another run holds the Lease of either, another run has stopped this namespace's workloads, or a RestoreRun has deleted a Cluster in this namespace and waits for it to be created again; the message names that run and what it holds |
+| ClaimInUse | an in-place restore waits for its claim: `claim <claim> is mounted by pod <pod>; stop the workload and this restore starts on its own`, or `ReplicationDestination <name> is restoring into claim <claim>` while another restore writes into it |
+| WaitingForShutdown | the run waits for something to be gone before it goes on: the instance pods and PVCs of a Cluster it deleted, or the Job and pods of a restore mover it stopped; the app stays stopped and the run keeps its Leases until then |
+| WaitingForRecreate | the run deleted a Cluster and waits for its owner to create it again: `recreate <cluster> to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it` |
+| RestartFailed | the run could not give a workload it stopped its replicas back, could not resume a Kustomization it suspended, or could not stop a restore mover while the app is down; the message names what failed and what to scale, resume or delete by hand |
+| ReleaseFailed | the app is back, and the run cannot finish because it could not release its Leases or stop a restore mover; the message says what to delete by hand |
+| CRDOutdated | the run ended before it changed anything, because the installed CRD of its kind lacks a field the controller writes, or the controller may not read that CRD |
+| Invalid | the spec names something no retry can fix, such as an `into` claim that already exists, a Cluster carrying `backup.wlz.li/bootstrap: initdb` named in `database`, or a Cluster another unfinished RestoreRun is restoring |
+| NoBackupInReach | the run ended before it deleted or wrote anything, because an item has no backup at or before `restoreAsOf`, or its selected snapshot is one VolSync's mover would not restore; also a run that restored nothing because every item was Skipped |
+| TimedOut | the run had not finished by its `timeout`, had not passed its checks by then (`the run had not passed its checks by <deadline>: <message>`), or its `into` claim had not been restored by then (`claim <into> had not been restored by <deadline>`); a run that was waiting for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |
+| Succeeded | every item holds the restored data |
+| Failed | an item failed; the message names each failed item and its message |
 
 A RestoreRun records an event at each new Ready reason, the same way a
 [BackupRun](#backuprun) does.
