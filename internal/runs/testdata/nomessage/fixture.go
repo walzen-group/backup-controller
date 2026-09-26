@@ -115,6 +115,32 @@ func joinedInline(err error) bool {
 	return "x: "+err.Error() == "x: done" // want comparison
 }
 
+func measured(it item) bool {
+	return len(it.LastStartError) > 0 // want comparison
+}
+
+func measuredLocal(it item) bool {
+	n := len(it.Message)
+	return n >= 3 // want comparison
+}
+
+func keyed(it item) bool {
+	return map[string]bool{"not started yet": true}[it.Message] // want comparison
+}
+
+func ordered(it item) bool {
+	return it.Message > "not" // want comparison
+}
+
+func ranged(it item) bool {
+	for _, c := range it.Message {
+		if c == 'n' { // want comparison
+			return true
+		}
+	}
+	return false
+}
+
 func allowed(key string) string {
 	return str.TrimPrefix(key, "ns/")
 }

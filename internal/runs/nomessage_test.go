@@ -78,10 +78,11 @@ var messageComparisonAllowlist = []messageRuleEntry{
 // controller's own messages, VolSync's mover logs, or an error's string.
 // Part 1 fails on any text matcher outside the allowlist, since a message
 // read through a local looks like any other string. Part 2 fails on a
-// comparison (==, !=, a switch) of a .Message or .Logs field, an Error()
-// string, an index, slice or concatenation of one, or a local assigned from
-// any of those. An entry on a list that matches nothing fails too, so the
-// lists stay exact.
+// comparison (==, !=, <, >, <=, >=, a switch) of a .Message or .Logs
+// field, an Error() string, an index, slice, len or concatenation of one, a
+// local assigned from any of those, or the key or value of a range over
+// one, and on a lookup keyed by any of them. An entry on a list that
+// matches nothing fails too, so the lists stay exact.
 //
 // The rule reads each declaration on its own and without types, so two
 // ways around it stay open, and a reviewer still checks for them:
@@ -114,9 +115,10 @@ func TestNoDecisionReadsAMessage(t *testing.T) {
 // on a field, on a local and in a package-level var, a split, a Compare, a
 // bytes.Equal, a regexp method, a comparison of a field (lastStartError
 // included), of an Error() string, of an index, a slice or a concatenation
-// of one and of locals assigned from them, and a switch on a message. A
-// declaration on the allowlist is let through, and an entry that matches
-// nothing is reported.
+// of one and of locals assigned from them, the len of one, an order
+// comparison, a range over one, a lookup keyed by one, and a switch on a
+// message. A declaration on the allowlist is let through, and an entry that
+// matches nothing is reported.
 func TestTheMessageRuleCatchesEveryShape(t *testing.T) {
 	findings := scanMessageRule(t, messageRuleDir{dir: "testdata/nomessage"})
 	lists := messageRuleLists{
@@ -373,8 +375,12 @@ func (p messagePackage) scanDecl(named namedNode, matchers map[string]string) []
 		case *ast.SelectorExpr:
 			p.checkMatcher(n, matchers, add)
 		case *ast.BinaryExpr:
-			if (n.Op == token.EQL || n.Op == token.NEQ) && (message(n.X) || message(n.Y)) {
+			if comparisonOps[n.Op] && (message(n.X) || message(n.Y)) {
 				add(n, ruleComparison, "a comparison of a message, a log or an error string")
+			}
+		case *ast.IndexExpr:
+			if message(n.Index) {
+				add(n, ruleComparison, "a lookup keyed by a message, a log or an error string")
 			}
 		case *ast.SwitchStmt:
 			checkSwitch(n, message, add)
@@ -382,6 +388,12 @@ func (p messagePackage) scanDecl(named namedNode, matchers map[string]string) []
 		return true
 	})
 	return findings
+}
+
+// comparisonOps are the operators that compare two values: equality and
+// order. Either one applied to a message decides on its text.
+var comparisonOps = map[token.Token]bool{
+	token.EQL: true, token.NEQ: true, token.LSS: true, token.GTR: true, token.LEQ: true, token.GEQ: true,
 }
 
 // checkMatcher reports a selector that names a text matcher: a matching
@@ -424,20 +436,30 @@ func checkSwitch(s *ast.SwitchStmt, message func(ast.Expr) bool, add func(ast.No
 
 // taintedLocals returns the names in a declaration that are assigned a
 // message, through :=, =, += or var, directly or from another such name,
-// repeated until no name is added.
+// and the key and value of a range over a message, repeated until no name
+// is added.
 func taintedLocals(node ast.Node) map[string]bool {
 	tainted := map[string]bool{}
 	for changed := true; changed; {
 		changed = false
+		taint := func(e ast.Expr) {
+			if id, ok := e.(*ast.Ident); ok && id.Name != "_" && !tainted[id.Name] {
+				tainted[id.Name], changed = true, true
+			}
+		}
 		ast.Inspect(node, func(n ast.Node) bool {
+			if loop, ok := n.(*ast.RangeStmt); ok && isMessage(loop.X, tainted) {
+				taint(loop.Key)
+				taint(loop.Value)
+				return true
+			}
 			lhs, rhs := assignment(n)
 			if len(lhs) != len(rhs) {
 				return true
 			}
 			for i, value := range rhs {
-				id, ok := lhs[i].(*ast.Ident)
-				if ok && !tainted[id.Name] && isMessage(value, tainted) {
-					tainted[id.Name], changed = true, true
+				if isMessage(value, tainted) {
+					taint(lhs[i])
 				}
 			}
 			return true
@@ -449,8 +471,8 @@ func taintedLocals(node ast.Node) map[string]bool {
 // isMessage reports whether an expression is text a component wrote for a
 // person: a field .Message, .Logs or .LastStartError (an error string
 // stored), an Error() call, a string conversion of one, a tainted local, or
-// anything cut from one: an index, a slice, or a + concatenation with a
-// message on either side.
+// anything cut from one: an index, a slice, its len, or a + concatenation
+// with a message on either side.
 func isMessage(e ast.Expr, tainted map[string]bool) bool {
 	switch e := ast.Unparen(e).(type) {
 	case *ast.SelectorExpr:
@@ -465,7 +487,7 @@ func isMessage(e ast.Expr, tainted map[string]bool) bool {
 		if sel, ok := e.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Error" && len(e.Args) == 0 {
 			return true
 		}
-		if id, ok := e.Fun.(*ast.Ident); ok && id.Name == "string" && len(e.Args) == 1 {
+		if id, ok := e.Fun.(*ast.Ident); ok && (id.Name == "string" || id.Name == "len") && len(e.Args) == 1 {
 			return isMessage(e.Args[0], tainted)
 		}
 	case *ast.Ident:
