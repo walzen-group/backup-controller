@@ -35,6 +35,19 @@ func calls(forwarded backupv1alpha1.ItemReason) []error {
 	}
 }
 
+func failAll(items []item, reason backupv1alpha1.ItemReason) {
+	for i := range items {
+		items[i].Reason = reason
+	}
+}
+
+func passed(items []item, forwarded backupv1alpha1.ItemReason) {
+	failAll(items, backupv1alpha1.ItemReasonTimedOut)
+	failAll(items, "")        // want reason
+	failAll(items, "Made")    // want reason
+	failAll(items, forwarded) // want reason
+}
+
 func assignments(it *item) {
 	it.Reason = backupv1alpha1.ItemReasonClaimMissing
 	it.Reason = "ClaimGone"                             // want reason

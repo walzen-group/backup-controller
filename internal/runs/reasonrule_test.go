@@ -41,11 +41,13 @@ type reasonRuleEntry struct {
 	what string
 }
 
-// reasonForwardingAllowlist lets failure.go pass on a reason its caller
-// chose: refuse stores the reason of a checked call, and the item
-// failures copy a *refusalError's reason into the item. The constant
-// reasons these declarations set of their own are checked. A new entry
-// needs a reviewer's eye like any rule exception.
+// reasonForwardingAllowlist lets a declaration pass on a reason its caller
+// chose: refuse stores the reason of a checked call, the item failures
+// copy a *refusalError's reason into the item, and failRemainingItems
+// passes its checked reason to refuse. The constant reasons these
+// declarations set of their own are checked. abort passes no reason until
+// RestoreRun step R5 adds RunEnded, and that step empties its entry. A new
+// entry needs a reviewer's eye like any rule exception.
 var reasonForwardingAllowlist = []reasonRuleEntry{
 	{file: "failure.go", decl: "refuse", forwarded: []string{"reason"},
 		what: "stores its reason parameter, which the rule checks at every call"},
@@ -55,6 +57,10 @@ var reasonForwardingAllowlist = []reasonRuleEntry{
 		what: "copies the reason asItemFailure returned"},
 	{file: "failure.go", decl: "failRestoreItem", forwarded: []string{"failure.reason"},
 		what: "copies the reason asItemFailure returned"},
+	{file: "restorerun.go", decl: "failRemainingItems", forwarded: []string{"reason"},
+		what: "passes to refuse the reason its callers give, which the rule checks at every call"},
+	{file: "restorerun.go", decl: "RestoreRunReconciler.abort", forwarded: []string{`""`},
+		what: "the items abort fails record no reason until RestoreRun step R5 adds RunEnded"},
 }
 
 // reasonListUse is one value of an entry, as applyReasonList reports it
@@ -67,11 +73,12 @@ type reasonListUse struct {
 
 // Every reason an item records is a constant the API package declares, so
 // no item carries a reason that docs/api.md does not list and no decision
-// has to guess what a reason means. The rule checks the first argument of
-// each call to refuse, and each value assigned to a field or a variable of
-// type ItemReason: by =, :=, an operator assignment, a var declaration or a
-// struct literal. The value passes only when it names a *types.Const of
-// type ItemReason from the API package. failure.go's forwarding is let
+// has to guess what a reason means. The rule checks each argument a call
+// passes to a parameter of type ItemReason, such as refuse's first, and
+// each value assigned to a field or a variable of type ItemReason: by =,
+// :=, an operator assignment, a var declaration or a struct literal. The
+// value passes only when it names a *types.Const of
+// type ItemReason from the API package. The listed forwarding is let
 // through by declaration and value, so any other value in those
 // declarations is checked, and a listed value that matches nothing fails
 // too, so the list stays exact.
@@ -87,16 +94,17 @@ func TestEveryItemReasonIsAnAPIConstant(t *testing.T) {
 }
 
 // The rule catches each shape of a reason that is not an API constant in
-// its fixture: an untyped string passed to refuse or assigned, a
-// conversion, a parameter or variable, a constant of another type, an
-// operator assignment, a var declaration and struct literals with and
-// without keys. A listed value in a listed declaration is let through, a
+// its fixture: an untyped string passed to refuse, to another function
+// with a reason parameter, or assigned, a conversion, a parameter or
+// variable, a constant of another type, an operator assignment, a var
+// declaration and struct literals with and without keys. A listed value in a listed declaration is let through, a
 // literal beside it in the same declaration is still reported, and a
 // listed value that matches nothing is reported.
 func TestTheReasonRuleCatchesEveryShape(t *testing.T) {
 	findings := scanReasonRule(t, "./testdata/reasonrule")
 	left, unused := applyReasonList(findings, []reasonRuleEntry{
 		{file: "fixture.go", decl: "allowed", forwarded: []string{"f.reason", "g.reason"}, what: "a reason the fixture's failure carries"},
+		{file: "fixture.go", decl: "failAll", forwarded: []string{"reason"}, what: "the reason its callers pass, which the rule checks at every call"},
 		{file: "fixture.go", decl: "stale", forwarded: []string{"f.reason"}, what: "nothing"},
 	})
 	got := map[int]bool{}
@@ -190,11 +198,10 @@ func scanReasonRule(t *testing.T, dirs ...string) []reasonFinding {
 	for _, dir := range dirs {
 		files := parseNonTestFiles(t, fset, dir)
 		info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Defs: map[*ast.Ident]types.Object{}, Uses: map[*ast.Ident]types.Object{}}
-		pkg, err := config.Check(dir, fset, files, info)
-		if err != nil {
+		if _, err := config.Check(dir, fset, files, info); err != nil {
 			t.Fatalf("type-check %s: %v", dir, err)
 		}
-		scan := reasonScan{fset: fset, info: info, refuse: pkg.Scope().Lookup("refuse")}
+		scan := reasonScan{fset: fset, info: info}
 		for _, file := range files {
 			for _, decl := range file.Decls {
 				for _, named := range declNames(decl) {
@@ -260,8 +267,6 @@ func parseNonTestFiles(t *testing.T, fset *token.FileSet, dir string) []*ast.Fil
 type reasonScan struct {
 	fset *token.FileSet
 	info *types.Info
-	// refuse is the package's refuse function, or nil when it has none.
-	refuse types.Object
 }
 
 // decl returns the reasons in one top-level declaration that are not API
@@ -278,9 +283,7 @@ func (s reasonScan) decl(named namedNode) []reasonFinding {
 	ast.Inspect(named.node, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.CallExpr:
-			if id, ok := ast.Unparen(n.Fun).(*ast.Ident); ok && s.refuse != nil && s.info.Uses[id] == s.refuse && len(n.Args) > 0 {
-				check(n.Args[0], "the reason passed to refuse")
-			}
+			s.checkCall(n, check)
 		case *ast.AssignStmt:
 			s.checkAssign(n, check)
 		case *ast.ValueSpec:
@@ -295,6 +298,26 @@ func (s reasonScan) decl(named namedNode) []reasonFinding {
 		return true
 	})
 	return findings
+}
+
+// checkCall checks each argument a call passes to a parameter of type
+// ItemReason, such as the reason of refuse, so a function that passes its
+// reason parameter on is checked at every call. A conversion is no call and
+// is checked where its value is used.
+func (s reasonScan) checkCall(call *ast.CallExpr, check func(ast.Expr, string)) {
+	sig, ok := s.info.TypeOf(call.Fun).(*types.Signature)
+	if !ok {
+		return
+	}
+	params := sig.Params()
+	for i, arg := range call.Args {
+		if i >= params.Len() || (sig.Variadic() && i >= params.Len()-1) {
+			return
+		}
+		if param := params.At(i); isItemReason(param.Type()) {
+			check(arg, "the reason passed to "+types.ExprString(call.Fun))
+		}
+	}
 }
 
 // checkAssign checks each value an assignment gives a field or a variable

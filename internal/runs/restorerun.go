@@ -1995,8 +1995,9 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 }
 
 // abort ends a run early as Failed. It fails every item that has not
-// finished with the given message (see failUnfinished), then calls finish,
-// which records the ending, stops the run's movers and gives the app back.
+// finished with the given message (see failRemainingItems), then calls
+// finish, which records the ending, stops the run's movers and gives the
+// app back.
 //
 // Parameters:
 //   - reason is the Ready reason the run ends with: ReasonInvalid when it
@@ -2013,9 +2014,7 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 // message also carries the note of each Cluster the run left deleted (see
 // leftDeletedNotes). A run past its deadline ends through timeOut instead.
 func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
-	failUnfinished(run, message, func(item *backupv1alpha1.RestoreItem, text string) {
-		item.Phase, item.Message = backupv1alpha1.ItemFailed, text
-	})
+	failRemainingItems(run, message, "")
 	return r.finish(ctx, run, reason, leftDeletedNotes(run.Status.Items, message))
 }
 
@@ -2031,42 +2030,40 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 // the wait for a stopped mover, or the error of a release that failed, for
 // a retry.
 //
-// Every unfinished item fails with reason TimedOut (see failUnfinished), and
-// finish records the Ready message, with the note of each Cluster the run
-// left deleted, in status.ending. Every status write from then on carries
+// Every unfinished item fails with reason TimedOut (see
+// failRemainingItems), and finish records the Ready message, with the note
+// of each Cluster the run left deleted, in status.ending. Every status write from then on carries
 // the ending, and a later pass, such as one after the wait for a stopped
 // mover replaced the SourceBusy condition, ends with it as recorded.
 func (r *RestoreRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
-	failUnfinished(run, message, func(item *backupv1alpha1.RestoreItem, text string) {
-		failRestoreItem(item, refuse(backupv1alpha1.ItemReasonTimedOut, "%s", text))
-	})
+	failRemainingItems(run, message, backupv1alpha1.ItemReasonTimedOut)
 	return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, leftDeletedNotes(run.Status.Items, message))
 }
 
-// failUnfinished fails every item of a run that ends early and has not
+// failRemainingItems fails every item of a run that ends early and has not
 // finished, each with a message that starts with the run's.
 //
 // Parameters:
 //   - run is the RestoreRun that ends. Its items are changed in place, and
 //     the caller writes the status.
 //   - message is the run's Ready message.
-//   - fail sets an item Failed with its message; the caller decides which
-//     reason the item records.
+//   - reason is the reason each failed item records: ItemReasonTimedOut
+//     from timeOut, and none from abort, whose run's ending says why.
 //
 // A Pending, Running or Recovering item gets the message as it is. A
 // Cluster item in phase Deleted records status.items[].clusterLeftDeleted,
 // and its message adds the note from clusterLeftDeleted: the run deleted
 // that Cluster, and the webhook recovers its next creation without the run.
 // An item in any other phase has already ended and keeps how it ended.
-func failUnfinished(run *backupv1alpha1.RestoreRun, message string, fail func(item *backupv1alpha1.RestoreItem, text string)) {
+func failRemainingItems(run *backupv1alpha1.RestoreRun, message string, reason backupv1alpha1.ItemReason) {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		switch item.Phase {
 		case backupv1alpha1.ItemDeleted:
 			item.ClusterLeftDeleted = true
-			fail(item, message+". "+clusterLeftDeleted(item.Name))
+			failRestoreItem(item, refuse(reason, "%s", message+". "+clusterLeftDeleted(item.Name)))
 		case backupv1alpha1.ItemPending, backupv1alpha1.ItemRunning, backupv1alpha1.ItemRecovering:
-			fail(item, message)
+			failRestoreItem(item, refuse(reason, "%s", message))
 		default:
 			// An item in any other phase has already ended, and keeps its
 			// phase and message.
@@ -2079,7 +2076,7 @@ func failUnfinished(run *backupv1alpha1.RestoreRun, message string, fail func(it
 // records status.items[].clusterLeftDeleted.
 //
 // Parameters:
-//   - items are the run's items, after failUnfinished.
+//   - items are the run's items, after failRemainingItems.
 //   - message is the message the run ends with.
 func leftDeletedNotes(items []backupv1alpha1.RestoreItem, message string) string {
 	for _, item := range items {
@@ -2386,7 +2383,7 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // A run never reaches finish with a Cluster item still in phase Deleted:
 // such an item is not finished, so work ends the run only through abort or
 // timeOut, which fail the item with the note from clusterLeftDeleted first
-// (see failUnfinished).
+// (see failRemainingItems).
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
 	if run.Status.Ending == nil {
 		run.Status.Ending = &backupv1alpha1.RunEnding{Reason: reason, Message: message}
