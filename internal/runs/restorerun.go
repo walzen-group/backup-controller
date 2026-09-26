@@ -617,6 +617,43 @@ func (r *RestoreRunReconciler) recheckSnapshot(ctx context.Context, run *backupv
 	return why, nil
 }
 
+// failBeforeStart returns the message of a Pending volume item that fails
+// before its mover's object is created, and names on the item a
+// ReplicationDestination an earlier pass created and lost the record of.
+//
+// Parameters:
+//   - item is the Pending volume item. Its destination is set when the lost
+//     destination exists, so work deletes it once the item's end is in the
+//     status and waits for its mover to stop (rule X2).
+//   - name is the name the item's ReplicationDestination has, from
+//     destinationName.
+//   - why says why the item fails, such as a snapshot that changed since the
+//     checks or a repository Secret that is gone.
+//
+// It returns why followed by what the claim holds: when the run owns a
+// destination of that name, the message says that destination is deleted
+// and that its mover may have written part of the claim; otherwise it says
+// nothing was written (see nothingWritten). A read of the destination that
+// fails for any reason but NotFound comes back as an error, and the item is
+// left as it was.
+//
+// A pass that created the destination and then lost the status write that
+// recorded it leaves the item Pending. Unnamed on the item, that
+// destination's mover would run on with nothing tracking it.
+func (r *RestoreRunReconciler) failBeforeStart(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, name, why string) (string, error) {
+	left := &volsyncv1alpha1.ReplicationDestination{}
+	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, left)
+	switch {
+	case err == nil && ownsDestination(run, left):
+		item.Destination = name
+		return fmt.Sprintf("%s. ReplicationDestination %s, which an earlier pass created before its status write was lost, is deleted, "+
+			"and its mover may have written part of claim %s. Create a new RestoreRun to restore it", why, name, item.Name), nil
+	case err == nil || apierrors.IsNotFound(err):
+		return why + nothingWritten(item.Name), nil
+	}
+	return "", fmt.Errorf("get ReplicationDestination %s: %w", name, err)
+}
+
 // nothingWritten returns the end of the message of an item that
 // recheckSnapshot failed before its mover's object existed: nothing was
 // written to the claim named claim, and a new RestoreRun selects again.
@@ -859,9 +896,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // lists the repository again (see recheckSnapshot), creates the item's
 // ReplicationDestination and moves the item to Running. A snapshot the mover
 // would no longer restore, because it was forgotten, retimed or shadowed in
-// its second since the checks, fails the item before the destination exists;
-// a destination an earlier pass created and lost the record of is named on
-// the item then, so work deletes it.
+// its second since the checks, fails the item before the destination exists.
 //
 // A Running item fails with the mover's logs when the mover failed. Once the
 // destination has completed the run's trigger, the item succeeds only when
@@ -871,10 +906,13 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // once the item's end is in the status.
 //
 // A claim that is gone, or whose VolumeRestore or repository Secret is
-// missing, fails the item before the destination exists. So does a
-// destination with the item's name that the run did not create (see
-// ownsDestination), found at the create or on a later pass; the item then
-// names no destination, so nothing the run does afterwards touches it.
+// missing, fails the item before the destination exists. When an item fails
+// before its destination exists, a destination an earlier pass created and
+// lost the record of is named on the item, so work deletes it (see
+// failBeforeStart). A destination with the item's name that the run did not
+// create (see ownsDestination), found at the create or on a later pass, fails
+// the item too; the item then names no destination, so nothing the run does
+// afterwards touches it.
 //
 // It returns reason ClaimInUse and a message naming the pod while a pod
 // mounts the claim, and reason SourceBusy and a message naming the other run
@@ -899,7 +937,11 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			if !isRefusal(err) {
 				return "", "", err
 			}
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
+			message, err := r.failBeforeStart(ctx, run, item, destinationName(run.UID, index), err.Error())
+			if err != nil {
+				return "", "", err
+			}
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 			return "", "", nil
 		}
 		// The Leases make the restore and a backup of the claim or its
@@ -908,7 +950,11 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 		busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: "RestoreRun", run: run, item: item.Name},
 			run.Namespace, item.Name, settings.Secret)
 		if isRefusal(err) {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()+nothingWritten(item.Name)
+			message, err := r.failBeforeStart(ctx, run, item, destinationName(run.UID, index), err.Error())
+			if err != nil {
+				return "", "", err
+			}
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 			return "", "", nil
 		}
 		if err != nil {
@@ -935,24 +981,11 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			return "", "", err
 		}
 		if why != "" {
-			// A pass that created the destination and then lost the status
-			// write that recorded it leaves the item Pending. Named on the
-			// item, that destination is deleted once the item's end is in
-			// the status (see work); unnamed, its mover would run on with
-			// nothing tracking it.
-			left := &volsyncv1alpha1.ReplicationDestination{}
-			err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, left)
-			switch {
-			case err == nil && ownsDestination(run, left):
-				item.Destination = name
-				why = fmt.Sprintf("%s. ReplicationDestination %s, which an earlier pass created before its status write was lost, is deleted, "+
-					"and its mover may have written part of claim %s. Create a new RestoreRun to restore it", why, name, item.Name)
-			case err == nil || apierrors.IsNotFound(err):
-				why += nothingWritten(item.Name)
-			default:
-				return "", "", fmt.Errorf("get ReplicationDestination %s: %w", name, err)
+			message, err := r.failBeforeStart(ctx, run, item, name, why)
+			if err != nil {
+				return "", "", err
 			}
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, why
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 			return "", "", nil
 		}
 		refusal, err := r.createDestination(ctx, run, directDestination(run, *item, settings, name))

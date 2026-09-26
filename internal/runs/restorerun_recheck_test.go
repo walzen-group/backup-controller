@@ -255,6 +255,45 @@ func TestARecheckAfterALostWriteDeletesTheDestinationItCreated(t *testing.T) {
 	expectNothingCreated(t, c, "")
 }
 
+// A pass that created the item's destination and lost the status write
+// leaves the item Pending. When the repository Secret, or the claim's
+// VolumeRestore that names it, is gone on the next pass, the run fails the
+// item, says the destination from the lost pass may have written part of the
+// claim, and deletes that destination. Before, the item named no destination
+// and said nothing was written, or nothing about the claim, so the mover ran
+// on with nothing tracking it (UF1).
+func TestARefusalAfterALostWriteDeletesTheDestinationItCreated(t *testing.T) {
+	for name, tc := range map[string]struct {
+		gone client.Object
+		want string
+	}{
+		"repository Secret": {gone: repository(), want: "repository Secret " + repoN},
+		"VolumeRestore":     {gone: volumeRestore(), want: "VolumeRestore"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }), claim(), volumeRestore(), repository())
+			restoreStep(t, r) // plan
+
+			r.Client = loseNextStatusWrite(c)
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+				t.Fatal("the pass whose status write was lost succeeded, want the error returned")
+			}
+			r.Client = c
+			if names := destinations(t, c); len(names) != 1 {
+				t.Fatalf("destinations = %v, want the one the lost pass created", names)
+			}
+			if err := c.Delete(context.Background(), tc.gone); err != nil {
+				t.Fatal(err)
+			}
+			restoreStep(t, r)
+			restoreStep(t, r) // the pass after the destination's delete finds its mover gone
+
+			expectItemFailed(t, c, tc.want, "ReplicationDestination "+destinationName(restoreUID, 0), "may have written part of claim "+claimN)
+			expectNothingCreated(t, c, "")
+		})
+	}
+}
+
 // A restore selects its snapshot only once a backup of its repository has
 // finished, so it selects after that backup's restic forget and retime. Until
 // then the run stays unplanned with reason SourceBusy, names the backup, and

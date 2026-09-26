@@ -292,6 +292,15 @@ snapshot 6e473100 (2026-09-26T09:03:53Z), which the checks selected, is no longe
 snapshot 6e473100, which the checks selected, was rewritten as 2edf5bab at 2026-09-26T09:05:00Z by a quiesced backup after the checks
 ```
 
+A repository Secret or a VolumeRestore that is gone by then fails the item the
+same way. When an earlier pass created the destination and lost the status
+write that recorded it, the message names that destination in place of
+`. Nothing was written`, and the run deletes it and waits for its mover to stop
+before it gives the app back:
+
+```text
+repository Secret notes-restic-data does not exist in this namespace, so the run can't take the Lease that keeps other runs' movers off the repository. ReplicationDestination restore-9b7d4e21-0, which an earlier pass created before its status write was lost, is deleted, and its mover may have written part of claim notes-data. Create a new RestoreRun to restore it
+```
 
 One kind of snapshot holds data older than its time. When a BackupRun fails a
 volume item, VolSync keeps retrying that sync with the clone it cut when the
