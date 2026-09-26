@@ -40,7 +40,9 @@ import (
 // object (see Cascades), and with Options.GarbageCollect those dependents are
 // handled the way the garbage collector would; see deleteCascading. A delete
 // that a finalizer holds in place raises the object's generation by one, as
-// the server does; see bumpGenerationOnDelete.
+// the server does; see bumpGenerationOnDelete. A further delete of an object
+// that is already being deleted and still has finalizers stores nothing, so
+// its deletionTimestamp stays; see deleteStored.
 func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
 	o := &client.DeleteOptions{}
 	o.ApplyOptions(opts)
@@ -64,6 +66,49 @@ func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.D
 		return err
 	}
 	return c.bumpGenerationOnDelete(ctx, owner)
+}
+
+// deleteStored deletes owner, the stored object, as kube-apiserver 1.36.3
+// would.
+//
+// Parameters:
+//   - owner is the stored object, as Delete read it before the delete.
+//   - o are the applied delete options, for the ResourceVersion precondition.
+//   - opts are the caller's delete options, passed to the fake client.
+//
+// It calls the fake client for every delete except one that stores nothing on
+// the server: a delete of an object that already has a deletionTimestamp and
+// still has finalizers. There markAsDeleting keeps the deletionTimestamp that
+// is already set and not in the future
+// (k8s.io/apiserver@v0.36.3/pkg/registry/generic/registry/store.go:1030-1034),
+// and the guaranteed update that follows serialises the stored object, so the
+// etcd3 store returns without a write
+// (k8s.io/apiserver@v0.36.3/pkg/storage/etcd3/store.go:553-570). The fake
+// client stamps a new deletionTimestamp on every delete of such an object
+// (deleteObjectLocked, sigs.k8s.io/controller-runtime@v0.24.1/pkg/client/fake/client.go:1198-1200),
+// and its tracker refuses the update that would put the older timestamp back
+// (versioned_tracker.go:296-298), so the wrapper answers without calling it
+// and the first timestamp stays.
+//
+// A ResourceVersion precondition is checked here when the delete stores
+// nothing, with the Conflict the fake client builds for one, so a delete with
+// a stale precondition answers the same whether or not the object was already
+// being deleted. Its other errors are the fake client's.
+func (c *Client) deleteStored(ctx context.Context, owner client.Object, o *client.DeleteOptions, opts []client.DeleteOption) error {
+	if owner.GetDeletionTimestamp() == nil || len(owner.GetFinalizers()) == 0 {
+		return c.WithWatch.Delete(ctx, owner, opts...)
+	}
+	if p := o.Preconditions; p != nil && p.ResourceVersion != nil && *p.ResourceVersion != owner.GetResourceVersion() {
+		gvk, err := apiutil.GVKForObject(owner, c.Scheme())
+		if err != nil {
+			return err
+		}
+		gvr, _ := meta.UnsafeGuessKindToResource(gvk)
+		return apierrors.NewConflict(gvr.GroupResource(), owner.GetName(), fmt.Errorf(
+			"the ResourceVersion in the precondition (%s) does not match the ResourceVersion in record (%s). "+
+				"The object might have been modified", *p.ResourceVersion, owner.GetResourceVersion()))
+	}
+	return nil
 }
 
 // bumpGenerationOnDelete raises the generation of an object that the delete

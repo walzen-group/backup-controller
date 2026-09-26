@@ -23,8 +23,10 @@
 //     With a status subresource the fake keeps the stored status on a plain
 //     update, so only spec changes count, as on the real server.
 //   - Delete honours a UID precondition with a Conflict (the fake already
-//     honours a ResourceVersion one) and raises the generation of an object a
-//     finalizer holds in place, as the server does. See Client.Delete.
+//     honours a ResourceVersion one), raises the generation of an object a
+//     finalizer holds in place, and stores nothing when the object already
+//     has a deletionTimestamp and finalizers, as the server does. See
+//     Client.Delete.
 //   - An update or patch cannot add a finalizer to an object that has a
 //     deletionTimestamp; removing the last one deletes the object and the
 //     write still succeeds. See checkNoNewFinalizers.
