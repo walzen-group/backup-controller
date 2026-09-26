@@ -57,4 +57,5 @@ func literals() []any {
 
 func allowed(it *item, f failure) {
 	it.Reason = f.reason
+	it.Reason = "Listed" // want reason
 }

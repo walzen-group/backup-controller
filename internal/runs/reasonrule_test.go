@@ -25,13 +25,17 @@ const apiPackage = "github.com/walzen-group/backup-controller/internal/api/v1alp
 // non-test files are read.
 var reasonRuleScope = []string{".", "../populator"}
 
-// reasonRuleEntry names one top-level declaration the reason rule lets
-// through, and why.
+// reasonRuleEntry names the values one top-level declaration may give a
+// reason although they are no API constant, and why. Every other value in
+// the declaration is checked as anywhere else.
 type reasonRuleEntry struct {
 	// file is the base name of the file that holds the declaration.
 	file string
 	// decl is the declaration: a function, or a method as Type.name.
 	decl string
+	// forwarded are the values let through, each written as the source
+	// has it, such as failure.reason.
+	forwarded []string
 	// what says where the reason it passes on comes from, which is always
 	// a reason a checked site already set.
 	what string
@@ -39,13 +43,26 @@ type reasonRuleEntry struct {
 
 // reasonForwardingAllowlist lets failure.go pass on a reason its caller
 // chose: refuse stores the reason of a checked call, and the item
-// failures copy a *refusalError's reason into the item. A new entry needs a
-// reviewer's eye like any rule exception.
+// failures copy a *refusalError's reason into the item. The constant
+// reasons these declarations set of their own are checked. A new entry
+// needs a reviewer's eye like any rule exception.
 var reasonForwardingAllowlist = []reasonRuleEntry{
-	{file: "failure.go", decl: "refuse", what: "stores its reason parameter, which the rule checks at every call"},
-	{file: "failure.go", decl: "asItemFailure", what: "copies the reason of the *refusalError it found"},
-	{file: "failure.go", decl: "failBackupItem", what: "copies the reason asItemFailure returned"},
-	{file: "failure.go", decl: "failRestoreItem", what: "copies the reason asItemFailure returned"},
+	{file: "failure.go", decl: "refuse", forwarded: []string{"reason"},
+		what: "stores its reason parameter, which the rule checks at every call"},
+	{file: "failure.go", decl: "asItemFailure", forwarded: []string{"refused.reason"},
+		what: "copies the reason of the *refusalError it found"},
+	{file: "failure.go", decl: "failBackupItem", forwarded: []string{"failure.reason"},
+		what: "copies the reason asItemFailure returned"},
+	{file: "failure.go", decl: "failRestoreItem", forwarded: []string{"failure.reason"},
+		what: "copies the reason asItemFailure returned"},
+}
+
+// reasonListUse is one value of an entry, as applyReasonList reports it
+// when the value let nothing through.
+type reasonListUse struct {
+	file, decl string
+	// value is the forwarded value.
+	value string
 }
 
 // Every reason an item records is a constant the API package declares, so
@@ -55,16 +72,17 @@ var reasonForwardingAllowlist = []reasonRuleEntry{
 // type ItemReason: by =, :=, an operator assignment, a var declaration or a
 // struct literal. The value passes only when it names a *types.Const of
 // type ItemReason from the API package. failure.go's forwarding is let
-// through by declaration, and an entry that matches nothing fails too, so
-// the list stays exact.
+// through by declaration and value, so any other value in those
+// declarations is checked, and a listed value that matches nothing fails
+// too, so the list stays exact.
 func TestEveryItemReasonIsAnAPIConstant(t *testing.T) {
 	findings := scanReasonRule(t, reasonRuleScope...)
 	left, unused := applyReasonList(findings, reasonForwardingAllowlist)
 	for _, f := range left {
 		t.Errorf("%s", f)
 	}
-	for _, e := range unused {
-		t.Errorf("the list entry %s %s (%s) matches nothing; delete it", e.file, e.decl, e.what)
+	for _, u := range unused {
+		t.Errorf("the list entry %s %s lets %s through, which matches nothing; delete it", u.file, u.decl, u.value)
 	}
 }
 
@@ -72,13 +90,14 @@ func TestEveryItemReasonIsAnAPIConstant(t *testing.T) {
 // its fixture: an untyped string passed to refuse or assigned, a
 // conversion, a parameter or variable, a constant of another type, an
 // operator assignment, a var declaration and struct literals with and
-// without keys. A declaration on the list is let through, and an entry that
-// matches nothing is reported.
+// without keys. A listed value in a listed declaration is let through, a
+// literal beside it in the same declaration is still reported, and a
+// listed value that matches nothing is reported.
 func TestTheReasonRuleCatchesEveryShape(t *testing.T) {
 	findings := scanReasonRule(t, "./testdata/reasonrule")
 	left, unused := applyReasonList(findings, []reasonRuleEntry{
-		{file: "fixture.go", decl: "allowed", what: "a reason the fixture's failure carries"},
-		{file: "fixture.go", decl: "stale", what: "nothing"},
+		{file: "fixture.go", decl: "allowed", forwarded: []string{"f.reason", "g.reason"}, what: "a reason the fixture's failure carries"},
+		{file: "fixture.go", decl: "stale", forwarded: []string{"f.reason"}, what: "nothing"},
 	})
 	got := map[int]bool{}
 	for _, f := range left {
@@ -95,8 +114,12 @@ func TestTheReasonRuleCatchesEveryShape(t *testing.T) {
 			t.Errorf("fixture line %d: %s found where none is wanted", f.line, f.text)
 		}
 	}
-	if len(unused) != 1 || unused[0].decl != "stale" {
-		t.Errorf("unused entries = %+v, want only stale", unused)
+	wantUnused := []reasonListUse{
+		{file: "fixture.go", decl: "allowed", value: "g.reason"},
+		{file: "fixture.go", decl: "stale", value: "f.reason"},
+	}
+	if !slices.Equal(unused, wantUnused) {
+		t.Errorf("unused values = %+v, want %+v", unused, wantUnused)
 	}
 }
 
@@ -104,29 +127,48 @@ func TestTheReasonRuleCatchesEveryShape(t *testing.T) {
 type reasonFinding struct {
 	file, decl string
 	line       int
+	// value is the reason's expression as the source has it.
+	value string
 	// text says what was found.
 	text string
 }
 
+// String renders the finding for a test failure: where it is, in which
+// declaration, and what was found.
 func (f reasonFinding) String() string {
 	return fmt.Sprintf("%s:%d in %s: %s", f.file, f.line, f.decl, f.text)
 }
 
-// applyReasonList drops the findings the list lets through. It returns the
-// findings left and the entries that let nothing through.
-func applyReasonList(findings []reasonFinding, list []reasonRuleEntry) (left []reasonFinding, unused []reasonRuleEntry) {
-	used := map[reasonRuleEntry]bool{}
+// applyReasonList drops the findings the list lets through.
+//
+// Parameters:
+//   - findings are the rule's findings, before any list applies.
+//   - list names, per declaration, the values let through.
+//
+// It returns the findings left, and each listed value that let nothing
+// through, in the list's order.
+//
+// A finding is let through only when its declaration is listed and its
+// value is one of that entry's forwarded values; any other value in a
+// listed declaration stays a finding.
+func applyReasonList(findings []reasonFinding, list []reasonRuleEntry) (left []reasonFinding, unused []reasonListUse) {
+	used := map[reasonListUse]bool{}
 	for _, f := range findings {
-		i := slices.IndexFunc(list, func(e reasonRuleEntry) bool { return e.file == filepath.Base(f.file) && e.decl == f.decl })
-		if i < 0 {
+		use := reasonListUse{file: filepath.Base(f.file), decl: f.decl, value: f.value}
+		listed := slices.ContainsFunc(list, func(e reasonRuleEntry) bool {
+			return e.file == use.file && e.decl == use.decl && slices.Contains(e.forwarded, use.value)
+		})
+		if !listed {
 			left = append(left, f)
 			continue
 		}
-		used[list[i]] = true
+		used[use] = true
 	}
 	for _, e := range list {
-		if !used[e] {
-			unused = append(unused, e)
+		for _, value := range e.forwarded {
+			if use := (reasonListUse{file: e.file, decl: e.decl, value: value}); !used[use] {
+				unused = append(unused, use)
+			}
 		}
 	}
 	return left, unused
@@ -230,7 +272,7 @@ func (s reasonScan) decl(named namedNode) []reasonFinding {
 		if !s.isAPIReason(value) {
 			pos := s.fset.Position(value.Pos())
 			findings = append(findings, reasonFinding{file: pos.Filename, decl: named.name, line: pos.Line,
-				text: what + " is not an ItemReason constant of " + apiPackage})
+				value: types.ExprString(value), text: what + " is not an ItemReason constant of " + apiPackage})
 		}
 	}
 	ast.Inspect(named.node, func(n ast.Node) bool {
