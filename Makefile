@@ -42,9 +42,10 @@ envtest:
 ## fixtures: re-record every checked-in fixture that real programs produce. Run it after a pin in versions.json moves; check fails until it has.
 fixtures: fixtures-restic fixtures-barman fixtures-crds
 
-## fixtures-restic: re-record the restic repositories and restic's verdicts under internal/restic/testdata/recorded.
+## fixtures-restic: re-record the restic repositories and restic's verdicts under internal/restic/testdata/recorded, and the same-time repository under internal/restic/testdata/same-time.
 fixtures-restic:
 	$(FIXTURES) hack/fixtures/restic.sh
+	$(FIXTURES) hack/fixtures/restic-same-time.sh
 
 ## fixtures-barman: re-record the barman stores, barman's verdicts and RustFS's answers under internal/testinfra/barmanstore/recorded.
 fixtures-barman:

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Records the repository under testdata/same-time/restic-<version>, with real
-# restic of the version inside the VolSync mover image (versions.json,
-# restic-mover). The conformance tests in internal/restic read it to check two
+# Records the repository under internal/restic/testdata/same-time/restic-<version>,
+# with real restic of the version inside the VolSync mover image
+# (versions.json, restic-mover). The conformance tests in internal/restic read it to check two
 # things against restic itself: that Snapshots orders two snapshots with the
 # same time by ID, and that MoverWritten accepts only snapshots written the way
 # VolSync's backup mover writes them.
 #
-# Run it from the repository root in the flake's fixtures shell:
-#
-#	nix develop .#fixtures -c internal/restic/testdata/same-time/record.sh
+# Run it through make fixtures-restic, which enters the flake's fixtures shell;
+# it needs nothing that shell doesn't provide. It lives apart from restic.sh,
+# which removes and rewrites all of testdata/recorded.
 #
 # Every restic command runs in a bubblewrap sandbox where the data
 # directories sit at /data, /extra and /srv, so the snapshots record those
-# absolute paths, as a mover's backup of /data does. It writes:
+# absolute paths, as a mover's backup of /data does. It writes provenance.json,
+# with the tool versions and this script's name, and under restic-<version>:
 #
 #	repo/           the repository (version 2, password "backup")
 #	snapshots.json  restic snapshots --json
@@ -28,8 +29,8 @@
 # identical times.
 set -euo pipefail
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-root=$(cd "$here/../../../.." && pwd)
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+out="$root/internal/restic/testdata/same-time"
 version=$(jq -r '.components["restic-mover"].version' "$root/versions.json")
 restic=$(command -v "restic-$version")
 "$restic" version | grep -q "^restic $version " || { echo "$restic is not restic $version" >&2; exit 1; }
@@ -68,7 +69,7 @@ echo srv >"$work/srv/file"
 other_path=$(backup /srv backup --host volsync --time "2026-09-26 10:03:00" .)
 run / rewrite --new-time "2026-09-26 09:00:00" "$mover1" >/dev/null 2>&1
 
-target="$here/restic-$version"
+target="$out/restic-$version"
 rm -rf "$target"
 mkdir -p "$target"
 cp -r "$work/repo" "$target/repo"
@@ -78,4 +79,10 @@ retimed=$(jq -r --arg old "$mover1" '.[] | select(.original == $old) | .id' "$ta
 jq -n --arg m1 "$mover1" --arg m2 "$mover2" --arg oh "$other_host" --arg tp "$two_paths" \
 	--arg op "$other_path" --arg rt "$retimed" \
 	'{mover: [$m1, $m2], otherHost: [$oh], twoPaths: [$tp], otherPath: [$op], retimed: [$rt]}' >"$target/kinds.json"
-echo "wrote $target"
+
+jq -n --arg generator "hack/fixtures/restic-same-time.sh" --arg recorded "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	--arg mover "$version" --arg bwrapSeen "$(bwrap --version | awk '{print $2}')" \
+	'{generator: $generator, recorded: $recorded,
+	  tools: {"restic-mover": $mover, bubblewrap: $bwrapSeen},
+	  password: "backup"}' >"$out/provenance.json"
+echo "wrote $target and $out/provenance.json"

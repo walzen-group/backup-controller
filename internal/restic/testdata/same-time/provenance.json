@@ -1,0 +1,9 @@
+{
+  "generator": "hack/fixtures/restic-same-time.sh",
+  "recorded": "2026-09-26T22:08:56Z",
+  "tools": {
+    "restic-mover": "0.18.1",
+    "bubblewrap": "0.12.0"
+  },
+  "password": "backup"
+}
