@@ -21,7 +21,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 )
@@ -135,7 +135,12 @@ type snapshotFile struct {
 }
 
 // Snapshots returns every snapshot in the repository, sorted by time with the
-// oldest first.
+// oldest first, and by ID among snapshots with the same time.
+//
+// restic can stamp two snapshots with the same time (two backups given the
+// same --time do), and restic snapshots lists such snapshots in no set order.
+// The order by ID makes the last snapshot of the list the same one on every
+// read, so a caller that takes the newest always takes the same snapshot.
 func (r *Repository) Snapshots(ctx context.Context) ([]Snapshot, error) {
 	files, err := r.snapshotFiles(ctx)
 	if err != nil {
@@ -149,8 +154,9 @@ func (r *Repository) Snapshots(ctx context.Context) ([]Snapshot, error) {
 }
 
 // snapshotFiles reads, decrypts and decodes every snapshot document under
-// snapshots/, and returns them sorted by time with the oldest first. It skips
-// files whose names aren't storage IDs.
+// snapshots/, and returns them sorted by time with the oldest first, and by ID
+// among documents with the same time. It skips files whose names aren't
+// storage IDs.
 func (r *Repository) snapshotFiles(ctx context.Context) ([]snapshotFile, error) {
 	names, err := r.store.List(ctx, "snapshots")
 	if err != nil {
@@ -173,8 +179,39 @@ func (r *Repository) snapshotFiles(ctx context.Context) ([]snapshotFile, error) 
 		files = append(files, f)
 	}
 
-	sort.Slice(files, func(i, j int) bool { return files[i].snapshot.Time.Before(files[j].snapshot.Time) })
+	slices.SortFunc(files, func(a, b snapshotFile) int {
+		if c := a.snapshot.Time.Compare(b.snapshot.Time); c != 0 {
+			return c
+		}
+		return strings.Compare(a.snapshot.ID, b.snapshot.ID)
+	})
 	return files, nil
+}
+
+// moverHostname and moverDataPath are the host and the only path VolSync's
+// backup mover records on a snapshot: it runs `restic backup --host volsync .`
+// in /data (VolSync v0.16.0 mover-restic/entry.sh, lines 62 and 155 to 158).
+const (
+	moverHostname = "volsync"
+	moverDataPath = "/data"
+)
+
+// MoverWritten reports whether a snapshot looks the way VolSync's backup
+// mover writes one, so a backup looking for the snapshot its sync wrote can
+// pass over every other snapshot in the repository.
+//
+// Parameters:
+//   - s is the snapshot to judge, as Snapshots returns it.
+//
+// It returns true when the snapshot's host is exactly "volsync", its paths
+// are exactly the one path "/data", and it has no original. A snapshot of
+// another host or of other directories was written by something other than a
+// mover, and a snapshot with an original is a rewritten copy, such as the one
+// Retime makes. Tags don't count. The check can't tell a mover's snapshot
+// from one that `restic backup /data --host volsync` wrote elsewhere, since
+// restic records the same host and path for both.
+func MoverWritten(s Snapshot) bool {
+	return s.Hostname == moverHostname && slices.Equal(s.Paths, []string{moverDataPath}) && s.Original == ""
 }
 
 // parseSnapshot decodes a decrypted snapshot document stored under the given

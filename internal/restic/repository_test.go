@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -237,5 +238,36 @@ func TestUnpackRejectsAnUnknownEncoding(t *testing.T) {
 	}
 	if got, err := unpack([]byte(`{"a":1}`)); err != nil || string(got) != `{"a":1}` {
 		t.Fatalf("plain JSON: %q, %v", got, err)
+	}
+}
+
+// TestMoverWrittenNeedsHostVolsyncOnlyDataAndNoOriginal checks each condition
+// MoverWritten puts on a snapshot on its own: host exactly volsync, paths
+// exactly /data and nothing else, and no original. Tags don't count.
+func TestMoverWrittenNeedsHostVolsyncOnlyDataAndNoOriginal(t *testing.T) {
+	mover := Snapshot{ID: "a", Hostname: "volsync", Paths: []string{"/data"}}
+	cases := []struct {
+		name   string
+		change func(s *Snapshot)
+		want   bool
+	}{
+		{"as a mover writes it", func(*Snapshot) {}, true},
+		{"with tags", func(s *Snapshot) { s.Tags = []string{"quiesced"} }, true},
+		{"another host", func(s *Snapshot) { s.Hostname = "volsync-src-notes-data-7xk2p" }, false},
+		{"no host", func(s *Snapshot) { s.Hostname = "" }, false},
+		{"no paths", func(s *Snapshot) { s.Paths = nil }, false},
+		{"a second path", func(s *Snapshot) { s.Paths = []string{"/data", "/extra"} }, false},
+		{"/data twice", func(s *Snapshot) { s.Paths = []string{"/data", "/data"} }, false},
+		{"a path below /data", func(s *Snapshot) { s.Paths = []string{"/data/sub"} }, false},
+		{"another path", func(s *Snapshot) { s.Paths = []string{"/srv"} }, false},
+		{"a retimed copy", func(s *Snapshot) { s.Original = "b" }, false},
+	}
+	for _, c := range cases {
+		s := mover
+		s.Paths = slices.Clone(mover.Paths)
+		c.change(&s)
+		if got := MoverWritten(s); got != c.want {
+			t.Errorf("%s: MoverWritten(%+v) = %v, want %v", c.name, s, got, c.want)
+		}
 	}
 }
