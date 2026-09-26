@@ -42,10 +42,11 @@ import (
 // backups of spec.claim or from spec.repository, so its mover's log confirms
 // the snapshot the same way as in place.
 //
-// When the run stops a mover, which is when it ends or is deleted, it deletes
-// the mover's ReplicationDestination and waits until that mover's Job and
-// pods are gone before it gives the app back, releases its Leases or
-// finishes (rule X2, see removeDestinations).
+// The run stops a mover once the item's end is in its status, when the run
+// ends and when it is deleted. It deletes the mover's ReplicationDestination
+// and waits until that mover's Job and pods are gone before it gives the app
+// back, releases the item's Leases or finishes (rule X2, see
+// removeDestinations).
 type RestoreRunReconciler struct {
 	client.Client
 
@@ -87,12 +88,12 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// Reconcile moves the RestoreRun that req names one step further, and requeues
-// until the run has finished.
+// Reconcile moves the RestoreRun the request names one step further, and
+// requeues until the run has finished.
 //
 // A new run starts in plan, which checks that every item has a backup in reach
 // before anything is changed, or in planIntoNewClaim when spec.into is set. An
-// error either returns for a retry goes through planFailed, which reports it
+// error that either of them returns for a retry goes through planFailed, which reports it
 // on the Ready condition and ends the run once spec.timeout has passed since
 // its creation. A run past its checks continues in work, or in
 // restoreIntoEmptyClaim for an into restore. Before any of these, Reconcile
@@ -103,7 +104,8 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // An unfinished run that an older release planned, whose status.plannedBy is
 // not this release's format, goes through none of these: abort ends it with
 // reason Upgraded, and finish stops its movers and gives back what it
-// stopped (see olderPlan). Both plans record the format.
+// stopped (see olderPlan). plan and planIntoNewClaim both record the format
+// in status.plannedBy.
 //
 // A new run is first checked against the installed RestoreRun CRD (see
 // schemaCache.crdOutdated), and a run whose CRD lacks a field the controller
@@ -886,17 +888,19 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // its second since the checks, fails the item before the destination exists;
 // a destination an earlier pass created and lost the record of is named on
 // the item then, so work deletes it.
+//
 // A Running item fails with the mover's logs when the mover failed. Once the
 // destination has completed the run's trigger, the item succeeds only when
 // the mover's log names the snapshot the checks recorded, and fails
-// otherwise (see unconfirmedRestore). It also fails when its destination
-// is gone. restoreVolume leaves the destination in place, and work deletes it
-// once the item's end is in the status. A claim that is gone, or whose
-// VolumeRestore or repository Secret is missing, fails the item before the
-// destination exists. So does a destination with the
-// item's name that the run did not create (see ownsDestination), found at
-// the create or on a later pass; the item then names no destination, so
-// nothing the run does afterwards touches it.
+// otherwise (see unconfirmedRestore). It also fails when its destination is
+// gone. restoreVolume leaves the destination in place, and work deletes it
+// once the item's end is in the status.
+//
+// A claim that is gone, or whose VolumeRestore or repository Secret is
+// missing, fails the item before the destination exists. So does a
+// destination with the item's name that the run did not create (see
+// ownsDestination), found at the create or on a later pass; the item then
+// names no destination, so nothing the run does afterwards touches it.
 //
 // It returns reason ClaimInUse and a message naming the pod while a pod
 // mounts the claim, and reason SourceBusy and a message naming the other run
@@ -1049,9 +1053,9 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 //     notRecovered), and the run leaves the Cluster alone. It did not create
 //     that Cluster, and deleting it would only loop as Flux creates it again.
 //
-// An item marked Deleted without a UID, which a run that found no Cluster to
-// delete leaves, has no old Cluster, so a live Cluster that is not the run's
-// recovery fails the item.
+// A run that found no Cluster to delete leaves its item Deleted without a
+// UID. Such an item has no old Cluster, so a live Cluster that is not the
+// run's recovery fails the item.
 func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
@@ -1301,7 +1305,8 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 // reason TimedOut when the restore has not finished by spec.timeout, and the
 // deadline is checked before anything is created. A source claim that is
 // gone before anything was created, or whose VolumeRestore or repository
-// Secret is, aborts the run with reason Failed.
+// Secret is gone by then, aborts the run with reason Failed.
+//
 // While a backup of the source claim or the repository is in progress (see
 // otherMover), the run waits with reason SourceBusy before it creates
 // anything. Right before the claim is created, the repository is listed
@@ -1581,8 +1586,9 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 //
 // Parameters:
 //   - reason is the Ready reason the run ends with: ReasonTimedOut when the
-//     run ran past spec.timeout, ReasonFailed when it hit an error it can't
-//     get past, such as a workload it couldn't stop or one that was deleted.
+//     run ran past spec.timeout, ReasonUpgraded when an older release
+//     planned it, and ReasonFailed when it hit an error it cannot get past,
+//     such as a workload it could not stop or one that was deleted.
 //   - message is the Ready message, and each unfinished item's message.
 //
 // It returns what finish returns: an empty result once the run has ended, or
@@ -1609,8 +1615,8 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 // workloads had before the run touched them. quiesce then writes
 // status.quiescedAt. After a failed stop, it narrows the plan with
 // appliedPart to what is stopped now, and aborts the run with reason Failed,
-// which starts those workloads again and resumes the Kustomizations, the same as a
-// BackupRun. A spec.quiesce entry the namespace does not hold ends the run as
+// which starts those workloads again and resumes the Kustomizations, the
+// same as a BackupRun does. A spec.quiesce entry the namespace does not hold ends the run as
 // Failed with reason Invalid before anything is stopped, and a failed read of
 // an entry or a Kustomization is returned for a retry.
 //
@@ -1769,19 +1775,36 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 	return false
 }
 
-// finish ends the run. It stops the run's movers, which means deleting the
-// ReplicationDestinations the run created and waiting until the Job and pods
-// of each stopped mover are gone (rule X2), releases the run's Leases (see
-// releaseLeases), starts any workload it still holds stopped, and records the
-// terminal phase: Succeeded when reason is ReasonSucceeded and Failed for any
-// other reason. It sets the Ready condition to reason and message, records
-// status.completedAt, and removes the finalizer, unless the run holds a
-// VolumeRestore an older controller created for an into restore, whose
-// release waits for the claim (see releaseVolumeRestore).
+// finish ends the run and gives back what it holds.
 //
-// A stopped mover that is not gone yet holds the run: finish reports the
-// wait and returns, so the app is not given back and the Leases are not
-// released while the mover may still write into the claim or the repository.
+// Parameters:
+//   - run is the RestoreRun to end. Its status is written with the end.
+//   - reason is the Ready reason the run ends with. ReasonSucceeded ends it
+//     Succeeded, and any other reason ends it Failed.
+//   - message is the Ready message the run ends with.
+//
+// It returns an empty result once the run has ended. While a stopped mover
+// is not gone yet, it returns the wait from waitForStopped, and the run stays
+// unfinished. A step that fails is reported through releaseFailed, whose
+// error it returns for a retry; a failed status write comes back as it is.
+//
+// The steps run in this order, and each one runs only once the one before it
+// went through:
+//
+//  1. It stops the run's movers (see removeDestinations) and waits until
+//     each one is gone (rule X2), so no mover still writes into a claim or
+//     the repository once the app is back or another run takes over.
+//  2. It gives back the workloads the run stopped and resumes the
+//     Kustomizations it suspended, and records status.restartedAt.
+//  3. It releases the run's claim and repository Leases (see releaseLeases).
+//  4. It writes the end: the phase, the Ready condition and
+//     status.completedAt.
+//  5. It releases the namespace's quiesce Lease, which the stored status now
+//     shows is no longer needed.
+//  6. It removes the run's finalizer, unless the run holds a VolumeRestore an
+//     older release created for an into restore. That VolumeRestore goes
+//     only once its claim is gone, which finalize sees to when the run is
+//     deleted (see releaseVolumeRestore).
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
 	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
@@ -1825,31 +1848,41 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 			"namespace", run.Namespace, "name", run.Name)
 	}
 	// A run whose VolumeRestore an older controller created keeps its
-	// finalizer: that VolumeRestore goes only once the claim the populator
-	// library fills is gone, and finalize does that (see
-	// releaseVolumeRestore). The run's TTL or a person deletes it, and the
-	// deletion then releases the VolumeRestore.
+	// finalizer. That VolumeRestore goes only once the claim the populator
+	// library fills is gone, which finalize sees to (see
+	// releaseVolumeRestore). The run's TTL or a person deletes the run, and
+	// the deletion then releases the VolumeRestore.
 	if held {
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{}, dropFinalizer(ctx, r.Client, run)
 }
 
-// finalize runs when the run is deleted before it finished. It deletes the
-// run's ReplicationDestinations and waits until the Job and pods of each
-// mover it stopped are gone (rule X2), releases the run's Leases (see releaseLeases),
-// starts any workload the run still holds stopped, releases the VolumeRestore
-// an older controller created for an into restore with releaseVolumeRestore,
-// and removes the finalizer so the deletion can complete. Without it, a run
-// deleted while its mover writes would leave a restore running against a
-// claim with nothing tracking it.
+// finalize gives back what a run holds when the run is deleted, and then
+// removes its finalizer so the deletion can complete.
 //
-// While a stopped mover is not gone yet the run keeps its finalizer and
-// its Leases, and the run reports that wait on its Ready condition (see
-// waitForStopped). A step that fails is reported the same way, through
-// releaseFailed, and the run keeps its finalizer and its Leases: a Lease
-// released before the finalizer is dropped lets another run take the claim
-// over while this run repeats its restart.
+// Parameters:
+//   - run is the RestoreRun being deleted. It may be unfinished, or finished
+//     with its finalizer kept for a VolumeRestore (see finish).
+//
+// It returns an empty result once the finalizer is gone, or when the run
+// holds none. While a stopped mover is not gone yet, or the claim of an older
+// release's VolumeRestore is still there, it returns the wait from
+// waitForStopped. A step that fails is reported through releaseFailed, whose
+// error it returns for a retry. A Conflict on the VolumeRestore release is
+// retried after a second with nothing reported.
+//
+// The steps run in this order, and each one runs only once the one before it
+// went through: it stops the run's movers and waits until each is gone (rule
+// X2), releases the VolumeRestore an older release created (see
+// releaseVolumeRestore), gives the stopped workloads back and resumes the
+// suspended Kustomizations, releases the claim and repository Leases, drops
+// the finalizer, and last releases the namespace's quiesce Lease. Without
+// finalize, a run deleted while its mover writes would leave a restore
+// running against a claim with nothing tracking it. The run keeps its
+// finalizer and its Leases while it waits or retries: a Lease released
+// before the finalizer is dropped would let another run take the claim over
+// while this run repeats its restart.
 func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
@@ -1883,10 +1916,12 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if err := dropFinalizer(ctx, r.Client, run); err != nil {
 		return ctrl.Result{}, err
 	}
-	// After dropFinalizer, and not before: finalize writes no status, so a
-	// release that happened while the drop still failed would let another run
-	// take the Lease and then watch this run repeat its restart on the retry.
-	// Best effort: a Lease left behind is stale under holderLive's rule.
+	// The quiesce Lease goes after dropFinalizer. finalize does not store the
+	// restart in the run's status, so when the drop fails, the next pass
+	// restarts the app again. Released before that, the Lease would let
+	// another run stop the app in between, and the repeated restart would
+	// undo that stop. The release is best effort: a Lease left behind is
+	// stale under holderLive's rule.
 	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
 		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the deletion goes on",
 			"namespace", run.Namespace, "name", run.Name)
@@ -2078,21 +2113,28 @@ func moverRemains(ctx context.Context, c client.Reader, namespace, destination s
 	return "", fmt.Errorf("get the mover Job %s of ReplicationDestination %s: %w", job, destination, err)
 }
 
-// waitForStopped reports on a run that may not yet give the app back, release
-// its Leases, release its VolumeRestore or finish, because something it
-// stopped is still there: a mover it stopped (see removeDestinations)
-// or the claim it must delete before it releases the VolumeRestore (see
-// releaseVolumeRestore). Rule X2 and designs/restorerun.md D1.
+// waitForStopped reports that a run waits for something it stopped to go
+// before it gives the app back, releases its Leases or its VolumeRestore, or
+// finishes (rule X2 and designs/restorerun.md D1).
 //
-// It moves an unfinished run to Waiting and sets its Ready condition to False
-// with reason WaitingForShutdown and message, and writes the status when that
-// condition changed. A finished run that finalize holds keeps the phase it
-// finished with, which is the record of how its restore went. It returns the
-// result the reconcile hands back, which looks again after pollInterval.
+// Parameters:
+//   - run is the RestoreRun that waits. Its status is written when the
+//     Ready condition changes.
+//   - message is the Ready message that says what the run waits for: a
+//     mover it stopped (see moverList.message) or the claim it must delete
+//     before it releases the VolumeRestore (see releaseVolumeRestore).
 //
-// The run keeps its finalizer and its Leases meanwhile, so nothing takes the
-// claim or the repository over while the mover may still write, and nothing
-// starts the populator on a claim the run is releasing.
+// It returns a result that looks again after pollInterval, and the error of
+// the status write, if any.
+//
+// It moves an unfinished run to Waiting and sets the Ready condition to
+// False with reason WaitingForShutdown and the message. A finished run that
+// finalize holds keeps the phase it finished with, which is the record of how
+// its restore went. The status is written only when the condition changed,
+// since every write starts another reconcile. The run keeps its finalizer and
+// its Leases meanwhile, so nothing takes the claim or the repository over
+// while the mover may still write, and nothing starts the populator on a
+// claim the run is releasing.
 func (r *RestoreRunReconciler) waitForStopped(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
 	if !run.Status.Phase.Finished() {
 		run.Status.Phase = backupv1alpha1.RunPhaseWaiting
@@ -2124,8 +2166,14 @@ func (r *RestoreRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.
 }
 
 // waitForBackup keeps an into restore from creating anything while a backup
-// of the claim or the repository Secret secret is in progress. It is called
-// right before the run creates its first object. It first takes the Leases of
+// of its claim or its repository is in progress.
+//
+// Parameters:
+//   - claim is the name of the claim the run takes a Lease on: the source
+//     claim, or the new claim for a restore from spec.repository alone.
+//   - secret is the name of the repository Secret.
+//
+// The run calls it right before it creates its first object. It first takes the Leases of
 // the claim and the repository for the run's item (see acquireLeases), then
 // looks for a backup's mover object (see otherMover), which catches a backup
 // started before the controller took Leases.
@@ -2310,13 +2358,22 @@ func finishedWithDestination(items []backupv1alpha1.RestoreItem) bool {
 	return false
 }
 
-// releaseVolumeRestore releases the VolumeRestore named spec.into that a
-// v0.8.1 or older controller created for an into restore from a claim, once
-// the populator library can no longer start on the claim it fills. Such a
-// run ends with reason Upgraded (see olderPlan), and finalize calls this
-// when it is deleted. A run this release planned (see status.plannedBy)
-// creates no VolumeRestore, so for it there is nothing to release and
-// nothing is read.
+// releaseVolumeRestore removes populator.Finalizer from the VolumeRestore an
+// older release created for an into restore, once the populator library can
+// no longer start on the claim that VolumeRestore fills.
+//
+// Parameters:
+//   - run is the RestoreRun being deleted. Only a run that a v0.8.1 or older
+//     controller planned for an into restore from a claim has such a
+//     VolumeRestore, named spec.into; such a run ends with reason Upgraded
+//     (see olderPlan). For a run this release planned (see
+//     status.plannedBy) nothing is read.
+//
+// It returns a message for the Ready condition while the run waits for the
+// claim, and "" once nothing holds the VolumeRestore or there is none to
+// release. A failed read, delete or update comes back as a *releaseError,
+// and the next pass looks again; nothing is released on an unknown state.
+// finalize retries a Conflict quietly.
 //
 // The older controller created the VolumeRestore with populator.Finalizer,
 // and the populator's Cleanup removes that once the claim is filled or
@@ -2342,14 +2399,9 @@ func finishedWithDestination(items []backupv1alpha1.RestoreItem) bool {
 //     the library's finalizer, which the API server refuses to add to a
 //     deleting object. Either way the library cannot start on it: release.
 //
-// Nothing is released on an unknown state: a failed read comes back as an
-// error, and the next pass looks again. A VolumeRestore the run does not
-// control, one that carries no populator.Finalizer, and one whose status
-// lists a claim are left alone: the library then either cannot reach it or
-// removes the finalizer itself.
-//
-// It returns a message while the run waits for the claim, and "" once
-// nothing holds the VolumeRestore, or there is none to release.
+// A VolumeRestore the run does not control, one that carries no
+// populator.Finalizer, and one whose status lists a claim are left alone:
+// the library then either cannot reach it or removes the finalizer itself.
 func (r *RestoreRunReconciler) releaseVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun) (string, error) {
 	if run.Spec.Into == "" || run.Status.PlannedBy == runFormat {
 		return "", nil
@@ -2458,12 +2510,21 @@ func (r *RestoreRunReconciler) releaseFailed(ctx context.Context, run *backupv1a
 	return err
 }
 
-// holdsVolumeRestore reports whether the run controls a VolumeRestore named
-// spec.into whose populator.Finalizer releaseVolumeRestore has yet to
-// release. finish keeps the run's finalizer while it does, because that
-// release happens only once the claim the library fills is gone, and finalize
-// waits for the claim. A run this release planned creates no VolumeRestore,
-// so for it nothing is read.
+// holdsVolumeRestore reports whether a run controls a VolumeRestore that
+// releaseVolumeRestore has yet to release.
+//
+// Parameters:
+//   - run is the RestoreRun that finish is ending. Only a run an older
+//     release planned for an into restore can hold such a VolumeRestore,
+//     named spec.into; for a run this release planned nothing is read.
+//
+// It returns true when the run controls that VolumeRestore and it still
+// carries populator.Finalizer. A failed read comes back as a *releaseError,
+// and finish then stays unfinished and reads again on the next pass.
+//
+// finish keeps the run's finalizer while the VolumeRestore is held, because
+// the release happens only once the claim the library fills is gone, and
+// finalize waits for that claim when the run is deleted.
 func (r *RestoreRunReconciler) holdsVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun) (bool, error) {
 	if run.Spec.Into == "" || run.Status.PlannedBy == runFormat {
 		return false, nil

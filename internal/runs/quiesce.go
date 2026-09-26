@@ -269,20 +269,26 @@ func deletedCluster(run *backupv1alpha1.RestoreRun) string {
 // error for a failed API call. The caller waits with reason SourceBusy and
 // tries again on a later pass, with nothing stopped.
 //
-// The Leases of a namespace are taken by runs of both kinds, so a backup and
-// a restore of different claims in one namespace wait for each other. That
-// costs a wait between runs whose workloads do not overlap, and it covers
-// every overlap: a namespace run stops every marked workload, and a restore's
-// spec.quiesce overlap with it is the normal case.
+// Runs of both kinds take the same Lease, so a backup and a restore of
+// different claims in one namespace wait for each other even when their
+// workloads do not overlap. The one Lease covers every overlap: a namespace
+// run stops every marked workload, and a restore's spec.quiesce usually
+// lists some of them.
 func acquireQuiesceLease(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object, kind string) (string, error) {
 	holder := leaseHolder{kind: kind, run: run, scope: scopeQuiesce}
 	return acquireLease(ctx, c, reader, holder, run.GetNamespace(), quiesceLeaseName)
 }
 
 // timedOutMessage returns the Ready message of a run that ends because its
-// deadline passed: the deadline, and, when the run was waiting for another
-// run, the wait itself (see ReasonSourceBusy). The message then says what the
-// run waited for, which the timeout alone does not.
+// deadline passed.
+//
+// Parameters:
+//   - deadline is the moment the run had to finish by, which the message
+//     gives.
+//   - conditions are the run's status.conditions before it ends.
+//
+// When the run was waiting for another run (reason SourceBusy), the message
+// adds that wait's own message, so it says what the run waited for.
 func timedOutMessage(deadline time.Time, conditions []metav1.Condition) string {
 	message := fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339))
 	if ready := meta.FindStatusCondition(conditions, backupv1alpha1.ConditionReady); ready != nil && ready.Reason == backupv1alpha1.ReasonSourceBusy {
@@ -494,10 +500,18 @@ func planStop(ctx context.Context, reader client.Reader, mapper meta.RESTMapper,
 	return stop, suspend, nil
 }
 
-// otherNamespaces returns the namespaces of the Deployments and StatefulSets
-// a Kustomization's status.inventory.entries lists, together with the
-// namespace given, sorted, when at least one of them is another namespace.
-// It returns nil when every such workload is in the namespace given.
+// otherNamespaces lists the namespaces a Kustomization applies workloads in
+// when they go beyond the run's namespace.
+//
+// Parameters:
+//   - kustomization is the Kustomization as read, with its
+//     status.inventory.entries.
+//   - namespace is the run's namespace.
+//
+// It returns the run's namespace and the namespaces of the Deployments and
+// StatefulSets the inventory lists, sorted, when at least one of them is
+// another namespace, and nil when every such workload is in the run's
+// namespace.
 //
 // Each entry's id is "<namespace>_<name>_<group>_<kind>" (see
 // inventoryLists), and only apps Deployments and StatefulSets count, since
@@ -531,8 +545,8 @@ func otherNamespaces(kustomization *unstructured.Unstructured, namespace string)
 	return namespaces
 }
 
-// joinAnd joins names the way a sentence lists them: "a", "a and b", or
-// "a, b and c".
+// joinAnd returns the given names listed the way a sentence lists them: "a",
+// "a and b", or "a, b and c".
 func joinAnd(names []string) string {
 	if len(names) < 2 {
 		return strings.Join(names, "")
@@ -805,8 +819,10 @@ func (e *releaseError) Error() string { return "could not " + e.action + ": " + 
 // Unwrap returns the error from the API server or the RESTMapper.
 func (e *releaseError) Unwrap() error { return e.err }
 
-// releasePlan is the part of a BackupRun's or a RestoreRun's status that a
-// failed release is reported with.
+// releasePlan holds what releaseFailure needs from a BackupRun or a
+// RestoreRun to pick the Ready reason and write the advice for a failed
+// restart or release. The run's releaseFailed fills it from the run's
+// status and deletion timestamp.
 type releasePlan struct {
 	// stopped is the run's status.quiesced, the workloads it may still hold
 	// stopped.
@@ -917,11 +933,17 @@ func stillDoing(kind string) string {
 	return "backing up"
 }
 
-// byHand returns what a person does to give a run's app back by hand, as a
-// phrase that starts with a verb: "scale Deployment notes to 2 and resume
-// Kustomization flux-system/notes". It names each workload in stopped with
-// the replica count the run recorded for it, and each Kustomization in
-// suspended by its namespace/name key.
+// byHand returns what a person does to give a run's app back by hand.
+//
+// Parameters:
+//   - stopped is the run's status.quiesced. Each workload is named with the
+//     replica count the run recorded for it.
+//   - suspended is the run's status.suspendedKustomizations. Each
+//     Kustomization is named by its namespace/name key.
+//
+// It returns a phrase that starts with a verb, such as "scale Deployment
+// notes to 2 and resume Kustomization flux-system/notes", and "put the
+// workloads back" when the run recorded neither.
 func byHand(stopped []backupv1alpha1.QuiescedWorkload, suspended []string) string {
 	var steps []string
 	var counts []string

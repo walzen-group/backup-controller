@@ -61,33 +61,35 @@ func claimLeaseName(uid types.UID) string { return "backup-controller-claim-" + 
 // repository whose Secret has the given UID.
 func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-" + string(uid) }
 
-
-// acquireLeases takes the Leases that let one run at a time start a mover
-// on a claim and on its restic repository. A backup and a restore of the
-// same claim or repository call it right before they create their mover
-// object; otherMover's check on the objects themselves can't be atomic with
-// that create, and two runs that pass it in the same instant would both start
-// a mover. Creating a Lease is atomic: of two runs that create the same one,
-// the API server lets exactly one succeed.
+// acquireLeases takes the Leases that let only one run at a time start a
+// mover on a claim and on its restic repository.
 //
 // Parameters:
-//   - c creates, updates and reads the Leases. Reads go through reader.
-//   - reader reads the claim, the Secret and the holder run, uncached.
-//   - holder is the run and item that takes the Leases.
+//   - c creates and updates the Leases. The reads go through the reader.
+//   - reader reads the claim, the Secret, the Leases and the holder run,
+//     uncached, so a Lease another run took a moment ago is seen.
+//   - holder is the run and the item that take the Leases.
 //   - namespace is the run's namespace, where the Leases live.
-//   - claim names the claim; empty takes no claim Lease, as for a restore
-//     into a claim that does not exist yet. A claim that does not exist takes
-//     no Lease either: nothing can back it up.
-//   - secret names the repository Secret; empty takes no repository Lease.
+//   - claim is the name of the claim. With an empty name the run takes no
+//     claim Lease, as for a restore into a claim that does not exist yet.
+//   - secret is the name of the repository Secret. With an empty name the
+//     run takes no repository Lease.
 //
 // It returns "" once the run holds every Lease, and otherwise a message for
-// the Ready condition that names the run that holds one. The run then waits
-// with reason SourceBusy and tries again on a later pass. A claim that does
-// not exist takes no Lease, so a run whose claim is gone goes as far as
-// startItem or restoreVolume, which fails its item with a message naming the
-// claim. A repository Secret that does not exist comes back as a refusal
-// (see leaseNamesFor), and the caller fails the item with nothing started.
-// Any other failed API call comes back as an error, and the caller retries.
+// the Ready condition that names the run that holds one; the run then waits
+// with reason SourceBusy and tries again on a later pass. A repository Secret
+// that does not exist comes back as a refusal (see leaseNamesFor), and the
+// caller fails the item with nothing started. Any other failed API call comes
+// back as an error, and the caller retries.
+//
+// A backup and a restore of the same claim or repository call it right
+// before they create their mover object. otherMover's look at the objects
+// themselves cannot be atomic with that create, and two runs that passed it
+// in the same instant would both start a mover. Creating a Lease is atomic:
+// of two runs that create the same one, the API server lets exactly one
+// succeed. The run takes no Lease for a claim that does not exist, since
+// nothing can back that claim up; such a run goes as far as startItem or
+// restoreVolume, which fails its item with a message naming the claim.
 //
 // The claim Lease is taken before the repository Lease, always. A run that
 // holds a repository Lease therefore already holds its claim Lease, and never
@@ -124,14 +126,16 @@ func acquireLeases(ctx context.Context, c client.Client, reader client.Reader, h
 //     Reader, and acquireLeases and leaseHeldElsewhere share this function,
 //     so a pre-check looks at exactly the Leases the run would take later.
 //   - namespace is the run's namespace, which holds both objects.
-//   - claim names the claim; empty takes no claim Lease.
-//   - secret names the repository Secret; empty takes no repository Lease.
+//   - claim is the name of the claim. An empty name adds no claim Lease.
+//   - secret is the name of the repository Secret. An empty name adds no
+//     repository Lease.
 //
-// A claim that reads NotFound takes no Lease: nothing can write to it. A
-// repository Secret that reads NotFound comes back as a refusal (see
-// isRefusal), since a mover started without the repository Lease would be
-// unguarded once the Secret appears; the caller fails the item with nothing
-// started. Any other failed read comes back as an error.
+// It returns the Lease names, and an error when a read fails or the Secret
+// is missing. A claim that reads NotFound gets no Lease, because nothing can
+// write to it. A repository Secret that reads NotFound comes back as a
+// refusal (see isRefusal): a mover started without the repository Lease
+// would be unguarded once the Secret appears, so the caller fails the item
+// with nothing started. Any other failed read comes back as an error.
 func leaseNamesFor(ctx context.Context, reader client.Reader, namespace, claim, secret string) ([]string, error) {
 	var names []string
 	if claim != "" {
@@ -160,9 +164,15 @@ func leaseNamesFor(ctx context.Context, reader client.Reader, namespace, claim, 
 	return names, nil
 }
 
-// acquireLease takes one Lease for holder, as acquireLeases describes. It
-// returns "" when holder holds it, a message naming the holder when another
-// live run does (see leaseBusyMessage), and an error for a failed API call.
+// acquireLease takes one Lease for a run, as acquireLeases describes.
+//
+// Parameters:
+//   - holder is the run and the item that take the Lease.
+//   - namespace and name place and name the Lease.
+//
+// It returns "" once the run holds the Lease, a message naming the holder
+// when another live run holds it (see leaseBusyMessage), and an error when
+// an API call fails.
 func acquireLease(ctx context.Context, c client.Client, reader client.Reader, holder leaseHolder, namespace, name string) (string, error) {
 	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
 	stamp(lease, holder, []string{holder.item})
@@ -209,8 +219,14 @@ func acquireLease(ctx context.Context, c client.Client, reader client.Reader, ho
 }
 
 // leaseBusyMessage returns the Ready message for a run that waits while
-// another live run holds lease (see acquireLease). It names the holder, and
-// for a quiesce Lease the workloads the holder stopped.
+// another live run holds a Lease it needs (see acquireLease).
+//
+// Parameters:
+//   - lease is the Lease as stored, whose labels and annotations name the
+//     holder.
+//
+// The message names the holder, and for a quiesce Lease also the workloads
+// the holder stopped.
 func leaseBusyMessage(lease *coordinationv1.Lease) string {
 	kind := lease.Labels[labelLeaseHolderKind]
 	name := lease.Annotations[annotationLeaseHolderName]
@@ -284,22 +300,25 @@ const (
 	restoreLeaseItemKind = "PersistentVolumeClaim"
 )
 
-// holderLive reports whether the run that holds the Lease still needs it.
-// A claim or repository Lease is live while the run exists with the UID the
-// Lease names, has not finished, and has an item the Lease names that is
-// Pending or Running. Only an item of the kind that takes Leases counts (see
-// backupLeaseItemKind), so a Cluster item of the same name as the claim does
-// not keep the claim's Lease. A quiesce Lease is live while the holder's
-// stored status does not show the workloads given back (see
-// durablyRestarted): it exists with the UID the Lease names, has not
-// finished, and has no plan yet or has not recorded its restart as done. A
-// run being deleted counts as live until its finalizer has released the
-// Lease. A Lease that names no run kind this controller knows is left alone,
-// and counts as live. A failed read comes back as an error.
+// holderLive reports whether the run that holds a Lease still needs it.
 //
 // Parameters:
 //   - reader reads the holder run, uncached.
 //   - lease is the Lease as stored. It lives in its holder's namespace.
+//
+// It returns true while the holder needs the Lease, and an error when the
+// read of the holder fails.
+//
+// A claim or repository Lease is live while the run exists with the UID the
+// Lease names, has not finished, and has an item the Lease names that is
+// Pending or Running. Only an item of the kind that takes Leases counts (see
+// backupLeaseItemKind), so a Cluster item with the claim's name does not
+// keep the claim's Lease. A quiesce Lease is live while the holder's stored
+// status does not show the workloads given back (see durablyRestarted): the
+// holder exists with the UID the Lease names, has not finished, and has no
+// plan yet or has not recorded its restart as done. A run being deleted
+// counts as live until its finalizer has released the Lease. A Lease that
+// names no run kind this controller knows is left alone, and counts as live.
 func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1.Lease) (bool, error) {
 	key := types.NamespacedName{Namespace: lease.Namespace, Name: lease.Annotations[annotationLeaseHolderName]}
 	items := leaseItems(lease)
@@ -350,11 +369,20 @@ func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1
 	return true, nil
 }
 
-// releaseLeases deletes the Leases the run holds in its namespace whose items
-// have all finished by done's account. finish and finalize pass a done that
-// accepts every item; work passes one that accepts the items that finished.
-// A quiesce Lease is skipped: it goes only once the run has given the
-// workloads back, which releaseQuiesceLeases waits for (see holderLive).
+// releaseLeases deletes the claim and repository Leases a run holds in its
+// namespace once every item each Lease names is done.
+//
+// Parameters:
+//   - run is the BackupRun or RestoreRun whose Leases go, found by the UID
+//     label.
+//   - done tells whether the item with the given name is done. finish and
+//     finalize pass a function that accepts every item; work passes one that
+//     accepts the items that finished and whose movers are gone.
+//
+// It returns nil once every such Lease is gone or left alone, and an error
+// when the list or a delete fails. A quiesce Lease is skipped: it goes only
+// once the run has given the workloads back, which releaseQuiesceLeases
+// waits for (see holderLive).
 //
 // The delete carries the UID and the resourceVersion of the Lease as read, so
 // a Lease another run has taken over since is left alone. A Lease that is
@@ -385,10 +413,16 @@ func releaseLeases(ctx context.Context, c client.Client, reader client.Reader, r
 	return nil
 }
 
-// leaseReleaseError returns the *releaseError for a failed release of the
-// Leases a run holds (see releaseLeases). It names the Lease release as the
-// step that failed and tells a person how to find the Leases and delete them
-// by hand, which is what releaseFailure puts on the run's Ready condition.
+// leaseReleaseError returns the error for a failed release of the Leases a
+// run holds (see releaseLeases).
+//
+// Parameters:
+//   - run is the run whose Leases stayed. Its UID goes into the advice.
+//   - err is the error from releaseLeases.
+//
+// It returns a *releaseError, which releaseFailure puts on the run's Ready
+// condition. The error names the Lease release as the step that failed, and
+// its advice tells a person which label finds the Leases to delete by hand.
 func leaseReleaseError(run metav1.Object, err error) error {
 	return &releaseError{
 		action: "release the Leases it holds on its claims and repositories",
@@ -398,9 +432,16 @@ func leaseReleaseError(run metav1.Object, err error) error {
 	}
 }
 
-// releaseQuiesceLeases deletes the quiesce Lease the run holds in its
-// namespace. It is called once the run's stored status shows the workloads
-// back, so another run may take the Lease over.
+// releaseQuiesceLeases deletes the quiesce Lease a run holds in its
+// namespace.
+//
+// Parameters:
+//   - run is the BackupRun or RestoreRun whose quiesce Lease goes, found by
+//     the UID label.
+//
+// It returns nil once the Lease is gone or left alone, and an error when the
+// list or the delete fails. A run calls it once its stored status shows the
+// workloads back, so another run may take the Lease over.
 //
 // The delete carries the UID and the resourceVersion of the Lease as read, so
 // a Lease another run has taken over since is left alone. A Lease that is
