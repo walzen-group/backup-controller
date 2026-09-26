@@ -14,7 +14,7 @@ FIXTURES := nix develop .\#fixtures -c
 # copy, because kustomize and helm both read a directory of their own. Every
 # generated file is copied, so a new kind needs no edit here.
 
-.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic fixtures-barman fixtures-crds e2e-fetch e2e-up e2e-check e2e-down
+.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic fixtures-barman fixtures-crds e2e e2e-fetch e2e-up e2e-check e2e-down
 
 ## build: compile every package.
 build:
@@ -72,6 +72,10 @@ e2e-up:
 ## e2e-check: run every e2e component's smoke check against the cluster.
 e2e-check:
 	@set -e; for c in $(E2E_COMPONENTS); do echo "== check $$c"; $(NIX) hack/e2e/$$c/$$c.sh check; done
+
+## e2e: run every test tagged e2e against the cluster behind the docker-desktop context, after e2e-up. Required before a release.
+e2e:
+	$(NIX) go test -tags e2e -count=1 -timeout 60m ./...
 
 ## e2e-down: uninstall every e2e component, in reverse order. The cluster itself stays.
 e2e-down:
