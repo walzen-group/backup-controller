@@ -1417,12 +1417,22 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		// The item's end goes into the status before finish deletes the
+		// ReplicationDestination. A lost write then leaves the item Running
+		// with its destination still recorded, so the retry fails it again
+		// instead of starting the mover again on a claim that is gone.
 		if lost != "" {
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, lost
+			if err := r.writeStatus(ctx, run); err != nil {
+				return ctrl.Result{}, err
+			}
 			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
 		}
 		if reason, failed := failedMover(destination); failed {
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, reason
+			if err := r.writeStatus(ctx, run); err != nil {
+				return ctrl.Result{}, err
+			}
 			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
 		}
 		if destination.Status != nil && destination.Status.LastManualSync == string(run.UID) {
