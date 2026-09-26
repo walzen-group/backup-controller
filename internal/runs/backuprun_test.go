@@ -30,6 +30,7 @@ func backupRun(mutate ...func(*backupv1alpha1.BackupRun)) *backupv1alpha1.Backup
 	run := &backupv1alpha1.BackupRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "before-upgrade", Namespace: ns, UID: runUID, Generation: 1},
 		Spec:       backupv1alpha1.BackupRunSpec{Timeout: &metav1.Duration{Duration: time.Hour}},
+		Status:     backupv1alpha1.BackupRunStatus{PlannedBy: runFormat},
 	}
 	for _, m := range mutate {
 		m(run)
@@ -498,7 +499,7 @@ func otherRun() *backupv1alpha1.BackupRun {
 		ObjectMeta: metav1.ObjectMeta{Name: "manual-notes", Namespace: ns, UID: otherRunUID, Generation: 1},
 		Spec:       backupv1alpha1.BackupRunSpec{Source: claimN, Timeout: &metav1.Duration{Duration: time.Hour}},
 		Status: backupv1alpha1.BackupRunStatus{
-			Phase: backupv1alpha1.RunPhaseRunning,
+			Phase: backupv1alpha1.RunPhaseRunning, PlannedBy: runFormat,
 			Items: []backupv1alpha1.BackupItem{{Kind: "ReplicationSource", Name: claimN,
 				Phase: backupv1alpha1.ItemRunning, Trigger: TriggerFor(otherRunUID)}},
 		},

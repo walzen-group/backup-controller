@@ -142,6 +142,15 @@ type RestoreRunStatus struct {
 	// +optional
 	Phase RunPhase `json:"phase,omitempty"`
 
+	// PlannedBy names the status format of the controller release that
+	// planned the run, such as v0.9. The controller writes it with the plan.
+	// It continues only a run whose format matches its own, and ends any
+	// other unfinished run with reason Upgraded, because what an older
+	// release recorded in the status may not mean what this release reads
+	// in it. A patch release keeps the format.
+	// +optional
+	PlannedBy string `json:"plannedBy,omitempty"`
+
 	// Target is the name of the claim an into restore creates and fills.
 	// +optional
 	Target string `json:"target,omitempty"`

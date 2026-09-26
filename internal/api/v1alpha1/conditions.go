@@ -105,6 +105,16 @@ const (
 	// CRDs on its own.
 	ReasonCRDOutdated = "CRDOutdated"
 
+	// ReasonUpgraded reports an unfinished run that an older release of the
+	// controller planned (see status.plannedBy). This release does not
+	// continue such a run: it ends it as Failed, the way it ends any failed
+	// run. It gives back the workloads the run stopped, resumes the
+	// Kustomizations it suspended, deletes the ReplicationDestinations it
+	// created, and releases its Leases and its Kueue Workload. The message
+	// says to create a new run, and names a Cluster the run deleted that has
+	// not been recovered. The run records a Warning event.
+	ReasonUpgraded = "Upgraded"
+
 	// ReasonRestartFailed reports a BackupRun or RestoreRun whose app is
 	// still down, or whose state the run could not read, because the run
 	// could not give a stopped workload its replicas back, resume a

@@ -15,7 +15,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 )
@@ -51,16 +50,16 @@ func readCRD(t *testing.T, path string) *unstructured.Unstructured {
 }
 
 // The CRDs make manifests generates declare every field of their Go types,
-// and the v0.7.2 CRDs lack exactly the fields v0.8 added. This is also the
-// guard against the generated CRDs drifting from the types.
+// and the v0.7.2 CRDs lack exactly the fields v0.8 and v0.9 added. This is
+// also the guard against the generated CRDs drifting from the types.
 func TestSchemaGapsNamesTheFieldsAnOldCRDLacks(t *testing.T) {
 	for _, tc := range []struct {
 		file   string
 		sample any
 		old    []string
 	}{
-		{"backup.wlz.li_backupruns.yaml", backupv1alpha1.BackupRun{}, []string{"status.restartPending"}},
-		{"backup.wlz.li_restoreruns.yaml", backupv1alpha1.RestoreRun{}, []string{"status.items[].clusterUID", "status.items[].snapshotTime"}},
+		{"backup.wlz.li_backupruns.yaml", backupv1alpha1.BackupRun{}, []string{"status.plannedBy", "status.restartPending"}},
+		{"backup.wlz.li_restoreruns.yaml", backupv1alpha1.RestoreRun{}, []string{"status.items[].clusterUID", "status.items[].snapshotTime", "status.plannedBy"}},
 		{"backup.wlz.li_volumerestores.yaml", backupv1alpha1.VolumeRestore{}, nil},
 	} {
 		gaps, err := schemaGaps(readCRD(t, ownCRDDir+tc.file), tc.sample)
@@ -105,45 +104,35 @@ func TestABackupRunUnderAnOldCRDStopsNothing(t *testing.T) {
 	}
 }
 
-// A run that an older controller planned before the upgrade, and that has
-// not stopped anything yet, is checked again before it quiesces.
-func TestAPlannedBackupRunUnderAnOldCRDIsCheckedBeforeItQuiesces(t *testing.T) {
+// A run that v0.8.1 planned under the v0.7.2 BackupRun CRD before the
+// upgrade, and that has not stopped anything yet, ends with reason Upgraded
+// on the upgraded controller's first pass, and nothing is stopped. The CRD
+// has no status.plannedBy, so it could not hold one even for a run this
+// release planned. Before, the run was checked again before it quiesced.
+func TestABackupRunPlannedUnderAnOldCRDEndsBeforeItQuiesces(t *testing.T) {
 	c := newClientWithCRDs(t, withOldCRD("backup.wlz.li_backupruns.yaml"),
-		backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		backupRun(func(b *backupv1alpha1.BackupRun) {
+			b.Finalizers = []string{Finalizer}
+			b.Spec.All = true
+			b.Status.PlannedBy = ""
+			b.Status.Phase = backupv1alpha1.RunPhaseRunning
+			b.Status.StartedAt = atFrozen(-time.Minute)
+			b.Status.Items = []backupv1alpha1.BackupItem{{Kind: "ReplicationSource", Name: claimN, Phase: backupv1alpha1.ItemPending}}
+		}),
 		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
 	r := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}
-	// Plan as v0.8.1 did, without the check: mark the CRD as already walked
-	// with no gaps at its current resourceVersion.
-	crd := &unstructured.Unstructured{}
-	crd.SetGroupVersionKind(crdGVK)
-	if err := c.Get(context.Background(), types.NamespacedName{Name: backupRunsCRD}, crd); err != nil {
-		t.Fatalf("read the CRD: %v", err)
-	}
-	r.schemas.store(backupRunsCRD, crd.GetResourceVersion(), nil)
-	step(t, r) // plan
-	step(t, r) // admit: no LocalQueue, so it starts at once
-	if run := readBackupRun(t, c); run.Status.Phase.Finished() || len(run.Status.Items) == 0 {
-		t.Fatalf("the run did not get past plan: phase %q", run.Status.Phase)
-	}
 
-	// The CRD is updated in place, still without the field: a new
-	// resourceVersion, so the cached result no longer applies.
-	crd.SetLabels(map[string]string{"touched": "yes"})
-	if err := c.Update(context.Background(), crd); err != nil {
-		t.Fatalf("update the CRD: %v", err)
-	}
-	for range 3 {
-		step(t, r)
-	}
+	step(t, r)
+
 	run := readBackupRun(t, c)
 	ready := meta.FindStatusCondition(run.Status.Conditions, backupv1alpha1.ConditionReady)
-	if ready == nil || ready.Reason != backupv1alpha1.ReasonCRDOutdated {
-		t.Fatalf("Ready = %+v, want reason CRDOutdated", ready)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || ready == nil || ready.Reason != backupv1alpha1.ReasonUpgraded {
+		t.Fatalf("phase = %q, Ready = %+v; want Failed with reason Upgraded", run.Status.Phase, ready)
 	}
 	d := &appsv1.Deployment{}
 	get(t, c, ns, appN, d)
-	if *d.Spec.Replicas != 2 || len(run.Status.Quiesced) != 0 {
-		t.Errorf("replicas = %d, quiesced = %v; want nothing stopped", *d.Spec.Replicas, run.Status.Quiesced)
+	if *d.Spec.Replicas != 2 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
+		t.Errorf("replicas = %d, quiesced = %v, suspended = %t; want nothing stopped", *d.Spec.Replicas, run.Status.Quiesced, suspended(t, c))
 	}
 }
 
@@ -207,51 +196,25 @@ func (f forbidCRDs) Get(ctx context.Context, key client.ObjectKey, obj client.Ob
 }
 
 // A run that v0.8.1 quiesced under the v0.7.2 BackupRun CRD before the
-// upgrade is past both schema checks, since they run only before the run
-// stops anything. The CRD drops status.restartPending from the pass that
-// records the restart moment, and the status write decodes the stored
-// object back into the run. The pass still gives the app back and resumes
-// its Kustomization, and the run finishes with the app running.
-func TestARunQuiescedUnderAnOldCRDStillGivesTheAppBack(t *testing.T) {
-	c := newClientWithCRDs(t, withOldCRD("backup.wlz.li_backupruns.yaml"),
-		backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+// upgrade ends with reason Upgraded on the upgraded controller's first pass,
+// which gives the app back and resumes its Kustomization. Before, the run
+// went on to its restart and its upload.
+func TestARunQuiescedUnderAnOldCRDEndsAndGivesTheAppBack(t *testing.T) {
+	c := newClientWithCRDs(t, withOldCRD("backup.wlz.li_backupruns.yaml"), olderBackupRun(),
+		claim(), volume(), volumeRestore(), repository(), cluster(), stoppedDeployment(), kustomization(true))
 	r := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}
-	// v0.8.1 had no schema check: mark the CRD as walked with no gaps, so
-	// the run plans and quiesces as it did then.
-	crd := &unstructured.Unstructured{}
-	crd.SetGroupVersionKind(crdGVK)
-	if err := c.Get(context.Background(), types.NamespacedName{Name: backupRunsCRD}, crd); err != nil {
-		t.Fatalf("read the CRD: %v", err)
-	}
-	r.schemas.store(backupRunsCRD, crd.GetResourceVersion(), nil)
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce
-	step(t, r) // start
-	if got := replicasOf(t, c); got != 0 || !suspended(t, c) {
-		t.Fatalf("replicas = %d, suspended = %t before the upgrade, want the app stopped", got, suspended(t, c))
-	}
 
-	// The upgraded controller starts with no cached check.
-	r = &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}
-	cutClone(t, c)
-	step(t, r) // restart
+	step(t, r)
+
 	run := readBackupRun(t, c)
-	if run.Status.RestartedAt == nil {
-		t.Fatal("restartedAt is unset after the clone was cut")
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonUpgraded {
+		t.Fatalf("phase = %q, reason = %q (%s); want Failed, Upgraded", run.Status.Phase, readyReason(run.Status.Conditions),
+			readyMessage(run.Status.Conditions))
 	}
 	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d after the restart pass, want 2 back", got)
+		t.Errorf("replicas = %d, want the 2 the run recorded given back", got)
 	}
 	if suspended(t, c) {
-		t.Error("the Kustomization is still suspended after the restart pass")
-	}
-
-	complete(t, c, "snapshot 6e473100 saved")
-	step(t, r) // collect
-	run = readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || replicasOf(t, c) != 2 {
-		t.Errorf("phase = %q, replicas = %d; want Succeeded with the app at 2", run.Status.Phase, replicasOf(t, c))
+		t.Error("the Kustomization the run suspended is still suspended")
 	}
 }

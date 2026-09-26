@@ -12,7 +12,6 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -115,6 +114,7 @@ func secondBackupRun(mutate ...func(*backupv1alpha1.BackupRun)) *backupv1alpha1.
 	run := &backupv1alpha1.BackupRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "manual-notes", Namespace: ns, UID: otherRunUID, Generation: 1},
 		Spec:       backupv1alpha1.BackupRunSpec{Timeout: &metav1.Duration{Duration: time.Hour}},
+		Status:     backupv1alpha1.BackupRunStatus{PlannedBy: runFormat},
 	}
 	for _, m := range mutate {
 		m(run)
@@ -398,83 +398,6 @@ func TestARunFromBeforeLeasesIsWaitedFor(t *testing.T) {
 	old.Status.RestartPending = false
 	if err := c.Status().Update(context.Background(), old); err != nil {
 		t.Fatal(err)
-	}
-	restoreStep(t, rr)
-	restore = readRestoreRun(t, c)
-	if len(restore.Status.Quiesced) != 1 || restore.Status.Quiesced[0].Replicas != 2 {
-		t.Fatalf("the restore recorded %+v, want Deployment %s at 2", restore.Status.Quiesced, appN)
-	}
-}
-
-// A run whose restart failed under the v0.7.2 BackupRun CRD stores
-// restartedAt with restartPending pruned, so its stored status reads
-// restarted. The app still stands at 0, and a new run must wait for it rather
-// than record 0 as the count to give back. The old run itself repeats its
-// restart, since its plan does not read back.
-func TestAnOldCRDRunThatFailedItsRestartKeepsANewRunWaiting(t *testing.T) {
-	c := newClientWithCRDs(t, withOldCRD("backup.wlz.li_backupruns.yaml"),
-		backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }), quiescedRestoreOf(),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
-	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
-	rr := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
-	// v0.8.1 had no schema check: mark the CRD as walked with no gaps, so the
-	// run plans and quiesces as it did then.
-	crd := &unstructured.Unstructured{}
-	crd.SetGroupVersionKind(crdGVK)
-	if err := c.Get(context.Background(), types.NamespacedName{Name: backupRunsCRD}, crd); err != nil {
-		t.Fatalf("read the CRD: %v", err)
-	}
-	br.schemas.store(backupRunsCRD, crd.GetResourceVersion(), nil)
-
-	step(t, br) // plan
-	step(t, br) // admit
-	step(t, br) // quiesce
-	step(t, br) // start
-	cutClone(t, c)
-	br.Client = refuseDeploymentPatches(c)
-	_ = tryStep(br) // restart: the refused patch leaves the app at 0
-	// The wrapper the refusing client needs passes status writes to the fake
-	// client without the strict client's pruning, while the v0.7.2 API server
-	// prunes every write. This write through the plain client stores what the
-	// server would have: restartedAt kept, restartPending dropped.
-	stored := readBackupRun(t, c)
-	stored.Status.RestartPending = false
-	if err := c.Status().Update(context.Background(), stored); err != nil {
-		t.Fatal(err)
-	}
-	br.Client = c
-	stored = readBackupRun(t, c)
-	if stored.Status.RestartedAt == nil || stored.Status.RestartPending {
-		t.Fatalf("stored restartedAt = %v, restartPending = %t; want the pruned CRD to drop the flag",
-			stored.Status.RestartedAt, stored.Status.RestartPending)
-	}
-	if got := replicasOf(t, c); got != 0 {
-		t.Fatalf("replicas = %d after the refused restart, want the app still down", got)
-	}
-
-	restoreStep(t, rr) // quiesce: waits for the old run
-	restore := readRestoreRun(t, c)
-	if len(restore.Status.Quiesced) != 0 {
-		t.Fatalf("the restore recorded %+v; want no plan while the app stands at 0", restore.Status.Quiesced)
-	}
-	if readyReason(restore.Status.Conditions) != backupv1alpha1.ReasonSourceBusy ||
-		!strings.Contains(readyMessage(restore.Status.Conditions), "BackupRun before-upgrade") {
-		t.Fatalf("reason = %q, message = %q; want SourceBusy naming the old run",
-			readyReason(restore.Status.Conditions), readyMessage(restore.Status.Conditions))
-	}
-
-	// The old run repeats its restart because its plan does not read back.
-	step(t, br)
-	if got := replicasOf(t, c); got != 2 {
-		t.Fatalf("replicas = %d after the old run's repeated restart, want 2", got)
-	}
-	// The run goes on to start its backup, so the restore waits for that
-	// mover as well. Once the backup has finished, the restore plans the
-	// count the old run gave back.
-	complete(t, c, "snapshot 6e473100 saved")
-	step(t, br)
-	if backup := readBackupRun(t, c); backup.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
-		t.Fatalf("the old run ended %s: %s", backup.Status.Phase, readyMessage(backup.Status.Conditions))
 	}
 	restoreStep(t, rr)
 	restore = readRestoreRun(t, c)

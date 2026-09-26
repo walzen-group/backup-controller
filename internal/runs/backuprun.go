@@ -84,8 +84,12 @@ func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //
 // Before any stage, Reconcile adds the run's finalizer. A run being deleted
 // gets its changes put back by finalize, and a finished run is deleted once
-// spec.ttlSecondsAfterFinished has passed. Whenever the Ready reason changes
-// during a reconcile, Reconcile records an event on the run.
+// spec.ttlSecondsAfterFinished has passed. An unfinished run that an older
+// release planned, whose status.plannedBy is not this release's format, goes
+// through no stage: abort ends it with reason Upgraded, and finish gives back
+// what it stopped (see olderPlan). plan records the format with every plan.
+// Whenever the Ready reason changes during a reconcile, Reconcile records an
+// event on the run.
 func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.BackupRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -104,6 +108,21 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err := r.Update(ctx, run); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add the finalizer to BackupRun %s/%s: %w", run.Namespace, run.Name, err)
 		}
+	}
+	// A run an older release planned is not continued: what it recorded may
+	// not mean what this release reads. It ends here, and finish gives back
+	// what it stopped.
+	planned := run.Status.Phase != "" || len(run.Status.Items) > 0 || run.Status.QuiescedAt != nil
+	if olderPlan(run.Status.PlannedBy, planned) {
+		stopped := stoppedNothing
+		switch {
+		case len(run.Status.Quiesced) == 0 && len(run.Status.SuspendedKustomizations) == 0:
+		case run.Status.RestartedAt == nil || run.Status.RestartPending:
+			stopped = stoppedNotBack
+		default:
+			stopped = stoppedBackBefore
+		}
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonUpgraded, upgradedMessage("BackupRun", stopped, nil))
 	}
 
 	switch run.Status.Phase {
@@ -135,6 +154,7 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 	run.Status.Items = items
+	run.Status.PlannedBy = runFormat
 	run.Status.Phase = backupv1alpha1.RunPhaseQueued
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonQueued,
 		"waiting for the backup queue to admit the run")
@@ -270,7 +290,7 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 	if _, err := timeoutFor(ctx, r.Reader, run); err != nil {
 		var bad invalidSetting
 		if errors.As(err, &bad) {
-			return ctrl.Result{}, r.abort(ctx, run, bad.Error())
+			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, bad.Error())
 		}
 		return ctrl.Result{}, err
 	}
@@ -281,7 +301,7 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 		if _, err := maxQuiesceFor(ctx, r.Reader, run.Namespace); err != nil {
 			var bad invalidSetting
 			if errors.As(err, &bad) {
-				return ctrl.Result{}, r.abort(ctx, run, bad.Error())
+				return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, bad.Error())
 			}
 			return ctrl.Result{}, err
 		}
@@ -346,7 +366,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, err
 	}
 	if over {
-		return ctrl.Result{}, r.abort(ctx, run, timedOutMessage(deadline, run.Status.Conditions))
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, timedOutMessage(deadline, run.Status.Conditions))
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
 	// restore of that claim need not wait for the rest of the run. This is
@@ -382,7 +402,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 			// workloads again, so they are never held without a limit.
 			var bad invalidSetting
 			if errors.As(err, &bad) {
-				return ctrl.Result{}, r.abort(ctx, run, bad.Error())
+				return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, bad.Error())
 			}
 			return ctrl.Result{}, err
 		}
@@ -642,7 +662,7 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		return ctrl.Result{}, err
 	}
 	if stopErr != nil {
-		return ctrl.Result{}, r.abort(ctx, run, stopErr.Error())
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, stopErr.Error())
 	}
 	return ctrl.Result{RequeueAfter: time.Second}, nil
 }
@@ -1077,11 +1097,19 @@ func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claim
 // abort ends a run early as Failed. It marks every Pending or Running item as
 // Failed with the given message, then calls finish, which starts the stopped
 // workloads again and deletes the run's Workload so the queue gets its slot
-// back. A Pending item whose last start attempt failed keeps that error: its
+// back.
+//
+// Parameters:
+//   - reason is the Ready reason the run ends with: ReasonFailed for a run
+//     that hit something it can't get past, such as its timeout, and
+//     ReasonUpgraded for a run an older release planned.
+//   - message is the Ready message, and each unfinished item's message.
+//
+// A Pending item whose last start attempt failed keeps that error: its
 // message becomes the given message, "; last error: " and the error. A
 // Running volume item's message also says what data a snapshot of the sync
 // VolSync goes on with holds (see syncGoesOn).
-func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, message string) error {
+func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		if item.Phase != backupv1alpha1.ItemPending && item.Phase != backupv1alpha1.ItemRunning {
@@ -1098,7 +1126,7 @@ func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Bac
 		}
 		item.Phase, item.Message = backupv1alpha1.ItemFailed, failed
 	}
-	return r.finish(ctx, run, backupv1alpha1.ReasonFailed, message)
+	return r.finish(ctx, run, reason, message)
 }
 
 // finish ends the run. It starts any workload the run still holds stopped,

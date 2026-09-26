@@ -100,6 +100,11 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // put back by finalize, and a finished run is deleted once
 // spec.ttlSecondsAfterFinished has passed.
 //
+// An unfinished run that an older release planned, whose status.plannedBy is
+// not this release's format, goes through none of these: abort ends it with
+// reason Upgraded, and finish stops its movers and gives back what it
+// stopped (see olderPlan). Both plans record the format.
+//
 // A new run is first checked against the installed RestoreRun CRD (see
 // schemaCache.crdOutdated), and a run whose CRD lacks a field the controller
 // writes ends with reason CRDOutdated before anything is planned.
@@ -123,6 +128,25 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.Update(ctx, run); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add the finalizer to RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
 		}
+	}
+	// A run an older release planned is not continued: what it recorded may
+	// not mean what this release reads. It ends here, and finish stops its
+	// movers and gives back what it stopped.
+	planned := run.Status.Phase != "" || len(run.Status.Items) > 0 || run.Status.QuiescedAt != nil
+	if olderPlan(run.Status.PlannedBy, planned) {
+		// A RestoreRun records restartedAt only after its restart succeeded,
+		// so a run that recorded it has nothing left to give back.
+		stopped := stoppedNothing
+		if (len(run.Status.Quiesced) > 0 || len(run.Status.SuspendedKustomizations) > 0) && run.Status.RestartedAt == nil {
+			stopped = stoppedNotBack
+		}
+		var deleted []string
+		for _, item := range run.Status.Items {
+			if item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemDeleted {
+				deleted = append(deleted, item.Name)
+			}
+		}
+		return r.abort(ctx, run, backupv1alpha1.ReasonUpgraded, upgradedMessage("RestoreRun", stopped, deleted))
 	}
 
 	if run.Status.Phase == "" {
@@ -386,6 +410,7 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 	}
 
 	now := metav1.NewTime(r.Now())
+	run.Status.PlannedBy = runFormat
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	run.Status.StartedAt = &now
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "restoring")
@@ -1256,6 +1281,7 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 		Destination: destinationName(run.UID, 0),
 	}
 	now := metav1.NewTime(r.Now())
+	run.Status.PlannedBy = runFormat
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	run.Status.StartedAt = &now
 	run.Status.Items = []backupv1alpha1.RestoreItem{item}
