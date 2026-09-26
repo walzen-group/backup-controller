@@ -13,14 +13,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// defaultTimeout and defaultPruneIntervalDays are the settings a namespace
-// gets when it has no annotation for them, or an empty one. defaultTimeout is
-// how long a BackupRun may work once admitted, and defaultPruneIntervalDays is
-// how many days pass between prunes of a repository. An empty value counts as
-// no annotation, so a Flux component can write the key from a substitution
-// that defaults to "".
+// defaultTimeout, defaultMaxQuiesce and defaultPruneIntervalDays are the
+// settings a namespace gets when it has no annotation for them, or an empty
+// one. defaultTimeout is how long a BackupRun may work once admitted,
+// defaultMaxQuiesce is how long a BackupRun may keep the quiesced workloads
+// stopped, and defaultPruneIntervalDays is how many days pass between prunes
+// of a repository. An empty value counts as no annotation, so a Flux
+// component can write the key from a substitution that defaults to "".
 const (
 	defaultTimeout           = 6 * time.Hour
+	defaultMaxQuiesce        = 10 * time.Minute
 	defaultPruneIntervalDays = int32(1)
 )
 
@@ -68,6 +70,29 @@ func timeoutFor(ctx context.Context, reader client.Reader, run *backupv1alpha1.B
 	d, err := time.ParseDuration(value)
 	if err != nil || d <= 0 {
 		return 0, invalidSetting{fmt.Sprintf("namespace %s has %s %q, which is not a duration such as 10h", run.Namespace, backupv1alpha1.AnnotationTimeout, value)}
+	}
+	return d, nil
+}
+
+// maxQuiesceFor returns how long a BackupRun with spec.all set may keep the
+// workloads marked backup.wlz.li/quiesce stopped, counted from
+// status.quiescedAt. That is the namespace's backup.wlz.li/max-quiesce
+// annotation when set, or else defaultMaxQuiesce.
+//
+// It returns an invalidSetting error when the annotation isn't a positive Go
+// duration such as 20m, and any error from reading the Namespace.
+func maxQuiesceFor(ctx context.Context, reader client.Reader, namespace string) (time.Duration, error) {
+	annotations, err := namespaceAnnotations(ctx, reader, namespace)
+	if err != nil {
+		return 0, err
+	}
+	value := annotations[backupv1alpha1.AnnotationMaxQuiesce]
+	if value == "" {
+		return defaultMaxQuiesce, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil || d <= 0 {
+		return 0, invalidSetting{fmt.Sprintf("namespace %s has %s %q, which is not a duration such as 20m", namespace, backupv1alpha1.AnnotationMaxQuiesce, value)}
 	}
 	return d, nil
 }

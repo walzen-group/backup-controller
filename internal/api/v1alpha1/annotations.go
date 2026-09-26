@@ -15,6 +15,14 @@ const (
 	// hours. RestoreRuns ignore this annotation.
 	AnnotationTimeout = "backup.wlz.li/timeout"
 
+	// AnnotationMaxQuiesce, on a Namespace, is how long a BackupRun with all
+	// set may keep the workloads marked backup.wlz.li/quiesce stopped, as a
+	// Go duration such as 20m, measured from status.quiescedAt. Once it runs
+	// out, every volume whose clone VolSync has not cut yet fails its item,
+	// and the run starts the workloads again. Without it, the limit is ten
+	// minutes.
+	AnnotationMaxQuiesce = "backup.wlz.li/max-quiesce"
+
 	// AnnotationPruneIntervalDays, on a Namespace, is the number of days
 	// between prunes of each repository the namespace's ReplicationSources
 	// write. Without it, each repository is pruned every day.

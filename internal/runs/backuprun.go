@@ -240,6 +240,18 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 		}
 		return ctrl.Result{}, err
 	}
+	// The same goes for a backup.wlz.li/max-quiesce that does not parse on a
+	// run that stops workloads: it would have no limit on how long they stay
+	// down.
+	if run.Spec.All {
+		if _, err := maxQuiesceFor(ctx, r.Reader, run.Namespace); err != nil {
+			var bad invalidSetting
+			if errors.As(err, &bad) {
+				return ctrl.Result{}, r.abort(ctx, run, bad.Error())
+			}
+			return ctrl.Result{}, err
+		}
+	}
 
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	run.Status.StartedAt = newTime(metav1.NewTime(r.Now()))
@@ -265,6 +277,14 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // moment. Times in the status are whole seconds. Last, it collects the result
 // of every Running item.
 //
+// The workloads stay stopped for at most the namespace's
+// backup.wlz.li/max-quiesce limit, ten minutes by default, counted from
+// status.quiescedAt. A pass at or past that moment first fails every volume
+// item whose clone is not cut (see giveUpUncut), skips the wait for pods,
+// and so reaches the restart above. That also bounds pods that never stop and
+// a VolSync that never cuts a clone. A limit that does not parse aborts the
+// run, which starts the workloads again.
+//
 // The run finishes once every item is done and, on a run with spec.all set,
 // the workloads are running again. It finishes Succeeded when no item failed
 // and Failed otherwise. A run past its timeout is aborted. While the
@@ -286,7 +306,25 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		return r.quiesce(ctx, run, now)
 	}
 
-	if run.Spec.All && run.Status.RestartedAt == nil && anyPending(run.Status.Items) {
+	limited := false
+	if run.Spec.All && run.Status.RestartedAt == nil && len(run.Status.Quiesced) > 0 {
+		limit, err := maxQuiesceFor(ctx, r.Reader, run.Namespace)
+		if err != nil {
+			// A limit that no longer parses fails the run, which starts the
+			// workloads again, so they are never held without a limit.
+			var bad invalidSetting
+			if errors.As(err, &bad) {
+				return ctrl.Result{}, r.abort(ctx, run, bad.Error())
+			}
+			return ctrl.Result{}, err
+		}
+		if !now.Time.Before(run.Status.QuiescedAt.Add(limit)) {
+			r.giveUpUncut(ctx, run, limit, now)
+			limited = true
+		}
+	}
+
+	if run.Spec.All && run.Status.RestartedAt == nil && !limited && anyPending(run.Status.Items) {
 		targets, err := quiesceTargets(ctx, r.Reader, run.Namespace)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -548,23 +586,72 @@ func (r *BackupRunReconciler) clonesCut(ctx context.Context, run *backupv1alpha1
 		case backupv1alpha1.ItemPending:
 			return false
 		case backupv1alpha1.ItemRunning:
-		default:
-			continue
-		}
-		source := &volsyncv1alpha1.ReplicationSource{}
-		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source); err == nil && lastManual(source) == item.Trigger {
-			continue
-		}
-		clone := &corev1.PersistentVolumeClaim{}
-		key := types.NamespacedName{Namespace: run.Namespace, Name: "volsync-" + item.Name + "-src"}
-		if err := r.Reader.Get(ctx, key, clone); err != nil || clone.Status.Phase != corev1.ClaimBound {
-			return false
-		}
-		if !clone.DeletionTimestamp.IsZero() || run.Status.QuiescedAt == nil || !clone.CreationTimestamp.After(run.Status.QuiescedAt.Time) {
-			return false
+			if !r.cloneCut(ctx, run, item) {
+				return false
+			}
 		}
 	}
 	return true
+}
+
+// cloneCut reports whether VolSync has cut the clone of the Running volume
+// item, by the rules clonesCut describes. A failed read counts as no clone.
+func (r *BackupRunReconciler) cloneCut(ctx context.Context, run *backupv1alpha1.BackupRun, item backupv1alpha1.BackupItem) bool {
+	source := &volsyncv1alpha1.ReplicationSource{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source); err == nil && lastManual(source) == item.Trigger {
+		return true
+	}
+	clone := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{Namespace: run.Namespace, Name: cloneName(item.Name)}
+	if err := r.Reader.Get(ctx, key, clone); err != nil || clone.Status.Phase != corev1.ClaimBound {
+		return false
+	}
+	return clone.DeletionTimestamp.IsZero() && run.Status.QuiescedAt != nil && clone.CreationTimestamp.After(run.Status.QuiescedAt.Time)
+}
+
+// cloneName returns the name of the claim VolSync clones the given claim
+// into for a backup.
+func cloneName(claim string) string { return "volsync-" + claim + "-src" }
+
+// giveUpUncut fails every volume item of the run whose clone VolSync has not
+// cut, because the workloads have been stopped for the namespace's
+// backup.wlz.li/max-quiesce limit and the pass starts them again.
+//
+// Parameters:
+//   - limit is the limit that ran out, for the message.
+//   - now is the time of the pass, which becomes status.restartedAt.
+//
+// A Pending item fails with a message that says it never started, with the
+// error of its last start attempt when it has one. A Running item whose clone
+// is not cut fails with a message that names the missing clone. A Running
+// item whose clone is cut goes on. Afterwards clonesCut is true, so the
+// caller's restart path records status.restartedAt and starts the workloads.
+// The check reads only the clones; a failed read counts as no clone, so an
+// API outage never keeps the workloads down past the limit.
+func (r *BackupRunReconciler) giveUpUncut(ctx context.Context, run *backupv1alpha1.BackupRun, limit time.Duration, now metav1.Time) {
+	at := now.UTC().Format(time.RFC3339)
+	for i := range run.Status.Items {
+		item := &run.Status.Items[i]
+		if item.Kind != "ReplicationSource" {
+			continue
+		}
+		switch item.Phase {
+		case backupv1alpha1.ItemPending:
+			message := fmt.Sprintf("not started before the workloads were given back at %s, when the %s limit of %s ran out, so the clone %s was never cut",
+				at, backupv1alpha1.AnnotationMaxQuiesce, limit, cloneName(item.Name))
+			if last, ok := strings.CutPrefix(item.Message, notStartedYet); ok {
+				message += ": " + last
+			}
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+		case backupv1alpha1.ItemRunning:
+			if r.cloneCut(ctx, run, *item) {
+				continue
+			}
+			item.Phase, item.Message = backupv1alpha1.ItemFailed,
+				fmt.Sprintf("VolSync had not cut the clone %s by %s, when the %s limit of %s ran out and the workloads were given back",
+					cloneName(item.Name), at, backupv1alpha1.AnnotationMaxQuiesce, limit)
+		}
+	}
 }
 
 // collectItem records the result of a Running item once it has one, and
