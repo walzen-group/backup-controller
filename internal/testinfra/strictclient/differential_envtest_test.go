@@ -2,11 +2,11 @@
 
 // The envtest differential suite runs the custom resource rules of the strict
 // client against envtest's kube-apiserver 1.36.3, with this repository's
-// BackupRun CRD at v0.7.2 and at v0.8.1 from internal/testinfra/crds and
-// VolSync's ReplicationSource CRD from the same folder (written as an
-// unstructured object), and compares what a client observes, the RestoreRun
-// defaults included. Each version gets its own control plane,
-// which is stopped at the end, so the CRDs go with it.
+// BackupRun CRD at v0.7.2 and at v0.8.1 from internal/testinfra/crds,
+// VolSync's ReplicationSource CRD and CloudNativePG's Cluster CRD from the
+// same folder (written as an unstructured object), and compares what a client
+// observes, the RestoreRun defaults included. Each version gets its own
+// control plane, which is stopped at the end, so the CRDs go with it.
 //
 //	nix develop .#envtest -c go test -tags envtest ./internal/testinfra/strictclient/
 package strictclient_test
@@ -38,7 +38,7 @@ func TestDifferentialAgainstEnvtest(t *testing.T) {
 	for _, version := range []string{"v0.7.2", "v0.8.1"} {
 		t.Run(version, func(t *testing.T) {
 			dir := filepath.Join("..", "crds", "backup-controller", version)
-			env := &envtest.Environment{CRDDirectoryPaths: []string{dir, replicationSourceCRD}, ErrorIfCRDPathMissing: true}
+			env := &envtest.Environment{CRDDirectoryPaths: []string{dir, replicationSourceCRD, cnpgClusterCRD}, ErrorIfCRDPathMissing: true}
 			cfg, err := env.Start()
 			if err != nil {
 				t.Fatalf("start envtest: %v", err)
@@ -52,6 +52,8 @@ func TestDifferentialAgainstEnvtest(t *testing.T) {
 			}
 			scheme.AddKnownTypeWithName(replicationSourceGVK, &unstructured.Unstructured{})
 			scheme.AddKnownTypeWithName(replicationSourceGVK.GroupVersion().WithKind("ReplicationSourceList"), &unstructured.UnstructuredList{})
+			scheme.AddKnownTypeWithName(clusterGVK, &unstructured.Unstructured{})
+			scheme.AddKnownTypeWithName(clusterGVK.GroupVersion().WithKind("ClusterList"), &unstructured.UnstructuredList{})
 			real, err := client.New(cfg, client.Options{Scheme: scheme})
 			if err != nil {
 				t.Fatal(err)
@@ -60,7 +62,7 @@ func TestDifferentialAgainstEnvtest(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			files = append(files, replicationSourceCRD)
+			files = append(files, replicationSourceCRD, cnpgClusterCRD)
 			strict := strictclient.Build(fake.NewClientBuilder(), scheme, strictclient.Options{Clock: time.Now, CRDs: files})
 
 			want := envtestOps(t, strict)
@@ -191,6 +193,7 @@ func envtestOps(t *testing.T, c client.Client) map[string]string {
 	}
 	restoreRunDefaultOps(t, c, o)
 	replicationSourceOps(t, c, o)
+	clusterBeingDeletedOps(t, c, o)
 	return o
 }
 
@@ -301,4 +304,90 @@ func envtestReason(err error) string {
 		return "ok"
 	}
 	return string(apierrors.ReasonForError(err))
+}
+
+// clusterBeingDeletedOps writes an unstructured CloudNativePG Cluster with c,
+// a third-party kind whose version declares a status subresource, and adds
+// what it observed to o: the generation, whether the object carries a status
+// key and the stored phase after the create, after the finalizer write and
+// after the delete that the finalizer holds in place, the outcome of a status
+// write and of a plain update while the object is being deleted, from the
+// stored object and from the object as it was before the delete, and what
+// happens when the last finalizer goes.
+func clusterBeingDeletedOps(t *testing.T, c client.Client, o map[string]string) {
+	t.Helper()
+	ctx := context.Background()
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(clusterGVK)
+	u.SetNamespace("default")
+	u.SetName("being-deleted")
+	if err := unstructured.SetNestedField(u.Object, int64(1), "spec", "instances"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	read := func() *unstructured.Unstructured {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(clusterGVK)
+		if err := c.Get(ctx, client.ObjectKeyFromObject(u), got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	record := func(label string, got *unstructured.Unstructured) {
+		_, present := got.Object["status"]
+		phase, _, _ := unstructured.NestedString(got.Object, "status", "phase")
+		o["Cluster "+label+": status key"] = fmt.Sprint(present)
+		o["Cluster "+label+": status phase"] = phase
+		o["Cluster "+label+": generation"] = fmt.Sprint(got.GetGeneration())
+	}
+	record("create", read())
+
+	u.SetFinalizers([]string{"diff.example.com/hold"})
+	if err := c.Update(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	o["Cluster finalizer write: status writable"] = fmt.Sprint(unstructured.SetNestedField(u.Object, "Cluster in recovery", "status", "phase") == nil)
+	record("finalizer write", read())
+
+	stale := read()
+	if err := c.Delete(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	after := read()
+	o["Cluster delete: deletionTimestamp"] = fmt.Sprint(after.GetDeletionTimestamp() != nil)
+	o["Cluster delete: caller kept"] = fmt.Sprint(u.GetDeletionTimestamp() == nil)
+	record("delete", after)
+
+	// A status write from the stored object is admitted, and the status is
+	// readable afterwards.
+	if err := unstructured.SetNestedField(after.Object, "Cluster in healthy state", "status", "phase"); err != nil {
+		t.Fatal(err)
+	}
+	o["Cluster status write: result"] = envtestReason(c.Status().Update(ctx, after))
+	record("status write", read())
+
+	// A status write from the object as it was before the delete carries the
+	// resourceVersion from before it.
+	if err := unstructured.SetNestedField(stale.Object, "Cluster in recovery", "status", "phase"); err != nil {
+		t.Fatal(err)
+	}
+	o["Cluster stale status write: result"] = envtestReason(c.Status().Update(ctx, stale))
+	record("stale status write", read())
+
+	// A plain update from the same object.
+	stale.SetLabels(map[string]string{"diff.example.com/stale": "yes"})
+	o["Cluster stale update: result"] = envtestReason(c.Update(ctx, stale))
+	got := read()
+	o["Cluster after the stale update: labels"] = fmt.Sprint(got.GetLabels())
+	record("stale update", got)
+
+	// The last finalizer going takes the object with it.
+	final := read()
+	final.SetFinalizers(nil)
+	o["Cluster remove the last finalizer: result"] = envtestReason(c.Update(ctx, final))
+	gone := &unstructured.Unstructured{}
+	gone.SetGroupVersionKind(clusterGVK)
+	o["Cluster after the last finalizer: gone"] = fmt.Sprint(apierrors.IsNotFound(c.Get(ctx, client.ObjectKeyFromObject(u), gone)))
 }
