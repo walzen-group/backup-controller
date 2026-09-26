@@ -1,15 +1,14 @@
 package runs
 
 import (
-	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/served"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
 // webhookClusterKind is CloudNativePG's Cluster at the one version the
@@ -32,13 +31,18 @@ var webhookClusterKind = ClusterGVK
 // for only some versions of the group. The callers act only on a real
 // incompatibility, and a failed lookup is reported by the requests that
 // follow.
+//
+// The kind is looked up by group and kind with no version, which makes
+// controller-runtime's lazy mapper read the discovery of every version of
+// the group. A first lookup at one version reads that version alone, and a
+// fresh mapper then answers a later lookup of the group's other kinds from
+// what it has read so far, so one of two unserved kinds went unnamed.
 func servedElsewhere(mapper meta.RESTMapper, gvk schema.GroupVersionKind) []string {
-	_, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
-	var partial *apiutil.ErrResourceDiscoveryFailed
-	if err == nil || !meta.IsNoMatchError(err) || errors.As(err, &partial) {
+	versions := served.Versions(mapper, gvk.GroupKind())
+	if slices.Contains(versions, gvk.GroupVersion().String()) {
 		return nil
 	}
-	return served.Versions(mapper, gvk.GroupKind())
+	return versions
 }
 
 // clusterWebhookBlind reports whether the API server serves CloudNativePG's
