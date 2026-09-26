@@ -12,7 +12,7 @@ import (
 )
 
 // The tests in this file read testdata/same-time, a repository that
-// testdata/same-time/record.sh wrote with the restic of the VolSync mover
+// hack/fixtures/restic-same-time.sh wrote with the restic of the VolSync mover
 // image: two mover snapshots with identical times, and one snapshot for each
 // way a snapshot can differ from what a mover writes.
 
