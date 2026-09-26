@@ -36,6 +36,46 @@ k8s.io/api v0.36.0, k8s.io/apimachinery v0.36.0, k8s.io/client-go v0.36.0,
 k8s.io/apiextensions-apiserver v0.36.0, controller-runtime v0.24.1,
 lib-volume-populator v3.3.0 and github.com/backube/volsync v0.16.0.
 
+## Following the versions the API server serves
+
+An upgrade of Flux, Kueue, VolSync, CloudNativePG or the barman-cloud plugin
+must not stop the controller. Most upgrades change nothing the controller uses,
+so the controller follows whatever version the API server serves and fails
+loudly only when it meets a real incompatibility.
+
+| Kinds | How the controller finds the version | When the version it used is gone |
+| --- | --- | --- |
+| Flux Kustomization; Kueue Workload and LocalQueue; CloudNativePG Cluster and Backup; barman-cloud ObjectStore | served.Kind looks the kind up by group and kind in the manager's RESTMapper, which caches the answer, and every request goes out at that version (internal/served/served.go). | The API server answers "404 page not found". served.VersionGone turns that into an error the run retries, makes the mapper read discovery again, and the next pass uses the new version. The 404 never counts as a missing object. |
+| VolSync ReplicationSource and ReplicationDestination | The controller has Go types for volsync.backube/v1alpha1 only, from github.com/backube/volsync v0.16.0. | holdForVolSync (internal/runs/volsynccheck.go) holds every unfinished run that is not a database-only run, with Ready reason VolSyncUnsupported and a message that names each kind and the versions served. The run creates, deletes and stops nothing until v1alpha1 is served again or a controller release that knows the new version is installed. The controller also logs the message once at startup. |
+| Core Kubernetes kinds (apps/v1, v1, batch/v1, coordination/v1, apiextensions.k8s.io/v1) | Fixed. These versions are GA and Kubernetes keeps serving them. | served.Client and served.Reader turn the 404 into a retried error for every kind, typed ones included. |
+
+VolSync has published only v1alpha1, in every tag up to v0.16.0 and on its
+main branch as of 2026-09-26 (api/ holds v1alpha1 alone, and the CRDs under
+config/crd/bases serve that version only). The controller therefore has no
+other version to fall back to. It waits, and it never sends a request at a
+version it guessed.
+
+Every create, update and patch the controller sends carries
+fieldValidation=Strict (clientOptions in cmd/backup-controller/main.go).
+Without that parameter kube-apiserver uses Warn: it drops a field the CRD does
+not declare and answers with a warning only (k8s.io/apiserver v0.36.3
+pkg/endpoints/handlers/rest.go:409-414, and the apiextensions-apiserver v0.36.0
+custom resource decoder, pkg/apiserver/customresource_handler.go:1190-1192 and
+1338-1340). With Strict, a field that a new release renamed or removed fails
+the write, and the run reports an error such as `unknown field
+"spec.renamedField"`. controller-runtime v0.24.1 adds the parameter to every
+Create, Update and Patch of the client and of its Status and SubResource
+writers (pkg/client/client.go:124-126, pkg/client/fieldvalidation.go).
+TestEnvtestTheControllersWritesRefuseUnknownFields in
+cmd/backup-controller/strict_envtest_test.go checks both halves against the
+pinned kube-apiserver, a merge patch shaped like the Kustomization suspend
+included.
+
+After infra bumps any of these projects, run `make e2e` against the new pins
+(see "When infra bumps a dependency" below). The unit and envtest suites check
+that the controller follows a new version with unchanged fields. Only the e2e
+run shows whether the new release changed a field the controller reads.
+
 ## Behaviours the controller relies on
 
 Each row names the file and line where the behaviour was read, in the source
@@ -66,7 +106,7 @@ module published at that release.
 | The admission call carries the API server's deadline in the timeout query parameter. The bootstrap webhook answers inside that budget. | k8s.io/apiserver v0.36.3 (the module of Kubernetes 1.36.3; go.mod does not pin it, and the build graph selects v0.36.0, where this range is the same) pkg/admission/plugin/webhook/mutating/dispatcher.go:276-295 |
 | Creating an object that exists fails with AlreadyExists, and a failed create commits nothing: etcd's create is a put with expected revision 0, so of two runs that create the same Lease in one instant exactly one wins. The claim, repository and quiesce Leases rest on this. | k8s.io/apiserver v0.36.3 pkg/storage/etcd3/store.go:317-326 and pkg/storage/errors/storage.go:63-64 |
 | An update carrying a resourceVersion other than the stored one fails with Conflict, and a delete whose UID or resourceVersion precondition does not match the stored object fails with Conflict too, so a run that takes over a stale Lease never overwrites the run that took it first. | k8s.io/apiserver v0.36.3 pkg/registry/generic/registry/store.go:743-744; pkg/storage/interfaces.go:150-163 with pkg/storage/errors/storage.go:103-104 (a mismatched delete precondition becomes an invalid-object error, which InterpretDeleteError turns into Conflict) |
-| The API server answers a request at a version it does not serve, a discovery read or an object request, with a plain-text "404 page not found" body from its not-found handler. client-go turns that answer into a NotFound whose details carry an UnexpectedServerResponse cause, which apierrors.IsUnexpectedServerError reports. controller-runtime v0.24.1's mapper has no Reset: a lookup of a kind its group does not have makes it read the discovery of every version of the group it has cached, and it drops the group from its cache when one of those versions answers 404. internal/runs/quiesce.go's versionGone and rediscover rely on both. | k8s.io/apiextensions-apiserver v0.36.0 pkg/apiserver/customresource_handler.go:313-316 and pkg/apiserver/customresource_discovery.go:36-47 (an unserved version goes to the delegate), pkg/apiserver/apiserver.go:172-175 (the delegate is Go's http.NotFoundHandler when the CRD server has none, whose body is "404 page not found": go1.26.7 net/http/server.go:2322); k8s.io/apiserver v0.36.3 pkg/server/config.go:823 and pkg/server/handler.go:73-77, 121-154; k8s.io/client-go v0.36.0 rest/request.go:1242-1255, 1326-1361 (a text body goes through newUnstructuredResponseError); apimachinery v0.36.0 pkg/api/errors/errors.go:448-450, 501-507, 761-771; controller-runtime v0.24.1 pkg/client/apiutil/restmapper.go:55, 122-132, 158-216, 309-331; internal/runs/quiesce.go:66-138; internal/runs/versiongone_envtest_test.go |
+| The API server answers a request at a version it does not serve, a discovery read or an object request, with a plain-text "404 page not found" body from its not-found handler. client-go turns that answer into a NotFound whose details carry an UnexpectedServerResponse cause, which apierrors.IsUnexpectedServerError reports. controller-runtime v0.24.1's mapper has no Reset: a lookup of a kind its group does not have makes it read the discovery of every version of the group it has cached, and it drops the group from its cache when one of those versions answers 404. served.VersionGone and served.Rediscover (internal/served/served.go) rely on both. | k8s.io/apiextensions-apiserver v0.36.0 pkg/apiserver/customresource_handler.go:313-316 and pkg/apiserver/customresource_discovery.go:36-47 (an unserved version goes to the delegate), pkg/apiserver/apiserver.go:172-175 (the delegate is Go's http.NotFoundHandler when the CRD server has none, whose body is "404 page not found": go1.26.7 net/http/server.go:2322); k8s.io/apiserver v0.36.3 pkg/server/config.go:823 and pkg/server/handler.go:73-77, 121-154; k8s.io/client-go v0.36.0 rest/request.go:1242-1255, 1326-1361 (a text body goes through newUnstructuredResponseError); apimachinery v0.36.0 pkg/api/errors/errors.go:448-450, 501-507, 761-771; controller-runtime v0.24.1 pkg/client/apiutil/restmapper.go:55, 122-132, 158-216, 309-331; internal/served/served.go; internal/runs/versiongone_envtest_test.go |
 
 ### Flux 2.9.5
 
@@ -182,6 +222,34 @@ cited code is identical in both.
 | Behaviour | Source |
 | --- | --- |
 | ListObjectsV2 honours prefix, delimiter and max-keys, and GET returns backup.info bodies as barman wrote them. The webhook's S3Prober and restic's S3 backend depend on those answers. | internal/testinfra/s3fake (replays of recorded RustFS answers) |
+
+## Fields the controller reads from other projects
+
+Each row says what the controller does when the field is missing, which is
+what a release that moves or renames the field looks like to it. "Loud" means
+the run fails or reports an error that names the field. "Legitimate" means
+the missing field is a normal state and the controller waits; each of those
+waits ends at the run's timeout, so none of them can report success.
+
+| Project | Object and field | Read in | When the field is missing |
+| --- | --- | --- | --- |
+| CloudNativePG | Backup status.phase | backupResult, internal/runs/cnpg.go | Legitimate while empty or pending, started, running, finalizing or walArchivingFailing (the phases in CloudNativePG 1.30 api/v1/backup_types.go:32-58). Loud for any other value: the item fails naming status.phase and the value. |
+| CloudNativePG | Backup status.error | backupResult | Legitimate: a failed Backup without it gets a message naming its phase. |
+| CloudNativePG | Cluster status.phase | clusterPhase, internal/runs/cnpg.go | Legitimate: a RestoreRun waits for "Cluster in healthy state" and counts no other phase as healthy. |
+| CloudNativePG | Cluster metadata annotations cnpg.io/hibernation, backup.wlz.li/enabled | internal/runs/cnpg.go | Legitimate: annotations are optional. |
+| CloudNativePG | Cluster spec.plugins (name, isWALArchiver, parameters.barmanObjectName, parameters.serverName), spec.bootstrap, spec.externalClusters | Archiver and declaredBootstrap, internal/bootstrap/webhook.go | Legitimate: the webhook always receives the Cluster at postgresql.cnpg.io/v1, whose fields CloudNativePG keeps, because deploy/webhook.yaml registers apiVersions ["v1"]. |
+| barman-cloud | ObjectStore spec.configuration.destinationPath | storeLocation, internal/bootstrap/archive.go | Loud: the webhook refuses the create and a RestoreRun fails its check, naming the field. |
+| barman-cloud | ObjectStore spec.configuration.endpointURL | storeLocation | Legitimate: barman then uses AWS S3's endpoint. |
+| barman-cloud | ObjectStore spec.configuration.s3Credentials.{accessKeyId,secretAccessKey}.{name,key} | credential, internal/bootstrap/archive.go | Loud: the error names the field. |
+| barman-cloud | ObjectStore spec.configuration.endpointCA.{name,key} | endpointCA, internal/bootstrap/archive.go | Legitimate when name is absent: the endpoint then needs a public authority. Loud when name is set with no key. |
+| Flux | Kustomization status.inventory.entries[].id | inventoryIDs, internal/runs/quiesce.go | Loud: when a workload's kustomize-controller labels name the Kustomization and the list is missing or an id is not "<namespace>_<name>_<group>_<kind>", the run is refused before it stops anything. |
+| Flux | Kustomization spec.suspend | setSuspend and planStop, internal/runs/quiesce.go | Loud: setSuspend reads the value back from the patch's answer and fails when it differs from the value it set. |
+| Kueue | Workload status.conditions Admitted and PodsReady | admitted and markPodsReady, internal/runs/kueue.go | Legitimate while the Workload waits in its queue. Loud once the run's timeout has passed since its creation: awaitAdmission fails the run naming Kueue, the Workload and the LocalQueue. |
+| Kueue | LocalQueue metadata.name | localQueue, internal/runs/kueue.go | Legitimate: a namespace with no LocalQueue runs without admission. Kueue 0.19.5 serves v1beta1 and v1beta2, and every field the controller uses is the same in both. |
+| VolSync | ReplicationSource status.lastSyncStartTime | inUse, internal/runs/sources.go; syncGoesOn, internal/runs/backuprun.go | Legitimate: no sync is running. The field comes from the v1alpha1 Go type, and a rename would arrive as a new version, which holdForVolSync catches. |
+| VolSync | ReplicationSource and ReplicationDestination status.lastManualSync | lastManual, internal/runs/trigger.go; internal/runs/restorerun.go; internal/volsync/volsync.go | Legitimate: VolSync writes it only when a manual sync completes. A run waits for its own tag there. |
+| VolSync | status.latestMoverStatus.result and .logs | internal/runs/trigger.go, moverpick.go, restorerun.go; internal/volsync/volsync.go | Legitimate: no mover has finished yet. |
+| VolSync | ReplicationSource status.restic.lastUnlocked | internal/runs/trigger.go | Legitimate: the next mover runs restic unlock again, which removes only stale locks. |
 
 ## When infra bumps a dependency
 

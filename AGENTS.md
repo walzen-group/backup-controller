@@ -10,6 +10,11 @@ docs/compatibility.md: bump versions.json and the hack/e2e pins, re-record the
 fixtures, run the e2e suites, and re-check every behaviour that doc lists for
 the bumped dependency against the new version's source.
 
+The controller follows the version the API server serves for every kind of
+another project, and it fails loudly only on a real incompatibility; the rule
+and the table of fields it reads are in docs/compatibility.md. After an infra
+bump, run `make e2e` against the new pins.
+
 ## Releases
 
 A release follows docs/releasing.md. Before every tag, on the commit being
