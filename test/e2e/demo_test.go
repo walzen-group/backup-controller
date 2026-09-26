@@ -188,9 +188,9 @@ spec:
 	}
 
 	step(3, "change the data in the app, so the restore has something to undo")
-	changed := fmt.Sprintf("changed after the backup, at %s\n", time.Now().UTC().Format(time.RFC3339))
+	changed := "changed after the backup, at " + time.Now().UTC().Format(time.RFC3339)
 	mustKubectl(t, "", "-n", ns.Name, "exec", "deploy/app", "--", "/bin/sh", "-ec",
-		fmt.Sprintf("printf '%%s' %q > /data/%s && sync", changed, file))
+		fmt.Sprintf(`printf '%%s\n' "$1" > /data/%s && sync`, file), "sh", changed)
 	now := mustKubectl(t, "", "-n", ns.Name, "exec", "deploy/app", "--", "cat", "/data/"+file)
 	t.Logf("/data/%s now holds: %s", file, strings.TrimSpace(now))
 	if now == original {
