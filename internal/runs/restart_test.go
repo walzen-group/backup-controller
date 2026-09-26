@@ -10,6 +10,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -298,5 +299,220 @@ func TestOnlyAKindNoVersionOfWhichIsServedIsGone(t *testing.T) {
 				t.Errorf("deleteWorkload error = %v, want an error only when the lookup failed", err)
 			}
 		})
+	}
+}
+
+// A run that has given back everything it stopped, and then cannot release
+// its Leases or delete its Kueue Workload, says which of the two failed and
+// gives advice for that. It never tells a person to scale workloads or
+// resume Kustomizations, which the run has already done.
+func TestAReleaseFailureNamesWhatFailed(t *testing.T) {
+	refused := errors.New("a policy refuses the delete")
+	for name, tc := range map[string]struct {
+		refuse func(client.Object) bool
+		names  []string
+	}{
+		"Lease": {
+			refuse: func(obj client.Object) bool { _, ok := obj.(*coordinationv1.Lease); return ok },
+			names:  []string{"Lease", labelLeaseHolderUID},
+		},
+		"Workload": {
+			refuse: func(obj client.Object) bool {
+				u, ok := obj.(*unstructured.Unstructured)
+				return ok && u.GroupVersionKind().GroupKind() == WorkloadGVK.GroupKind()
+			},
+			names: []string{"Workload " + workloadName(runUID)},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+				claim(), volume(), volumeRestore(), repository())
+			r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+				Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if tc.refuse(obj) {
+						return apierrors.NewForbidden(schema.GroupResource{Resource: name}, obj.GetName(), refused)
+					}
+					return cl.Delete(ctx, obj, opts...)
+				},
+			})
+			step(t, r) // plan
+			step(t, r) // admit, no queue
+			step(t, r) // start: the run takes the Leases
+			complete(t, c, "snapshot 6e473100 saved")
+			if err := tryStep(r); err == nil {
+				t.Fatal("the collect pass returned no error, want the refused delete retried")
+			}
+
+			run := readBackupRun(t, c)
+			if run.Status.Phase.Finished() || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonRestartFailed {
+				t.Fatalf("phase = %q, reason = %q, want the run unfinished with %s", run.Status.Phase, readyReason(run.Status.Conditions), backupv1alpha1.ReasonRestartFailed)
+			}
+			message := readyMessage(run.Status.Conditions)
+			for _, want := range append(tc.names, refused.Error()) {
+				if !strings.Contains(message, want) {
+					t.Errorf("message %q does not name %q", message, want)
+				}
+			}
+			for _, wrong := range []string{"status.quiesced", "replicas", "put back what the run changed"} {
+				if strings.Contains(message, wrong) {
+					t.Errorf("message %q says %q, which is advice for another failure", message, wrong)
+				}
+			}
+		})
+	}
+}
+
+// A restart that fails in the pass that gives the app back after the clones
+// are cut, long before the run's timeout, is reported at once: Ready turns
+// False with reason RestartFailed and the message finish writes, with one
+// Warning event. Each later pass tries again, and the first one the API
+// server accepts gives the app back and goes on backing up.
+func TestARestartThatFailsBeforeTheTimeoutIsReported(t *testing.T) {
+	r, c, _ := servedBackupReconciler(t, nil, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	refuse := false
+	r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok && refuse {
+				if data, _ := patch.Data(obj); !strings.Contains(string(data), `"replicas":0`) {
+					return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, obj.GetName(), errors.New("a policy refuses the change"))
+				}
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // start
+	cutClone(t, c)
+
+	refuse = true
+	recorder := events.NewFakeRecorder(10)
+	r.Recorder = recorder
+	for pass := 1; pass <= 2; pass++ {
+		if err := tryStep(r); err == nil {
+			t.Fatalf("pass %d: the reconcile returned no error, want the refused restart retried", pass)
+		}
+		run := readBackupRun(t, c)
+		if !run.Status.RestartPending || run.Status.Phase.Finished() {
+			t.Fatalf("pass %d: restartPending = %t, phase = %q, want the restart still owed", pass, run.Status.RestartPending, run.Status.Phase)
+		}
+		if reason := readyReason(run.Status.Conditions); reason != backupv1alpha1.ReasonRestartFailed {
+			t.Fatalf("pass %d: reason = %q, want %s", pass, reason, backupv1alpha1.ReasonRestartFailed)
+		}
+		message := readyMessage(run.Status.Conditions)
+		for _, want := range []string{"Deployment " + appN, "2 replicas", "a policy refuses the change", Finalizer} {
+			if !strings.Contains(message, want) {
+				t.Errorf("pass %d: message %q does not name %q", pass, message, want)
+			}
+		}
+	}
+	got := recorded(recorder)
+	if len(got) != 1 || !strings.HasPrefix(got[0], "Warning "+backupv1alpha1.ReasonRestartFailed+" ") {
+		t.Fatalf("events = %q, want one Warning %s", got, backupv1alpha1.ReasonRestartFailed)
+	}
+
+	refuse = false
+	if err := tryStep(r); err != nil {
+		t.Fatalf("pass after the refusal ended: %v", err)
+	}
+	if replicas := replicasOf(t, c); replicas != 2 {
+		t.Fatalf("replicas = %d once the API server accepts the restart, want 2 back", replicas)
+	}
+	run := readBackupRun(t, c)
+	if run.Status.RestartPending || readyReason(run.Status.Conditions) == backupv1alpha1.ReasonRestartFailed {
+		t.Errorf("restartPending = %t, reason = %q after the restart went through, want the run backing up again",
+			run.Status.RestartPending, readyReason(run.Status.Conditions))
+	}
+}
+
+// staleFluxReconciler returns a BackupRunReconciler whose client looks
+// versions up through controller-runtime's lazy RESTMapper over a discovery
+// endpoint that serves Kustomization at v1 (see fluxServedAt), and the
+// endpoint, so the test can switch Flux to v2 mid-run. It also returns the
+// strict client underneath, which stores the Kustomization at v1.
+func staleFluxReconciler(t *testing.T, aggregated bool, objects ...client.Object) (*BackupRunReconciler, client.Client, *fluxDiscovery) {
+	t.Helper()
+	c := newClient(t, objects...)
+	d := newFluxDiscovery(t, "v1", aggregated)
+	served := fluxServedAt(c, d, d.mapper(t))
+	return &BackupRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}, c, d
+}
+
+// A Flux upgrade that stops serving the Kustomization version the controller
+// looked up and cached, while a run holds the app down, never leaves the
+// Kustomization suspended. The API server answers the resume at the cached
+// version with a 404 for the resource, which is not a deleted
+// Kustomization: the pass reports RestartFailed and the mapper looks the
+// version up again, and the next pass resumes the Kustomization at the new
+// version.
+func TestAKustomizationVersionFluxStopsServingIsNotTakenForGone(t *testing.T) {
+	for name, aggregated := range map[string]bool{"aggregated discovery": true, "legacy discovery": false} {
+		t.Run(name, func(t *testing.T) {
+			r, c, d := staleFluxReconciler(t, aggregated, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+				claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+			step(t, r) // plan
+			step(t, r) // admit, no queue
+			step(t, r) // quiesce: the mapper caches v1
+			step(t, r) // start
+			if !suspended(t, c) {
+				t.Fatal("the quiesce pass did not suspend the Kustomization")
+			}
+
+			d.serve("v2")
+			cutClone(t, c)
+			if err := tryStep(r); err == nil {
+				t.Fatal("the restart pass returned no error, want the resume at the unserved version retried")
+			}
+			run := readBackupRun(t, c)
+			if reason := readyReason(run.Status.Conditions); reason != backupv1alpha1.ReasonRestartFailed || !run.Status.RestartPending {
+				t.Fatalf("reason = %q, restartPending = %t after the failed resume, want %s and the restart still owed",
+					reason, run.Status.RestartPending, backupv1alpha1.ReasonRestartFailed)
+			}
+			if message := readyMessage(run.Status.Conditions); !strings.Contains(message, "Kustomization flux-system/"+appN) {
+				t.Errorf("message %q does not name the Kustomization", message)
+			}
+
+			if err := tryStep(r); err != nil {
+				t.Fatalf("pass after the mapper looked v2 up: %v", err)
+			}
+			if suspended(t, c) {
+				t.Fatal("the Kustomization stayed suspended after Flux moved to v2")
+			}
+			if run := readBackupRun(t, c); run.Status.RestartPending || readyReason(run.Status.Conditions) == backupv1alpha1.ReasonRestartFailed {
+				t.Errorf("restartPending = %t, reason = %q, want the restart done", run.Status.RestartPending, readyReason(run.Status.Conditions))
+			}
+			if replicas := replicasOf(t, c); replicas != 2 {
+				t.Errorf("replicas = %d, want 2 back", replicas)
+			}
+		})
+	}
+}
+
+// A Flux upgrade that stops serving the cached Kustomization version before
+// a run stops the app does not make the run stop the app with its
+// Kustomization left running, which would scale the app back up mid-backup.
+// The quiesce pass fails and stops nothing; the next one suspends the
+// Kustomization at the new version.
+func TestAQuiesceAfterFluxMovesVersionStillSuspends(t *testing.T) {
+	r, c, d := staleFluxReconciler(t, true, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	if _, err := r.RESTMapper().RESTMapping(KustomizationGVK.GroupKind()); err != nil {
+		t.Fatal(err)
+	}
+	d.serve("v2")
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	if err := tryStep(r); err == nil {
+		t.Fatal("the quiesce pass returned no error, want the read at the unserved version retried")
+	}
+	if run := readBackupRun(t, c); len(run.Status.Quiesced) != 0 || replicasOf(t, c) != 2 {
+		t.Fatalf("quiesced = %v, replicas = %d after the failed read, want nothing stopped", run.Status.Quiesced, replicasOf(t, c))
+	}
+	step(t, r) // quiesce at v2
+	run := readBackupRun(t, c)
+	if len(run.Status.SuspendedKustomizations) != 1 || !suspended(t, c) {
+		t.Fatalf("suspended = %v, want the Kustomization suspended at the new version", run.Status.SuspendedKustomizations)
 	}
 }

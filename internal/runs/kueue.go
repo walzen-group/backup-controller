@@ -160,7 +160,10 @@ func markPodsReady(ctx context.Context, c client.Client, workload *unstructured.
 //
 // It returns an error when the lookup of the served version fails for
 // another reason, such as a failed discovery call, or when the delete fails
-// with an error other than NotFound.
+// with an error other than NotFound. A delete at a version the API server
+// has stopped serving since the client's mapper cached it is such an error
+// (see versionGone), because the Workload may still exist at another
+// version.
 func deleteWorkload(ctx context.Context, c client.Client, namespace string, uid types.UID) error {
 	gvk, err := servedKind(c.RESTMapper(), WorkloadGVK.GroupKind())
 	if apierrors.IsNotFound(err) {
@@ -173,7 +176,7 @@ func deleteWorkload(ctx context.Context, c client.Client, namespace string, uid 
 	workload.SetGroupVersionKind(gvk)
 	workload.SetNamespace(namespace)
 	workload.SetName(workloadName(uid))
-	if err := c.Delete(ctx, workload); err != nil && !apierrors.IsNotFound(err) {
+	if err := versionGone(c.RESTMapper(), gvk, c.Delete(ctx, workload)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete Workload %s: %w", workload.GetName(), err)
 	}
 	return nil

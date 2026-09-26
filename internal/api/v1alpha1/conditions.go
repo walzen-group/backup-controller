@@ -109,11 +109,15 @@ const (
 	// stays unfinished and tries again on every reconcile until it can,
 	// because finishing would leave the app down with no record of the
 	// replicas it is owed. While a namespace run is unfinished, the
-	// namespace's schedule starts no new one. The message names the object
-	// and the error. Fixing the cause lets the run finish by itself; a person
-	// can also scale the workloads and resume the Kustomizations by hand,
-	// then delete the run and remove its backup.wlz.li/run-cleanup finalizer.
-	// The run records a Warning event when it first reports this.
+	// namespace's schedule starts no new one. A run also reports it while it
+	// is still working, as soon as the restart after the clones are cut
+	// fails. The message names what the run could not do and the error, and
+	// says what a person can do about that. Fixing the cause lets the run
+	// finish by itself. After a failed restart a person can also scale the
+	// workloads and resume the Kustomizations by hand, then delete the run
+	// and remove its backup.wlz.li/run-cleanup finalizer; after a failed
+	// Lease release or Workload delete, a person can delete those. The run
+	// records a Warning event when it first reports this.
 	ReasonRestartFailed = "RestartFailed"
 )
 
