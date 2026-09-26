@@ -352,9 +352,10 @@ func TestARestoreWaitingForABackupAtItsChecksTimesOut(t *testing.T) {
 
 // An item that records a snapshot and no snapshotTime fails before its
 // destination exists: the run has no second to pin the mover to, and a mover
-// left to choose by spec.restoreAsOf could restore another snapshot. Only an
-// older release planned such an item. Before, the item took the time of the
-// listed snapshot with its short ID.
+// left to choose by spec.restoreAsOf could restore another snapshot. The run
+// records both with its plan, so only a status the run did not write holds
+// such an item. Before, the item took the time of the listed snapshot with
+// its short ID.
 func TestAnItemWithoutASnapshotTimeFailsBeforeItStarts(t *testing.T) {
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) {
 		r.Spec.Claim = claimN

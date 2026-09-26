@@ -193,37 +193,14 @@ func durablyRestarted(run client.Object) bool {
 // Lease, with nothing stopped.
 //
 // Parameters:
-//   - reader lists the namespace's runs, uncached. A failed list comes back
-//     as an error, and nothing is decided on it.
-//   - run is the asking run; runs with its UID are skipped.
+//   - reader lists the namespace's RestoreRuns, uncached. A failed list comes
+//     back as an error, and nothing is decided on it.
+//   - run is the asking run; a RestoreRun with its UID is skipped.
 //
-// It names two kinds of run. The first is an unfinished run that an older
-// release planned (see olderPlan). Such a run took no quiesce Lease, and it
-// may hold the workloads stopped until this release has ended it and given
-// them back, which can take more than one pass while a mover it stopped
-// shuts down; a run that planned meanwhile would record the stopped count as
-// the one to give back. The second is an unfinished RestoreRun with a
-// Cluster item in phase Deleted. It waits for its Cluster to be created
-// again, and a Kustomization this run suspends may be the one Flux needs to
-// create it.
+// The run it names is an unfinished RestoreRun with a Cluster item in phase
+// Deleted. That RestoreRun waits for its Cluster to be created again, and a
+// Kustomization this run suspends may be the one Flux needs to create it.
 func waitingOn(ctx context.Context, reader client.Reader, run metav1.Object) (string, error) {
-	older := func(kind, name string) string {
-		return fmt.Sprintf("%s %s was started by an older version of backup-controller and is being ended; this run stops the workloads once that run has given them back",
-			kind, name)
-	}
-	backups := &backupv1alpha1.BackupRunList{}
-	if err := reader.List(ctx, backups, client.InNamespace(run.GetNamespace())); err != nil {
-		return "", fmt.Errorf("list BackupRuns in %s: %w", run.GetNamespace(), err)
-	}
-	for i := range backups.Items {
-		other := &backups.Items[i]
-		if other.UID == run.GetUID() || other.Status.Phase.Finished() {
-			continue
-		}
-		if olderPlan(other) {
-			return older("BackupRun", other.Name), nil
-		}
-	}
 	restores := &backupv1alpha1.RestoreRunList{}
 	if err := reader.List(ctx, restores, client.InNamespace(run.GetNamespace())); err != nil {
 		return "", fmt.Errorf("list RestoreRuns in %s: %w", run.GetNamespace(), err)
@@ -232,9 +209,6 @@ func waitingOn(ctx context.Context, reader client.Reader, run metav1.Object) (st
 		other := &restores.Items[i]
 		if other.UID == run.GetUID() || other.Status.Phase.Finished() {
 			continue
-		}
-		if olderPlan(other) {
-			return older("RestoreRun", other.Name), nil
 		}
 		if cluster := deletedCluster(other); cluster != "" {
 			return fmt.Sprintf("RestoreRun %s has deleted Cluster %s and waits for it to be created again; this run stops the workloads once that Cluster is back",
@@ -794,13 +768,12 @@ func (e *restartError) Error() string { return "could not " + e.action + ": " + 
 func (e *restartError) Unwrap() error { return e.err }
 
 // releaseError is a failure of a step that releases or deletes something a
-// run holds: its Leases, its Kueue Workload, a restore mover it stops (the
-// ReplicationDestination, and the wait for the mover's Job and pods), or the
-// VolumeRestore an older release created. The step can come before the
-// workloads are back, as a RestoreRun stops its movers first, or after them;
-// releasePlan.appDown tells releaseFailure which. The error says what the run
-// could not do and what a person can do about it, so the run can put both on
-// its Ready condition.
+// run holds: its Leases, its Kueue Workload, or a restore mover it stops (the
+// ReplicationDestination, and the wait for the mover's Job and pods). The
+// step can come before the workloads are back, as a RestoreRun stops its
+// movers first, or after them; releasePlan.appDown tells releaseFailure
+// which. The error says what the run could not do and what a person can do
+// about it, so the run can put both on its Ready condition.
 type releaseError struct {
 	// action is what the run could not do, such as "release the Leases it
 	// holds on its claims and repositories".

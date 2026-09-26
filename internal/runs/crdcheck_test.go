@@ -58,8 +58,8 @@ func TestSchemaGapsNamesTheFieldsAnOldCRDLacks(t *testing.T) {
 		sample any
 		old    []string
 	}{
-		{"backup.wlz.li_backupruns.yaml", backupv1alpha1.BackupRun{}, []string{"status.plannedBy", "status.restartPending"}},
-		{"backup.wlz.li_restoreruns.yaml", backupv1alpha1.RestoreRun{}, []string{"status.items[].clusterUID", "status.items[].snapshotTime", "status.plannedBy"}},
+		{"backup.wlz.li_backupruns.yaml", backupv1alpha1.BackupRun{}, []string{"status.restartPending"}},
+		{"backup.wlz.li_restoreruns.yaml", backupv1alpha1.RestoreRun{}, []string{"status.items[].clusterUID", "status.items[].snapshotTime"}},
 		{"backup.wlz.li_volumerestores.yaml", backupv1alpha1.VolumeRestore{}, nil},
 	} {
 		gaps, err := schemaGaps(readCRD(t, ownCRDDir+tc.file), tc.sample)
@@ -101,38 +101,6 @@ func TestABackupRunUnderAnOldCRDStopsNothing(t *testing.T) {
 	}
 	if len(run.Status.Items) != 0 {
 		t.Errorf("items = %+v; a refused run plans nothing", run.Status.Items)
-	}
-}
-
-// A run that v0.8.1 planned under the v0.7.2 BackupRun CRD before the
-// upgrade, and that has not stopped anything yet, ends with reason Upgraded
-// on the upgraded controller's first pass, and nothing is stopped. The CRD
-// has no status.plannedBy, so it could not hold one even for a run this
-// release planned. Before, the run was checked again before it quiesced.
-func TestABackupRunPlannedUnderAnOldCRDEndsBeforeItQuiesces(t *testing.T) {
-	c := newClientWithCRDs(t, withOldCRD("backup.wlz.li_backupruns.yaml"),
-		backupRun(func(b *backupv1alpha1.BackupRun) {
-			b.Finalizers = []string{Finalizer}
-			b.Spec.All = true
-			b.Status.PlannedBy = ""
-			b.Status.Phase = backupv1alpha1.RunPhaseRunning
-			b.Status.StartedAt = atFrozen(-time.Minute)
-			b.Status.Items = []backupv1alpha1.BackupItem{{Kind: "ReplicationSource", Name: claimN, Phase: backupv1alpha1.ItemPending}}
-		}),
-		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
-	r := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}
-
-	step(t, r)
-
-	run := readBackupRun(t, c)
-	ready := meta.FindStatusCondition(run.Status.Conditions, backupv1alpha1.ConditionReady)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || ready == nil || ready.Reason != backupv1alpha1.ReasonUpgraded {
-		t.Fatalf("phase = %q, Ready = %+v; want Failed with reason Upgraded", run.Status.Phase, ready)
-	}
-	d := &appsv1.Deployment{}
-	get(t, c, ns, appN, d)
-	if *d.Spec.Replicas != 2 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
-		t.Errorf("replicas = %d, quiesced = %v, suspended = %t; want nothing stopped", *d.Spec.Replicas, run.Status.Quiesced, suspended(t, c))
 	}
 }
 
@@ -193,28 +161,4 @@ func (f forbidCRDs) Get(ctx context.Context, key client.ObjectKey, obj client.Ob
 		return apierrors.NewForbidden(schema.GroupResource{Group: "apiextensions.k8s.io", Resource: "customresourcedefinitions"}, key.Name, errors.New("RBAC: access denied"))
 	}
 	return f.Reader.Get(ctx, key, obj, opts...)
-}
-
-// A run that v0.8.1 quiesced under the v0.7.2 BackupRun CRD before the
-// upgrade ends with reason Upgraded on the upgraded controller's first pass,
-// which gives the app back and resumes its Kustomization. Before, the run
-// went on to its restart and its upload.
-func TestARunQuiescedUnderAnOldCRDEndsAndGivesTheAppBack(t *testing.T) {
-	c := newClientWithCRDs(t, withOldCRD("backup.wlz.li_backupruns.yaml"), olderBackupRun(),
-		claim(), volume(), volumeRestore(), repository(), cluster(), stoppedDeployment(), kustomization(true))
-	r := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}
-
-	step(t, r)
-
-	run := readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonUpgraded {
-		t.Fatalf("phase = %q, reason = %q (%s); want Failed, Upgraded", run.Status.Phase, readyReason(run.Status.Conditions),
-			readyMessage(run.Status.Conditions))
-	}
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d, want the 2 the run recorded given back", got)
-	}
-	if suspended(t, c) {
-		t.Error("the Kustomization the run suspended is still suspended")
-	}
 }

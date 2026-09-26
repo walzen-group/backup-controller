@@ -207,9 +207,8 @@ func ownsDestination(run *backupv1alpha1.RestoreRun, destination *volsyncv1alpha
 //
 // Parameters:
 //   - run is the RestoreRun. It controls an object whose controller
-//     reference carries its UID, as scratchClaim sets it, and as a v0.8.1
-//     or older controller set it on the VolumeRestore of an into restore
-//     from a claim; a run created again under the same name does not.
+//     reference carries its UID, as scratchClaim sets it; a run created
+//     again under the same name does not.
 //   - kind is "claim" or "VolumeRestore", for the message.
 //   - object is the object as read from the API server.
 //

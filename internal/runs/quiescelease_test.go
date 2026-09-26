@@ -102,7 +102,6 @@ func secondBackupRun(mutate ...func(*backupv1alpha1.BackupRun)) *backupv1alpha1.
 	run := &backupv1alpha1.BackupRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "manual-notes", Namespace: ns, UID: otherRunUID, Generation: 1},
 		Spec:       backupv1alpha1.BackupRunSpec{Timeout: &metav1.Duration{Duration: time.Hour}},
-		Status:     backupv1alpha1.BackupRunStatus{PlannedBy: runFormat},
 	}
 	for _, m := range mutate {
 		m(run)
@@ -640,42 +639,5 @@ func TestARestoreNeverRepeatsARestartItsStatusShowsDone(t *testing.T) {
 	}
 	if got := replicasOf(t, c); got != 0 || !suspended(t, c) {
 		t.Errorf("replicas = %d, suspended = %t; want the other stop left alone", got, suspended(t, c))
-	}
-}
-
-// A run an older release planned took no quiesce Lease and holds the app
-// stopped until this release has ended it. A new run in the namespace waits
-// for it, with no Lease taken and nothing recorded, and plans the count the
-// ended run gave back. Before, a new run waited for such a run only while
-// its plan did not read back.
-func TestANewRunWaitsForARunAnOlderReleasePlanned(t *testing.T) {
-	c := newClient(t, quiescedBackup(func(b *backupv1alpha1.BackupRun) {
-		b.Finalizers = []string{Finalizer}
-		b.Status.PlannedBy = ""
-	}), quiescedRestoreOf(), claim(), volume(), volumeRestore(), repository(), stoppedDeployment(), kustomization(false))
-	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
-	rr := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
-
-	restoreStep(t, rr) // quiesce: waits for the older run
-	restore := readRestoreRun(t, c)
-	if len(restore.Status.Quiesced) != 0 || quiesceLeaseIn(t, c, ns) != nil {
-		t.Fatalf("the restore recorded %+v and the Lease is %v; want no plan and no Lease while the older run is unfinished",
-			restore.Status.Quiesced, quiesceLeaseIn(t, c, ns))
-	}
-	if readyReason(restore.Status.Conditions) != backupv1alpha1.ReasonSourceBusy ||
-		!strings.Contains(readyMessage(restore.Status.Conditions), "BackupRun before-upgrade was started by an older version") {
-		t.Fatalf("reason = %q, message = %q; want SourceBusy naming the older run",
-			readyReason(restore.Status.Conditions), readyMessage(restore.Status.Conditions))
-	}
-
-	step(t, br) // the older run ends with reason Upgraded and gives the app back
-	if backup := readBackupRun(t, c); readyReason(backup.Status.Conditions) != backupv1alpha1.ReasonUpgraded || replicasOf(t, c) != 2 {
-		t.Fatalf("reason = %q, replicas = %d; want the older run ended with reason Upgraded and the app at 2",
-			readyReason(backup.Status.Conditions), replicasOf(t, c))
-	}
-	restoreStep(t, rr)
-	restore = readRestoreRun(t, c)
-	if len(restore.Status.Quiesced) != 1 || restore.Status.Quiesced[0].Replicas != 2 {
-		t.Fatalf("the restore recorded %+v, want Deployment %s at 2", restore.Status.Quiesced, appN)
 	}
 }

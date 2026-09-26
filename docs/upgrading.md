@@ -6,11 +6,11 @@ what to do during and after the upgrade. The Releases table in the
 
 ## v0.9.0
 
-### Step 1: Let the old controller finish its runs
+### Step 1: Upgrade only while no run is active
 
-v0.9.0 does not continue a BackupRun or RestoreRun that an older version
-started ([decisions.md](decisions.md#end-the-runs-an-older-version-started)).
-Finish those runs under the old controller before you move the image.
+Move the image only while no BackupRun or RestoreRun is active
+([decisions.md](decisions.md#upgrade-only-while-no-run-is-active)). A run lasts
+minutes, so wait for the running ones to finish.
 
 List the runs that have not finished:
 
@@ -30,35 +30,13 @@ Delete a RestoreRun with `restorerun` in place of `backuprun`. The old
 controller's finalizer scales the workloads the run stopped back up, resumes
 the Kustomizations it suspended and deletes the objects it created, and the
 deletion completes once it has. Run the listing again until it prints nothing,
-then move to the next step while the old controller's pod is still the one
-running. A namespace schedule can start a new run in the meantime; move the
-image between two ticks of the schedules you know about.
+then move the image while the old controller's pod is still the one running.
+A namespace schedule can start a new run in the meantime, so move the image
+between two ticks of the schedules you know about.
 
-A run that is still unfinished when v0.9.0 starts, or that the old pod plans
-while it shuts down, ends Failed with reason `Upgraded` and a Warning event on
-its first reconcile. Ending it runs the same steps as any failed run: v0.9.0
-gives back the workloads it stopped and resumes its Kustomizations, deletes its
-ReplicationDestinations once their mover pods are gone, and releases its Leases
-and its Kueue Workload. The message says to create a new run:
-
-```text
-this run was started by an older version of backup-controller, which this version does not continue. The run gave back the workloads it had stopped. Create a new BackupRun to run it again.
-```
-
-The message adds one sentence per Cluster that a RestoreRun deleted and that
-has not been recovered, `Cluster <name> was deleted by this run and has not
-been recovered; create a new RestoreRun for it.` A BackupRun whose status
-already records its restart gives nothing back, and its message asks you to
-check that each workload in `status.quiesced` runs with the recorded replicas;
-under the v0.7.2 CRD that status can record a restart that failed (step 4).
-Ending the run deletes only what any failed run deletes. The claim and the
-VolumeRestore that a v0.8.1 `into` restore from a claim created stay owned by
-the run. When you delete the run, v0.9.0 deletes the claim, then removes the
-`backup.wlz.li/volume-populator` finalizer from the VolumeRestore, and the
-garbage collector deletes the VolumeRestore with the run.
-
-v0.9.0 records `status.plannedBy: v0.9` on every run it plans. A run without
-it, or with another value, is one an older version planned.
+v0.9.0 carries on a run that was still active at the upgrade as if it had
+planned that run itself, and does not check what the older version wrote into
+its status.
 
 ### Step 2: Check that no two Clusters share an archive
 
@@ -126,6 +104,9 @@ Three rules are added, and one of them refuses work until it is applied:
 - it gains get, list, create, update and delete on `leases` in
   `coordination.k8s.io`, which the runs take before they start a mover.
 
+One rule loses a verb: `create` on `volumerestores.backup.wlz.li` goes, because
+v0.9.0 creates no VolumeRestore.
+
 Apply deploy/rbac.yaml, or upgrade the chart, in the same change that moves the
 image. A v0.9.0 image running under the v0.8.x ClusterRole refuses every
 Cluster create with an HTTP 500 while any other Cluster archives, until the
@@ -160,10 +141,9 @@ kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o json | jq -r '.item
 ```
 
 Expected result: only workloads and Kustomizations you stopped by hand. Scale
-each one back up and resume each Kustomization. v0.9.0 gives back what its own
-runs stopped, and an older run it ends with reason `Upgraded` gives back only
-what its status records as still stopped (step 1), so this listing is where an
-app that a failed restart left at zero shows up.
+each one back up and resume each Kustomization. v0.9.0 gives back only what
+its own runs record as stopped, so this listing is where an app that a failed
+restart under the old CRD left at zero shows up.
 
 ### Step 5: Check how long an app may stay down
 

@@ -130,7 +130,7 @@ caller in the controller:
 | `persistentvolumes` | get, list, watch, patch | rebinding the volume to the app's claim, and reading a volume's node for its mover |
 | `storageclasses` | get, list, watch | reading the binding mode |
 | `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used, a RestoreRun finding the pod that holds a claim, and the orphan reconciler listing the mover pod it waits for |
-| `volumerestores` (our group) | get, list, watch, create, update | reading the data source, adding and removing the `backup.wlz.li/volume-populator` finalizer, and the orphan reconciler's check that a claim's VolumeRestore is gone and its watch for deleted ones. `create` is left from the point-in-time VolumeRestore an `into` RestoreRun wrote before v0.9.0, which no caller writes any more |
+| `volumerestores` (our group) | get, list, watch, update | reading the data source, adding and removing the `backup.wlz.li/volume-populator` finalizer, and the orphan reconciler's check that a claim's VolumeRestore is gone and its watch for deleted ones |
 | `volumerestores/status` | patch, update | reporting conditions |
 | `backupruns` | get, list, watch, create, update, delete | the runs and their finalizer; create is the scheduler, delete the 30-day TTL |
 | `restoreruns` | get, list, watch, update, delete | the runs and their finalizer |

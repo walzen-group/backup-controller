@@ -168,7 +168,6 @@ scheduled run is an ordinary BackupRun named `scheduled-<yyyymmdd-hhmm>` with
 | Status field | Holds |
 | --- | --- |
 | `phase` | Queued, Running, Waiting, Succeeded or Failed; the column `kubectl get brun` prints |
-| `plannedBy` | the status format of the release that planned the run, `v0.9` for v0.9.x; an unfinished run with another value, or none, ends with reason Upgraded |
 | `workload` | the Kueue Workload admitting the run, while it exists |
 | `startedAt`, `completedAt` | when Kueue admitted the run, and when it finished |
 | `quiescedAt`, `restartedAt` | when the run stopped and restarted the quiesced workloads, in whole seconds |
@@ -199,12 +198,11 @@ doing it.
 | --- | --- |
 | Queued | the run waits for Kueue to admit it |
 | Running | work is under way; the message is `backing up` |
-| SourceBusy | another run holds the run's claim or repository, holds this namespace's quiesce Lease, was planned by an older version and is being ended, or has deleted a Cluster this run waits to see created again; the message names that run, what it holds, and every wait |
+| SourceBusy | another run holds the run's claim or repository, holds this namespace's quiesce Lease, or has deleted a Cluster this run waits to see created again; the message names that run, what it holds, and every wait |
 | Retrying | an item could not start with an error a retry may fix, such as a Backup a CloudNativePG webhook refuses; the message names every such item and its error |
 | RestartFailed | the run could not give a stopped workload its replicas back or resume a Kustomization it suspended, so the app is still down; when the Lease release or the Workload delete failed as well, the reason stays RestartFailed and the message names both |
 | ReleaseFailed | the app is back, and the run cannot finish because it could not release its Leases or delete its Kueue Workload |
 | CRDOutdated | the run ended before it changed anything, because the installed CRD of its kind lacks a field the controller writes |
-| Upgraded | an older version planned the run, and this version ended it without continuing it: it gave back the workloads the run stopped and released what the run held; the message says to create a new run ([upgrading.md](upgrading.md#step-1-let-the-old-controller-finish-its-runs)) |
 | Invalid | the spec names something no retry can fix, such as a claim that is not marked `backup.wlz.li/enabled`, or workloads to stop whose Flux Kustomization also applies workloads in another namespace |
 | Succeeded | the run finished with every item done |
 | Failed | the run finished with a failed item, or past its timeout; a run that passed its deadline while waiting for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |
@@ -250,7 +248,6 @@ spec:
 | Status field | Holds |
 | --- | --- |
 | `phase` | Queued, Running, Waiting, Succeeded or Failed; the column `kubectl get rrun` prints |
-| `plannedBy` | the status format of the release that planned the run, as on a BackupRun |
 | `target` | the claim an `into` restore creates and fills |
 | `startedAt`, `completedAt` | when the run passed its checks and began, and when it finished |
 | `syncedTo` | the moment a `syncDatabaseToVolume` run restores the volumes and recovers the databases to |

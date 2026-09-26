@@ -42,7 +42,6 @@ var grants = []grant{
 	{"", "persistentvolumes", []string{"patch"}, "rebinding the volume to the app's claim"},
 	{"", "secrets", []string{"get", "create", "delete"}, "the repository Secret copied for the length of a restore"},
 	{"", "events", []string{"create", "patch"}, "the recorder the library hands to the callbacks"},
-	{"backup.wlz.li", "volumerestores", []string{"create"}, "a RestoreRun's point-in-time VolumeRestore"},
 	{"backup.wlz.li", "volumerestores", []string{"update"}, "the populator's backup.wlz.li/volume-populator finalizer on a VolumeRestore"},
 	{"backup.wlz.li", "volumerestores/status", []string{"patch", "update"}, "the conditions reported on a VolumeRestore"},
 	{"volsync.backube", "replicationdestinations", []string{"get", "list", "watch", "create", "delete"}, "one destination per restore"},

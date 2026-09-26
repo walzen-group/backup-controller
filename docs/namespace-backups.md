@@ -601,17 +601,8 @@ SourceBusy:
 BackupRun scheduled-20260926-0300 has stopped the workloads of this namespace (Lease backup-controller-quiesce); this run stops them once that run has given them back
 ```
 
-Before it acquires the Lease, a run about to stop workloads also waits for two
-kinds of run in its namespace. The first is an unfinished run an older version
-of the controller planned: such a run holds no Lease, and v0.9.0 ends it with
-reason `Upgraded` ([upgrading.md](upgrading.md#step-1-let-the-old-controller-finish-its-runs)),
-which can span a few passes while a mover it stopped shuts down:
-
-```text
-RestoreRun back-to-monday was started by an older version of backup-controller and is being ended; this run stops the workloads once that run has given them back
-```
-
-The second is an unfinished RestoreRun with a Cluster item in phase Deleted,
+Before it acquires the Lease, a run about to stop workloads also waits while an
+unfinished RestoreRun in its namespace has a Cluster item in phase Deleted,
 because the Kustomization this run would suspend may be the one Flux needs to
 create that Cluster again:
 

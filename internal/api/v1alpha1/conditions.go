@@ -105,16 +105,6 @@ const (
 	// CRDs on its own.
 	ReasonCRDOutdated = "CRDOutdated"
 
-	// ReasonUpgraded reports an unfinished run that an older release of the
-	// controller planned (see status.plannedBy). This release does not
-	// continue such a run: it ends it as Failed, the way it ends any failed
-	// run. It gives back the workloads the run stopped, resumes the
-	// Kustomizations it suspended, deletes the ReplicationDestinations it
-	// created, and releases its Leases and its Kueue Workload. The message
-	// says to create a new run, and names a Cluster the run deleted that has
-	// not been recovered. The run records a Warning event.
-	ReasonUpgraded = "Upgraded"
-
 	// ReasonRestartFailed reports a BackupRun or RestoreRun whose app is
 	// still down because a step the run takes before it gives the app back
 	// failed, or whose state the run could not read. That step is giving a
@@ -145,14 +135,13 @@ const (
 	// ReasonReleaseFailed reports a BackupRun or RestoreRun that is ending,
 	// or being deleted, and holds no workload stopped, because it gave the
 	// app back or stopped none, but could not release what it still holds:
-	// its Leases on its claims and repositories, its Kueue Workload, a
+	// its Leases on its claims and repositories, its Kueue Workload, or a
 	// restore mover it has to stop (its ReplicationDestination, and the
-	// mover's Job and pods), or the VolumeRestore an older release created
-	// for an into restore, which the run reads and releases. The run stays
-	// unfinished and tries again on every reconcile until it can. The message
-	// names what the run could not do and the error, and says what a person
-	// can fix or delete by hand, after which the run finishes by itself. The
-	// run records a Warning event when it first reports this.
+	// mover's Job and pods). The run stays unfinished and tries again on
+	// every reconcile until it can. The message names what the run could not
+	// do and the error, and says what a person can fix or delete by hand,
+	// after which the run finishes by itself. The run records a Warning event
+	// when it first reports this.
 	ReasonReleaseFailed = "ReleaseFailed"
 )
 

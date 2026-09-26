@@ -84,12 +84,8 @@ func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //
 // Before any stage, Reconcile adds the run's finalizer. A run being deleted
 // gets its changes put back by finalize, and a finished run is deleted once
-// spec.ttlSecondsAfterFinished has passed. An unfinished run that an older
-// release planned, whose status.plannedBy is not this release's format, goes
-// through no stage: abort ends it with reason Upgraded, and finish gives back
-// what it stopped (see olderPlan). plan records the format with every plan.
-// Whenever the Ready reason changes during a reconcile, Reconcile records an
-// event on the run.
+// spec.ttlSecondsAfterFinished has passed. Whenever the Ready reason changes
+// during a reconcile, Reconcile records an event on the run.
 func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.BackupRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -108,20 +104,6 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err := r.Update(ctx, run); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add the finalizer to BackupRun %s/%s: %w", run.Namespace, run.Name, err)
 		}
-	}
-	// A run an older release planned is not continued: what it recorded may
-	// not mean what this release reads. It ends here, and finish gives back
-	// what it stopped.
-	if olderPlan(run) {
-		stopped := stoppedNothing
-		switch {
-		case len(run.Status.Quiesced) == 0 && len(run.Status.SuspendedKustomizations) == 0:
-		case run.Status.RestartedAt == nil || run.Status.RestartPending:
-			stopped = stoppedNotBack
-		default:
-			stopped = stoppedBackBefore
-		}
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonUpgraded, upgradedMessage("BackupRun", stopped, nil))
 	}
 
 	switch run.Status.Phase {
@@ -153,7 +135,6 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 	run.Status.Items = items
-	run.Status.PlannedBy = runFormat
 	run.Status.Phase = backupv1alpha1.RunPhaseQueued
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonQueued,
 		"waiting for the backup queue to admit the run")
@@ -586,9 +567,8 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			run.Status.QuiescedAt, run.Status.RestartedAt = newTime(now), newTime(now)
 			return after(time.Second, r.writeStatus(ctx, run))
 		}
-		// A run an older release planned, which holds no Lease, and a
-		// restore that waits for the Cluster it deleted keep this run
-		// waiting with nothing stopped and no Lease held.
+		// A restore that waits for the Cluster it deleted keeps this run
+		// waiting with nothing stopped and no Lease held (see waitingOn).
 		waiting, err := waitingOn(ctx, r.Reader, run)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -1077,7 +1057,7 @@ func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claim
 // Parameters:
 //   - reason is the Ready reason the run ends with: ReasonFailed for a run
 //     that hit something it can't get past, such as its timeout, and
-//     ReasonUpgraded for a run an older release planned.
+//     ReasonInvalid for a run whose targets it refuses.
 //   - message is the Ready message, and each unfinished item's message.
 //
 // A Pending item whose last start attempt failed keeps that error: its

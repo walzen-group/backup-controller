@@ -47,14 +47,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  # The data source the claim names. create is for a RestoreRun writing the
-  # point-in-time VolumeRestore its scratch claim is filled from. update is
-  # for the populator adding and removing its backup.wlz.li/volume-populator
-  # finalizer. The populator orphan reconciler watches VolumeRestores and
-  # reads one by name to learn that it is gone.
+  # The data source the claim names. update is for the populator adding and
+  # removing its backup.wlz.li/volume-populator finalizer. The populator
+  # orphan reconciler watches VolumeRestores and reads one by name to learn
+  # that it is gone.
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores"]
-    verbs: ["get", "list", "watch", "create", "update"]
+    verbs: ["get", "list", "watch", "update"]
   # The conditions the controller reports on a VolumeRestore.
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores/status"]

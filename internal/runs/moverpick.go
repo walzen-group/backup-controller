@@ -126,8 +126,9 @@ func unpinnable(all []restic.Snapshot, s restic.Snapshot, quiescedOnly bool) str
 //     second, or can't be predicted (see unpinnable).
 //
 // An item with no recorded snapshot, or no recorded snapshot time, gets a
-// reason too, since the run can't pin the mover to anything. Only an older
-// release planned such an item. It does not change all.
+// reason too, since the run can't pin the mover to anything. The run records
+// both with its plan, so such an item holds a status the run did not write.
+// It does not change all.
 func changedSince(all []restic.Snapshot, item backupv1alpha1.RestoreItem, quiescedOnly bool) (restic.Snapshot, string) {
 	id := item.Snapshot
 	if id == "" {

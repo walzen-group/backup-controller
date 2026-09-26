@@ -34,7 +34,6 @@ func restoreRun(mutate ...func(*backupv1alpha1.RestoreRun)) *backupv1alpha1.Rest
 	run := &backupv1alpha1.RestoreRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "back-to-monday", Namespace: ns, UID: restoreUID, Generation: 1},
 		Spec:       backupv1alpha1.RestoreRunSpec{Timeout: &metav1.Duration{Duration: 4 * time.Hour}},
-		Status:     backupv1alpha1.RestoreRunStatus{PlannedBy: runFormat},
 	}
 	for _, m := range mutate {
 		m(run)

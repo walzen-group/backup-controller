@@ -454,33 +454,34 @@ hold one Lease while waiting for another, and two runs could then wait on each
 other until both timed out. Every app on the walzen cluster has a Kustomization
 of its own, so the refusal asks for the layout the cluster already uses.
 
-## End the runs an older version started
+## Upgrade only while no run is active
 
-From v0.9.0 the controller does not continue a BackupRun or RestoreRun that an
-older version planned. Every plan records `status.plannedBy`, `v0.9` for
-v0.9.x, and an unfinished run with another value, or none, ends Failed with
-reason Upgraded on its first reconcile. The ending runs the finish every failed
-run runs: it gives back the workloads the run stopped, deletes its
-ReplicationDestinations, and releases its Leases and its Kueue Workload.
+From v0.9.0 the upgrade procedure requires that no BackupRun or RestoreRun is
+active when the image moves, and the controller has no code for a run that an
+older version started. The new version carries on a run left active as if it
+had planned that run itself.
 
-The alternative was to continue each older run under the new code. A run's
-status records what the release that wrote it meant, and v0.9.0 changed that
-meaning in places. v0.7.2 and v0.8.x took no Leases, so the new quiesce
-exclusion had to read other runs' plans back from the workloads to decide
-whether they still held an app stopped. v0.7.2 recorded no snapshot time on a
-restore item, so the mover had to be pinned from a snapshot listed later.
-v0.8.1 ran an `into` restore through the VolumeRestore populator, whose mover
-log nothing can read. Each of those paths needed code of its own that no new
-run used, and the read-back path repeated restarts under another run's stop.
-Runs last minutes to hours, and everything else a run touches belongs to it or
-to a user who keeps it across versions, so ending a run and asking for a new
-one loses no state the controller needs.
+The first alternative was to continue each older run under the new code. A
+run's status records what the release that wrote it meant, and v0.9.0 changed
+that meaning in places: v0.7.2 and v0.8.x took no Leases, v0.7.2 recorded no
+snapshot time on a restore item, and v0.8.1 ran an `into` restore through a
+VolumeRestore it created for the run. Each of those needed a code path of its
+own that no new run used, and the path that read older plans back from the
+workloads repeated restarts under another run's stop.
 
-`plannedBy` changes only when a release changes what an unfinished run's
-status means, and a patch release keeps it. VolumeRestores, schedules,
-repositories, snapshots and Clusters carry across versions as before.
-[upgrading.md](upgrading.md#step-1-let-the-old-controller-finish-its-runs) has
-the steps before an upgrade.
+The second alternative was to end each older run on the new version's first
+reconcile, with a reason of its own, through the finish every failed run runs.
+That still needed a field on every run recording the release that planned it,
+a wait in every new run for an older run being ended, and a release step for
+the VolumeRestore an older `into` restore had created.
+
+A run lasts minutes, so an operator can wait for the active runs to finish
+before moving the image, and the new controller then holds no code for
+temporary objects an older version left. Objects that outlive a run carry
+across versions as before: VolumeRestores, schedules, repositories, snapshots,
+Clusters and the CRDs, which each run checks before it changes anything.
+[upgrading.md](upgrading.md#step-1-upgrade-only-while-no-run-is-active) has the
+check to run before an upgrade.
 
 ## Confirm a restore from the mover's log
 

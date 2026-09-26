@@ -3,13 +3,11 @@ package runs
 import (
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	"github.com/walzen-group/backup-controller/internal/populator"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -171,92 +169,5 @@ func TestARestoreThatCannotDeleteItsDestinationSaysWhatFailed(t *testing.T) {
 		if !strings.Contains(message, want) {
 			t.Errorf("message %q does not name %q", message, want)
 		}
-	}
-}
-
-// An upgraded run that stopped the app, and whose read of its VolumeRestore
-// fails once the app is back, reports ReleaseFailed. The app runs again by
-// then, so RestartFailed would say it is down.
-func TestARestoreThatCannotReadItsVolumeRestoreAfterTheRestartSaysReleaseFailed(t *testing.T) {
-	run := populatorRun()
-	run.Status.QuiescedAt = run.Status.StartedAt
-	run.Status.Quiesced = []backupv1alpha1.QuiescedWorkload{{Kind: "Deployment", Name: appN, Replicas: 2}}
-	r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(), stoppedDeployment(),
-		populatorRestore(run, populator.Finalizer))
-	refused := errors.New("the API server is overloaded")
-	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*backupv1alpha1.VolumeRestore); ok && key.Name == run.Spec.Into {
-				return apierrors.NewServiceUnavailable(refused.Error())
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-	})
-
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass succeeded, want the failed read returned")
-	}
-
-	if got := replicasOf(t, c); got != 2 {
-		t.Fatalf("replicas = %d, want the app back before the VolumeRestore is read", got)
-	}
-	after := readRestoreRun(t, c)
-	if after.Status.Phase.Finished() || readyReason(after.Status.Conditions) != backupv1alpha1.ReasonReleaseFailed {
-		t.Fatalf("phase = %q, reason = %q, message = %q; want the run unfinished with %s", after.Status.Phase,
-			readyReason(after.Status.Conditions), readyMessage(after.Status.Conditions), backupv1alpha1.ReasonReleaseFailed)
-	}
-	message := readyMessage(after.Status.Conditions)
-	for _, want := range []string{"VolumeRestore " + run.Spec.Into, refused.Error()} {
-		if !strings.Contains(message, want) {
-			t.Errorf("message %q does not name %q", message, want)
-		}
-	}
-}
-
-// A Conflict on the update that releases the VolumeRestore means another
-// writer changed it since the run read it. The run retries on the next pass
-// with a fresh read, and reports nothing: a Conflict is no failure a person
-// has to act on.
-func TestAConflictOnTheVolumeRestoreReleaseRetriesQuietly(t *testing.T) {
-	run := populatorRun()
-	r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(), populatorRestore(run, populator.Finalizer))
-	restoreStep(t, r) // ends Upgraded and keeps the finalizer
-	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
-		t.Fatal(err)
-	}
-	conflicted := false
-	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-			if _, ok := obj.(*backupv1alpha1.VolumeRestore); ok && !conflicted {
-				conflicted = true
-				return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("volumerestores").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
-			}
-			return cl.Update(ctx, obj, opts...)
-		},
-	})
-	recorder := events.NewFakeRecorder(10)
-	r.Recorder = recorder
-	before := readyReason(readRestoreRun(t, c).Status.Conditions)
-
-	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
-	if err != nil || result.RequeueAfter == 0 {
-		t.Fatalf("result = %+v, err = %v; want a quiet requeue", result, err)
-	}
-	if !conflicted {
-		t.Fatal("the pass did not try to release the VolumeRestore")
-	}
-	if got := readyReason(readRestoreRun(t, c).Status.Conditions); got != before {
-		t.Errorf("reason = %q after the Conflict, want %q left as it was", got, before)
-	}
-	if got := recorded(recorder); len(got) != 0 {
-		t.Errorf("events = %q, want none for a Conflict", got)
-	}
-
-	restoreStep(t, r)
-
-	vr := &backupv1alpha1.VolumeRestore{}
-	get(t, c, ns, run.Spec.Into, vr)
-	if slices.Contains(vr.Finalizers, populator.Finalizer) {
-		t.Errorf("VolumeRestore finalizers = %v, want %s released on the retry", vr.Finalizers, populator.Finalizer)
 	}
 }
