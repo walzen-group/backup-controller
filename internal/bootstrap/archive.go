@@ -87,6 +87,32 @@ type Prober interface {
 	BaseBackups(ctx context.Context, at Location) ([]BaseBackup, error)
 }
 
+// ArchiveProber is the Prober the webhook needs. Beyond the base backups, it
+// can tell whether a database's prefix holds anything at all, which decides
+// whether a new database may start empty there. S3Prober is the real one.
+type ArchiveProber interface {
+	Prober
+	// Contents reports whether anything exists under the location's
+	// server prefix, and how many directories it holds under base/.
+	Contents(ctx context.Context, at Location) (Contents, error)
+}
+
+// Contents is what ArchiveProber.Contents found under a database's prefix.
+type Contents struct {
+	// Any is true when at least one object exists under the server prefix.
+	Any bool
+	// BaseDirs counts the base backup directories under base/, in any
+	// state. It is counted only when Any is true.
+	BaseDirs int
+}
+
+// ServerPrefix returns the key prefix of everything barman writes for the
+// database: Prefix followed by "/", or "" when Prefix is empty. The trailing
+// slash keeps app/app-pg from matching app/app-pg-old.
+func (l Location) ServerPrefix() string {
+	return strings.TrimPrefix(l.Prefix+"/", "/")
+}
+
 // ResolveLocation works out where one database's backups live and how to
 // reach them, by reading its ObjectStore and the Secrets that store names.
 //

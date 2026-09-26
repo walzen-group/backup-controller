@@ -33,8 +33,11 @@ const (
 	SkipCheckAnnotation = "cnpg.io/skipEmptyWalArchiveCheck"
 
 	// OptOutAnnotation, set to OptOutValue on a Cluster, asks for an empty
-	// database whatever the object store holds. Without it there is no way to
-	// discard a database, because deleting the Cluster would restore it again.
+	// database. Without it there is no way to discard a database, because
+	// deleting the Cluster would restore it again. Handle admits it only over
+	// an empty prefix: discarding a database also means deleting its archive
+	// or choosing a new serverName, since CloudNativePG never archives a new
+	// database into a prefix that holds WAL.
 	OptOutAnnotation = "backup.wlz.li/bootstrap"
 
 	// OptOutValue is the value OptOutAnnotation must have to opt out. The
@@ -61,9 +64,10 @@ type Decider struct {
 	// list and watch on every Secret in the cluster and would hold them all
 	// in memory.
 	Client client.Reader
-	// Prober asks the object store which base backups exist.
-	// cmd/backup-controller passes S3Prober, and the tests pass a stub.
-	Prober Prober
+	// Prober asks the object store what the database's prefix holds and
+	// which base backups exist. cmd/backup-controller passes S3Prober, and
+	// the tests pass a stub.
+	Prober ArchiveProber
 }
 
 // Handle answers one admission request for a Cluster. For a new Cluster whose
@@ -75,10 +79,14 @@ type Decider struct {
 //   - An update goes to keepRecovery, on a dry run too.
 //   - Any operation other than create or update is allowed unchanged.
 //   - A dry-run create is allowed unchanged without reading anything.
-//   - A create is allowed unchanged when the Cluster carries OptOutAnnotation
-//     set to OptOutValue, or when it has no archiving plugin (see Archiver).
+//   - A create is allowed unchanged when the Cluster has no archiving plugin
+//     (see Archiver).
 //   - A create is refused when the ObjectStore can't be resolved, or when
 //     another Cluster anywhere already archives to the same bucket and prefix.
+//   - A Cluster that carries OptOutAnnotation set to OptOutValue and declares
+//     no bootstrap other than initdb is allowed unchanged when nothing exists
+//     under its prefix, and refused when anything does, since CloudNativePG
+//     would never archive the new database there.
 //   - A Cluster that declares a bootstrap other than initdb, such as
 //     recovery or pg_basebackup (see declaredBootstrap), is allowed unchanged,
 //     unless a RestoreRun is waiting for it. Then it's refused.
@@ -92,8 +100,10 @@ type Decider struct {
 //     RestoreRun waits for the Cluster, the patch also sets the
 //     backup.wlz.li/restore-run annotation to the run's name. With no
 //     completed base backup and nothing asking for a recovery, the Cluster is
-//     allowed unchanged and starts empty. A store whose only base backups
-//     failed or never finished counts as holding none.
+//     allowed unchanged and starts empty when nothing at all exists under
+//     its prefix, and refused when anything does (WAL, or base backups that
+//     failed or never finished): CloudNativePG would never archive a new
+//     database there, and a recovery has nothing to start from.
 //
 // Failures to read the store, list Clusters or RestoreRuns, or talk to the
 // object store return an HTTP 500 error response, which the API server treats
@@ -131,11 +141,6 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
-	if cluster.GetAnnotations()[OptOutAnnotation] == OptOutValue {
-		logger.Info("leaving the Cluster to initdb", "reason", "opted out by annotation")
-		return admission.Allowed("opted out")
-	}
-
 	method := declaredBootstrap(cluster)
 
 	store, serverName, found := Archiver(cluster)
@@ -169,6 +174,28 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 			"%s already archives to %s/%s. Two databases writing one archive interleave their WAL and leave it unrestorable. Give this Cluster an archive of its own, or a serverName that is not %q.",
 			holder, at.Bucket, at.Prefix, serverName,
 		))
+	}
+
+	// The opt-out asks for an empty database, which only initdb gives, so it
+	// changes nothing for a Cluster that declares another bootstrap. An empty
+	// database can archive only into an empty prefix: CloudNativePG refuses a
+	// prefix that holds WAL, and the skip annotation would let the new
+	// database overwrite the old one's segments.
+	if cluster.GetAnnotations()[OptOutAnnotation] == OptOutValue && method == "" {
+		contents, err := d.Prober.Contents(ctx, at)
+		if err != nil {
+			logger.Error(err, "cannot list the object store")
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+		if contents.Any {
+			logger.Info("refusing the Cluster", "reason", "opted out over an old archive", "prefix", at.ServerPrefix())
+			return admission.Denied(fmt.Sprintf(
+				"The Cluster asks for an empty database (%s: %s), and s3://%s/%s still holds the archive of an earlier one. CloudNativePG will not archive a new database into a prefix that holds WAL, so this one would never be backed up. To discard the old archive, delete everything under s3://%s/%s and create the Cluster again. To keep it, give this Cluster a serverName that is not %q.",
+				OptOutAnnotation, OptOutValue, at.Bucket, at.ServerPrefix(), at.Bucket, at.ServerPrefix(), serverName,
+			))
+		}
+		logger.Info("leaving the Cluster to initdb", "reason", "opted out by annotation, and the prefix is empty")
+		return admission.Allowed("opted out")
 	}
 
 	run, err := waitingRun(ctx, d.Client, req.Namespace, req.Name)
@@ -209,6 +236,19 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 				"%s asks for a recovery, and %s/%s holds no completed base backup to recover from.",
 				source, at.Bucket, at.BasePrefix(),
 			))
+		}
+		// CloudNativePG refuses to archive a new database into a prefix that
+		// holds WAL, so a database started empty over anything at all could
+		// never be backed up, and a recovery has no base backup to start
+		// from. An empty prefix is the only place initdb is safe.
+		contents, err := d.Prober.Contents(ctx, at)
+		if err != nil {
+			logger.Error(err, "cannot list the object store")
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+		if contents.Any {
+			logger.Info("refusing the Cluster", "reason", "an archive with no completed base backup", "prefix", at.ServerPrefix())
+			return admission.Denied(noDoneBackup(at, serverName, contents))
 		}
 		logger.Info("leaving the Cluster to initdb", "reason", "no completed base backup in the store", "prefix", at.BasePrefix())
 		return admission.Allowed("no base backup")
@@ -597,4 +637,29 @@ func setRecovery(cluster *unstructured.Unstructured, store, serverName string, t
 	annotations[SkipCheckAnnotation] = "enabled"
 	cluster.SetAnnotations(annotations)
 	return nil
+}
+
+// noDoneBackup words the refusal of a Cluster whose prefix holds objects but
+// no completed base backup, and nothing asks for a recovery.
+//
+// Parameters:
+//   - at is the database's Location.
+//   - serverName is the directory the Cluster archives under, which the
+//     message suggests changing.
+//   - contents is what the prefix holds. BaseDirs picks the wording of the
+//     parenthesis.
+func noDoneBackup(at Location, serverName string, contents Contents) string {
+	what := "(no base backup under base/, but other objects, such as WAL, under the prefix)"
+	switch contents.BaseDirs {
+	case 0:
+	case 1:
+		what = "(1 base backup under base/, not DONE)"
+	default:
+		what = fmt.Sprintf("(%d base backups under base/, none DONE)", contents.BaseDirs)
+	}
+	prefix := fmt.Sprintf("s3://%s/%s", at.Bucket, at.ServerPrefix())
+	return fmt.Sprintf(
+		"%s holds an archive with no completed base backup %s. A database started empty here could never archive its WAL, because CloudNativePG refuses a prefix that already holds WAL, and a recovery has nothing to start from. If that archive is worth nothing, delete everything under %s and create the Cluster again. Otherwise give this Cluster a serverName that is not %q.",
+		prefix, what, prefix, serverName,
+	)
 }

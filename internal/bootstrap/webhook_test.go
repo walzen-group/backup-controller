@@ -31,10 +31,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-// stubProber is a Prober that returns fixed answers, so the handler can be
+// stubProber is an ArchiveProber that returns fixed answers, so the handler can be
 // tested without an object store, for the cases whose outcome doesn't depend
-// on what the store holds. BaseBackups lists no backup. Both methods also
-// return the err field.
+// on what the store holds. BaseBackups lists no backup. Every method also
+// returns the err field.
 type stubProber struct {
 	has bool
 	err error
@@ -46,6 +46,15 @@ func (s stubProber) HasBaseBackup(context.Context, Location) (bool, error) {
 
 func (s stubProber) BaseBackups(context.Context, Location) ([]BaseBackup, error) {
 	return nil, s.err
+}
+
+// Contents answers from the has field: a stub store with a completed base
+// backup holds one base backup directory, and one without is an empty prefix.
+func (s stubProber) Contents(context.Context, Location) (Contents, error) {
+	if s.has {
+		return Contents{Any: true, BaseDirs: 1}, s.err
+	}
+	return Contents{}, s.err
 }
 
 // scheme registers the core and backup types, plus ObjectStore and Cluster as
@@ -134,14 +143,14 @@ func secret() *corev1.Secret {
 // decide sends a create of the Cluster c in namespace app to a Decider with
 // the given Prober. Its fake client holds store(), secret() and any extra
 // objects passed in existing.
-func decide(t *testing.T, c *unstructured.Unstructured, prober Prober, existing ...runtime.Object) admission.Response {
+func decide(t *testing.T, c *unstructured.Unstructured, prober ArchiveProber, existing ...runtime.Object) admission.Response {
 	t.Helper()
 	return decideWith(t, c, prober, store(), existing...)
 }
 
 // decideWith is decide with the Cluster's ObjectStore passed in, for the cases
 // that point the store at another endpoint, such as a fake S3 server.
-func decideWith(t *testing.T, c *unstructured.Unstructured, prober Prober, objectStore *unstructured.Unstructured, existing ...runtime.Object) admission.Response {
+func decideWith(t *testing.T, c *unstructured.Unstructured, prober ArchiveProber, objectStore *unstructured.Unstructured, existing ...runtime.Object) admission.Response {
 	t.Helper()
 	raw, err := json.Marshal(c)
 	if err != nil {
@@ -485,22 +494,84 @@ func TestTheDatabaseAndOwnerSurviveTheRewrite(t *testing.T) {
 	}
 }
 
-// TestTheOptOutAnnotationKeepsTheDatabaseEmpty checks that a Cluster carrying
-// OptOutAnnotation set to OptOutValue is admitted without a patch, even though
-// its store holds a base backup.
-func TestTheOptOutAnnotationKeepsTheDatabaseEmpty(t *testing.T) {
-	c := cluster(t, func(object map[string]any) {
+// optedOut builds the Cluster from cluster() carrying OptOutAnnotation set to
+// OptOutValue.
+func optedOut(t *testing.T) *unstructured.Unstructured {
+	return cluster(t, func(object map[string]any) {
 		metadata, _ := object["metadata"].(map[string]any)
 		metadata["annotations"] = map[string]any{OptOutAnnotation: OptOutValue}
 	})
+}
 
-	response := decide(t, c, stubProber{has: true})
+// TestTheOptOutAnnotationStartsEmptyOnAnEmptyPrefix checks that an opted-out
+// Cluster whose prefix holds nothing is admitted without a patch, through the
+// real S3Prober against the recorded empty store.
+func TestTheOptOutAnnotationStartsEmptyOnAnEmptyPrefix(t *testing.T) {
+	response := decideOn(t, optedOut(t), recordedS3(t, barmanstore.MustLoad(t, "empty")))
 
 	if !response.Allowed {
 		t.Fatalf("the cluster was refused: %v", response.Result)
 	}
 	if len(response.Patches) != 0 {
 		t.Fatalf("an opted-out cluster was rewritten: %v", response.Patches)
+	}
+}
+
+// TestTheOptOutAnnotationIsRefusedOverAnOldArchive checks that an opted-out
+// Cluster is refused, with the way out, when its prefix still holds the
+// archive of an earlier database, here the recorded done-base store. Finding
+// W1, designs/webhook.md A: CloudNativePG would never archive the new
+// database into a prefix holding WAL.
+func TestTheOptOutAnnotationIsRefusedOverAnOldArchive(t *testing.T) {
+	response := decideOn(t, optedOut(t), recordedS3(t, barmanstore.MustLoad(t, "done-base")))
+
+	if response.Allowed {
+		t.Fatalf("an opted-out cluster was admitted over an old archive (patches %v)", response.Patches)
+	}
+	message := response.Result.Message
+	for _, want := range []string{OptOutAnnotation + ": " + OptOutValue, "s3://backups/app/app-pg/", "delete everything under s3://backups/app/app-pg/", `serverName that is not "app-pg"`} {
+		if !strings.Contains(message, want) {
+			t.Errorf("the refusal %q does not say %q", message, want)
+		}
+	}
+}
+
+// TestTheOptOutAnnotationCollidesLikeAnyCluster checks that an opted-out
+// Cluster is refused when another Cluster already archives to its prefix.
+func TestTheOptOutAnnotationCollidesLikeAnyCluster(t *testing.T) {
+	other := cluster(t, func(object map[string]any) {
+		metadata, _ := object["metadata"].(map[string]any)
+		metadata["namespace"] = "other"
+	})
+	otherStore := store()
+	otherStore.SetNamespace("other")
+	otherSecret := secret()
+	otherSecret.Namespace = "other"
+
+	response := decide(t, optedOut(t), stubProber{}, other, otherStore, otherSecret)
+
+	if response.Allowed {
+		t.Fatal("an opted-out cluster was admitted onto another Cluster's archive")
+	}
+	if !strings.Contains(response.Result.Message, "other/app-pg already archives") {
+		t.Errorf("the refusal %q does not name the holder", response.Result.Message)
+	}
+}
+
+// TestTheOptOutAnnotationNeedsTheStore checks that an opted-out Cluster is
+// refused with an HTTP 500 when its store can't be read, since admitting it
+// could start a database that never archives.
+func TestTheOptOutAnnotationNeedsTheStore(t *testing.T) {
+	endpoint, proxy := faultyS3(t, recordedS3(t, barmanstore.MustLoad(t, "empty")))
+	proxy.Add(s3fault.Rule{Status: http.StatusServiceUnavailable, Code: "SlowDown"})
+
+	response := decideWith(t, optedOut(t), S3Prober{}, storeAt(endpoint))
+
+	if response.Allowed {
+		t.Fatal("an opted-out cluster was admitted while its store could not be read")
+	}
+	if response.Result.Code != http.StatusInternalServerError {
+		t.Errorf("code = %d, want %d", response.Result.Code, http.StatusInternalServerError)
 	}
 }
 

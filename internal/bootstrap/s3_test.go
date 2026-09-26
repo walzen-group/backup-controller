@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -40,31 +41,71 @@ func TestSplitEndpoint(t *testing.T) {
 	}
 }
 
-// TestAStoreWhoseOnlyBaseBackupFailedLeavesTheClusterAsWritten checks that a
-// Cluster whose archive holds only a failed base backup is admitted without a
-// patch, through the real S3Prober against the failed-base store that
-// barman-cloud 3.20.0 recorded.
+// TestAnArchiveWithNoDoneBaseBackupRefusesTheCluster checks that a Cluster
+// is refused, and not started empty, when its prefix holds objects but no
+// completed base backup, through the real S3Prober against stores that
+// barman-cloud 3.20.0 recorded. Finding W1, designs/webhook.md A.
 //
-// barman writes base/<id>/ as soon as a backup starts, so a backup that failed
-// or never finished leaves objects under base/. Recovering from such an
-// archive fails in CloudNativePG and the Cluster never starts.
-//
-// The assertion here is a known bug, kept until its fix lands: finding W1,
-// designs/webhook.md A. The recorded store also holds the WAL the Cluster
-// archived before its backup failed, as every real failed-base archive does.
-// A Cluster admitted as written then fails CloudNativePG's
-// barman-cloud-check-wal-archive, because the archive is not empty, and never
-// starts either. The old hand-written store held no WAL and hid this.
-func TestAStoreWhoseOnlyBaseBackupFailedLeavesTheClusterAsWritten(t *testing.T) {
-	server := recordedS3(t, barmanstore.MustLoad(t, "failed-base"))
+// CloudNativePG runs barman-cloud-check-wal-archive before a new database
+// archives, and barman fails it on any WAL under the prefix (the recorded
+// verdicts of failed-base, started-base and wal-only), so a Cluster started
+// empty there would never archive. A recovery has nothing to start from
+// either. The failed-base store without its WAL passes barman's check; the
+// webhook refuses it too, since its fix (clearing a prefix that holds nothing
+// recoverable) costs nothing.
+func TestAnArchiveWithNoDoneBaseBackupRefusesTheCluster(t *testing.T) {
+	failed := barmanstore.MustLoad(t, "failed-base")
+	failedNoWAL := barmanstore.Store{Manifest: barmanstore.Manifest{Store: "failed-base without WAL"}}
+	for _, o := range failed.Objects {
+		if !strings.Contains(o.Key, "/wals/") {
+			failedNoWAL.Objects = append(failedNoWAL.Objects, o)
+		}
+	}
 
-	response := decideOn(t, cluster(t, nil), server)
+	for _, tc := range []struct {
+		name  string
+		store barmanstore.Store
+		want  string
+	}{
+		{"failed-base", failed, "(1 base backup under base/, not DONE)"},
+		{"started-base", barmanstore.MustLoad(t, "started-base"), "(1 base backup under base/, not DONE)"},
+		{"wal-only", barmanstore.MustLoad(t, "wal-only"), "no base backup under base/, but other objects, such as WAL, under the prefix"},
+		{"two-servers", barmanstore.MustLoad(t, "two-servers"), "no base backup under base/"},
+		{"failed-base without WAL", failedNoWAL, "(1 base backup under base/, not DONE)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := decideOn(t, cluster(t, nil), recordedS3(t, tc.store))
+
+			if response.Allowed {
+				t.Fatalf("the cluster was admitted over an archive with no completed base backup (patches %v)", response.Patches)
+			}
+			message := response.Result.Message
+			for _, want := range []string{"s3://backups/app/app-pg/", tc.want, `serverName that is not "app-pg"`, "delete everything under s3://backups/app/app-pg/"} {
+				if !strings.Contains(message, want) {
+					t.Errorf("the refusal %q does not say %q", message, want)
+				}
+			}
+		})
+	}
+}
+
+// TestASiblingPrefixDoesNotCount checks that objects under a prefix that
+// merely starts with the Cluster's own, such as app/app-pg/ beside a
+// serverName of app-p, leave the Cluster to initdb.
+func TestASiblingPrefixDoesNotCount(t *testing.T) {
+	c := cluster(t, func(object map[string]any) {
+		spec, _ := object["spec"].(map[string]any)
+		plugin, _ := spec["plugins"].([]any)[0].(map[string]any)
+		plugin["parameters"] = map[string]any{"barmanObjectName": "app-pg-store", "serverName": "app-p"}
+	})
+
+	response := decideOn(t, c, recordedS3(t, barmanstore.MustLoad(t, "wal-only")))
 
 	if !response.Allowed {
 		t.Fatalf("the cluster was refused: %v", response.Result)
 	}
 	if len(response.Patches) != 0 {
-		t.Fatalf("the cluster was rewritten to recover from a failed base backup: %v", response.Patches)
+		t.Fatalf("the cluster was rewritten: %v", response.Patches)
 	}
 }
 
@@ -90,5 +131,15 @@ func TestAStoreWithADoneBaseBackupRecoversTheCluster(t *testing.T) {
 	source, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "source")
 	if source != RecoverySource {
 		t.Errorf("recovery source = %q, want %q", source, RecoverySource)
+	}
+}
+
+// TestTheRefusalCountsTheBaseBackups checks the parenthesis of the refusal
+// for a prefix with several base backup directories and none DONE.
+func TestTheRefusalCountsTheBaseBackups(t *testing.T) {
+	at := Location{Bucket: "backups", Prefix: "app/app-pg"}
+	message := noDoneBackup(at, "app-pg", Contents{Any: true, BaseDirs: 3})
+	if want := "s3://backups/app/app-pg/ holds an archive with no completed base backup (3 base backups under base/, none DONE)."; !strings.HasPrefix(message, want) {
+		t.Errorf("refusal %q does not start with %q", message, want)
 	}
 }

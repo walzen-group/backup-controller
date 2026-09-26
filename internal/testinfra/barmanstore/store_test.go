@@ -107,10 +107,11 @@ func TestTheProberAgreesWithBarman(t *testing.T) {
 }
 
 // TestAStoreLeftToInitdbPassesBarmansArchiveCheck checks the webhook's
-// decision against barman's: where HasBaseBackup says there is nothing to
-// recover from, the webhook leaves the Cluster to initdb, and CloudNativePG
-// then runs barman-cloud-check-wal-archive, which must pass or the Cluster
-// never archives.
+// decision against barman's: the webhook leaves a Cluster to initdb only
+// where HasBaseBackup finds no completed base backup and Contents finds
+// nothing at all under the prefix, and CloudNativePG then runs
+// barman-cloud-check-wal-archive, which must pass on every such store or the
+// Cluster never archives. Finding W1, designs/webhook.md A.
 func TestAStoreLeftToInitdbPassesBarmansArchiveCheck(t *testing.T) {
 	names, err := barmanstore.Names()
 	if err != nil {
@@ -125,21 +126,20 @@ func TestAStoreLeftToInitdbPassesBarmansArchiveCheck(t *testing.T) {
 			}
 			for server, verdict := range s.Verdicts {
 				t.Run(server, func(t *testing.T) {
-					has, err := bootstrap.S3Prober{}.HasBaseBackup(context.Background(), location(srv, server))
+					at := location(srv, server)
+					has, err := bootstrap.S3Prober{}.HasBaseBackup(context.Background(), at)
 					if err != nil {
 						t.Fatalf("HasBaseBackup: %v", err)
 					}
-					if has || verdict.CheckWalArchive.ExitCode == 0 {
-						return
+					contents, err := bootstrap.S3Prober{}.Contents(context.Background(), at)
+					if err != nil {
+						t.Fatalf("Contents: %v", err)
 					}
-					what := "only failed or unfinished base backups plus WAL"
-					if len(s.Backups()[server]) == 0 {
-						what = "WAL and no base backup (the WAL-only row of designs/webhook.md's alternatives)"
+					initdb := !has && !contents.Any
+					if initdb && verdict.CheckWalArchive.ExitCode != 0 {
+						t.Errorf("the webhook leaves the Cluster to initdb, but barman-cloud-check-wal-archive fails on the store (exit %d: %s), so the Cluster could never archive",
+							verdict.CheckWalArchive.ExitCode, strings.TrimSpace(verdict.CheckWalArchive.Output))
 					}
-					t.Skipf("finding W1 (designs/webhook.md): the store holds %s; HasBaseBackup is false, so the webhook "+
-						"admits the Cluster to initdb, but barman-cloud-check-wal-archive fails on it (exit %d: %s), "+
-						"so the Cluster can never archive",
-						what, verdict.CheckWalArchive.ExitCode, strings.TrimSpace(verdict.CheckWalArchive.Output))
 				})
 			}
 		})
