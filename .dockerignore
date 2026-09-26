@@ -11,3 +11,11 @@ result-*
 docs
 chart
 deploy
+# Test tooling and recordings: the image builds ./cmd/backup-controller only, and
+# the e2e components' caches under hack/ would otherwise change the image on
+# every fetch.
+hack
+.claude
+**/testdata
+internal/testinfra
+nix
