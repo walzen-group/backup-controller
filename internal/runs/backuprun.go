@@ -306,9 +306,10 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // every Pending item. An item that fails to start with an error other than a
 // refusal stays Pending with "not started yet: " and the error in its
 // message, the Ready condition takes reason Retrying and names each such
-// item, and the pass goes on; the next pass tries the item again. When
-// another item waits for a source busy with another run, the Retrying
-// message names that wait as well. Once
+// item, and the pass goes on; the next pass tries the item again. Items that
+// wait for another run are named as well: the Retrying message names every
+// such wait, and without a retry the run waits with reason SourceBusy and a
+// message that names every wait. Once
 // every volume's clone is cut, it records the time of the pass in
 // status.restartedAt with status.restartPending set, and
 // writes the status. It then scales the workloads back up, resumes the
@@ -396,7 +397,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	// giving keeps its place and is tried again on the next pass. The pass
 	// goes on, because the restart below looks only at volume items, and a
 	// database whose Backup cannot be created must not keep the app down.
-	waiting := ""
+	var waits []string
 	var retrying []string
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
@@ -413,7 +414,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 			item.Message = ""
 		}
 		if message != "" {
-			waiting = message
+			waits = append(waits, message)
 		}
 	}
 
@@ -462,11 +463,12 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		// An item that waits for another run is named as well, so the retry
 		// does not hide it.
 		reason, message = backupv1alpha1.ReasonRetrying, "retrying the start of "+strings.Join(retrying, "; ")
-		if waiting != "" {
-			message += "; " + waiting
+		if len(waits) > 0 {
+			message += "; " + strings.Join(waits, "; ")
 		}
-	case waiting != "":
-		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, waiting))
+	case len(waits) > 0:
+		// Every wait is named, so one item's wait does not hide another's.
+		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, strings.Join(waits, "; ")))
 	}
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)

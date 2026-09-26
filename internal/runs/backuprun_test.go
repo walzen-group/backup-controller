@@ -1679,3 +1679,39 @@ func sourceRun(t *testing.T) (*BackupRunReconciler, client.Client) {
 	}
 	return r, c
 }
+
+// A run with two items that both wait for another run names both waits on
+// its Ready condition, so the first wait is not hidden by the second.
+func TestReadyNamesEveryWait(t *testing.T) {
+	other := otherRun()
+	other.Spec.Source, other.Spec.All = "", true
+	other.Status.Items = append(other.Status.Items, backupv1alpha1.BackupItem{Kind: "ReplicationSource", Name: cacheN,
+		Phase: backupv1alpha1.ItemRunning, Trigger: TriggerFor(otherRunUID)})
+	objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), other}, cacheClaim()...)
+	r, c := backupReconciler(t, objects...)
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce: nothing is marked, and both sources are still idle
+
+	// The other run tags both sources before this run starts its items.
+	for _, name := range []string{claimN, cacheN} {
+		source := busySource(TriggerFor(otherRunUID))
+		source.Name, source.Spec.SourcePVC = name, name
+		if err := c.Create(context.Background(), source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	step(t, r) // start: both items wait
+
+	run := readBackupRun(t, c)
+	for _, item := range run.Status.Items {
+		if item.Phase != backupv1alpha1.ItemPending {
+			t.Fatalf("item = %+v, want both items Pending while the other run holds them", item)
+		}
+	}
+	reason, message := readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions)
+	if reason != backupv1alpha1.ReasonSourceBusy || !strings.Contains(message, claimN) || !strings.Contains(message, cacheN) {
+		t.Errorf("Ready = %s: %q, want SourceBusy naming both %s and %s", reason, message, claimN, cacheN)
+	}
+}

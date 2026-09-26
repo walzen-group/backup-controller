@@ -208,11 +208,22 @@ func leaseItems(lease *coordinationv1.Lease) []string {
 	return strings.Split(value, ",")
 }
 
+// backupLeaseItemKind and restoreLeaseItemKind are the kinds of the items
+// that take Leases: a BackupRun's volume item and a RestoreRun's claim item.
+// A Lease names its items by name alone, and a run's Cluster item can share a
+// claim's name, so holderLive matches the kind as well.
+const (
+	backupLeaseItemKind  = "ReplicationSource"
+	restoreLeaseItemKind = "PersistentVolumeClaim"
+)
+
 // holderLive reports whether the run that holds the Lease still needs it:
 // the run exists with the UID the Lease names, has not finished, and has an
-// item the Lease names that is Pending or Running. A Lease that names no run
-// kind this controller knows is left alone, and counts as live. A failed
-// read comes back as an error.
+// item the Lease names that is Pending or Running. Only an item of the kind
+// that takes Leases counts (see backupLeaseItemKind), so a Cluster item of
+// the same name as the claim does not keep the claim's Lease. A Lease that
+// names no run kind this controller knows is left alone, and counts as live.
+// A failed read comes back as an error.
 func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1.Lease) (bool, error) {
 	key := types.NamespacedName{Namespace: lease.Namespace, Name: lease.Annotations[annotationLeaseHolderName]}
 	items := leaseItems(lease)
@@ -229,7 +240,7 @@ func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1
 			return false, nil
 		}
 		for _, item := range run.Status.Items {
-			if slices.Contains(items, item.Name) &&
+			if item.Kind == backupLeaseItemKind && slices.Contains(items, item.Name) &&
 				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
 				return true, nil
 			}
@@ -247,7 +258,7 @@ func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1
 			return false, nil
 		}
 		for _, item := range run.Status.Items {
-			if slices.Contains(items, item.Name) && !finished(item) {
+			if item.Kind == restoreLeaseItemKind && slices.Contains(items, item.Name) && !finished(item) {
 				return true, nil
 			}
 		}
