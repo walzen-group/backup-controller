@@ -189,8 +189,11 @@ func (r *Repository) snapshotFiles(ctx context.Context) ([]snapshotFile, error) 
 }
 
 // moverHostname and moverDataPath are the host and the only path VolSync's
-// backup mover records on a snapshot: it runs `restic backup --host volsync .`
-// in /data (VolSync v0.16.0 mover-restic/entry.sh, lines 62 and 155 to 158).
+// backup mover records on a snapshot. In VolSync v0.16.0, do_backup in
+// mover-restic/entry.sh (lines 154 to 158) runs `restic backup --host
+// "${RESTIC_HOST}" .` in ${DATA_DIR} (line 157), entry.sh sets RESTIC_HOST to
+// volsync (line 62), and internal/controller/mover/restic/mover.go sets
+// DATA_DIR (line 405) to its mount path /data (line 51).
 const (
 	moverHostname = "volsync"
 	moverDataPath = "/data"
@@ -278,7 +281,10 @@ func isID(name string) bool {
 // drops the fraction from each snapshot's time and from restoreAsOf before it
 // compares them. So a snapshot taken at 06:00:00.7 counts as taken at or before
 // 06:00:00, which is the time a BackupRun reports for it. Among the snapshots
-// in reach, the newest by full time wins.
+// in reach, the newest by full time wins, and among snapshots with the same
+// full time, the one with the higher ID wins. That is the order Snapshots
+// sorts by, so AtOrBefore picks the in-reach snapshot that comes last in that
+// order, whatever order the given list is in.
 func AtOrBefore(snapshots []Snapshot, t time.Time) (Snapshot, bool) {
 	var found Snapshot
 	ok := false
@@ -286,7 +292,7 @@ func AtOrBefore(snapshots []Snapshot, t time.Time) (Snapshot, bool) {
 		if s.Time.Unix() > t.Unix() {
 			continue
 		}
-		if !ok || s.Time.After(found.Time) {
+		if !ok || s.Time.After(found.Time) || s.Time.Equal(found.Time) && s.ID > found.ID {
 			found, ok = s, true
 		}
 	}

@@ -133,3 +133,33 @@ func TestMoverWrittenAcceptsOnlyWhatAMoverWrites(t *testing.T) {
 func recordedAsSnapshot(s recordedSnapshot) Snapshot {
 	return Snapshot{ID: s.ID, Time: s.Time, Hostname: s.Hostname, Paths: s.Paths, Tags: s.Tags, Original: s.Original}
 }
+
+// TestAtOrBeforeTakesTheHigherIDOfASameTimeTie checks that AtOrBefore, asked
+// for the time of the fixture's two same-time mover snapshots, returns the one
+// with the higher ID, whatever order the list holds them in. That is the
+// snapshot Snapshots lists last, so a restore at that time and a restore of
+// the newest snapshot pick the same one.
+func TestAtOrBeforeTakesTheHigherIDOfASameTimeTie(t *testing.T) {
+	f := sameTime(t)
+	var kinds map[string][]string
+	f.readJSON(t, "kinds.json", &kinds)
+	movers := kinds["mover"]
+	if len(movers) != 2 {
+		t.Fatalf("the fixture names %d mover snapshots, want 2", len(movers))
+	}
+	want := max(movers[0], movers[1])
+
+	snapshots, err := f.open(t).Snapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := snapshotTime(f.snapshots(t), want)
+	reversed := slices.Clone(snapshots)
+	slices.Reverse(reversed)
+	for _, list := range [][]Snapshot{snapshots, reversed} {
+		got, ok := AtOrBefore(list, at)
+		if !ok || got.ID != want {
+			t.Errorf("AtOrBefore(%s) = %s, %v; want %s, the higher ID of the tie", at.Format(time.RFC3339Nano), got.ID, ok, want)
+		}
+	}
+}
