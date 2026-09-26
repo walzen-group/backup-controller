@@ -61,15 +61,84 @@ ending in `(HTTP 403 AccessDenied)`.
 [architecture.md](architecture.md#where-a-databases-backups-are) lists the
 permissions.
 
-### Step 3: Apply the RBAC with the image
+### Step 3: Apply the CRDs, the RBAC and the image together
 
-The ClusterRole gains `list` on `objectstores.barmancloud.cnpg.io`. Apply
-deploy/rbac.yaml, or upgrade the chart, in the same change that moves the
+Three rules are added, and one of them refuses work until it is applied:
+
+- the ClusterRole gains `list` on `objectstores.barmancloud.cnpg.io`;
+- it gains `get` on `customresourcedefinitions.apiextensions.k8s.io`, named
+  `backupruns.backup.wlz.li`, `restoreruns.backup.wlz.li` and
+  `volumerestores.backup.wlz.li`;
+- it gains get, list, create, update and delete on `leases` in
+  `coordination.k8s.io`, which the runs take before they start a mover.
+
+Apply deploy/rbac.yaml, or upgrade the chart, in the same change that moves the
 image. A v0.9.0 image running under the v0.8.x ClusterRole refuses every
 Cluster create with an HTTP 500 while any other Cluster archives, until the
-RBAC is applied.
+`list` rule is there.
 
-### Step 4: Find Clusters v0.8.x admitted over an old archive
+The CRDs go with the image as well. A run reads the installed CRD of its kind
+before it changes anything and ends with reason CRDOutdated when the schema
+lacks a field the controller writes, since the API server drops that field from
+every write. Apply the release manifest server-side, or the CRD manifest:
+
+```
+kubectl apply --server-side -f https://github.com/walzen-group/backup-controller/releases/download/<version>/backup-controller-<version>.yaml
+```
+
+Helm upgrades no CRD on its own, so an install moved with `helm upgrade` alone
+keeps the CRDs of its first install.
+
+A cluster that ran v0.8.0 or v0.8.1 under the v0.7.2 BackupRun CRDs needs a look
+before the upgrade: that schema has no `status.restartPending`, so a status
+write there drops the field, and a run that stopped workloads could finish
+while the app was still at zero replicas. List the workloads that are marked
+for quiesce and stand at zero:
+
+```
+kubectl get deployments,statefulsets -A -o json | jq -r '.items[] | select((.metadata.annotations? // {})["backup.wlz.li/quiesce"] == "true" and ((.spec.replicas? // 1) == 0)) | "\(.metadata.namespace)/\(.kind)/\(.metadata.name)"'
+```
+
+and the Flux Kustomizations that are suspended:
+
+```
+kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o json | jq -r '.items[] | select(.spec.suspend? == true) | "\(.metadata.namespace)/\(.metadata.name)"'
+```
+
+Expected result: only workloads and Kustomizations you stopped by hand. Scale
+each one back up and resume each Kustomization; v0.9.0 gives back the ones its
+own runs stopped, a run an older version quiesced under the v0.7.2 CRD
+included.
+
+### Step 4: Check the runs in flight and how long an app may stay down
+
+A run with `all: true` now keeps an app stopped for at most the namespace's
+`backup.wlz.li/max-quiesce`, ten minutes without it, counted from the run's
+`status.quiescedAt`. A namespace whose mover regularly needs longer should set
+the annotation before the upgrade, or the run gives the app back and fails the
+volume item whose clone VolSync had not cut by then, with the clone named in
+the message. The annotation takes a Go duration, such as `20m`.
+
+A RestoreRun with `claim:` and `into:` that a v0.8.1 or older controller started
+ends Failed at its next pass, because that path ran its mover through the
+VolumeRestore populator and nothing can tell which snapshot the populator
+restored. The message says what the claim holds and how to restore again:
+compare the claim with the data you expect, or delete the run and create a new
+one, which deletes the claim and restores it again through a mover the run
+checks. This does not apply to an `into` restore from `repository:`, which
+always used the direct path.
+
+### Step 5: Check what VolSync keeps of a restore mover's log
+
+A volume restore now succeeds only when the log of the mover that completed its
+trigger names the snapshot the run's checks selected, so a VolSync that cuts
+that log too short fails every restore instead of confirming one. VolSync keeps
+the last `MOVER_LOG_MAX_BYTES` bytes of the filtered log, 1024 by default. Leave
+the default, or set it to at least a few kilobytes; a value of 0 leaves the log
+empty and every restore then fails with `the mover finished, but its logs name
+no snapshot, so the run cannot confirm what claim <claim> holds`.
+
+### Step 6: Find Clusters v0.8.x admitted over an old archive
 
 v0.8.x admitted a Cluster as `initdb` over a prefix holding WAL but no
 completed base backup, and over any prefix when it carried
@@ -118,9 +187,9 @@ ERROR: WAL archive check failed for server <serverName>: Expected empty archive
 Only this container logs that text. The condition and the postgres
 container's log carry the rpc error above. When the search prints nothing,
 archiving fails for another reason: read the rest of the same log for it, and
-leave that Cluster out of step 5.
+leave that Cluster out of step 7.
 
-### Step 5: Give each such Cluster an empty archive
+### Step 7: Give each such Cluster an empty archive
 
 The database in such a Cluster holds writes no backup has captured, so
 deleting the Cluster loses them. Repair the Cluster in place. It archives to
@@ -171,7 +240,7 @@ after initdb. The instance deletes the marker once ContinuousArchiving is
 True. On the e2e cluster, a Cluster recovered from the repaired archive held
 every row written before the repair.
 
-### Step 6: Take a base backup
+### Step 8: Take a base backup
 
 The new archive holds WAL but no base backup, so a recovery has nothing to
 start from yet. Create a BackupRun naming the database:
@@ -220,5 +289,5 @@ spec.configuration.serverName: Forbidden: use the 'serverName' plugin parameter 
 ```
 
 hack/e2e/cnpg/empty-archive-repair.sh starts a Cluster over an old archive on
-the e2e cluster, repairs it either way step 5 gives, runs step 6, and recovers
+the e2e cluster, repairs it either way step 7 gives, runs step 8, and recovers
 a second Cluster from the repaired archive to count its rows.
