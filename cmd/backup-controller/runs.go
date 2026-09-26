@@ -11,6 +11,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/runs"
+	"github.com/walzen-group/backup-controller/internal/served"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -22,6 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	ctrlmanager "sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -198,6 +200,18 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 		return fmt.Errorf("add the readiness check: %w", err)
 	}
 
+	// An incompatible VolSync holds every run that touches VolSync objects
+	// with reason VolSyncUnsupported. The check also runs once when the
+	// manager starts, so the log says it before any run does.
+	if err := manager.Add(ctrlmanager.RunnableFunc(func(context.Context) error {
+		if message := runs.VolSyncUnsupported(manager.GetRESTMapper()); message != "" {
+			klog.Errorf("VolSync is not served at the version this controller uses: %s", message)
+		}
+		return nil
+	})); err != nil {
+		return fmt.Errorf("add the VolSync version check: %w", err)
+	}
+
 	reader := manager.GetAPIReader()
 	recorder := manager.GetEventRecorder("backup-controller")
 	backups := &runs.BackupRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Retimer: restic.S3Lister{}, Recorder: recorder}
@@ -212,7 +226,11 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 		return fmt.Errorf("register the scheduler: %w", err)
 	}
 
-	orphans := &populator.OrphanReconciler{Client: manager.GetClient(), Reader: reader, Recorder: recorder, Namespace: namespace}
+	// The orphan reconciler reads ReplicationDestinations and takes a
+	// NotFound for one that is gone; served.Client makes a 404 for a VolSync
+	// version no longer served an error it retries instead.
+	orphanClient := served.Client(manager.GetClient())
+	orphans := &populator.OrphanReconciler{Client: orphanClient, Reader: served.Reader(reader, orphanClient), Recorder: recorder, Namespace: namespace}
 	if err := orphans.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the populator orphan controller: %w", err)
 	}

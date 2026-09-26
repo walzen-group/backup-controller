@@ -144,6 +144,21 @@ const (
 	// after which the run finishes by itself. The run records a Warning event
 	// when it first reports this.
 	ReasonReleaseFailed = "ReleaseFailed"
+
+	// ReasonVolSyncUnsupported reports a BackupRun or RestoreRun the
+	// controller holds where it is, because the API server does not serve
+	// VolSync's ReplicationSource or ReplicationDestination at
+	// volsync.backube/v1alpha1, the one version this controller reads and
+	// writes, while it serves the kind at another version. The message names
+	// the kind, v1alpha1 and the versions served. The run changes nothing
+	// while it waits: it creates no VolSync object, stops no workload, and
+	// gives back nothing it cannot confirm is safe to give back, since it can
+	// read neither its movers nor their clones. It checks again on every
+	// reconcile, and goes on by itself once v1alpha1 is served again or a
+	// controller release that reads the new version is installed. A workload
+	// the run stopped stays at 0 replicas meanwhile; the run's
+	// status.quiesced lists each one with the replica count it is owed.
+	ReasonVolSyncUnsupported = "VolSyncUnsupported"
 )
 
 // SetReady sets or replaces the Ready condition in a status's condition list.

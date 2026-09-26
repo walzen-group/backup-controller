@@ -20,6 +20,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	"github.com/walzen-group/backup-controller/internal/served"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -147,5 +148,8 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 		return nil, fmt.Errorf("create client: %w", err)
 	}
 	klog.Infof("starting backup-controller: watching %s VolumeRestore", backupv1alpha1.GroupVersion.String())
-	return &clientOperations{client: kubeClient}, nil
+	// served.Client makes a 404 for a VolSync version the API server no
+	// longer serves an error the populator retries, never a missing
+	// ReplicationDestination.
+	return &clientOperations{client: served.Client(kubeClient)}, nil
 }

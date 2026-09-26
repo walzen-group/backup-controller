@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -285,4 +286,161 @@ func Describe(mapper meta.RESTMapper, gk schema.GroupKind) string {
 		return "at no version"
 	}
 	return "at " + strings.Join(versions, ", ")
+}
+
+// Client wraps c so that every request the API server refuses because it no
+// longer serves the version it was sent at comes back as a
+// *VersionGoneError, and never as a NotFound (see VersionGone).
+//
+// Parameters:
+//   - c is the client to wrap. Its scheme gives the version of a typed
+//     object, such as VolSync's ReplicationSource at v1alpha1, and its
+//     RESTMapper is the one VersionGone makes look the group up again.
+//
+// The controller's typed kinds come from Go modules at one version, and many
+// callers read a NotFound as "the object is gone": a ReplicationDestination
+// that is gone means its mover is gone. After an upgrade that stops serving
+// that version, the API server answers with a plain-text 404 that client-go
+// also turns into a NotFound. The wrapper makes that answer an error the
+// caller retries, whatever the call site checks. It returns c itself when c
+// is already wrapped.
+func Client(c client.Client) client.Client {
+	if _, ok := c.(*servedClient); ok {
+		return c
+	}
+	return &servedClient{Client: c}
+}
+
+// Reader wraps r as Client wraps a client, with the scheme and RESTMapper of
+// c. The reconcilers pass their uncached API reader and their client.
+func Reader(r client.Reader, c client.Client) client.Reader {
+	if _, ok := r.(*servedReader); ok {
+		return r
+	}
+	return &servedReader{Reader: r, client: c}
+}
+
+// gone applies VersionGone to err for obj, whose version comes from the
+// object itself or, for a typed object, from scheme. A list's version is
+// that of its items. When the version can't be worked out, err is returned
+// as it is.
+func gone(c client.Client, obj runtime.Object, err error) error {
+	if err == nil {
+		return nil
+	}
+	gvk, gvkErr := apiutil.GVKForObject(obj, c.Scheme())
+	if gvkErr != nil {
+		return err
+	}
+	if _, list := obj.(client.ObjectList); list {
+		gvk.Kind = strings.TrimSuffix(gvk.Kind, "List")
+	}
+	return VersionGone(c.RESTMapper(), gvk, err)
+}
+
+// servedClient is the client Client returns.
+type servedClient struct {
+	client.Client
+}
+
+// Get reads obj, see Client.
+func (c *servedClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return gone(c.Client, obj, c.Client.Get(ctx, key, obj, opts...))
+}
+
+// List lists into list, see Client.
+func (c *servedClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return gone(c.Client, list, c.Client.List(ctx, list, opts...))
+}
+
+// Create creates obj, see Client.
+func (c *servedClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	return gone(c.Client, obj, c.Client.Create(ctx, obj, opts...))
+}
+
+// Update updates obj, see Client.
+func (c *servedClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	return gone(c.Client, obj, c.Client.Update(ctx, obj, opts...))
+}
+
+// Patch patches obj, see Client.
+func (c *servedClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	return gone(c.Client, obj, c.Client.Patch(ctx, obj, patch, opts...))
+}
+
+// Delete deletes obj, see Client.
+func (c *servedClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	return gone(c.Client, obj, c.Client.Delete(ctx, obj, opts...))
+}
+
+// DeleteAllOf deletes the objects of obj's kind, see Client.
+func (c *servedClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ...client.DeleteAllOfOption) error {
+	return gone(c.Client, obj, c.Client.DeleteAllOf(ctx, obj, opts...))
+}
+
+// Status returns the status writer of the wrapped client, wrapped the same
+// way.
+func (c *servedClient) Status() client.SubResourceWriter {
+	return &servedSubResource{SubResourceClient: statusClient{c.Client.Status()}, client: c.Client}
+}
+
+// SubResource returns the subresource client of the wrapped client, wrapped
+// the same way.
+func (c *servedClient) SubResource(subResource string) client.SubResourceClient {
+	return &servedSubResource{SubResourceClient: c.Client.SubResource(subResource), client: c.Client}
+}
+
+// statusClient makes the status writer a SubResourceClient, so one wrapper
+// serves both. Its Get is never called through Status, which returns only
+// the writer.
+type statusClient struct {
+	client.SubResourceWriter
+}
+
+// Get is not part of a status writer; it reports that.
+func (statusClient) Get(context.Context, client.Object, client.Object, ...client.SubResourceGetOption) error {
+	return fmt.Errorf("a status writer has no Get")
+}
+
+// servedSubResource is a subresource client whose errors go through
+// VersionGone.
+type servedSubResource struct {
+	client.SubResourceClient
+	client client.Client
+}
+
+// Get reads a subresource, see Client.
+func (s *servedSubResource) Get(ctx context.Context, obj, subResource client.Object, opts ...client.SubResourceGetOption) error {
+	return gone(s.client, obj, s.SubResourceClient.Get(ctx, obj, subResource, opts...))
+}
+
+// Create creates a subresource, see Client.
+func (s *servedSubResource) Create(ctx context.Context, obj, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+	return gone(s.client, obj, s.SubResourceClient.Create(ctx, obj, subResource, opts...))
+}
+
+// Update updates a subresource, see Client.
+func (s *servedSubResource) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	return gone(s.client, obj, s.SubResourceClient.Update(ctx, obj, opts...))
+}
+
+// Patch patches a subresource, see Client.
+func (s *servedSubResource) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	return gone(s.client, obj, s.SubResourceClient.Patch(ctx, obj, patch, opts...))
+}
+
+// servedReader is the reader Reader returns.
+type servedReader struct {
+	client.Reader
+	client client.Client
+}
+
+// Get reads obj, see Client.
+func (r *servedReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return gone(r.client, obj, r.Reader.Get(ctx, key, obj, opts...))
+}
+
+// List lists into list, see Client.
+func (r *servedReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return gone(r.client, list, r.Reader.List(ctx, list, opts...))
 }

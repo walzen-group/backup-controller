@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 
+	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	apidiscoveryv2 "k8s.io/api/apidiscovery/v2"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -222,7 +223,8 @@ func servingOnly(c client.Client) client.Client {
 }
 
 // fluxDiscovery is an API server's discovery endpoint, on an httptest
-// server, that serves Flux's Kustomization kind at one version at a time. A
+// server, that serves Flux's Kustomization kind at one version at a time. It
+// also serves VolSync at volsync.backube/v1alpha1. A
 // test switches the version mid-run with serve, which stands in for a Flux
 // upgrade that stops serving the version the controller cached.
 //
@@ -274,6 +276,11 @@ func (d *fluxDiscovery) mapper(t *testing.T) meta.RESTMapper {
 	return m
 }
 
+// volsyncGV is the VolSync API version the discovery endpoint serves beside
+// Flux, as every cluster the controller runs on does. holdForVolSync looks
+// it up on every pass.
+var volsyncGV = volsyncv1alpha1.GroupVersion
+
 // handle answers one discovery request.
 func (d *fluxDiscovery) handle(w http.ResponseWriter, req *http.Request) {
 	version := d.served()
@@ -298,6 +305,12 @@ func (d *fluxDiscovery) handle(w http.ResponseWriter, req *http.Request) {
 		write("application/json", metav1.APIVersions{TypeMeta: metav1.TypeMeta{Kind: "APIVersions"}, Versions: []string{"v1"}})
 	case "/apis":
 		if d.aggregated {
+			volsyncResource := func(resource, singular, kind string) apidiscoveryv2.APIResourceDiscovery {
+				return apidiscoveryv2.APIResourceDiscovery{
+					Resource: resource, SingularResource: singular, Scope: apidiscoveryv2.ScopeNamespace, Verbs: verbs,
+					ResponseKind: &metav1.GroupVersionKind{Group: volsyncGV.Group, Version: volsyncGV.Version, Kind: kind},
+				}
+			}
 			aggregated([]apidiscoveryv2.APIGroupDiscovery{{
 				ObjectMeta: metav1.ObjectMeta{Name: fluxGroup},
 				Versions: []apidiscoveryv2.APIVersionDiscovery{{
@@ -308,12 +321,32 @@ func (d *fluxDiscovery) handle(w http.ResponseWriter, req *http.Request) {
 					}},
 					Freshness: apidiscoveryv2.DiscoveryFreshnessCurrent,
 				}},
+			}, {
+				ObjectMeta: metav1.ObjectMeta{Name: volsyncGV.Group},
+				Versions: []apidiscoveryv2.APIVersionDiscovery{{
+					Version: volsyncGV.Version,
+					Resources: []apidiscoveryv2.APIResourceDiscovery{
+						volsyncResource("replicationsources", "replicationsource", "ReplicationSource"),
+						volsyncResource("replicationdestinations", "replicationdestination", "ReplicationDestination"),
+					},
+					Freshness: apidiscoveryv2.DiscoveryFreshnessCurrent,
+				}},
 			}})
 			return
 		}
 		served := metav1.GroupVersionForDiscovery{GroupVersion: gv, Version: version}
+		volsync := metav1.GroupVersionForDiscovery{GroupVersion: volsyncGV.String(), Version: volsyncGV.Version}
 		write("application/json", metav1.APIGroupList{TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
-			Groups: []metav1.APIGroup{{Name: fluxGroup, Versions: []metav1.GroupVersionForDiscovery{served}, PreferredVersion: served}}})
+			Groups: []metav1.APIGroup{
+				{Name: fluxGroup, Versions: []metav1.GroupVersionForDiscovery{served}, PreferredVersion: served},
+				{Name: volsyncGV.Group, Versions: []metav1.GroupVersionForDiscovery{volsync}, PreferredVersion: volsync},
+			}})
+	case "/apis/" + volsyncGV.String():
+		write("application/json", metav1.APIResourceList{TypeMeta: metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"}, GroupVersion: volsyncGV.String(),
+			APIResources: []metav1.APIResource{
+				{Name: "replicationsources", SingularName: "replicationsource", Namespaced: true, Kind: "ReplicationSource", Verbs: verbs},
+				{Name: "replicationdestinations", SingularName: "replicationdestination", Namespaced: true, Kind: "ReplicationDestination", Verbs: verbs},
+			}})
 	case "/apis/" + gv:
 		write("application/json", metav1.APIResourceList{TypeMeta: metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"}, GroupVersion: gv,
 			APIResources: []metav1.APIResource{{Name: "kustomizations", SingularName: "kustomization", Namespaced: true, Kind: "Kustomization", Verbs: verbs}}})

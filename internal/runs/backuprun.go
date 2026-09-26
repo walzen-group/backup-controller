@@ -65,6 +65,7 @@ func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Now == nil {
 		r.Now = time.Now
 	}
+	r.serve()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&backupv1alpha1.BackupRun{}).
 		Named("backuprun").
@@ -86,6 +87,10 @@ func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // gets its changes put back by finalize, and a finished run is deleted once
 // spec.ttlSecondsAfterFinished has passed. Whenever the Ready reason changes
 // during a reconcile, Reconcile records an event on the run.
+//
+// An unfinished run with no spec.database, being deleted or not, first goes
+// through holdForVolSync, which holds it with reason VolSyncUnsupported while
+// VolSync serves its kinds only at a version other than v1alpha1.
 func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.BackupRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -93,6 +98,15 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	before := readyReason(run.Status.Conditions)
 	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Backup") }()
+	// A run that may touch VolSync objects waits, changing nothing, while
+	// VolSync serves its kinds only at a version this controller has no
+	// Go types for (see holdForVolSync). A database-only run needs no
+	// VolSync object and goes on.
+	if !run.Status.Phase.Finished() && run.Spec.Database == "" {
+		if held, result, err := holdForVolSync(ctx, r.Client, run, &run.Status.Conditions, run.Generation); held {
+			return result, err
+		}
+	}
 	if !run.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, r.finalize(ctx, run)
 	}
