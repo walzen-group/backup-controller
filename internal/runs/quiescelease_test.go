@@ -163,6 +163,7 @@ func TestARestoreAndANamespaceBackupNeverStopTheAppTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoreStep(t, rr)
+	restoreStep(t, rr) // the pass after the destination's delete finds its mover gone
 	restore = readRestoreRun(t, c)
 	if restore.Status.Phase != backupv1alpha1.RunPhaseSucceeded || restore.Status.RestartedAt == nil {
 		t.Fatalf("the restore ended %+v; want it Succeeded after giving the app back", restore.Status)
@@ -380,7 +381,7 @@ func TestAQuiesceLeaseIsTakenOverOnlyWhenItsHolderRestarted(t *testing.T) {
 		"finished": {holder: func() *backupv1alpha1.BackupRun {
 			return quiescedBackup(func(b *backupv1alpha1.BackupRun) { b.Status.Phase = backupv1alpha1.RunPhaseSucceeded })
 		}, store: true, stopped: 0},
-		"restarted, plan back":    {holder: func() *backupv1alpha1.BackupRun { return quiescedBackup(restarted) }, store: true, stopped: 2},
+		"restarted, plan back":         {holder: func() *backupv1alpha1.BackupRun { return quiescedBackup(restarted) }, store: true, stopped: 2},
 		"restarted, app stopped since": {holder: func() *backupv1alpha1.BackupRun { return quiescedBackup(restarted) }, store: true, stopped: 0},
 		"restart pending": {
 			holder: func() *backupv1alpha1.BackupRun {

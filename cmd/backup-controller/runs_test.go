@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
 )
 
 // TestAManagerThatStopsOnItsOwnIsReported checks that startRunControllers
@@ -88,5 +90,19 @@ func TestTheManagerServesHealthAndReadiness(t *testing.T) {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
+	}
+}
+
+// TestTheRunSchemeKnowsTheMoverJob checks that the scheme of the run manager
+// holds batch/v1 Job. A RestoreRun reads the Job of a mover it stopped before
+// it gives the app back (rule X2). Without the kind in the scheme every such
+// read fails, and every restore would wait until someone deletes it.
+func TestTheRunSchemeKnowsTheMoverJob(t *testing.T) {
+	scheme, err := runScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job := batchv1.SchemeGroupVersion.WithKind("Job"); !scheme.Recognizes(job) {
+		t.Errorf("the run manager's scheme does not hold %s", job)
 	}
 }

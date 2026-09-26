@@ -165,9 +165,9 @@ func olderRestoreRun() (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.Replication
 }
 
 // A RestoreRun v0.8.1 left while its mover wrote the claim ends Failed with
-// reason Upgraded on the first pass: its ReplicationDestination is deleted,
-// the app gets its 2 replicas back and its Kustomization is resumed, and the
-// run records a Warning event.
+// reason Upgraded: the first pass deletes its ReplicationDestination, and the
+// pass after it, which finds the mover gone, gives the app its 2 replicas
+// back, resumes its Kustomization and records a Warning event.
 func TestARestoreRunAnOlderReleasePlannedEndsUpgraded(t *testing.T) {
 	run, destination := olderRestoreRun()
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(), destination, stoppedDeployment(), kustomization(true))
@@ -175,6 +175,7 @@ func TestARestoreRunAnOlderReleasePlannedEndsUpgraded(t *testing.T) {
 	r.Recorder = recorder
 
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 	got := readRestoreRun(t, c)
 	if got.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(got.Status.Conditions) != backupv1alpha1.ReasonUpgraded {
@@ -199,8 +200,8 @@ func TestARestoreRunAnOlderReleasePlannedEndsUpgraded(t *testing.T) {
 	if suspended(t, c) {
 		t.Error("the Kustomization the run suspended was not resumed")
 	}
-	if events := recorded(recorder); len(events) != 1 || !strings.HasPrefix(events[0], "Warning Upgraded ") {
-		t.Errorf("events = %q, want one Warning with reason Upgraded", events)
+	if events := recorded(recorder); len(events) == 0 || !strings.HasPrefix(events[len(events)-1], "Warning Upgraded ") {
+		t.Errorf("events = %q, want the last a Warning with reason Upgraded", events)
 	}
 }
 

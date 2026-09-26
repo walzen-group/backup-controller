@@ -8,7 +8,9 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -16,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // The tests in this file check that a restore stops a mover the way rule X2
@@ -176,6 +179,7 @@ func TestAnIntoRestoreWhoseClaimIsLostRecordsTheEndBeforeTheMoverGoes(t *testing
 	}
 
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 	after := readRestoreRun(t, c)
 	if after.Status.Phase != backupv1alpha1.RunPhaseFailed || after.Status.Items[0].Phase != backupv1alpha1.ItemFailed {
@@ -205,6 +209,7 @@ func TestAnIntoRestoreWhoseMoverFailedRecordsTheEndBeforeTheMoverGoes(t *testing
 	}
 
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 	after := readRestoreRun(t, c)
 	if item := after.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "repository is already locked") {
@@ -231,6 +236,7 @@ func TestATimedOutRestoreWaitsForItsStoppedMoversPod(t *testing.T) {
 
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the delete looks for the mover
 
 	if names := destinations(t, c); len(names) != 0 {
 		t.Fatalf("destinations = %v at the timeout, want the mover's deleted", names)
@@ -288,6 +294,7 @@ func TestADeletedRestoreWaitsForItsStoppedMoversPod(t *testing.T) {
 	}
 
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the delete looks for the mover
 
 	if names := destinations(t, c); len(names) != 0 {
 		t.Errorf("destinations = %v, want the mover's deleted", names)
@@ -463,5 +470,123 @@ func TestAnIntoRestoreWhoseMoverFailedKeepsFailedPastTheTimeout(t *testing.T) {
 	done := readRestoreRun(t, c)
 	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonFailed {
 		t.Errorf("phase = %q, reason = %q; want Failed, %s", done.Status.Phase, readyReason(done.Status.Conditions), backupv1alpha1.ReasonFailed)
+	}
+}
+
+// moverJob returns the Job VolSync runs for the mover of the
+// ReplicationDestination named destination, in the run's namespace, with the
+// name internalvolsync.MoverJobName gives it.
+func moverJob(destination string) *batchv1.Job {
+	return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: internalvolsync.MoverJobName(destination), Namespace: ns}}
+}
+
+// A mover Job whose pod is not there holds the run as a pod does. The Job
+// may be between two pods (VolSync gives it a backoffLimit of 8) or may not
+// have started its first, and either way it can still start a pod that
+// writes. The app comes back only once the Job is gone too.
+func TestAStoppedMoversJobWithoutAPodHoldsTheRestore(t *testing.T) {
+	run, destination := quiescedMidRestore()
+	job := moverJob(destination.Name)
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination, job)
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+
+	restoreStep(t, r)
+	restoreStep(t, r)
+
+	if names := destinations(t, c); len(names) != 0 {
+		t.Fatalf("destinations = %v at the timeout, want the mover's deleted", names)
+	}
+	if got := replicasOf(t, c); got != 0 {
+		t.Fatalf("replicas = %d while mover Job %s was still there, want the app still down", got, job.Name)
+	}
+	waiting := readRestoreRun(t, c)
+	if waiting.Status.Phase.Finished() || !strings.Contains(readyMessage(waiting.Status.Conditions), job.Name) {
+		t.Errorf("phase = %q, message = %q; want the run waiting and naming Job %s",
+			waiting.Status.Phase, readyMessage(waiting.Status.Conditions), job.Name)
+	}
+
+	if err := c.Delete(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d once the mover Job was gone, want the 2 the app had", got)
+	}
+	if done := readRestoreRun(t, c); readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+		t.Errorf("reason = %q, want %s", readyReason(done.Status.Conditions), backupv1alpha1.ReasonTimedOut)
+	}
+}
+
+// Which of a stopped mover's pods hold the run. While the mover's Job is
+// there, every pod counts, since the Job can start another after one that
+// ended. Once the Job is gone, a pod that has Succeeded or Failed has no
+// container left that writes and no Job to replace it, so it does not count;
+// a pod in any other phase still does.
+func TestWhichPodsOfAStoppedMoverHoldTheRestore(t *testing.T) {
+	for _, tc := range []struct {
+		phase   corev1.PodPhase
+		withJob bool
+		holds   bool
+	}{
+		{corev1.PodSucceeded, true, true},
+		{corev1.PodFailed, true, true},
+		{corev1.PodSucceeded, false, false},
+		{corev1.PodFailed, false, false},
+		{corev1.PodPending, false, true},
+		{corev1.PodRunning, false, true},
+		{corev1.PodUnknown, false, true},
+	} {
+		name := string(tc.phase) + " pod, no Job"
+		if tc.withJob {
+			name = string(tc.phase) + " pod of a Job still there"
+		}
+		t.Run(name, func(t *testing.T) {
+			run, destination := quiescedMidRestore()
+			objects := []client.Object{run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true),
+				destination, moverPod(destination.Name, tc.phase)}
+			if tc.withJob {
+				objects = append(objects, moverJob(destination.Name))
+			}
+			r, c := restoreReconciler(t, nil, objects...)
+			r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+
+			restoreStep(t, r)
+			restoreStep(t, r)
+
+			if back := replicasOf(t, c) == 2; back == tc.holds {
+				t.Errorf("app back = %t, want %t", back, !tc.holds)
+			}
+		})
+	}
+}
+
+// The pass that deletes a mover's ReplicationDestination does not go on to
+// give the app back, even when it finds no pod and no Job. VolSync may be in
+// the middle of a reconcile of that destination, and its Job may not be
+// visible yet. The next pass looks again.
+func TestThePassThatStopsAMoverDoesNotGiveTheAppBack(t *testing.T) {
+	run, destination := quiescedMidRestore()
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination)
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+
+	result := restoreStep(t, r)
+
+	if names := destinations(t, c); len(names) != 0 {
+		t.Fatalf("destinations = %v at the timeout, want the mover's deleted", names)
+	}
+	if got := replicasOf(t, c); got != 0 {
+		t.Errorf("replicas = %d in the pass that deleted the destination, want the app still down", got)
+	}
+	if result.RequeueAfter == 0 {
+		t.Errorf("result = %+v, want a requeue to look for the mover again", result)
+	}
+
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d on the pass after, want the 2 the app had", got)
 	}
 }

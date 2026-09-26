@@ -283,6 +283,7 @@ func TestARestoreReleasesItsLeasesWhenItFinishes(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 	if run := readRestoreRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q, want Succeeded", run.Status.Phase)

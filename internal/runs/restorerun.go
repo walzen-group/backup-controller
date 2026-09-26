@@ -14,6 +14,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -42,15 +43,16 @@ import (
 // the snapshot the same way as in place.
 //
 // When the run stops a mover, which is when it ends or is deleted, it deletes
-// the mover's ReplicationDestination and waits until that mover's pod is gone
-// before it gives the app back, releases its Leases or finishes (rule X2,
-// see stoppedMovers).
+// the mover's ReplicationDestination and waits until that mover's Job and
+// pods are gone before it gives the app back, releases its Leases or
+// finishes (rule X2, see removeDestinations).
 type RestoreRunReconciler struct {
 	client.Client
 
 	// Reader reads straight from the API server, without the informer cache.
 	// The run reads claims, VolumeRestores, Secrets, ObjectStores, Clusters,
-	// ReplicationDestinations, Deployments, StatefulSets and pods through it.
+	// ReplicationDestinations, Deployments, StatefulSets, pods and Jobs through
+	// it.
 	Reader client.Reader
 
 	// Snapshots lists the snapshots in a restic repository. plan uses it to
@@ -192,7 +194,7 @@ func (r *RestoreRunReconciler) planFailed(ctx context.Context, run *backupv1alph
 	}
 	if deadline, over := r.checksOverdue(run); over {
 		// Nothing was created before the checks passed, so there is no
-		// ReplicationDestination to stop and no mover pod to wait for.
+		// ReplicationDestination to stop and no mover to wait for.
 		_, finishErr := r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, checksTimedOut(deadline, err.Error()))
 		return finishErr
 	}
@@ -717,7 +719,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
 	// backup of that claim need not wait for the rest of the run. An item
-	// whose stopped mover's pod is still there keeps its Lease: another run's
+	// whose stopped mover is not gone yet keeps its Lease: another run's
 	// mover must not start on the claim or the repository while this one may
 	// still write (rule X2).
 	left, err := r.stoppedMovers(ctx, run, finished)
@@ -789,11 +791,12 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	// destination is gone, and no later pass could tell how it ended. A later
 	// pass deletes the destination of any finished item that still names one,
 	// and a destination that is already gone counts as deleted.
+	var stopping moverList
 	if finishedWithDestination(run.Status.Items) {
 		if err := r.writeStatus(ctx, run); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.removeDestinations(ctx, run, finished); err != nil {
+		if stopping, err = r.removeDestinations(ctx, run, finished); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -826,14 +829,12 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 		}
 	}
 
-	// A mover the run stopped may still be writing into a claim or the
-	// repository, so nothing is given back and no Lease that is still held
-	// goes before its pod is gone (rule X2, see stoppedMovers). Only a
-	// finished item counts here: an item still Pending or Running has a mover
-	// that is doing the restore, and its pod belongs there.
-	if left, err := r.stoppedMovers(ctx, run, finished); err != nil {
-		return ctrl.Result{}, err
-	} else if message := left.message(); message != "" {
+	// A mover the run stopped may still write into a claim or the
+	// repository, so the run gives nothing back and releases no Lease it
+	// still holds until that mover is gone (rule X2, see removeDestinations).
+	// Only a finished item counts here: the mover of an item that is still
+	// Pending or Running is doing the restore, and belongs there.
+	if message := stopping.message(); message != "" {
 		return r.waitForStopped(ctx, run, message)
 	}
 
@@ -1325,7 +1326,7 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 		return r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, done)
 	case backupv1alpha1.ItemFailed:
 		// An earlier pass recorded the end, and finish either lost its write
-		// or waited for the stopped mover's pod. Without this, a pass that
+		// or waited for the stopped mover. Without this, a pass that
 		// finds no destination would create one again. An item the timeout
 		// failed carries the timeout's message, and the run then ends with
 		// the reason the timeout gave it.
@@ -1585,7 +1586,7 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 //   - message is the Ready message, and each unfinished item's message.
 //
 // It returns what finish returns: an empty result once the run has ended, or
-// the wait for a stopped mover's pod, which finish reports (rule X2).
+// the wait for a stopped mover, which finish reports (rule X2).
 func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
@@ -1769,8 +1770,8 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 }
 
 // finish ends the run. It stops the run's movers, which means deleting the
-// ReplicationDestinations the run created and waiting until the pod of each
-// stopped mover is gone (rule X2), releases the run's Leases (see
+// ReplicationDestinations the run created and waiting until the Job and pods
+// of each stopped mover are gone (rule X2), releases the run's Leases (see
 // releaseLeases), starts any workload it still holds stopped, and records the
 // terminal phase: Succeeded when reason is ReasonSucceeded and Failed for any
 // other reason. It sets the Ready condition to reason and message, records
@@ -1778,14 +1779,11 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // VolumeRestore an older controller created for an into restore, whose
 // release waits for the claim (see releaseVolumeRestore).
 //
-// A stopped mover whose pod is still there holds the run: finish reports the
+// A stopped mover that is not gone yet holds the run: finish reports the
 // wait and returns, so the app is not given back and the Leases are not
 // released while the mover may still write into the claim or the repository.
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
-	if err := r.removeDestinations(ctx, run, anyItem); err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
-	}
-	left, err := r.stoppedMovers(ctx, run, anyItem)
+	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
 	}
@@ -1838,15 +1836,15 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 }
 
 // finalize runs when the run is deleted before it finished. It deletes the
-// run's ReplicationDestinations and waits until the pod of each mover it
-// stopped is gone (rule X2), releases the run's Leases (see releaseLeases),
+// run's ReplicationDestinations and waits until the Job and pods of each
+// mover it stopped are gone (rule X2), releases the run's Leases (see releaseLeases),
 // starts any workload the run still holds stopped, releases the VolumeRestore
 // an older controller created for an into restore with releaseVolumeRestore,
 // and removes the finalizer so the deletion can complete. Without it, a run
 // deleted while its mover writes would leave a restore running against a
 // claim with nothing tracking it.
 //
-// While a stopped mover's pod is still there the run keeps its finalizer and
+// While a stopped mover is not gone yet the run keeps its finalizer and
 // its Leases, and the run reports that wait on its Ready condition (see
 // waitForStopped). A step that fails is reported the same way, through
 // releaseFailed, and the run keeps its finalizer and its Leases: a Lease
@@ -1856,10 +1854,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
 	}
-	if err := r.removeDestinations(ctx, run, anyItem); err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
-	}
-	left, err := r.stoppedMovers(ctx, run, anyItem)
+	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
 	}
@@ -1894,25 +1889,36 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	return ctrl.Result{}, nil
 }
 
-// removeDestinations deletes the ReplicationDestination that each item
-// chosen by the function given in which still names, and clears the item's
-// destination once the mover's pod is gone. finish and finalize pass
-// anyItem, and work passes finished.
+// removeDestinations stops the movers of the items the run is done with: it
+// deletes the ReplicationDestination each chosen item names and reports the
+// movers that are not gone yet (rule X2).
 //
-// It reads each destination first and deletes it only when the run owns it
-// (see ownsDestination); one with another trigger is left alone, and the
-// item's destination is cleared all the same. The delete carries the UID it
-// read as a precondition, so a destination created under the name since the
-// read is never deleted. A destination that is already gone is not an error.
-// A failed read or delete, and a delete whose precondition fails, come back
-// as an error, and the next pass reads the destination again.
+// Parameters:
+//   - run is the RestoreRun whose status.items are stopped. An item whose
+//     mover is gone has its destination cleared in place, and the caller
+//     writes the status.
+//   - which chooses the items to stop. finish and finalize pass anyItem,
+//     because the run is ending, and work passes finished, so a mover that is
+//     still restoring keeps running.
 //
-// An item whose mover pod is still there keeps the destination's name, so
-// the run can still look the pod up: deleting a destination does not stop
-// its mover, whose pod the garbage collector takes with the Job (rule X2,
-// see stoppedMovers). The next pass reads the destination again, finds it
-// gone, and clears the item once the pod has left.
-func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) error {
+// It returns the chosen movers that are not gone yet, in the order of
+// status.items, and an empty list once every one is. An error is a
+// *releaseError naming the destination: a failed read or delete, a delete
+// whose precondition fails, or a failed look at the mover's Job and pods.
+// The caller keeps waiting on an error, and the next pass tries again.
+//
+// The destination is read first and deleted only when the run owns it (see
+// ownsDestination); one with another trigger is left alone. The delete
+// carries the UID it read as a precondition, so a destination created under
+// the name since the read is never deleted. A destination that is already
+// gone is not an error. A mover the run deleted the destination of in this
+// pass counts as not gone, whatever the run can see of it: VolSync may be in
+// the middle of a reconcile of that destination and create the Job after
+// the look, so only the next pass looks (see moverRemains). An item keeps
+// the destination's name until its mover is gone, so every pass can look the
+// mover up again.
+func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) (moverList, error) {
+	var left moverList
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		if item.Destination == "" || !which(*item) {
@@ -1922,108 +1928,154 @@ func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *back
 		key := types.NamespacedName{Namespace: run.Namespace, Name: item.Destination}
 		if err := r.Reader.Get(ctx, key, destination); err != nil {
 			if !apierrors.IsNotFound(err) {
-				return destinationReleaseError(item.Destination, fmt.Errorf("get ReplicationDestination %s: %w", item.Destination, err))
+				return nil, destinationReleaseError(item.Destination, fmt.Errorf("get ReplicationDestination %s: %w", item.Destination, err))
 			}
 		} else if ownsDestination(run, destination) {
 			uid := destination.UID
 			if err := r.Delete(ctx, destination, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
-				return destinationReleaseError(item.Destination, fmt.Errorf("delete ReplicationDestination %s: %w", item.Destination, err))
+				return nil, destinationReleaseError(item.Destination, fmt.Errorf("delete ReplicationDestination %s: %w", item.Destination, err))
 			}
+			left = append(left, moverLeft{item: item.Name, destination: item.Destination})
+			continue
 		}
-		pod, err := moverPodLeft(ctx, r.Reader, run.Namespace, item.Destination)
+		what, err := moverRemains(ctx, r.Reader, run.Namespace, item.Destination)
 		if err != nil {
-			return destinationReleaseError(item.Destination, err)
+			return nil, destinationReleaseError(item.Destination, err)
 		}
-		if pod != "" {
+		if what != "" {
+			left = append(left, moverLeft{item: item.Name, destination: item.Destination, what: what})
 			continue
 		}
 		item.Destination = ""
 	}
-	return nil
+	return left, nil
 }
 
-// moverLeft is a restore mover the run has stopped whose pod is still there:
-// the item that was being restored, the ReplicationDestination the run
-// deleted or is about to delete for it, and a pod of its mover.
+// moverLeft is a restore mover the run has stopped that is not gone yet.
 type moverLeft struct {
-	item        string
+	// item is the name of the item the mover was restoring.
+	item string
+
+	// destination is the name of the ReplicationDestination the run deleted
+	// to stop the mover.
 	destination string
-	pod         string
+
+	// what names the part of the mover that is still there, such as "pod
+	// volsync-dst-restore-9b7d4e21-0-abcde" or "Job
+	// volsync-dst-restore-9b7d4e21-0". It is empty when the run deleted the
+	// destination in this pass and has not looked for the mover yet.
+	what string
 }
 
-// moverList holds the movers a run has stopped whose pods are still there,
-// in the order of status.items.
+// moverList holds the movers a run has stopped that are not gone yet, in the
+// order of status.items.
 type moverList []moverLeft
 
-// stoppedMovers returns the movers the run has stopped, chosen by which,
-// whose pod is still there, in the order of status.items.
+// stoppedMovers returns the movers the run has stopped that are not gone yet,
+// without deleting anything.
 //
-// An item counts once it names a ReplicationDestination: the run has deleted
-// that destination or is about to, so the mover must not outlive it. A pod
-// whose phase is Succeeded or Failed has ended and does not count (see
-// moverPodLeft). A failed pod list comes back as an error, and the caller
-// waits, which is the choice that writes nothing while the state is unknown.
+// Parameters:
+//   - run is the RestoreRun whose status.items are looked at. It is not
+//     changed.
+//   - which chooses the items to look at. work passes finished, before it
+//     releases the Leases of the items that are done.
+//
+// It returns the chosen movers that are still there, in the order of
+// status.items. An item counts once it names a ReplicationDestination,
+// because the run has deleted that destination or is about to. An error is a
+// *releaseError from a failed look at a mover (see moverRemains), and the
+// caller then releases nothing, which is the choice that changes nothing
+// while the state is unknown.
 func (r *RestoreRunReconciler) stoppedMovers(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) (moverList, error) {
-	var left []moverLeft
+	var left moverList
 	for _, item := range run.Status.Items {
 		if item.Destination == "" || !which(item) {
 			continue
 		}
-		pod, err := moverPodLeft(ctx, r.Reader, run.Namespace, item.Destination)
+		what, err := moverRemains(ctx, r.Reader, run.Namespace, item.Destination)
 		if err != nil {
 			return nil, destinationReleaseError(item.Destination, err)
 		}
-		if pod != "" {
-			left = append(left, moverLeft{item: item.Name, destination: item.Destination, pod: pod})
+		if what != "" {
+			left = append(left, moverLeft{item: item.Name, destination: item.Destination, what: what})
 		}
 	}
 	return left, nil
 }
 
-// holds reports whether left names the item called item, so a run may not
-// release that item's Lease yet (see releaseLeases).
+// holds reports whether the list names a mover of the item with the given
+// name.
+//
+// Parameters:
+//   - item is the name of a restore item, as status.items records it.
+//
+// work asks it before it releases an item's Leases: a mover that may still
+// write keeps the claim and the repository to its run (see releaseLeases).
 func (l moverList) holds(item string) bool {
 	return slices.ContainsFunc(l, func(m moverLeft) bool { return m.item == item })
 }
 
-// message returns the Ready message for a run that waits for the first of the
-// movers in left to go, and "" when there is none.
+// message returns the Ready message for a run that waits for the first mover
+// in the list to go, and "" when the list is empty.
 func (l moverList) message() string {
 	if len(l) == 0 {
 		return ""
 	}
 	m := l[0]
-	return fmt.Sprintf("waiting for mover pod %s of ReplicationDestination %s, which the run stopped while it restored %s, "+
-		"to go before the run gives the app back or lets another run at the claim", m.pod, m.destination, m.item)
+	still := "the run deleted the destination in this pass and looks for the mover's Job and pods on the next"
+	if m.what != "" {
+		still = "its " + m.what + " is still there"
+	}
+	return fmt.Sprintf("waiting for the mover of ReplicationDestination %s, which the run stopped while it restored %s, to go: %s. "+
+		"The run gives the app back and lets other runs at the claim only after that", m.destination, m.item, still)
 }
 
-// moverPodLeft returns the name of a pod of the VolSync mover that wrote
-// through the ReplicationDestination named destination that is still there,
-// and "" when there is none. VolSync runs that mover as a Job in the
-// destination's namespace (see internalvolsync.MoverJobName), and the Job's
-// pods carry the label job-name with the Job's name.
+// moverRemains returns what is left of the VolSync mover that wrote through
+// the ReplicationDestination with the given name, and "" once it is gone.
 //
-// A pod in phase Succeeded or Failed has ended and does not count, the same
-// rule podsGone uses: its containers are gone, and the garbage collector
-// takes the object with the Job. Every other phase counts, including Pending
-// and a pod that is terminating, because each of those can still start
-// writing. A failed list comes back as an error.
-func moverPodLeft(ctx context.Context, c client.Reader, namespace, destination string) (string, error) {
+// Parameters:
+//   - c is the uncached reader, so a pod or Job created a moment ago is seen.
+//   - namespace is the run's namespace, which holds the destination, its Job
+//     and the Job's pods.
+//   - destination is the name of the ReplicationDestination.
+//
+// It returns "pod <name>" for a pod of the mover that can still write, "Job
+// <name>" for the mover's Job, and "" when neither is there. A failed list
+// or read comes back as an error.
+//
+// VolSync runs the mover as a Job in the destination's namespace, named by
+// internalvolsync.MoverJobName, and the Job's pods carry the label job-name
+// with the Job's name. The mover is gone only when the Job is gone and no
+// pod of it can write. While the Job is there it can start a pod at any time:
+// it may not have started its first yet, or be between two (VolSync gives it
+// a backoffLimit of 8). A pod in phase Succeeded or Failed has no container
+// left, the same rule podsGone uses, so once the Job is gone such a pod does
+// not count. Every other phase does, including Pending and a pod that is
+// being deleted, because each of those can still write.
+func moverRemains(ctx context.Context, c client.Reader, namespace, destination string) (string, error) {
+	job := internalvolsync.MoverJobName(destination)
 	pods := &corev1.PodList{}
-	if err := c.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{"job-name": internalvolsync.MoverJobName(destination)}); err != nil {
+	if err := c.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{"job-name": job}); err != nil {
 		return "", fmt.Errorf("list the mover pods of ReplicationDestination %s: %w", destination, err)
 	}
 	for _, pod := range pods.Items {
 		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
-			return pod.Name, nil
+			return "pod " + pod.Name, nil
 		}
 	}
-	return "", nil
+	err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: job}, &batchv1.Job{})
+	switch {
+	case err == nil:
+		return "Job " + job, nil
+	case apierrors.IsNotFound(err):
+		return "", nil
+	}
+	return "", fmt.Errorf("get the mover Job %s of ReplicationDestination %s: %w", job, destination, err)
 }
 
 // waitForStopped reports on a run that may not yet give the app back, release
 // its Leases, release its VolumeRestore or finish, because something it
-// stopped is still there: the pod of a mover it stopped (see stoppedMovers)
+// stopped is still there: a mover it stopped (see removeDestinations)
 // or the claim it must delete before it releases the VolumeRestore (see
 // releaseVolumeRestore). Rule X2 and designs/restorerun.md D1.
 //
@@ -2336,15 +2388,23 @@ func (r *RestoreRunReconciler) releaseVolumeRestore(ctx context.Context, run *ba
 	return "", nil
 }
 
-// destinationReleaseError returns the *releaseError for a stop of the mover
-// of the ReplicationDestination named name that failed: the run could not
-// delete the destination, or could not tell whether the mover's pod is gone.
-// releaseFailure puts it on the run's Ready condition.
+// destinationReleaseError returns the error for a restore mover the run could
+// not stop.
+//
+// Parameters:
+//   - name is the name of the ReplicationDestination whose mover the run
+//     stops, which the action and the advice name.
+//   - err is what failed: the read or the delete of the destination, or the
+//     look at the mover's Job and pods.
+//
+// It returns a *releaseError, which releaseFailure puts on the run's Ready
+// condition. The advice names the destination, the mover's Job and that
+// Job's pods, which a person can delete by hand.
 func destinationReleaseError(name string, err error) error {
 	return &releaseError{
-		action: "delete its ReplicationDestination " + name + " and see that mover's pod out",
-		advice: fmt.Sprintf("Fix the cause, or delete ReplicationDestination %s and its mover's pod yourself; "+
-			"either way the run then finishes by itself.", name),
+		action: "stop the mover of its ReplicationDestination " + name,
+		advice: fmt.Sprintf("Fix the cause, or delete ReplicationDestination %s, its mover's Job %s and that Job's pods yourself; "+
+			"either way the run then finishes by itself.", name, internalvolsync.MoverJobName(name)),
 		err: err,
 	}
 }

@@ -131,6 +131,7 @@ func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 	run = readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
@@ -351,6 +352,7 @@ func TestAQuiescedRestoreStopsTheAppUntilTheDatabaseIsDeleted(t *testing.T) {
 	}
 
 	restoreStep(t, r) // volume done, database deleted
+	restoreStep(t, r) // the volume's stopped mover is gone
 	run = readRestoreRun(t, c)
 	if run.Status.Items[1].Phase != backupv1alpha1.ItemDeleted {
 		t.Fatalf("database item = %+v, want Deleted", run.Status.Items[1])
@@ -539,6 +541,7 @@ func TestANamespaceRestoreLeavesTheDatabasesWhenAVolumeFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 	run = readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.Items[1].Phase != backupv1alpha1.ItemSkipped {
@@ -975,6 +978,7 @@ func TestANamespaceRestoreLeavesAnOptedOutClusterAlone(t *testing.T) {
 			restoreStep(t, r) // restore the volume
 			completeVolume(t, c)
 			restoreStep(t, r)
+			restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 			run = readRestoreRun(t, c)
 			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
@@ -1039,6 +1043,7 @@ func TestAVolumeRestoreWhoseSuccessWasNotRecordedFinishes(t *testing.T) {
 		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
 	}
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 	run := readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
@@ -1137,6 +1142,7 @@ func TestAnIntoRestoreFromARepositoryFillsAClaimTheMoverPlaces(t *testing.T) {
 
 	completeVolume(t, c)
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 	run = readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
 		t.Fatalf("phase = %q, item = %+v; want Succeeded", run.Status.Phase, run.Status.Items[0])
@@ -1219,6 +1225,7 @@ func TestANamespaceRestoreLeavesAClusterWithADeclaredBootstrapAlone(t *testing.T
 			restoreStep(t, r) // restore the volume
 			completeVolume(t, c)
 			restoreStep(t, r)
+			restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 			run = readRestoreRun(t, c)
 			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {

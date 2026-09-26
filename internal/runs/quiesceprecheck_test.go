@@ -127,6 +127,7 @@ func TestANamespaceBackupAndARestoreNeverStopTheAppTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoreStep(t, rr)
+	restoreStep(t, rr) // the pass after the destination's delete finds its mover gone
 	if restore := readRestoreRun(t, c); restore.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("the restore ended %s: %s", restore.Status.Phase, readyMessage(restore.Status.Conditions))
 	}

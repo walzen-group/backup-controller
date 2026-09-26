@@ -46,6 +46,8 @@ func TestADeletedRestoreThatCannotReleaseItsLeasesSaysWhatFailed(t *testing.T) {
 	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
 		t.Fatal(err)
 	}
+	restoreStep(t, r) // deletes the destination, and waits a pass for its mover
+	recorded(recorder)
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
 		t.Fatal("the deletion pass succeeded, want the refused delete returned")
@@ -96,6 +98,8 @@ func TestARestoreThatCannotGiveTheAppBackSaysWhatFailed(t *testing.T) {
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
 	recorder := events.NewFakeRecorder(10)
 	r.Recorder = recorder
+	restoreStep(t, r) // deletes the destination, and waits a pass for its mover
+	recorded(recorder)
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
 		t.Fatal("the timeout pass succeeded, want the refused patch returned")

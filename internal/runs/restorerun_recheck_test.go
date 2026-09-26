@@ -249,6 +249,7 @@ func TestARecheckAfterALostWriteDeletesTheDestinationItCreated(t *testing.T) {
 	}
 	repo.forget(t, newestTimed)
 	restoreStep(t, r)
+	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
 	expectItemFailed(t, c, "is no longer in the repository", "ReplicationDestination "+destinationName(restoreUID, 0))
 	expectNothingCreated(t, c, "")

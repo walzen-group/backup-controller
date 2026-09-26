@@ -255,6 +255,7 @@ func loseFailedRunWrite(c client.Client) client.Client {
 func TestAnIntoRestoreFailedOnItsLogIsNotStartedAgain(t *testing.T) {
 	r, c := startedRestore(t, fromRepository)
 	finishMover(t, c, recordedNoEligibleLog)
+	restoreStep(t, r) // deletes the destination, and waits a pass for its mover
 
 	r.Client = loseFailedRunWrite(c)
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {

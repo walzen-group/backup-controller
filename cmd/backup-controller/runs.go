@@ -12,6 +12,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/runs"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -69,6 +70,31 @@ type BootstrapWebhook struct {
 	Port    int
 }
 
+// runScheme returns the scheme of the run manager: every typed kind the
+// runs, the scheduler and the populator's orphan reconciler read or write.
+// It returns an error when a group fails to register.
+//
+// A kind missing here makes every read of it fail at run time, so each kind
+// a reconciler reads through its typed client must be listed. batch/v1 is
+// here for the Job of a restore mover the run has stopped, which a RestoreRun
+// waits for before it gives the app back.
+func runScheme() (*runtime.Scheme, error) {
+	scheme := runtime.NewScheme()
+	for name, add := range map[string]func(*runtime.Scheme) error{
+		"core":                corev1.AddToScheme,
+		"apps":                appsv1.AddToScheme,
+		"batch":               batchv1.AddToScheme,
+		"coordination.k8s.io": coordinationv1.AddToScheme,
+		"volsync":             volsyncv1alpha1.AddToScheme,
+		"backup.wlz.li":       backupv1alpha1.AddToScheme,
+	} {
+		if err := add(scheme); err != nil {
+			return nil, fmt.Errorf("register the %s types: %w", name, err)
+		}
+	}
+	return scheme, nil
+}
+
 // startRunControllers starts the controller-runtime manager that reconciles
 // BackupRun and RestoreRun, finishes the cleanup of claims whose VolumeRestore
 // is gone, runs the namespace scheduler, and serves the
@@ -111,17 +137,9 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 
 	configureLogging()
 
-	scheme := runtime.NewScheme()
-	for name, add := range map[string]func(*runtime.Scheme) error{
-		"core":                corev1.AddToScheme,
-		"apps":                appsv1.AddToScheme,
-		"coordination.k8s.io": coordinationv1.AddToScheme,
-		"volsync":             volsyncv1alpha1.AddToScheme,
-		"backup.wlz.li":       backupv1alpha1.AddToScheme,
-	} {
-		if err := add(scheme); err != nil {
-			return fmt.Errorf("register the %s types: %w", name, err)
-		}
+	scheme, err := runScheme()
+	if err != nil {
+		return err
 	}
 
 	skipNameValidation := true
