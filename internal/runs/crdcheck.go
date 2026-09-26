@@ -19,8 +19,7 @@ import (
 )
 
 // The names of the CustomResourceDefinitions a run checks before it changes
-// anything. The controller's ClusterRole grants get on exactly these, and on
-// the VolumeRestore CRD.
+// anything. The controller's ClusterRole grants get on exactly these.
 const (
 	backupRunsCRD  = "backupruns.backup.wlz.li"
 	restoreRunsCRD = "restoreruns.backup.wlz.li"

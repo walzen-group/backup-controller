@@ -296,32 +296,44 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // work makes one pass over a run that the queue has admitted, and returns when
 // to look again.
 //
+// Parameters:
+//   - run is the admitted BackupRun, as the pass read it. Its status is
+//     changed and written during the pass.
+//
+// It returns when to look again: a second after a pass that stopped the app,
+// every two seconds while the workloads are stopped, and after pollInterval
+// otherwise. A failed read or write comes back as an error, and
+// controller-runtime runs the pass again with its backoff; a failed restart
+// comes back the same way, after releaseFailed has reported it on the run.
+//
 // Each pass first releases the Leases of the items that finished in an
 // earlier pass. That release is best effort: a failure is logged and the
 // pass goes on, so it never keeps the workloads down past the limit below.
 //
 // On a run with spec.all set, the first pass calls quiesce to stop the
 // workloads marked backup.wlz.li/quiesce and does nothing else. Later passes
-// start no item until every pod of those workloads is gone. work then starts
-// every Pending item. An item that fails to start with an error other than a
-// refusal stays Pending with "not started yet: " and the error in its
-// message, the Ready condition takes reason Retrying and names each such
-// item, and the pass goes on; the next pass tries the item again. Items that
-// wait for another run are named as well: the Retrying message names every
-// such wait, and without a retry the run waits with reason SourceBusy and a
-// message that names every wait. Once
-// every volume's clone is cut, it records the time of the pass in
-// status.restartedAt with status.restartPending set, and
-// writes the status. It then scales the workloads back up, resumes the
-// Kustomizations it suspended, and clears status.restartPending. When that
-// restart fails, the pass reports it at once with reason RestartFailed and a
-// message that says the run is still backing up and must not be deleted, and
-// how to give the app back by hand (see releaseFailed). It returns the error,
-// so the restart is retried. A pass that
-// finds status.restartPending set repeats the restart and keeps the recorded
-// moment. Once the stored status shows the restart done, no pass repeats it.
-// Times in the status are whole seconds. Last, it collects the result of
-// every Running item.
+// start no item until every pod of those workloads is gone.
+//
+// work then starts every Pending item. An item that fails to start with an
+// error other than a refusal stays Pending with "not started yet: " and the
+// error in its message, the Ready condition takes reason Retrying and names
+// each such item, and the pass goes on; the next pass tries the item again.
+// Items that wait for another run are named as well: the Retrying message
+// names every such wait, and without a retry the run waits with reason
+// SourceBusy and a message that names every wait.
+//
+// Once every volume's clone is cut, work records the time of the pass in
+// status.restartedAt with status.restartPending set, and writes the status.
+// It then scales the workloads back up, resumes the Kustomizations it
+// suspended, and clears status.restartPending. When that restart fails, the
+// pass reports it at once with reason RestartFailed and a message that says
+// the run is still backing up and must not be deleted, and how to give the
+// app back by hand (see releaseFailed). A pass that finds
+// status.restartPending set repeats the restart and keeps the recorded
+// moment, once it has read the run again through the uncached Reader and
+// the stored run still has the flag set (see readStop). Once the stored
+// status shows the restart done, no pass repeats it. Times in the status
+// are whole seconds. Last, work collects the result of every Running item.
 //
 // The workloads stay stopped for at most the namespace's
 // backup.wlz.li/max-quiesce limit, ten minutes by default, counted from
@@ -333,9 +345,7 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 //
 // The run finishes once every item is done and, on a run with spec.all set,
 // the workloads are running again. It finishes Succeeded when no item failed
-// and Failed otherwise. A run past its timeout is aborted. While the
-// workloads are stopped, work looks again every two seconds; otherwise it
-// waits pollInterval.
+// and Failed otherwise. A run past its timeout is aborted.
 func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
 	// The status keeps times in whole seconds. A snapshot moved in this pass
 	// must carry the restartedAt that later passes read back.
@@ -742,13 +752,13 @@ func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1al
 // wait, which happens when the volume's ReplicationSource is still completing
 // the backup of another run that waits for it, or when a RestoreRun's mover
 // works on the claim or its repository (see otherMover). The message names
-// that run, and the item stays Pending. When the source is busy with a backup no run
-// waits for (see holder), the item fails at once with a message that says
-// what a person can do, and the source is left alone. Otherwise it returns an
-// empty string. Any other failed read or write, such as a timeout from the
-// API server or a 500 from a webhook it cannot reach, comes back as an error
-// with the item left Pending. The caller records the error in the item's
-// message and tries the item again on its next pass.
+// that run, and the item stays Pending. When the source is busy with a
+// backup no run waits for (see holder), the item fails at once with a
+// message that says what a person can do, and the source is left alone.
+// Otherwise it returns an empty string. Any other failed read or write, such
+// as a timeout from the API server or a 500 from a webhook it cannot reach,
+// comes back as an error with the item left Pending. The caller records the
+// error in the item's message and tries the item again on its next pass.
 func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) (string, error) {
 	switch item.Kind {
 	case "ReplicationSource":

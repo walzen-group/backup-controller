@@ -64,12 +64,15 @@ type OrphanReconciler struct {
 	stops internalvolsync.Stops
 }
 
-// SetupWithManager registers the reconciler with mgr. It watches claims, and
-// passes on only those orphaned reports on, and VolumeRestores, whose deletion
-// enqueues the claims that name them. The manager's initial list sends every
-// claim through the predicate, so claims that were stuck before the process
-// started are cleaned up on its first start. It returns an error when the
-// controller cannot be built.
+// SetupWithManager registers the reconciler with the manager mgr, and
+// returns an error when the controller cannot be built.
+//
+// It watches two kinds. Of the claims, it passes on only those for which
+// orphaned reports true. Of the VolumeRestores, it passes on only a deletion,
+// which enqueues every claim that names the deleted VolumeRestore. The
+// manager's initial list sends every claim through the predicate, so claims
+// that were stuck before the process started are cleaned up on its first
+// start.
 func (r *OrphanReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.PersistentVolumeClaim{}, builder.WithPredicates(r.predicate())).
@@ -85,7 +88,7 @@ func (r *OrphanReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// predicate passes the claims orphaned reports on.
+// predicate passes the claims for which orphaned reports true.
 func (r *OrphanReconciler) predicate() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		claim, ok := obj.(*corev1.PersistentVolumeClaim)
