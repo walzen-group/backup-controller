@@ -152,7 +152,10 @@ replicas along with the Cluster.
 From v0.8.0 a RestoreRun with `repository:` and `into:` creates a plain claim
 of `intoSize` with no data source, and a ReplicationDestination with
 `copyMethod: Direct` whose mover writes the selected snapshot into that claim.
-A run with `claim:` and `into:` keeps the populator path.
+From v0.9.0 every `into` restore takes that path, from `claim:` and from
+`repository:` alike. Until then a run with `claim:` and `into:` wrote a
+VolumeRestore and a claim naming it in `dataSourceRef`, and the populator filled
+that claim.
 
 The populator path is what v0.7.x ran for both shapes: the run writes a
 VolumeRestore and a claim naming it in `dataSourceRef`. On a
@@ -173,9 +176,13 @@ create or no pod can reach, and the claim does not say why.
 
 With a Direct destination, the mover pod is the claim's first consumer. The
 scheduler places the mover, and the claim is provisioned on the mover's node,
-the way VolSync places a destination claim it creates itself. The claim is
-Bound while the mover still writes into it, so the run's Succeeded phase is
-what says the data is there. [restores.md](restores.md#submitting-a-restore)
+the way VolSync places a destination claim it creates itself. An `into` restore
+from a `claim:` has a node to copy as well, and takes it, so the copy lands on
+the pool that holds the original and the scheduler places the mover pod with
+the volume. The claim is Bound while the mover still writes into it, so the
+run's Succeeded phase is what says the data is there, and from v0.9.0 that phase
+also requires the mover's log to name the snapshot the checks selected.
+[restores.md](restores.md#submitting-a-restore)
 shows the run.
 
 ## Leave an opted-out Cluster out of a RestoreRun
@@ -339,3 +346,96 @@ A restore that is running, and a restore that has failed, both have to be
 visible without reading controller logs. The object carries kstatus-compatible
 conditions and a list of the claims being filled, so `kubectl get` answers the
 question and a Flux Kustomization with `wait: true` can gate on it.
+
+## Read the installed CRD before a run changes anything
+
+From v0.9.0 a run reads the CustomResourceDefinition of its kind straight from
+the API server before it stops a workload, creates a mover or deletes a
+Cluster, and ends with reason CRDOutdated when the schema lacks a field the
+controller writes. The API server drops an undeclared field from every write,
+so a run under an old CRD could stop an app, record nothing to start it again,
+and report Succeeded.
+
+The check walks the fields the controller writes out of the Go types rather
+than comparing version numbers, so an install that applied the CRDs of the
+current release passes it whatever the previous release was. A failed read of
+another kind is retried, but the run fails closed when it may not read the CRD
+at all, since it then cannot tell whether its writes survive. Helm upgrades no
+CRD on its own, which is why every release ships them in the same asset and the
+message names the fix.
+
+## Write every trigger into spec.restic.unlock too
+
+From v0.9.0 every ReplicationSource the controller writes carries
+`spec.restic.unlock` with the same value as its manual trigger. VolSync runs
+`restic unlock` before a backup only while that field differs from
+`status.restic.lastUnlocked`, which a mover writes once its Job succeeds, so
+the value has to move with every trigger. A restic that finds a lock left by a
+killed mover refuses the `forget` after the backup, and the repository then
+grows by snapshots nothing deletes. `restic unlock` removes only the locks it
+counts as stale, 30 minutes for a lock from another host, so this clears the
+lock left behind without an operator and without removing a lock that belongs
+to a mover still running.
+
+## Take one Lease per claim and repository
+
+From v0.9.0 a BackupRun and a RestoreRun each take a `coordination.k8s.io`
+Lease on the claim they work on and one on its repository Secret, right before
+they create their mover object, and release it once the item ends. Creating a
+Lease is atomic, so of two runs that reach that point in the same instant the
+API server admits exactly one, and the other waits with reason SourceBusy.
+
+The alternative was to look for the other run's mover object, which is what the
+controller did first: a ReplicationSource carrying a live run's trigger, or a
+ReplicationDestination carrying a live run's UID. That read and the create that
+follows it are two calls, and two runs that pass the read together both create
+their mover; two movers on one volume write the same files, and one run's clone
+can be cut while the other writes. The Lease closes that window without holding
+either run back otherwise: it names its holder by UID, so a run created again
+under the same name does not inherit it, and a Lease whose holder has finished
+or is gone is taken over rather than waited on.
+
+## Confirm a restore from the mover's log
+
+VolSync completes a restore trigger whatever its mover did: a mover that found
+no snapshot in reach exits 0, and VolSync reports the sync as done. From v0.9.0
+a RestoreRun reads `status.latestMoverStatus` of its ReplicationDestination and
+counts a volume item as restored only when the filtered log names the snapshot
+its checks selected.
+
+The alternative is to trust the completed trigger, which is how a restore
+reported success over a volume holding what it held before. VolSync leaves no
+other evidence: it keeps no exit status of a mover that succeeded, and the log
+is all that remains of it. It also keeps only the last `MOVER_LOG_MAX_BYTES`
+bytes of that log, so a VolSync installed with a small value fails every
+restore instead of confirming one, and the failure names that setting.
+
+## Give the app back when the quiesce limit runs out
+
+From v0.9.0 a run with `all: true` keeps its quiesced workloads stopped for a
+`backup.wlz.li/max-quiesce`, ten minutes by default, counted from
+`status.quiescedAt`. When the limit runs out the run gives the workloads back
+and fails every volume item whose clone VolSync has not cut, naming the clone
+that never appeared.
+
+A run could instead wait until its `timeout`, six hours by default. That leaves
+an app and its database down for six hours because one mover is stuck, with
+nothing on the run saying the app is what is being held. The limit bounds that,
+and the volumes whose clones were cut go on uploading after the app is running,
+so a slow mover costs the run nothing but its own item.
+
+## Fail an item whose source tag no run waits for
+
+A ReplicationSource holds the tag of the run that last used it, and VolSync
+retries that tag's sync until a mover succeeds. A later run writes its own
+trigger, VolSync completes the new trigger with the older backup the tag still
+holds, and the new run records a snapshot of data from before the older run
+started. From v0.9.0 a run that finds such an open tag fails that item at once,
+names the run or trigger the tag belongs to, what VolSync is doing with it, and
+how to give that backup up.
+
+Waiting was the earlier behaviour, and it cost the whole namespace: a namespace
+run checks every source before it stops the app, so one tag no run waited for
+kept every run of that namespace in SourceBusy until its timeout. Failing the
+item leaves the source alone, and VolSync still finishes on its own once the
+mover succeeds; the message says how to give the backup up when it never will.

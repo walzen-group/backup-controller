@@ -152,6 +152,13 @@ The last refusal matters most during a rebuild, when the controller may still
 be starting: letting the Cluster through would create the empty database this
 page exists to prevent.
 
+A database restore deletes its Cluster and waits for it to be created again.
+Any Cluster that comes back without the recovery the run recorded fails that
+item and is left alone, so a run never deletes a Cluster it did not recover.
+[restores.md](restores.md#starting-a-database-empty) and
+[namespace-backups.md](namespace-backups.md#a-database-restore) have the
+messages.
+
 ```mermaid
 flowchart LR
     archive[("barman archive<br/>base backups + WAL")]

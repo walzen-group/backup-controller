@@ -102,6 +102,13 @@ groups, so the render has to carry all of them:
 Do not split the install across two assets. One file is the whole install, which
 is what makes the module a single `data "http"` and a single version string.
 
+The CRDs are part of every install of a release, the upgrades included. A run
+reads the installed CRD of its kind before it changes anything and ends with
+reason CRDOutdated when the schema lacks a field the controller writes, because
+the API server would drop that field from every write. Applying this file
+server-side updates them; Helm upgrades no CRD on its own, and an install done
+with `helm upgrade` alone leaves the CRDs at their first version.
+
 ## Image
 
 | | |
@@ -123,14 +130,16 @@ caller in the controller:
 | `persistentvolumes` | get, list, watch, patch | rebinding the volume to the app's claim, and reading a volume's node for its mover |
 | `storageclasses` | get, list, watch | reading the binding mode |
 | `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used, a RestoreRun finding the pod that holds a claim, and the orphan reconciler listing the mover pod it waits for |
-| `volumerestores` (our group) | get, list, watch, create, update | reading the data source, a RestoreRun writing the point-in-time one its scratch claim fills from, adding and removing the `backup.wlz.li/volume-populator` finalizer, and the orphan reconciler's check that a claim's VolumeRestore is gone and its watch for deleted ones |
+| `volumerestores` (our group) | get, list, watch, create, update | reading the data source, adding and removing the `backup.wlz.li/volume-populator` finalizer, and the orphan reconciler's check that a claim's VolumeRestore is gone and its watch for deleted ones |
 | `volumerestores/status` | patch, update | reporting conditions |
 | `backupruns` | get, list, watch, create, update, delete | the runs and their finalizer; create is the scheduler, delete the 30-day TTL |
 | `restoreruns` | get, list, watch, update, delete | the runs and their finalizer |
 | `backupruns/status`, `restoreruns/status` | patch, update | reporting phase, items and conditions |
-| `backupruns/finalizers`, `restoreruns/finalizers` | update | the Workload, scratch claim and VolumeRestore a run creates name the run as their controller with `blockOwnerDeletion`, which OwnerReferencesPermissionEnforcement allows only with this verb |
+| `backupruns/finalizers`, `restoreruns/finalizers` | update | the Workload and scratch claim a run creates name the run as their controller with `blockOwnerDeletion`, which OwnerReferencesPermissionEnforcement allows only with this verb |
+| `customresourcedefinitions` (apiextensions.k8s.io), named `backupruns.backup.wlz.li`, `restoreruns.backup.wlz.li` and `volumerestores.backup.wlz.li` | get | a run reads the installed CRD of its kind before it changes anything, and ends with reason CRDOutdated when the schema lacks a field the controller writes, which the API server would drop |
 | `replicationsources.volsync.backube` | get, list, watch, create, update, patch | writing each enabled claim's source and its manual trigger; v0.8.2 dropped delete, which v0.8.0 and v0.8.1 used after a failed mover |
-| `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill, per in-place restore, and per restore from `repository:` into a new claim; the orphan reconciler deletes the destination of a claim whose VolumeRestore is gone |
+| `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill and one per volume restore, in place or with `into:`; the orphan reconciler deletes the destination of a claim whose VolumeRestore is gone |
+| `leases` (coordination.k8s.io) | get, list, create, update, delete | the Lease a BackupRun or RestoreRun takes on a claim and on its repository Secret right before it starts a mover, so a backup and a restore of either never run at once (internal/runs/lease.go). Runs live in every namespace, so the rule is cluster-wide, and `update` takes over the Lease of a run that has finished |
 | `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
 | `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |
 | `clusters.postgresql.cnpg.io` | get, list, delete | the webhook's shared-archive check, a database run, and a database restore deleting its Cluster |

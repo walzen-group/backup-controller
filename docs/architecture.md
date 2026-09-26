@@ -25,9 +25,10 @@ In the app's namespace:
 | Kueue Workload, one per run, named in the run's `status.workload` | each BackupRun, which also writes its `PodsReady` condition | deleted when the run ends |
 | ReplicationSource named after each claim marked `backup.wlz.li/enabled` | each BackupRun, owned by the claim and labelled `app.kubernetes.io/managed-by: backup-controller` | stays, and goes with the claim; a failed mover leaves it in place, and VolSync keeps retrying |
 | CloudNativePG Backup `<cluster>-<suffix>` | each BackupRun, one per Cluster marked `backup.wlz.li/enabled` | stays, as CloudNativePG's backup record |
-| ReplicationDestination | an in-place RestoreRun, and a RestoreRun with `repository:` and `into:` | deleted once the item's end is in the run's status |
-| VolumeRestore named by `into:`, with the finalizer `backup.wlz.li/volume-populator` | a RestoreRun with `claim:` and `into:`, owned by the run | deleted with the RestoreRun; the run removes the finalizer itself when it fails or is deleted before the populator started |
-| a scratch claim named by `into:` | a RestoreRun with `into:`, owned by the run; with `claim:` it names the VolumeRestore in `dataSourceRef`, with `repository:` it has no data source | deleted with the RestoreRun, the claim's dataset included |
+| ReplicationDestination | a RestoreRun that restores a volume: in place, or with `claim:` and `into:`, or with `repository:` and `into:` | deleted once the item's end is in the run's status |
+| Lease `backup-controller-claim-<claim uid>` and `backup-controller-repo-<secret uid>` | a run, right before it creates its mover object for an item | released once the item's end is in the run's status, and taken over by another run when its holder is gone or finished |
+| VolumeRestore named by `into:`, with the finalizer `backup.wlz.li/volume-populator` | a v0.8.1 or older controller, for an `into` restore from a claim, owned by the run | deleted with the RestoreRun; v0.9.0 creates none, and the run removes the finalizer itself when the populator never took the VolumeRestore on |
+| a scratch claim named by `into:` | a RestoreRun with `into:`, owned by the run; it carries no data source, and the run's ReplicationDestination fills it | deleted with the RestoreRun, the claim's dataset included |
 
 In the controller's namespace, for each claim the populator fills: a copy of the
 repository Secret and a ReplicationDestination, both deleted when the fill ends,
@@ -49,6 +50,26 @@ On objects the controller does not own:
 | a claim being filled | the library's `backup.wlz.li` annotations and finalizer | while the fill runs |
 | a claim being deleted whose VolumeRestore is gone | the library's finalizer `backup.wlz.li/populate-target-protection` removed by the orphan reconciler, and its WaitingForMover and DataSourceGone events | once the claim's destination, mover pod, Secret copy and prime claim are gone |
 | the VolumeRestore a claim fills from | the finalizer `backup.wlz.li/volume-populator` | while any claim is listed in its `status.claims`; the populator adds it on its first call for a claim, which the library makes once the claim's prime claim is bound |
+
+Before a run changes anything, the run manager reads the installed CRD of the
+run's kind straight from the API server and compares its schema with the fields
+the Go type writes. A run whose CRD lacks one of those fields ends Failed with
+reason CRDOutdated before it stops or creates anything, because the API server
+would drop that field from every write: a run that lost `status.quiesced` would
+stop an app and record nothing to start it again. A run that v0.8.x planned
+under an older CRD meets the check again right before it stops the workloads.
+The same reason covers a controller that may not read the CRD, and one whose
+CRD is not installed. Applying the CRDs of the controller's release fixes each;
+Helm upgrades no CRD on its own. [packaging.md](packaging.md#rbac-the-controller-needs)
+lists the rule this needs.
+
+A backup and a restore of one claim or repository never run at once. Each run
+takes a `coordination.k8s.io` Lease for the claim and one for the repository
+before it creates its mover object, so the API server admits exactly one of two
+runs that reach that moment together, and a run that finds a Lease held waits
+with reason SourceBusy.
+[namespace-backups.md](namespace-backups.md#one-mover-at-a-time) has the
+messages and the takeover rule.
 
 Its own BackupRuns and RestoreRuns carry a finalizer, which releases whatever a
 run changed when the run fails, times out or is deleted. The sources it writes
@@ -160,16 +181,20 @@ While the item says Deleted, the run sorts the Cluster it finds by name:
 | Cluster found | What the run does |
 | --- | --- |
 | none, or one being deleted | waits |
-| one carrying `backup.wlz.li/bootstrap: initdb` | marks the item Skipped and never deletes it |
+| the UID in `clusterUID`, carrying `backup.wlz.li/bootstrap: initdb` or declaring its own bootstrap method | marks the item Skipped and never deletes it |
 | the UID in `clusterUID` | deletes it again: the old Cluster, which a failed delete or a controller restart after the mark did not reach |
 | another UID, with `backup.wlz.li/restore-run` naming the run | marks the item Recovering |
-| another UID, without that annotation | deletes it again: it was not created through this run |
+| any other Cluster | fails the item and leaves the Cluster alone, naming what it does instead: it archives nowhere, another run recovered it, or the webhook did not mark it |
 
 The UID settles what the annotation alone cannot. The webhook's
 `backup.wlz.li/restore-run` stays on a recovered Cluster for good, so a run
 created again under the same name would find it on the old Cluster too, and
-take the old database for its recovery. A recovered Cluster deleted before it
-turns healthy fails the item.
+take the old database for its recovery. A run deletes only the Cluster it
+recorded, so a Cluster that comes back without that run's recovery is reported
+and left alone, and so is every Cluster an item without a `clusterUID`, from a
+run that started under v0.7.2, finds.
+[namespace-backups.md](namespace-backups.md#a-database-restore) has those
+messages. A recovered Cluster deleted before it turns healthy fails the item.
 
 ### A Cluster being created
 
@@ -332,6 +357,12 @@ the worker the scheduler chose for the pod, and the mover follows the volume it
 has to mount. One decision, made once.
 
 ## Object flow for one restore
+
+This is the path a claim takes when it is created and its `dataSourceRef` names
+a VolumeRestore. A RestoreRun writes into a claim the same way, through a
+ReplicationDestination with `copyMethod: Direct`, but in the app's namespace
+and without the populator library;
+[restores.md](restores.md#submitting-a-restore) has those runs.
 
 ```mermaid
 sequenceDiagram

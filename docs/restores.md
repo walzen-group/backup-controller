@@ -101,7 +101,10 @@ on one filesystem is how the volume being restored is corrupted.
 Stopping the workload is what prevents it. A RestoreRun with `quiesce` stops the
 workloads that list names itself, as
 [namespace-backups.md](namespace-backups.md#restore-a-whole-namespace-to-one-moment)
-shows. Without that list the run stops nothing: it waits in phase Waiting,
+shows; while a pod of one of them is still terminating, the run waits in phase
+Waiting with Ready reason Running and `waiting for pod <namespace>/<pod> to stop
+before anything is restored`, because a pod shutting down can still write.
+Without that list the run stops nothing: it waits in phase Waiting,
 reason ClaimInUse, until no pod mounts the claim. It lists the pods straight
 from the API server on every pass, because a cached list that had not yet seen
 a new pod would report the claim free. Who stops the workload then depends on
@@ -169,11 +172,31 @@ spec:
   restoreAsOf: "2026-09-13T00:00:00Z"
 ```
 
-The controller writes a VolumeRestore carrying the time of the snapshot the
-run selected, and a claim naming it, so the ordinary populator path fills it on
-the source claim's node. Mount `canary-backup-friday` from a throwaway pod and
-compare. Both objects are owned by the RestoreRun, so deleting the run deletes
-the claim and its dataset with it; keep the run until the comparison is done.
+The run creates `canary-backup-friday` empty, with the source claim's size and
+storage class, and takes the node the source claim's volume is on. A
+ReplicationDestination of the run's own, with `copyMethod: Direct`, writes the
+selected snapshot into that claim through a mover pod the scheduler places on
+that node, so the mover's log says which snapshot it restored and the run
+confirms it the way it does in place. Mount `canary-backup-friday` from a
+throwaway pod once the run reaches Succeeded and compare. The claim and the
+destination are owned by the RestoreRun, so deleting the run deletes the claim
+and its dataset with it; keep the run until the comparison is done.
+
+The run writes only into a claim it created itself. A claim or
+ReplicationDestination of the name `into` that the run does not control fails
+the run, and so does a claim of that name that appears after the checks:
+
+```text
+claim canary-backup-friday already exists and this run did not create it. spec.into names a new claim for the run to create, and a restore never writes into a claim it did not create. Choose a name no claim in this namespace has. To overwrite an existing claim, restore it in place with spec.claim.
+```
+
+An `into` restore that a v0.8.1 or older controller started through the
+VolumeRestore populator ends Failed, because nothing can tell which snapshot the
+populator restored: its mover ran in the controller's namespace, and the
+populator deletes its ReplicationDestination, and with it the mover's log,
+before the claim binds. The message says what the claim now holds and that a
+new RestoreRun either with another `into` name, or after this one is deleted,
+restores it again with a run whose mover's log is checked.
 
 Before it creates anything, a run lists the repository's snapshots and fails
 with reason NoBackupInReach when none is at or before `restoreAsOf`. VolSync's
@@ -204,7 +227,12 @@ of that size with no data source, and a ReplicationDestination with
 mover pod is the claim's first consumer, so on a WaitForFirstConsumer class the
 scheduler places the claim wherever the mover pod runs.
 [decisions.md](decisions.md#restore-a-repository-into-a-plain-claim-through-a-direct-replicationdestination)
-records why this path skips the populator.
+records why this path skips the populator. A run that names only
+`spec.repository` is refused before it creates anything: `spec.repository alone
+restores into a new claim, so spec.into is required, and it must name a claim
+that does not exist yet. To overwrite an existing claim from this repository,
+set spec.claim to it as well; the run then restores it in place once no pod
+mounts it.`
 
 `scratch` is Bound while the mover still writes into it, so wait for the run to
 reach Succeeded before you mount it. A mover that fails ends the run Failed
@@ -220,11 +248,87 @@ before it compares them. A snapshot taken at 06:00:00.7 is in reach of
 reports for it.
 
 The run records the snapshot it selected in `status.items[].snapshot` and its
-time in `status.items[].snapshotTime`. The mover, or the VolumeRestore of an
-`into` restore, gets that time in whole seconds as `restoreAsOf`, with no
-`previous`. Were the mover handed the run's own `restoreAsOf` and `previous`,
-it would choose again when it starts, and a scheduled backup that finished in
-between would change which snapshot is the newest, or the one before it.
+time in `status.items[].snapshotTime`. The mover gets that time in whole seconds
+as `restoreAsOf`, with no `previous`. Were the mover handed the run's own
+`restoreAsOf` and `previous`, it would choose again when it starts, and a
+scheduled backup that finished in between would change which snapshot is the
+newest, or the one before it.
+
+Pinning the mover to a second is not the same as pinning it to a snapshot: it
+lists the snapshots itself and takes the newest one in that second. So the
+checks refuse a selection the mover would not restore, and the run ends Failed
+with reason NoBackupInReach before anything is created. Each message says what
+the mover would restore instead, or why nothing can be told:
+
+| Case | Message |
+| --- | --- |
+| another snapshot shares the selected one's second | `snapshot 6e473100 (2026-09-26T09:03:53Z) shares its second with snapshot 2edf5bab, and VolSync's mover picks by the whole second, so it would restore 2edf5bab. Choose 2edf5bab or a snapshot in another second` |
+| the other snapshot in that second is not tagged `quiesced`, which a `syncDatabaseToVolume` run requires | `... shares its second with snapshot 2edf5bab, which is not tagged quiesced, ... Set restoreAsOf before 2026-09-26T09:03:53Z, or previous, to choose a quiesced snapshot in another second` |
+| two snapshots carry the same time to the nanosecond | `snapshot 6e473100 (2026-09-26T09:03:53Z) has the same time as snapshot 2edf5bab, to the nanosecond, and restic lists such snapshots in no set order, so VolSync's mover may restore 2edf5bab. Choose a snapshot in another second` |
+| the selected snapshot has no path containing /data, as the mover writes them | `snapshot 6e473100 (2026-09-26T09:03:53Z) has no path containing /data (its paths: /, /etc), and VolSync's mover passes over such snapshots, so it cannot restore 6e473100. Choose a snapshot a VolSync mover took` |
+| any snapshot in the repository lists /data after its first path, which the mover misreads | `snapshot 2edf5bab lists /data after its first path (its paths: /, /data), which VolSync's mover misreads as a snapshot of its own dated the day the mover runs, so the run cannot tell which snapshot the mover would restore from this repository. VolSync writes snapshots with /data as their only path; restore from a repository that holds only those` |
+
+A repository holding such a snapshot is refused as a whole, whatever the run
+selected.
+
+The run lists the repository once more right before it creates the destination,
+so nothing is created from a selection the repository no longer holds. A
+backup's `restic forget` that removed the selected snapshot after the checks, or
+a quiesced backup that rewrote it under another ID and time, fails the item and
+says so, each followed by `. Nothing was written to claim <claim>. Create a new
+RestoreRun to select again`:
+
+```text
+snapshot 6e473100 (2026-09-26T09:03:53Z), which the checks selected, is no longer in the repository; a backup's retention (restic forget) removed it after the checks
+```
+
+```text
+snapshot 6e473100, which the checks selected, was rewritten as 2edf5bab at 2026-09-26T09:05:00Z by a quiesced backup after the checks
+```
+
+An item that a v0.7.2 controller planned records no snapshot time. Its re-check
+goes by the recorded snapshot's own second, and its mover is handed the run's
+own `restoreAsOf`, so such an item still counts as restored only when the
+mover's log names the snapshot the item recorded.
+
+One kind of snapshot holds data older than its time. When a BackupRun fails a
+volume item, VolSync keeps retrying that sync with the clone it cut when the
+sync started, and restic stamps the retry's snapshot with the retry's own time,
+so the snapshot holds the data of that earlier moment.
+[namespace-backups.md](namespace-backups.md#sources-the-controller-writes) has
+the item message that says this. Such a snapshot carries no `quiesced` tag, so a
+`syncDatabaseToVolume` restore never chooses it. A plain `restoreAsOf` may, and
+the volume then holds the newest data captured for that claim, stamped later
+than the data is from.
+
+### What the mover restored
+
+VolSync completes a restore whatever its mover did, so the run reads the
+mover's log. `status.latestMoverStatus` of the item's ReplicationDestination
+holds the filtered log of the mover that completed the run's trigger, and the
+item succeeds only when that log names the recorded snapshot:
+
+```text
+restoring snapshot 6e473100 of [/data] at 2026-09-26 09:03:53.753460659 +0000 UTC by root@volsync to .
+```
+
+An item whose log names no snapshot fails, and the message says why the run
+cannot confirm what the claim holds: the log named another snapshot, the mover
+found none, the log named a snapshot and also said it found none, the log was
+empty, or the item records no snapshot to compare with. A mover that restored
+another snapshot names both: `the mover restored snapshot 2edf5bab where the
+checks selected 6e473100; claim canary-backup now holds 2edf5bab`. A mover that
+found nothing says what the claim holds now: `the mover found no snapshot at or
+before 2026-09-26T09:03:53Z and wrote nothing; claim canary-backup holds what it
+held before`, or `claim scratch is empty` for an `into` restore.
+
+VolSync keeps only the last `MOVER_LOG_MAX_BYTES` bytes of the filtered log,
+1024 by default, so a mover whose log is cut short fails the item as well:
+`the mover finished, but its logs name no snapshot, so the run cannot confirm
+what claim canary-backup holds. VolSync keeps only the last MOVER_LOG_MAX_BYTES
+bytes (1024 by default) of the filtered log. Logs: ...`. A VolSync installed
+with `MOVER_LOG_MAX_BYTES` set to 0 or a very small value therefore fails every
+restore rather than confirming one.
 
 ## Databases restore themselves
 
@@ -562,7 +666,15 @@ A RestoreRun leaves an opted-out Cluster alone too:
 | --- | --- |
 | `all: true` | its item is Skipped with `the Cluster carries backup.wlz.li/bootstrap: initdb, which asks for an empty database, so the run leaves it alone`, and the run restores everything else |
 | `database: <cluster>` | the run ends Invalid before it touches anything |
-| a Cluster that gains the annotation after the run marked it Deleted, or is created again with it | its item is Skipped, and the run never deletes it again |
+| a Cluster that gains the annotation after the run marked it Deleted | its item is Skipped, and the run never deletes it again |
+| a Cluster that is created again with the annotation after the run deleted it | its item is Failed: `Cluster <name> came back carrying backup.wlz.li/bootstrap: initdb after this run deleted it, so it started empty and nothing was restored. Remove the annotation from its manifest and create a new RestoreRun to recover it. The run leaves the Cluster alone` |
+
+Only the Cluster that carries the UID a run recorded is deleted again, so a run
+never deletes a Cluster it did not recover. Any other Cluster of the item's name
+fails the item with what the Cluster is doing instead, such as `it archives
+nowhere`, `RestoreRun <name> recovered it`, or one of the two messages above;
+[namespace-backups.md](namespace-backups.md#a-database-restore) has the
+messages.
 
 The webhook never recovers an opted-out Cluster and never marks it as a run's
 recovery. A run that deleted one would find it refused over its old archive,
@@ -578,4 +690,8 @@ own spec.bootstrap.<method>, so the run leaves it alone`. That covers
 that Cluster restores as usual. A run that deleted a Cluster declaring
 `pg_basebackup` would see Flux create it again with that method, the webhook
 refuse it while the run waits, and the database stay down until the run's
-timeout with nothing restored.
+timeout with nothing restored. When such a Cluster does exist, the item fails
+with `Cluster <name> came back declaring spec.bootstrap.pg_basebackup after this
+run deleted it, so it started from that bootstrap and nothing was restored.
+Remove spec.bootstrap.pg_basebackup from its manifest and create a new
+RestoreRun to recover it. The run leaves the Cluster alone`.
