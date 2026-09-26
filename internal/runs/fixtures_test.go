@@ -95,30 +95,10 @@ var crds = []string{
 // the server-owned metadata as kube-apiserver does, prunes custom resources
 // against the pinned CRDs in crds, and gives every kind the package uses the
 // status subresource its CRD declares. The server clock stands at frozen.
-//
-// It registers the status subresources itself and wraps the fake with
-// strictclient.New: strictclient.Build panics on this package's scheme,
-// because scheme.New returns an Unstructured without a kind for the kinds
-// registered as unstructured, and the fake builder cannot find the kind of
-// that object.
 func newClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
-	status := []client.Object{
-		&backupv1alpha1.BackupRun{}, &backupv1alpha1.RestoreRun{}, &backupv1alpha1.VolumeRestore{},
-		&volsyncv1alpha1.ReplicationSource{}, &volsyncv1alpha1.ReplicationDestination{},
-	}
-	for _, gvk := range unstructuredKinds {
-		u := &unstructured.Unstructured{}
-		u.SetGroupVersionKind(gvk)
-		status = append(status, u)
-	}
-	inner := fake.NewClientBuilder().
-		WithScheme(scheme(t)).
-		WithObjects(objects...).
-		WithStatusSubresource(status...).
-		Build()
 	now := frozen
-	c := strictclient.New(inner, strictclient.Options{
+	c := strictclient.Build(fake.NewClientBuilder().WithObjects(objects...), scheme(t), strictclient.Options{
 		Clock: func() time.Time { return now },
 		CRDs:  crds,
 	})
