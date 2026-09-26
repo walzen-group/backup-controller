@@ -60,6 +60,7 @@ var grants = []grant{
 	{"events.k8s.io", "events", []string{"create", "patch"}, "the orphan reconciler's WaitingForMover and DataSourceGone events"},
 
 	{"volsync.backube", "replicationsources", []string{"get", "list", "watch", "create", "update", "patch"}, "each enabled claim's source, which the controller writes and triggers"},
+	{"coordination.k8s.io", "leases", []string{"get", "list", "create", "update", "delete"}, "the Leases a BackupRun or RestoreRun takes on a claim and its repository before it starts a mover, in every namespace runs live in"},
 	{"backup.wlz.li", "backupruns", []string{"get", "list", "watch", "create", "update", "delete"}, "the runs, the finalizer each carries, and the scheduled runs"},
 	{"backup.wlz.li", "restoreruns", []string{"get", "list", "watch", "update", "delete"}, "the runs, the finalizer each carries, and the webhook's lookup of a waiting run"},
 	{"backup.wlz.li", "backupruns/status", []string{"patch", "update"}, "a BackupRun's phase and conditions"},

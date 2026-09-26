@@ -334,6 +334,11 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	if over {
 		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
 	}
+	// The Leases of an item that finished in an earlier pass go now, so a
+	// restore of that claim need not wait for the rest of the run.
+	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(name string) bool { return backupItemDone(run, name) }); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	if run.Spec.All && run.Status.QuiescedAt == nil {
 		return r.quiesce(ctx, run, now)
@@ -590,7 +595,7 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 			return "", nil
 		}
 		tag := TriggerFor(run.UID)
-		_, err := ensureSource(ctx, r.Client, r.Reader, claim, tag)
+		_, err := ensureSource(ctx, r.Client, r.Reader, claim, tag, leaseHolder{kind: "BackupRun", run: run, item: item.Name})
 		if errors.Is(err, errSourceBusy) {
 			return err.Error(), nil
 		}
@@ -924,8 +929,9 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 // resumes the Kustomizations it suspended, and records status.restartedAt. A
 // run that recorded its plan to stop them counts as having stopped them, even
 // before status.quiescedAt is set, because the pass that wrote the plan may
-// have stopped them and then lost its status write. release then deletes the
-// run's Workload.
+// have stopped them and then lost its status write. release then releases
+// every Lease the run holds (see releaseLeases) and deletes the run's
+// Workload.
 //
 // A run with status.restartPending set has chosen its restart moment and may
 // not have started the workloads yet. release starts them and keeps that
@@ -941,7 +947,22 @@ func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.B
 		}
 		run.Status.RestartPending = false
 	}
+	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
+		return err
+	}
 	return deleteWorkload(ctx, r.Client, run.Namespace, run.UID)
+}
+
+// backupItemDone reports whether the run's volume item for the claim name
+// has finished: it is neither Pending nor Running, or the run has no such
+// item.
+func backupItemDone(run *backupv1alpha1.BackupRun, name string) bool {
+	for _, item := range run.Status.Items {
+		if item.Kind == "ReplicationSource" && item.Name == name {
+			return item.Phase != backupv1alpha1.ItemPending && item.Phase != backupv1alpha1.ItemRunning
+		}
+	}
+	return true
 }
 
 // finalize puts back what a run changed when the run is deleted before it

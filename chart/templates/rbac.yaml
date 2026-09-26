@@ -126,6 +126,14 @@ rules:
   - apiGroups: ["volsync.backube"]
     resources: ["replicationdestinations"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  # The Leases a BackupRun or RestoreRun takes on a claim and on its repository
+  # Secret right before it starts a mover, so a backup and a restore of either
+  # never run at once (internal/runs/lease.go). Runs live in every namespace,
+  # so the rule is cluster-wide. get and list go through the uncached reader,
+  # so no watch; update takes over the Lease of a run that has finished.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "create", "update", "delete"]
   # The repository Secret copy the populator writes for the length of a
   # restore. The populator orphan reconciler deletes the copy of a claim whose
   # VolumeRestore is gone.

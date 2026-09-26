@@ -15,6 +15,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -59,7 +60,7 @@ func scheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{
-		corev1.AddToScheme, appsv1.AddToScheme, volsyncv1alpha1.AddToScheme, backupv1alpha1.AddToScheme,
+		corev1.AddToScheme, appsv1.AddToScheme, volsyncv1alpha1.AddToScheme, backupv1alpha1.AddToScheme, coordinationv1.AddToScheme,
 	} {
 		if err := add(s); err != nil {
 			t.Fatalf("register types: %v", err)

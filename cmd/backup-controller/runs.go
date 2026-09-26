@@ -12,6 +12,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/runs"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -112,10 +113,11 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 
 	scheme := runtime.NewScheme()
 	for name, add := range map[string]func(*runtime.Scheme) error{
-		"core":          corev1.AddToScheme,
-		"apps":          appsv1.AddToScheme,
-		"volsync":       volsyncv1alpha1.AddToScheme,
-		"backup.wlz.li": backupv1alpha1.AddToScheme,
+		"core":                corev1.AddToScheme,
+		"apps":                appsv1.AddToScheme,
+		"coordination.k8s.io": coordinationv1.AddToScheme,
+		"volsync":             volsyncv1alpha1.AddToScheme,
+		"backup.wlz.li":       backupv1alpha1.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {
 			return fmt.Errorf("register the %s types: %w", name, err)

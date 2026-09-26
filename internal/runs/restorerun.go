@@ -531,6 +531,11 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	if deadline, over := r.overdue(run); over {
 		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
 	}
+	// The Leases of an item that finished in an earlier pass go now, so a
+	// backup of that claim need not wait for the rest of the run.
+	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(name string) bool { return restoreItemDone(run, name) }); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	if len(run.Spec.Quiesce) > 0 && run.Status.QuiescedAt == nil {
 		return r.quiesce(ctx, run)
@@ -667,8 +672,9 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // VolumeRestore is missing, fails the item.
 //
 // It returns reason ClaimInUse and a message naming the pod while a pod
-// mounts the claim, and reason SourceBusy and a message naming the BackupRun
-// while a backup of the claim or its repository is in progress (see
+// mounts the claim, and reason SourceBusy and a message naming the other run
+// while another run holds the Lease of the claim or its repository (see
+// acquireLeases) or a backup of either is in progress (see
 // otherMover); the item stays Pending in both cases. It returns empty strings
 // otherwise. It returns an error, and leaves the item as it was, when an API
 // call fails for any other reason.
@@ -691,10 +697,22 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
 			return "", "", nil
 		}
+		// The Leases make the restore and a backup of the claim or its
+		// repository exclusive: of two runs that get here in the same
+		// instant, only one creates each Lease.
+		busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: "RestoreRun", run: run, item: item.Name},
+			run.Namespace, item.Name, settings.Secret)
+		if err != nil {
+			return "", "", err
+		}
+		if busy != "" {
+			return backupv1alpha1.ReasonSourceBusy, busy, nil
+		}
 		// A backup of the claim or its repository that already has its
-		// trigger on a ReplicationSource goes first. The check runs right
-		// before the create, so a backup that wrote its trigger after the
-		// checks is still seen.
+		// trigger on a ReplicationSource goes first, as one started before
+		// the controller took Leases does. The check runs right before the
+		// create, so a backup that wrote its trigger after the checks is
+		// still seen.
 		backing, err := otherMover(ctx, r.Reader, run.Namespace, item.Name, settings.Secret, backupMover)
 		if err != nil {
 			return "", "", err
@@ -1113,7 +1131,8 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 }
 
 // finish ends the run. It deletes the ReplicationDestinations the run
-// created, starts any workload it still holds stopped, and records the
+// created, releases the run's Leases (see releaseLeases), starts any
+// workload it still holds stopped, and records the
 // terminal phase: Succeeded when reason is ReasonSucceeded and Failed for any
 // other reason. It sets the Ready condition to reason and message, records
 // status.completedAt, and removes the finalizer. For an into restore that
@@ -1126,6 +1145,9 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 		}
 	}
 	if err := r.removeDestinations(ctx, run, anyItem); err != nil {
+		return err
+	}
+	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return err
 	}
 	if stopped(run) {
@@ -1147,7 +1169,8 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 }
 
 // finalize runs when the run is deleted before it finished. It deletes the
-// run's ReplicationDestinations, starts any workload the run still holds
+// run's ReplicationDestinations, releases the run's Leases (see
+// releaseLeases), starts any workload the run still holds
 // stopped, releases an into restore's VolumeRestore with
 // releaseVolumeRestore, and removes the finalizer so the deletion can
 // complete. Without it, a run deleted while its mover writes would leave a
@@ -1160,6 +1183,9 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 		return err
 	}
 	if err := r.releaseVolumeRestore(ctx, run); err != nil {
+		return err
+	}
+	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return err
 	}
 	if stopped(run) {
@@ -1211,14 +1237,25 @@ func (r *RestoreRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.
 }
 
 // waitForBackup keeps an into restore from creating anything while a backup
-// of the claim or the repository Secret secret is in progress (see
-// otherMover). It is called right before the run creates its first object,
-// so a backup that wrote its trigger after the checks is still seen.
+// of the claim or the repository Secret secret is in progress. It is called
+// right before the run creates its first object. It first takes the Leases of
+// the claim and the repository for the run's item (see acquireLeases), then
+// looks for a backup's mover object (see otherMover), which catches a backup
+// started before the controller took Leases.
 //
 // It returns true when the run has to wait. It has then moved the run to
-// Waiting with reason SourceBusy and a message naming the BackupRun. A failed
-// list or status write comes back as an error, which the caller retries.
+// Waiting with reason SourceBusy and a message naming the run that holds a
+// Lease or the BackupRun. A failed read, write or status write comes back as
+// an error, which the caller retries.
 func (r *RestoreRunReconciler) waitForBackup(ctx context.Context, run *backupv1alpha1.RestoreRun, claim, secret string) (bool, error) {
+	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: "RestoreRun", run: run, item: run.Status.Items[0].Name},
+		run.Namespace, claim, secret)
+	if err != nil {
+		return false, err
+	}
+	if busy != "" {
+		return true, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy)
+	}
 	backing, err := otherMover(ctx, r.Reader, run.Namespace, claim, secret, backupMover)
 	if err != nil || backing == "" {
 		return false, err
@@ -1356,6 +1393,17 @@ func finished(item backupv1alpha1.RestoreItem) bool {
 		return true
 	}
 	return false
+}
+
+// restoreItemDone reports whether the run's item named name has finished (see
+// finished), or the run has no such item.
+func restoreItemDone(run *backupv1alpha1.RestoreRun, name string) bool {
+	for _, item := range run.Status.Items {
+		if item.Name == name {
+			return finished(item)
+		}
+	}
+	return true
 }
 
 // finishedWithDestination reports whether any finished item still names a

@@ -375,6 +375,8 @@ func lastLines(logs string, n int) string {
 //   - claim is the claim to back up. The ReplicationSource takes its name.
 //   - tag is the run's manual trigger, from TriggerFor. VolSync starts a
 //     backup when spec.trigger.manual holds a value it hasn't completed yet.
+//   - lock is the run's item, which takes the Leases of the claim and its
+//     repository (see acquireLeases) right before the write.
 //
 // It returns the ReplicationSource as it stands after the call. It writes
 // nothing and returns the source as read in these cases:
@@ -384,9 +386,10 @@ func lastLines(logs string, n int) string {
 //     then also returns the sourceHeld from holder: one that matches
 //     errSourceBusy while a live run waits for that tag, or one that matches
 //     errSourceAbandoned when no run does.
-//   - A live RestoreRun's mover works on the claim or its repository (see
+//   - Another live run holds the Lease of the claim or its repository (see
+//     acquireLeases), or a live RestoreRun's mover works on either (see
 //     otherMover). It then also returns a sourceHeld that matches
-//     errSourceBusy and names that RestoreRun; the run waits.
+//     errSourceBusy and names that run; the run waits.
 //
 // It returns a refusal, and writes nothing, when a ReplicationSource of the
 // same name exists without the label app.kubernetes.io/managed-by:
@@ -417,7 +420,7 @@ func lastLines(logs string, n int) string {
 // A source of the same name that this controller didn't write is left alone.
 // Something else declares it, and writing over it would start a fight that the
 // other writer wins on its next reconcile.
-func ensureSource(ctx context.Context, c client.Client, reader client.Reader, claim *corev1.PersistentVolumeClaim, tag string) (*volsyncv1alpha1.ReplicationSource, error) {
+func ensureSource(ctx context.Context, c client.Client, reader client.Reader, claim *corev1.PersistentVolumeClaim, tag string, lock leaseHolder) (*volsyncv1alpha1.ReplicationSource, error) {
 	vr, err := volumeRestoreFor(ctx, reader, claim)
 	if err != nil {
 		return nil, err
@@ -453,10 +456,21 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 				return holder(ctx, reader, source)
 			}
 		}
+		// The Leases make the backup and a restore of the claim or its
+		// repository exclusive: of two runs that get here in the same
+		// instant, only one creates each Lease.
+		busy, err := acquireLeases(ctx, c, reader, lock, claim.Namespace, claim.Name, vr.Spec.Repository)
+		if err != nil {
+			return err
+		}
+		if busy != "" {
+			return &sourceHeld{message: busy}
+		}
 		// A restore of the claim or its repository that already has its
-		// ReplicationDestination goes first. The check runs here, right
-		// before the write, so a restore that created its destination
-		// after an earlier check is still seen.
+		// ReplicationDestination goes first, as one started before the
+		// controller took Leases does. The check runs here, right before
+		// the write, so a restore that created its destination after an
+		// earlier check is still seen.
 		restoring, err := otherMover(ctx, reader, claim.Namespace, claim.Name, vr.Spec.Repository, restoreMover)
 		if err != nil {
 			return err
