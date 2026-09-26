@@ -1027,11 +1027,12 @@ func restoreTimedOut(run *backupv1alpha1.RestoreRun, deadline time.Time) string 
 // claim. Any other Pending item waits until no pod mounts the claim.
 // restoreVolume then takes the Leases, lists the repository again (see
 // recheckSnapshot), creates the item's destination and moves the item to
-// Running. A claim that is gone, a VolumeRestore or repository Secret that
-// is missing, or a snapshot the mover would no longer restore, because it
-// was forgotten, retimed or shadowed in its second since the checks, fails
-// the item before the destination exists, with a message that says nothing
-// was written (see failBeforeStart). A destination with the item's name that
+// Running. A claim that is gone or being deleted (see startRefusal), a
+// VolumeRestore or repository Secret that is missing, or a snapshot the
+// mover would no longer restore, because it was forgotten, retimed or
+// shadowed in its second since the checks, fails the item before the
+// destination exists, with a message that says nothing was written (see
+// failBeforeStart). A destination with the item's name that
 // the run did not create (see ownsDestination), found at the create or on a
 // later pass, fails the item too; the item then names no destination, so
 // nothing the run does afterwards touches it.
@@ -1076,13 +1077,12 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			return backupv1alpha1.ReasonClaimInUse,
 				fmt.Sprintf("ReplicationDestination %s is restoring into claim %s", writer, item.Name), nil
 		}
-		settings, err := repositoryFor(ctx, r.Reader, run.Namespace, item.Name, run.Spec.Repository, run.Spec.MoverSecurityContext)
+		settings, refused, err := r.startRefusal(ctx, run, item.Name)
 		if err != nil {
-			if !isRefusal(err) {
-				return "", "", err
-			}
-			message := failBeforeStart(item.Name, err.Error())
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+			return "", "", err
+		}
+		if refused != "" {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, refused
 			return "", "", nil
 		}
 		// The Leases make the restore and a backup of the claim or its
@@ -1168,6 +1168,47 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 		}
 	}
 	return "", "", nil
+}
+
+// startRefusal returns the message restoreVolume fails a Pending in-place
+// item with when the item's claim or repository settings refuse the restore,
+// or "" when the restore can go on. restoreVolume calls it before it takes
+// the Leases, and quiesce calls it in its pre-check, so an item that cannot
+// start fails before the app is stopped for it.
+//
+// Parameters:
+//   - run is the asking run; its namespace is read, and spec.repository and
+//     spec.moverSecurityContext are used the way repositoryFor uses them.
+//   - claimName names the item's claim, which is also the item's name.
+//
+// It returns the settings from repositoryFor when the restore can go on. A
+// claim that is being deleted, and a refusal from repositoryFor (a claim
+// that is gone, or a VolumeRestore that is missing when the run names no
+// repository), give a message from failBeforeStart, which says nothing was
+// written to the claim. A claim being deleted is refused because the mover
+// would write into a claim that is about to go, and the scheduler does not
+// place a pod whose claim is being deleted (podHasPVCs, in the PreFilter
+// of the volumebinding plugin). A failed read comes back as an error, and
+// the caller leaves the item Pending.
+func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (restoreSettings, string, error) {
+	claim := &corev1.PersistentVolumeClaim{}
+	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim)
+	switch {
+	case apierrors.IsNotFound(err):
+		// repositoryFor refuses the claim that is gone with its message.
+	case err != nil:
+		return restoreSettings{}, "", fmt.Errorf("get PersistentVolumeClaim %s/%s: %w", run.Namespace, claimName, err)
+	case claim.DeletionTimestamp != nil:
+		return restoreSettings{}, failBeforeStart(claimName, fmt.Sprintf("claim %s is being deleted", claimName)), nil
+	}
+	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
+	if err != nil {
+		if isRefusal(err) {
+			return settings, failBeforeStart(claimName, err.Error()), nil
+		}
+		return settings, "", err
+	}
+	return settings, "", nil
 }
 
 // inPlaceClaimLost returns a message when the claim an in-place item
@@ -1958,17 +1999,18 @@ func clusterLeftDeleted(cluster string) string {
 // does not record.
 //
 // Before it records a plan, with nothing stopped, quiesce fails a Pending
-// volume item whose repository Secret is gone, and then waits with reason
-// SourceBusy while a backup holds one of the run's claims or repositories
-// (see backupHeldElsewhere), while another run is in the way (see
-// waitingOn), and while another run holds the namespace's quiesce Lease (see
-// acquireQuiesceLease). A run left with no Pending item, by that or because
-// the plan Skipped every item, stops nothing: quiesce records
-// status.quiescedAt and status.restartedAt at the same moment, and work then
-// finishes the run. A spec.quiesce entry the namespace does not hold ends the
-// run as Failed with reason Invalid before anything is stopped, and a
-// Kustomization that also applies workloads of another namespace aborts it
-// with reason Invalid (see planStop).
+// volume item that restoreVolume would refuse before its destination exists
+// (see startRefusal) or whose repository Secret is gone, with the message
+// restoreVolume gives. It then waits with reason SourceBusy while a backup
+// holds one of the run's claims or repositories (see backupHeldElsewhere),
+// while another run is in the way (see waitingOn), and while another run
+// holds the namespace's quiesce Lease (see acquireQuiesceLease). A run
+// left with no Pending item, by that or because the plan Skipped every item,
+// stops nothing: quiesce records status.quiescedAt and status.restartedAt at
+// the same moment, and work then finishes the run. A spec.quiesce entry the
+// namespace does not hold ends the run as Failed with reason Invalid before
+// anything is stopped, and a Kustomization that also applies workloads of
+// another namespace aborts it with reason Invalid (see planStop).
 //
 // quiesce then records the plan from planStop in status.quiesced and
 // status.suspendedKustomizations, with each workload's replica count, and
@@ -1996,12 +2038,21 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		// restoreVolume on. The run waits here instead, with the workloads
 		// still running. restoreVolume keeps its own check: this one is
 		// advisory, and the check at the mover object is the one that
-		// counts. A repository Secret that is gone fails the item now, so
-		// the app is not stopped for a restore that cannot start; any other
-		// refusal is left to restoreVolume, which fails the item with it.
+		// counts. An item restoreVolume would refuse before its
+		// destination exists (see startRefusal), and one whose repository
+		// Secret is gone, fail now with the message restoreVolume gives, so
+		// the app is not stopped for a restore that cannot start.
 		for i := range run.Status.Items {
 			item := &run.Status.Items[i]
 			if item.Kind != "PersistentVolumeClaim" || item.Phase != backupv1alpha1.ItemPending {
+				continue
+			}
+			_, refused, err := r.startRefusal(ctx, run, item.Name)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if refused != "" {
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, refused
 				continue
 			}
 			held, err := r.backupHeldElsewhere(ctx, run, item.Name)
@@ -2100,11 +2151,12 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 //   - claimName names the claim the item restores.
 //
 // A refusal from repositoryFor, for a claim or a VolumeRestore that is gone,
-// gives "": restoreVolume fails the item later. A repository Secret that
-// does not exist comes back as the refusal leaseNamesFor gives (see
-// isRefusal), and quiesce fails the item with it before anything is stopped.
-// Any other failed read comes back as an error, and the pass retries with
-// nothing stopped.
+// gives "": quiesce has failed such an item with startRefusal just before,
+// and restoreVolume fails an item that became one since. A repository
+// Secret that does not exist comes back as the refusal leaseNamesFor gives
+// (see isRefusal), and quiesce fails the item with it before anything is
+// stopped. Any other failed read comes back as an error, and the pass
+// retries with nothing stopped.
 //
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right

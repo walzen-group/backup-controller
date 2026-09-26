@@ -449,3 +449,94 @@ func TestAnItemStartItemWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
 		})
 	}
 }
+
+// A quiesced RestoreRun fails an item restoreVolume would refuse before its
+// ReplicationDestination exists in its pre-check, with the message
+// restoreVolume gives, and with no item left to restore it never stops the
+// app. The refusals it can know before the stop are a claim that is gone or
+// being deleted, and a claim whose VolumeRestore is gone, which repositoryFor
+// refuses. Before, the pre-check left them to restoreVolume, so the run
+// stopped the app, failed the item and gave the app back (AB9, like AB4 on a
+// BackupRun).
+func TestAnItemRestoreVolumeWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		breakIt func(t *testing.T, c client.Client)
+		want    string
+	}{
+		{"claim gone", func(t *testing.T, c client.Client) {
+			if err := c.Delete(context.Background(), claim()); err != nil {
+				t.Fatal(err)
+			}
+		}, "no PersistentVolumeClaim " + claimN + " in this namespace"},
+		{"claim being deleted", func(t *testing.T, c client.Client) {
+			held := &corev1.PersistentVolumeClaim{}
+			get(t, c, ns, claimN, held)
+			held.Finalizers = append(held.Finalizers, "kubernetes.io/pvc-protection")
+			if err := c.Update(context.Background(), held); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Delete(context.Background(), held); err != nil {
+				t.Fatal(err)
+			}
+		}, "claim " + claimN + " is being deleted"},
+		{"VolumeRestore gone", func(t *testing.T, c client.Client) {
+			if err := c.Delete(context.Background(), volumeRestore()); err != nil {
+				t.Fatal(err)
+			}
+		}, "claim " + claimN + " has no VolumeRestore " + claimN + " to name its repository"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newClient(t, quiescedRestore(), claim(), volumeRestore(), repository(), deployment(), kustomization(false))
+			watching, patches := countDeploymentPatches(c)
+			r := &RestoreRunReconciler{Client: watching, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
+
+			restoreStep(t, r) // plan
+			tc.breakIt(t, c)
+			restoreStep(t, r) // quiesce: the pre-check fails the item
+			restoreStep(t, r)
+
+			run := readRestoreRun(t, c)
+			if want := failBeforeStart(claimN, tc.want); run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
+				run.Status.Items[0].Phase != backupv1alpha1.ItemFailed || run.Status.Items[0].Message != want {
+				t.Fatalf("phase = %q, items = %+v; want Failed with the item message %q", run.Status.Phase, run.Status.Items, want)
+			}
+			if *patches != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
+				t.Errorf("Deployment patches = %d, quiesced = %+v, suspended = %t; want the app never stopped", *patches, run.Status.Quiesced, suspended(t, c))
+			}
+		})
+	}
+}
+
+// A RestoreRun without spec.quiesce fails an item whose claim is being
+// deleted before it creates a ReplicationDestination, with the message the
+// pre-check gives: the mover would write into a claim that is about to go,
+// and the scheduler does not place a pod whose claim is being deleted.
+func TestARestoreIntoAClaimBeingDeletedFailsBeforeTheMoverStarts(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
+		claim(), volumeRestore(), repository())
+
+	restoreStep(t, r) // plan
+	held := &corev1.PersistentVolumeClaim{}
+	get(t, c, ns, claimN, held)
+	held.Finalizers = append(held.Finalizers, "kubernetes.io/pvc-protection")
+	if err := c.Update(context.Background(), held); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), held); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	want := failBeforeStart(claimN, "claim "+claimN+" is being deleted")
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.Items[0].Phase != backupv1alpha1.ItemFailed ||
+		run.Status.Items[0].Message != want || run.Status.Items[0].Destination != "" {
+		t.Fatalf("phase = %q, items = %+v; want Failed with the item message %q and no destination", run.Status.Phase, run.Status.Items, want)
+	}
+	destinations := &volsyncv1alpha1.ReplicationDestinationList{}
+	if err := c.List(context.Background(), destinations); err != nil || len(destinations.Items) != 0 {
+		t.Errorf("ReplicationDestinations = %d (err %v); want none", len(destinations.Items), err)
+	}
+}
