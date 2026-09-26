@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -108,24 +109,121 @@ func TestTheClusterRoleCoversEverythingTheControllerDoes(t *testing.T) {
 	}
 }
 
-// TestTheChartGrantsTheSameRulesAsDeploy checks that the chart's
-// templates/rbac.yaml names a rule for every resource in grants. The chart and
-// deploy/ install the same controller, so a permission added to one and
-// forgotten in the other gives an install that works only one way.
+// TestTheChartGrantsTheSameRulesAsDeploy checks that the ClusterRole in the
+// chart's templates/rbac.yaml grants exactly the permissions of the one in
+// deploy/rbac.yaml. The chart and deploy/ install the same controller, so a
+// permission added to one and forgotten in the other gives an install that
+// works only one way.
+//
+// Both roles are reduced to single permissions (see permissions), so two rules
+// in one file and one merged rule in the other compare equal. An extra or
+// missing verb, resource, API group or resource name fails the test, which
+// names each permission one side grants and the other lacks.
 func TestTheChartGrantsTheSameRulesAsDeploy(t *testing.T) {
-	chart, err := os.ReadFile(filepath.Join("..", "..", "chart", "templates", "rbac.yaml"))
-	if err != nil {
-		t.Fatalf("read the chart's rbac: %v", err)
-	}
-	text := string(chart)
+	deploy := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
+	chart := readChartRules(t, filepath.Join("..", "..", "chart", "templates", "rbac.yaml"))
 
-	for _, want := range grants {
-		line := fmt.Sprintf("resources: [%q", want.resource)
-		if !strings.Contains(text, line) && !strings.Contains(text, fmt.Sprintf(`"%s"`, want.resource)) {
-			t.Errorf("the chart names no rule for %s, which deploy/ grants for %s",
-				resourceName(want.group, want.resource), want.why)
+	inDeploy, inChart := permissions(deploy.Rules), permissions(chart)
+	if len(inDeploy) == 0 {
+		t.Fatal("deploy/rbac.yaml grants nothing, so there is nothing to compare")
+	}
+	for _, missing := range difference(inDeploy, inChart) {
+		t.Errorf("deploy/ grants %s and the chart does not", missing)
+	}
+	for _, extra := range difference(inChart, inDeploy) {
+		t.Errorf("the chart grants %s and deploy/ does not", extra)
+	}
+}
+
+// permission is one verb on one resource, as a single ClusterRole rule could
+// grant it. name is the one object the rule is limited to through
+// resourceNames, or empty when the rule covers every object of the resource.
+type permission struct {
+	group, resource, name, verb string
+}
+
+// String returns the permission in a form for a test message, such as
+// "get on customresourcedefinitions.apiextensions.k8s.io named
+// backupruns.backup.wlz.li".
+func (p permission) String() string {
+	text := p.verb + " on " + resourceName(p.group, p.resource)
+	if p.name != "" {
+		text += " named " + p.name
+	}
+	return text
+}
+
+// permissions expands rules into the set of single permissions they grant:
+// one for each API group, resource, resource name (or none) and verb of each
+// rule.
+func permissions(rules []rbacv1.PolicyRule) map[permission]bool {
+	set := map[permission]bool{}
+	for _, rule := range rules {
+		names := rule.ResourceNames
+		if len(names) == 0 {
+			names = []string{""}
+		}
+		for _, group := range rule.APIGroups {
+			for _, resource := range rule.Resources {
+				for _, name := range names {
+					for _, verb := range rule.Verbs {
+						set[permission{group, resource, name, verb}] = true
+					}
+				}
+			}
 		}
 	}
+	return set
+}
+
+// difference returns the permissions in a that b lacks, sorted so a failure
+// reads the same on every run.
+func difference(a, b map[permission]bool) []permission {
+	var out []permission
+	for p := range a {
+		if !b[p] {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
+	return out
+}
+
+// readChartRules returns the rules of the ClusterRole in the chart template at
+// path, and fails the test when it cannot find or parse them.
+//
+// The template is read without Helm. Its rules block, from the line "rules:"
+// to the document separator after it, holds no template actions, so it parses
+// as plain YAML. The test fails when that block gains an action ("{{"),
+// because the parse would then no longer match what Helm renders.
+func readChartRules(t *testing.T, path string) []rbacv1.PolicyRule {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	text := string(content)
+	start := strings.Index(text, "\nrules:\n")
+	if start < 0 {
+		t.Fatalf("no rules block in %s", path)
+	}
+	block := text[start+1:]
+	if end := strings.Index(block, "\n---"); end >= 0 {
+		block = block[:end]
+	}
+	if strings.Contains(block, "{{") {
+		t.Fatalf("the rules block in %s holds a template action, so it cannot be read without rendering the chart", path)
+	}
+	var role struct {
+		Rules []rbacv1.PolicyRule `json:"rules"`
+	}
+	if err := yaml.Unmarshal([]byte(block), &role); err != nil {
+		t.Fatalf("parse the rules in %s: %v", path, err)
+	}
+	if len(role.Rules) == 0 {
+		t.Fatalf("the rules block in %s holds no rules", path)
+	}
+	return role.Rules
 }
 
 // ownCRDs are the CustomResourceDefinitions the controller may read, and the
