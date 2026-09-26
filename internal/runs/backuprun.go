@@ -482,8 +482,17 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			if item.Kind != "ReplicationSource" || item.Phase != backupv1alpha1.ItemPending {
 				continue
 			}
+			// A restore of the claim or its repository holds the item the
+			// same way, and startItem would wait for it with the app down.
+			restoring, err := r.restoreOf(ctx, run.Namespace, item.Name)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if restoring != "" {
+				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, restoring))
+			}
 			source := &volsyncv1alpha1.ReplicationSource{}
-			err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
+			err = r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
 			if err != nil || !inUse(source) || manualTag(source) == TriggerFor(run.UID) ||
 				source.Labels[backupv1alpha1.LabelManagedBy] != backupv1alpha1.ManagedByValue {
 				continue
@@ -531,6 +540,23 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 	return ctrl.Result{RequeueAfter: time.Second}, nil
 }
 
+// restoreOf returns a message naming the RestoreRun whose mover writes the
+// claim claimName or reads its repository (see otherMover), or "" when there
+// is none. A claim or VolumeRestore that can't be read gives "": startItem
+// fails or retries its item, and ensureSource checks again right before it
+// writes the trigger. A failed list comes back as an error.
+func (r *BackupRunReconciler) restoreOf(ctx context.Context, namespace, claimName string) (string, error) {
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: claimName}, claim); err != nil {
+		return "", nil
+	}
+	vr, err := volumeRestoreFor(ctx, r.Reader, claim)
+	if err != nil {
+		return "", nil
+	}
+	return otherMover(ctx, r.Reader, namespace, claimName, vr.Spec.Repository, restoreMover)
+}
+
 // startItem starts the backup of one Pending item and sets the item's phase.
 //
 // For a volume, it writes the claim's ReplicationSource with the run's manual
@@ -543,8 +569,9 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 //
 // It returns a message for the run's Ready condition when the item has to
 // wait, which happens when the volume's ReplicationSource is still completing
-// the backup of another run that waits for it. The message names that run,
-// and the item stays Pending. When the source is busy with a backup no run
+// the backup of another run that waits for it, or when a RestoreRun's mover
+// works on the claim or its repository (see otherMover). The message names
+// that run, and the item stays Pending. When the source is busy with a backup no run
 // waits for (see holder), the item fails at once with a message that says
 // what a person can do, and the source is left alone. Otherwise it returns an
 // empty string. Any other failed read or write, such as a timeout from the

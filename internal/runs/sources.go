@@ -384,6 +384,9 @@ func lastLines(logs string, n int) string {
 //     then also returns the sourceHeld from holder: one that matches
 //     errSourceBusy while a live run waits for that tag, or one that matches
 //     errSourceAbandoned when no run does.
+//   - A live RestoreRun's mover works on the claim or its repository (see
+//     otherMover). It then also returns a sourceHeld that matches
+//     errSourceBusy and names that RestoreRun; the run waits.
 //
 // It returns a refusal, and writes nothing, when a ReplicationSource of the
 // same name exists without the label app.kubernetes.io/managed-by:
@@ -449,6 +452,17 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 			case inUse(source):
 				return holder(ctx, reader, source)
 			}
+		}
+		// A restore of the claim or its repository that already has its
+		// ReplicationDestination goes first. The check runs here, right
+		// before the write, so a restore that created its destination
+		// after an earlier check is still seen.
+		restoring, err := otherMover(ctx, reader, claim.Namespace, claim.Name, vr.Spec.Repository, restoreMover)
+		if err != nil {
+			return err
+		}
+		if restoring != "" {
+			return &sourceHeld{message: restoring}
 		}
 		if source.Labels == nil {
 			source.Labels = map[string]string{}

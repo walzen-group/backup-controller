@@ -667,8 +667,11 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // VolumeRestore is missing, fails the item.
 //
 // It returns reason ClaimInUse and a message naming the pod while a pod
-// mounts the claim, and empty strings otherwise. It returns an error, and
-// leaves the item as it was, when an API call fails for any other reason.
+// mounts the claim, and reason SourceBusy and a message naming the BackupRun
+// while a backup of the claim or its repository is in progress (see
+// otherMover); the item stays Pending in both cases. It returns empty strings
+// otherwise. It returns an error, and leaves the item as it was, when an API
+// call fails for any other reason.
 func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (string, string, error) {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
@@ -687,6 +690,17 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			}
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
 			return "", "", nil
+		}
+		// A backup of the claim or its repository that already has its
+		// trigger on a ReplicationSource goes first. The check runs right
+		// before the create, so a backup that wrote its trigger after the
+		// checks is still seen.
+		backing, err := otherMover(ctx, r.Reader, run.Namespace, item.Name, settings.Secret, backupMover)
+		if err != nil {
+			return "", "", err
+		}
+		if backing != "" {
+			return backupv1alpha1.ReasonSourceBusy, backing, nil
 		}
 		name := destinationName(run.UID, index)
 		if err := r.Create(ctx, directDestination(run, *item, settings, name)); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -879,7 +893,9 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 // not bound by spec.timeout. The deadline is checked before anything is
 // created, so a create the API server keeps refusing can't hold the run past
 // it. A source claim deleted before the new claim was created ends the run as
-// Failed.
+// Failed. While a backup of the source claim or its repository is in progress
+// (see otherMover), the run waits with reason SourceBusy before it creates
+// anything.
 func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if run.Spec.Claim == "" {
 		return r.restoreIntoEmptyClaim(ctx, run)
@@ -911,6 +927,9 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 		}
 		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error())
 	}
+	if waiting, err := r.waitForBackup(ctx, run, run.Spec.Claim, settings.Secret); waiting || err != nil {
+		return after(pollInterval, err)
+	}
 	vr := pointInTimeRestore(run, run.Status.Items[0], settings)
 	if err := r.Create(ctx, vr); err != nil && !apierrors.IsAlreadyExists(err) {
 		return ctrl.Result{}, fmt.Errorf("create VolumeRestore %s/%s: %w", vr.Namespace, vr.Name, err)
@@ -919,7 +938,7 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 	if err := r.Create(ctx, claim); err != nil && !apierrors.IsAlreadyExists(err) {
 		return ctrl.Result{}, fmt.Errorf("create PersistentVolumeClaim %s/%s: %w", claim.Namespace, claim.Name, err)
 	}
-	return ctrl.Result{RequeueAfter: pollInterval}, nil
+	return after(pollInterval, r.resume(ctx, run))
 }
 
 // restoreIntoEmptyClaim restores a repository that no claim in the namespace
@@ -943,6 +962,8 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 // in the status before finish deletes the destination, for the reason work
 // gives. It is aborted with reason TimedOut when the restore has not finished
 // by spec.timeout, and the deadline is checked before anything is created.
+// While a backup of the repository is in progress (see otherMover), the run
+// waits with reason SourceBusy before it creates anything.
 func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	item := &run.Status.Items[0]
 	done := fmt.Sprintf("claim %s holds the restored data", run.Spec.Into)
@@ -979,6 +1000,9 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	if waiting, err := r.waitForBackup(ctx, run, run.Spec.Into, settings.Secret); waiting || err != nil {
+		return after(pollInterval, err)
+	}
 	claim := scratchClaim(run, settings, "")
 	if err := r.Create(ctx, claim); err != nil && !apierrors.IsAlreadyExists(err) {
 		return ctrl.Result{}, fmt.Errorf("create PersistentVolumeClaim %s/%s: %w", claim.Namespace, claim.Name, err)
@@ -986,7 +1010,7 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	if err := r.Create(ctx, directDestination(run, *item, settings, item.Destination)); err != nil && !apierrors.IsAlreadyExists(err) {
 		return ctrl.Result{}, fmt.Errorf("create ReplicationDestination %s: %w", item.Destination, err)
 	}
-	return ctrl.Result{RequeueAfter: pollInterval}, nil
+	return after(pollInterval, r.resume(ctx, run))
 }
 
 // abort ends a run early as Failed. It marks every item that has not finished
@@ -1183,6 +1207,35 @@ func (r *RestoreRunReconciler) overdue(run *backupv1alpha1.RestoreRun) (time.Tim
 func (r *RestoreRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
 	run.Status.Phase = backupv1alpha1.RunPhaseWaiting
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
+	return r.writeStatus(ctx, run)
+}
+
+// waitForBackup keeps an into restore from creating anything while a backup
+// of the claim or the repository Secret secret is in progress (see
+// otherMover). It is called right before the run creates its first object,
+// so a backup that wrote its trigger after the checks is still seen.
+//
+// It returns true when the run has to wait. It has then moved the run to
+// Waiting with reason SourceBusy and a message naming the BackupRun. A failed
+// list or status write comes back as an error, which the caller retries.
+func (r *RestoreRunReconciler) waitForBackup(ctx context.Context, run *backupv1alpha1.RestoreRun, claim, secret string) (bool, error) {
+	backing, err := otherMover(ctx, r.Reader, run.Namespace, claim, secret, backupMover)
+	if err != nil || backing == "" {
+		return false, err
+	}
+	return true, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, backing)
+}
+
+// resume moves an into restore that waited back to Running once it has
+// created its objects, and writes the status. A run that did not wait is
+// left as it is, and nothing is written.
+func (r *RestoreRunReconciler) resume(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+	if run.Status.Phase != backupv1alpha1.RunPhaseWaiting {
+		return nil
+	}
+	run.Status.Phase = backupv1alpha1.RunPhaseRunning
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning,
+		fmt.Sprintf("restoring into claim %s", run.Spec.Into))
 	return r.writeStatus(ctx, run)
 }
 
