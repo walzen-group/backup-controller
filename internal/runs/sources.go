@@ -345,7 +345,8 @@ func abandonedMessage(source *volsyncv1alpha1.ReplicationSource, owner string) s
 	return fmt.Sprintf("ReplicationSource %[1]s is still retrying the backup of %[2]s, which no run waits for any more. "+
 		"%[3]s; a new trigger would be completed by that older backup, so this run leaves the source alone.%[4]s "+
 		"Fix what the mover reports and VolSync finishes on its own. "+
-		"To give that backup up, delete the ReplicationSource %[1]s while no pod of Job volsync-src-%[1]s is running.",
+		"To give that backup up, delete the ReplicationSource %[1]s while no pod of Job volsync-src-%[1]s is running; "+
+		"the next backup unlocks the repository first.",
 		source.Name, of, started, mover)
 }
 
@@ -406,7 +407,9 @@ func lastLines(logs string, n int) string {
 // annotations, the prune interval from the namespace's annotation, and the
 // mover's node affinity from the claim's volume. The source carries a
 // controller reference to the claim, so a claim deleted for a restore takes
-// its source with it, and the next run writes a new one.
+// its source with it, and the next run writes a new one. spec.restic.unlock
+// gets the same value as the trigger, so every new backup first removes the
+// stale locks a killed mover can leave in the repository.
 //
 // A source of the same name that this controller didn't write is left alone.
 // Something else declares it, and writing over it would start a fight that the
@@ -465,7 +468,20 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 					// for its cache, whose reclaim policy is Delete.
 					StorageClassName: vr.Spec.CacheStorageClassName,
 				},
-				Repository:            vr.Spec.Repository,
+				Repository: vr.Spec.Repository,
+				// A new value makes every mover pod of this sync run
+				// `restic unlock` before `restic backup`, until a Job
+				// succeeds and VolSync records it in status.restic.lastUnlocked
+				// (VolSync v0.16.0 internal/controller/mover/restic/mover.go:373-376,
+				// 631-635, 669-674). entry.sh runs plain `restic unlock`
+				// (mover-restic/entry.sh:173-174), which removes only stale
+				// locks (restic 0.18.1 cmd/restic/cmd_unlock.go:51-54,
+				// internal/repository/lock.go:274-294). A lock from another
+				// host, which a killed mover's always is, counts as stale once
+				// it is older than 30 minutes (internal/restic/lock.go:252-288).
+				// The field is written only here, onto a new or idle source,
+				// which has no mover Job for the change to replace.
+				Unlock:                tag,
 				PruneIntervalDays:     &pruneInterval,
 				Retain:                retain,
 				CacheCapacity:         vr.Spec.CacheCapacity,

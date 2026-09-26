@@ -556,11 +556,13 @@ func (r *BackupRunReconciler) clonesCut(ctx context.Context, run *backupv1alpha1
 // status.latestMoverStatus, deletes the Job and starts another, for as long
 // as the tag stays. So while the tag is open, a Failed result that
 // moverFailed places in this run's sync fails the item with the mover's
-// logs. collectItem leaves the source alone: VolSync has already started the
-// next mover Job by then, and deleting the source would kill that mover
-// mid-backup and leave restic's lock in the repository. VolSync keeps
-// retrying, and a later run waits with reason SourceBusy until one of those
-// retries completes the tag. A volume with no files succeeds with Empty set,
+// logs, and, when restic found the repository locked, with how that lock is
+// cleared (see moverFailure). collectItem leaves the source alone: VolSync
+// has already started the next mover Job by then, and deleting the source
+// would kill that mover mid-backup and leave restic's lock in the
+// repository. VolSync keeps retrying, and a later run fails its item for the
+// claim at once while this run's tag is still open (see holder). A volume
+// with no files succeeds with Empty set,
 // since VolSync takes no snapshot of it. Otherwise the item records the snapshot ID
 // the mover logged and the time restic stamped on it. On a quiesced run, the
 // snapshot is first moved to status.restartedAt and tagged quiesced, and the
@@ -580,12 +582,12 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 				// it has already started a new mover Job, and deleting the
 				// source would kill that mover mid-backup and leave restic's
 				// lock in the repository.
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, logs
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, moverFailure(source, logs)
 			}
 			return
 		}
 		if source.Status.LatestMoverStatus != nil && source.Status.LatestMoverStatus.Result == volsyncv1alpha1.MoverResultFailed {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, source.Status.LatestMoverStatus.Logs
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, moverFailure(source, source.Status.LatestMoverStatus.Logs)
 			return
 		}
 		snapshot, empty := moverOutcome(source)

@@ -2,6 +2,8 @@ package runs
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -347,7 +349,8 @@ func TestADeadTriggerFailsTheItemAtOnce(t *testing.T) {
 			if item.Phase != backupv1alpha1.ItemFailed {
 				t.Fatalf("item = %+v, run reason %q; want the item Failed", item, readyReason(run.Status.Conditions))
 			}
-			for _, want := range []string{tc.names, "no run waits for", "Access Key Id", "delete the ReplicationSource " + claimN, "volsync-src-" + claimN} {
+			for _, want := range []string{tc.names, "no run waits for", "Access Key Id", "delete the ReplicationSource " + claimN, "volsync-src-" + claimN,
+				"the next backup unlocks the repository first"} {
 				if !strings.Contains(item.Message, want) {
 					t.Errorf("item message %q does not say %q", item.Message, want)
 				}
@@ -403,6 +406,66 @@ func TestADeadTriggerFailsOnlyItsItem(t *testing.T) {
 				t.Errorf("replicas = %d, want the app back at 2", *d.Spec.Replicas)
 			}
 		})
+	}
+}
+
+// cacheN is a second claim of the namespace, with its own volume,
+// VolumeRestore and repository.
+const cacheN = "notes-cache"
+
+// cacheClaim returns the claim cacheN and the objects it needs to be backed
+// up, built like claim, volume, volumeRestore and repository.
+func cacheClaim() []client.Object {
+	pvc := claim()
+	pvc.Name, pvc.UID, pvc.Spec.VolumeName, pvc.Spec.DataSourceRef.Name = cacheN, "cache-claim-uid", "pvc-"+cacheN, cacheN
+	pv := volume()
+	pv.Name = "pvc-" + cacheN
+	vr := volumeRestore()
+	vr.Name, vr.Spec.Repository = cacheN, "notes-restic-cache"
+	secret := repository()
+	secret.Name = "notes-restic-cache"
+	return []client.Object{pvc, pv, vr, secret}
+}
+
+// In a namespace run with two claims, a claim whose source is busy with a
+// tag no run waits for fails its item, and the other claim is backed up as
+// usual: its source gets the run's trigger, and the run records its snapshot.
+func TestADeadTriggerOnOneClaimLeavesTheOtherBackedUp(t *testing.T) {
+	dead := busySource(TriggerFor("0d1e2f3a-0000-4000-8000-000000000009"))
+	dead.Name, dead.Spec.SourcePVC = cacheN, cacheN
+	objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), dead}, cacheClaim()...)
+	r, c := backupReconciler(t, objects...)
+	r.Client = neverWriteSyncing(t, c)
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // start
+	cutClone(t, c)
+	step(t, r) // restart
+	complete(t, c, "snapshot 6e473100 saved")
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	byName := map[string]backupv1alpha1.BackupItem{}
+	for _, item := range run.Status.Items {
+		byName[item.Name] = item
+	}
+	if item := byName[cacheN]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "no run waits for") {
+		t.Errorf("dead claim's item = %+v, want it Failed as abandoned", item)
+	}
+	if item := byName[claimN]; item.Phase != backupv1alpha1.ItemSucceeded || item.Snapshot == "" {
+		t.Errorf("healthy claim's item = %+v, want it Succeeded with a snapshot", item)
+	}
+	source := &volsyncv1alpha1.ReplicationSource{}
+	get(t, c, ns, cacheN, source)
+	if manualTag(source) != manualTag(dead) || source.Spec.Restic != nil && source.Spec.Restic.Unlock != "" {
+		t.Errorf("dead source = %+v, want it left as it was", source.Spec)
+	}
+	d := &appsv1.Deployment{}
+	get(t, c, ns, appN, d)
+	if *d.Spec.Replicas != 2 {
+		t.Errorf("replicas = %d, want the app back at 2", *d.Spec.Replicas)
 	}
 }
 
@@ -627,6 +690,16 @@ func TestTheControllerNeverWritesASourceVolSyncIsSyncing(t *testing.T) {
 				}
 			},
 		},
+		// No BackupRun of the namespace has this UID, so no run waits for
+		// the tag.
+		"a dead tag": {
+			source: syncing(TriggerFor("0d1e2f3a-0000-4000-8000-000000000009")),
+			check: func(t *testing.T, run *backupv1alpha1.BackupRun) {
+				if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "no run waits for") {
+					t.Errorf("item = %+v, want it Failed as abandoned", item)
+				}
+			},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -645,6 +718,9 @@ func TestTheControllerNeverWritesASourceVolSyncIsSyncing(t *testing.T) {
 			}
 			if last := source.Spec.Restic.Retain.Last; last == nil || *last != "5" {
 				t.Error("retain-last changed from 5; the syncing source's spec was rewritten")
+			}
+			if unlock := source.Spec.Restic.Unlock; unlock != "" {
+				t.Errorf("unlock = %q on a syncing source; the new field would make VolSync replace the running mover", unlock)
 			}
 		})
 	}
@@ -1113,6 +1189,98 @@ func TestAFailedMoverFailsTheItem(t *testing.T) {
 	}
 	if got := manualTag(source); got != run.Status.Items[0].Trigger {
 		t.Errorf("source trigger = %q, want the run's %q left for VolSync to retry", got, run.Status.Items[0].Trigger)
+	}
+}
+
+// recordedLockedForget returns what restic 0.18.1's forget printed on a
+// repository that a killed mover left locked, as recorded in the restic
+// package's killed-mover fixture. VolSync keeps every line of a failed
+// mover's logs in status.latestMoverStatus.
+func recordedLockedForget(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile("../restic/testdata/recorded/restic-0.18.1/killed-mover/verdicts.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var verdicts struct {
+		Forget struct {
+			Output string `json:"output"`
+		} `json:"forget"`
+	}
+	if err := json.Unmarshal(raw, &verdicts); err != nil {
+		t.Fatal(err)
+	}
+	return verdicts.Forget.Output
+}
+
+// A mover that fails because the repository is locked fails the item with
+// a message that names the lock and says how it is cleared: `restic unlock`
+// removes a stale lock, and the backups the controller triggers run it first,
+// so they clear the lock once it is older than 30 minutes.
+func TestAMoverStoppedByALockSaysHowToClearIt(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore(), repository())
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // start
+
+	logs := "snapshot 6e473100 saved\n" + recordedLockedForget(t)
+	source := &volsyncv1alpha1.ReplicationSource{}
+	get(t, c, ns, claimN, source)
+	at := metav1.NewTime(frozen.Add(10 * time.Second))
+	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{
+		LastSyncStartTime: &at,
+		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: logs},
+	}
+	if err := c.Status().Update(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	step(t, r)
+
+	item := readBackupRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemFailed {
+		t.Fatalf("item = %+v, want it Failed", item)
+	}
+	for _, want := range []string{"repository is already locked", "`restic unlock`", "stale", "30 minutes", "next backup"} {
+		if !strings.Contains(item.Message, want) {
+			t.Errorf("item message %q does not say %q", item.Message, want)
+		}
+	}
+}
+
+// A mover that fails for another reason gets no word about locks.
+func TestAMoverFailureWithoutALockSaysNothingOfLocks(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore(), repository())
+	step(t, r)
+	step(t, r)
+	step(t, r)
+	failMover(t, c, frozen.Add(10*time.Second))
+	step(t, r)
+	if item := readBackupRun(t, c).Status.Items[0]; strings.Contains(item.Message, "unlock") {
+		t.Errorf("item message %q speaks of unlocking, but nothing was locked", item.Message)
+	}
+}
+
+// Every trigger the controller writes onto a new or idle source also sets
+// spec.restic.unlock to the same value, so VolSync runs `restic unlock`
+// before the backup and a lock a killed mover left behind is cleared once it
+// is stale.
+func TestASourceIsTriggeredWithAnUnlock(t *testing.T) {
+	for name, existing := range map[string][]client.Object{"a new source": nil, "an idle source": {idleSource()}} {
+		t.Run(name, func(t *testing.T) {
+			objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+				claim(), volume(), volumeRestore(), repository()}, existing...)
+			r, c := backupReconciler(t, objects...)
+			step(t, r)
+			step(t, r)
+			step(t, r)
+			source := &volsyncv1alpha1.ReplicationSource{}
+			get(t, c, ns, claimN, source)
+			if manualTag(source) != TriggerFor(runUID) || source.Spec.Restic == nil || source.Spec.Restic.Unlock != manualTag(source) {
+				t.Errorf("trigger = %q, restic = %+v; want unlock equal to the run's trigger", manualTag(source), source.Spec.Restic)
+			}
+		})
 	}
 }
 
