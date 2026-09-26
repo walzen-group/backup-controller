@@ -200,11 +200,13 @@ func kustomizationSuspended(t *testing.T, namespace, name string) bool {
 	return kustomization.Spec.Suspend
 }
 
-// quiesceLeases returns the quiesce Leases across the cluster, with the run
-// each names.
-func quiesceLeases(t *testing.T) []string {
+// quiesceLeases returns the Lease backup-controller-quiesce in namespace, the
+// app's namespace, with the run it names, or nothing when the namespace
+// holds none. It matches the Lease by its name as well as by the quiesce
+// label, so no other Lease can make a poll count two.
+func quiesceLeases(t *testing.T, namespace string) []string {
 	t.Helper()
-	out := mustKubectl(t, "", "get", "leases", "-A",
+	out := mustKubectl(t, "", "-n", namespace, "get", "leases",
 		"-l", "backup.wlz.li/lease-scope=quiesce", "-o", "json")
 	var list struct {
 		Items []struct {
@@ -220,6 +222,9 @@ func quiesceLeases(t *testing.T) []string {
 	}
 	var held []string
 	for _, lease := range list.Items {
+		if lease.Metadata.Name != "backup-controller-quiesce" {
+			continue
+		}
 		held = append(held, fmt.Sprintf("%s/%s held by %s %s",
 			lease.Metadata.Namespace, lease.Metadata.Name,
 			lease.Metadata.Labels["backup.wlz.li/lease-holder-kind"],
@@ -425,7 +430,7 @@ spec:
 	// exists at any poll (the design asks for this check to be sampled).
 	maxLeases, waited := 0, false
 	waitFor(t, "the second BackupRun to report the restore's wait", 3*time.Minute, 2*time.Second, func() (bool, string, error) {
-		if held := len(quiesceLeases(t)); held > maxLeases {
+		if held := len(quiesceLeases(t, ns.Name)); held > maxLeases {
 			maxLeases = held
 		}
 		run, err := readBackupRun(t, ns.Name, "second")
@@ -453,7 +458,7 @@ spec:
 	// The restore gives the app back and ends; only then does the backup plan
 	// the replicas the app has.
 	waitFor(t, "the restore to succeed", 12*time.Minute, 3*time.Second, func() (bool, string, error) {
-		if held := len(quiesceLeases(t)); held > maxLeases {
+		if held := len(quiesceLeases(t, ns.Name)); held > maxLeases {
 			maxLeases = held
 		}
 		restore, err := readRestoreRun(t, ns.Name, "restore")
@@ -474,7 +479,7 @@ spec:
 
 	var second backupv1alpha1.BackupRun
 	waitFor(t, "the second BackupRun to succeed", 12*time.Minute, 3*time.Second, func() (bool, string, error) {
-		if held := len(quiesceLeases(t)); held > maxLeases {
+		if held := len(quiesceLeases(t, ns.Name)); held > maxLeases {
 			maxLeases = held
 		}
 		run, err := readBackupRun(t, ns.Name, "second")
