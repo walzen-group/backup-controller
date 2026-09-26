@@ -197,11 +197,13 @@ spec:
 		t.Fatalf("the file did not change")
 	}
 
-	// restic stamps the snapshot to the nanosecond and the run records whole
-	// seconds, so one second past the recorded time still selects it, and
-	// no later snapshot exists.
-	asOf := item.SnapshotTime.UTC().Add(time.Second).Format(time.RFC3339)
-	step(4, "restore claim %s in place to snapshot %s (restoreAsOf %s), quiescing Deployment app", claim, snap.ShortID, asOf)
+	// The demo restores to the exact second the scheduled run recorded, the
+	// whole second restic stamped the snapshot in, which is what a user
+	// reading the run's snapshotTime passes. The run's checks select the
+	// snapshot of that second the way VolSync's mover does, and hand the
+	// mover the same second.
+	asOf := item.SnapshotTime.UTC().Format(time.RFC3339)
+	step(4, "restore claim %s in place to the recorded snapshot %s at %s (restoreAsOf %s), quiescing Deployment app", claim, snap.ShortID, asOf, asOf)
 	const restoreName = "demo-restore"
 	apply(t, fmt.Sprintf(`apiVersion: backup.wlz.li/v1alpha1
 kind: RestoreRun
@@ -237,11 +239,20 @@ spec:
 	if restore.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("RestoreRun %s ended %s: %s\n%s", restoreName, restore.Status.Phase, readyMessage(restore.Status.Conditions), evidence())
 	}
-	for _, it := range restore.Status.Items {
-		t.Logf("restored %s %s: phase=%s snapshot=%s %s", it.Kind, it.Name, it.Phase, it.Snapshot, it.Message)
-		if it.Snapshot != "" && it.Snapshot != item.Snapshot && !strings.HasPrefix(snap.ID, it.Snapshot) {
-			t.Errorf("RestoreRun restored snapshot %s, want %s", it.Snapshot, snap.ShortID)
-		}
+	if len(restore.Status.Items) != 1 || restore.Status.Items[0].Kind != "PersistentVolumeClaim" {
+		t.Fatalf("RestoreRun %s items = %+v, want the one claim\n%s", restoreName, restore.Status.Items, evidence())
+	}
+	restoredItem := restore.Status.Items[0]
+	t.Logf("restored %s %s: phase=%s snapshot=%s at %s %s",
+		restoredItem.Kind, restoredItem.Name, restoredItem.Phase, restoredItem.Snapshot, restoredItem.SnapshotTime, restoredItem.Message)
+	// The run selected the snapshot of the recorded second and reports what
+	// it restored, so the demo checks both the snapshot and the whole second
+	// against what the backup run recorded.
+	if restoredItem.Snapshot != item.Snapshot {
+		t.Errorf("RestoreRun %s restored snapshot %s, the BackupRun recorded %s", restoreName, restoredItem.Snapshot, item.Snapshot)
+	}
+	if restoredItem.SnapshotTime == nil || !restoredItem.SnapshotTime.UTC().Equal(item.SnapshotTime.UTC()) {
+		t.Errorf("RestoreRun %s reports the snapshot at %v, the BackupRun recorded %v", restoreName, restoredItem.SnapshotTime, item.SnapshotTime)
 	}
 
 	step(5, "check the restored file equals the original and the app runs again")
