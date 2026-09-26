@@ -1028,7 +1028,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	// Only a finished item counts here: the mover of an item that is still
 	// Pending or Running is doing the restore, and belongs there.
 	if message := stopping.message(); message != "" {
-		return r.waitForStopped(ctx, run, message)
+		return r.waitForStopped(ctx, run, message, false)
 	}
 
 	// A database comes back only when its owner creates it again, and a
@@ -2367,10 +2367,12 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 //
 // finish first records reason and message in status.ending, so every status
 // write from then on carries them, and the items the caller failed go in
-// the same write. The wait for a stopped mover and a failed release each
-// write the status, ending included. The next pass finds status.ending and
-// calls finish with it (see Reconcile), so the run ends as it decided to,
-// whatever it waited for when it decided.
+// the same write. The pass that records the ending writes the status in
+// the wait for a stopped mover (see waitForStopped), even when the wait is
+// the same as before, and a failed release writes it as well, ending
+// included. The next pass finds status.ending and calls finish with it (see
+// Reconcile), so the run ends as it decided to, whatever it waited for when
+// it decided.
 //
 // The steps run in this order, and each one runs only once the one before it
 // went through:
@@ -2392,7 +2394,8 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // timeOut, which fail the item with the note from clusterLeftDeleted first
 // (see failRemainingItems).
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
-	if run.Status.Ending == nil {
+	recorded := run.Status.Ending == nil
+	if recorded {
 		run.Status.Ending = &backupv1alpha1.RunEnding{Reason: reason, Message: message}
 	}
 	ending := *run.Status.Ending
@@ -2401,7 +2404,7 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err)
 	}
 	if waiting := left.message(); waiting != "" {
-		return r.waitForStopped(ctx, run, waiting)
+		return r.waitForStopped(ctx, run, waiting, recorded)
 	}
 	// The app is given back before the Leases go: a run that could not start
 	// the workloads keeps the claim and the repository to itself until it
@@ -2473,7 +2476,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err)
 	}
 	if waiting := left.message(); waiting != "" {
-		return r.waitForStopped(ctx, run, waiting)
+		return r.waitForStopped(ctx, run, waiting, false)
 	}
 	// The app is given back before the Leases go, as in finish.
 	if stopped(run) {
@@ -2749,9 +2752,14 @@ func moverRemains(ctx context.Context, c client.Reader, namespace, destination s
 //
 // Parameters:
 //   - run is the RestoreRun that waits. Its status is written when the
-//     Ready condition changes.
+//     Ready condition changes, or when changed is true.
 //   - message is the Ready message that says what the run waits for: a
 //     mover it stopped (see moverList.message).
+//   - changed is true when the caller changed the status in this pass
+//     beyond the Ready condition: finish passes it for the pass that
+//     records status.ending, so the ending and the items it failed are
+//     stored even when the run waits for the same mover as before. work
+//     and finalize pass false.
 //
 // It returns a result that looks again after pollInterval, and the error of
 // the status write, if any.
@@ -2760,14 +2768,14 @@ func moverRemains(ctx context.Context, c client.Reader, namespace, destination s
 // False with reason WaitingForShutdown and the message. A finished run that
 // finalize holds keeps the phase it finished with, which is the record of how
 // its restore went. The status is written only when the condition changed,
-// since every write starts another reconcile. The run keeps its finalizer and
+// or changed is true, since every write starts another reconcile. The run keeps its finalizer and
 // its Leases meanwhile, so nothing takes the claim or the repository over
 // while the mover may still write.
-func (r *RestoreRunReconciler) waitForStopped(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
+func (r *RestoreRunReconciler) waitForStopped(ctx context.Context, run *backupv1alpha1.RestoreRun, message string, changed bool) (ctrl.Result, error) {
 	if !run.Status.Phase.Finished() {
 		run.Status.Phase = backupv1alpha1.RunPhaseWaiting
 	}
-	if !readyChanged(run, backupv1alpha1.ReasonShutdown, message) {
+	if !changed && !readyChanged(run, backupv1alpha1.ReasonShutdown, message) {
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
 	}
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonShutdown, message)

@@ -821,3 +821,46 @@ func TestAFinishedRestoreEndsAsItsItemsSayWhenTheDeadlinePassesInItsMoverWait(t 
 		t.Errorf("replicas = %d once the mover was gone, want the 2 the app had", got)
 	}
 }
+
+// The pass that decides to end a run records the ending, even when it then
+// waits for the same stopped mover with the same message as the pass
+// before. Here one item failed before the deadline and its mover's pod is
+// still there, and the other waits for a pod that mounts its claim. The
+// pass after the deadline fails the waiting item with reason TimedOut, and
+// that item and the ending reach the stored status. Before, the wait wrote
+// only a changed Ready condition, so both were lost.
+func TestTheEndingIsStoredWhenTheMoverWaitIsUnchanged(t *testing.T) {
+	const other = "notes-cache"
+	run, destination := quiescedMidRestore()
+	run.Status.Items[0].Phase = backupv1alpha1.ItemFailed
+	run.Status.Items = append(run.Status.Items, backupv1alpha1.RestoreItem{Kind: "PersistentVolumeClaim", Name: other,
+		Phase: backupv1alpha1.ItemPending})
+	mover := moverPod(destination.Name, corev1.PodRunning)
+	mounting := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache-5d9f", Namespace: ns},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: other},
+		}}}},
+	}
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination, mover, mounting)
+	r.Now = func() time.Time { return frozen.Add(time.Hour) }
+
+	restoreStep(t, r) // deletes the failed item's destination
+	restoreStep(t, r) // finds the mover's pod still there
+	before := readRestoreRun(t, c)
+	if readyReason(before.Status.Conditions) != backupv1alpha1.ReasonShutdown || !strings.Contains(readyMessage(before.Status.Conditions), mover.Name) {
+		t.Fatalf("reason = %q, message = %q before the deadline; want %s naming pod %s", readyReason(before.Status.Conditions),
+			readyMessage(before.Status.Conditions), backupv1alpha1.ReasonShutdown, mover.Name)
+	}
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	restoreStep(t, r)
+
+	stored := readRestoreRun(t, c)
+	if stored.Status.Ending == nil || stored.Status.Ending.Reason != backupv1alpha1.ReasonTimedOut {
+		t.Errorf("ending = %+v after the pass that timed out, want reason %s stored", stored.Status.Ending, backupv1alpha1.ReasonTimedOut)
+	}
+	if item := stored.Status.Items[1]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonTimedOut {
+		t.Errorf("item %s = %+v, want it stored Failed with reason TimedOut", other, item)
+	}
+}
