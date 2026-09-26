@@ -1,0 +1,25 @@
+{
+  "rustfs": {
+    "image": {
+      "repository": "docker.io/rustfs/rustfs",
+      "tag": "1.0.0",
+      "digest": "sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff"
+    },
+    "s3client": {
+      "about": "The S3 client the install step and the in-cluster check run as a pod.",
+      "repository": "docker.io/amazon/aws-cli",
+      "tag": "2.37.4",
+      "digest": "sha256:fdd8d1fcbea9c371678dee5a40df8b178c7a781b4586605756ee28114c97ead6"
+    },
+    "hostClient": {
+      "about": "The S3 client the host side of the check runs, from the flake's locked nixpkgs.",
+      "nixpkgs": "awscli2"
+    },
+    "namespace": "e2e-s3",
+    "service": "rustfs",
+    "endpoint": "http://rustfs.e2e-s3.svc:9000",
+    "credentialsSecret": "rustfs-credentials",
+    "buckets": ["volsync", "postgres"],
+    "dataVolume": "emptyDir, sizeLimit 1Gi"
+  }
+}
