@@ -1793,15 +1793,42 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 //
 // It returns what finish returns: an empty result once the run has ended, or
 // the wait for a stopped mover, which finish reports (rule X2).
+//
+// A Cluster item in phase Deleted gets the note from clusterLeftDeleted after
+// the message, and so does the Ready message: the run deleted that Cluster,
+// and the webhook recovers its next creation without the run. A later pass
+// that aborts again finds the note on the Failed item and keeps it in the
+// Ready message, so the message stays the same from pass to pass.
 func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
+	ready := message
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		switch item.Phase {
-		case backupv1alpha1.ItemPending, backupv1alpha1.ItemRunning, backupv1alpha1.ItemDeleted, backupv1alpha1.ItemRecovering:
+		case backupv1alpha1.ItemDeleted:
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, message+". "+clusterLeftDeleted(item.Name)
+		case backupv1alpha1.ItemPending, backupv1alpha1.ItemRunning, backupv1alpha1.ItemRecovering:
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 		}
+		if item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemFailed && strings.HasSuffix(item.Message, clusterLeftDeleted(item.Name)) {
+			ready += ". " + clusterLeftDeleted(item.Name)
+		}
 	}
-	return r.finish(ctx, run, reason, message)
+	return r.finish(ctx, run, reason, ready)
+}
+
+// clusterLeftDeleted returns the note for a Cluster the run deleted and
+// ended without: no run waits for the Cluster any more, so the bootstrap
+// webhook recovers its next creation to the end of its archive, or to the
+// time in the Cluster's own backup.wlz.li/restore-as-of annotation (see
+// bootstrap.Decider.Handle, whose waitingRun passes over a finished run and
+// a run being deleted).
+//
+// Parameters:
+//   - cluster is the name of the Cluster, which the note names.
+func clusterLeftDeleted(cluster string) string {
+	return fmt.Sprintf("Cluster %s was deleted, and the run ended before it was created again. No run waits for it now, "+
+		"so when Flux or tofu creates it, the bootstrap webhook recovers it to the end of its archive, or to the time in its own %s annotation; "+
+		"the moment this run chose no longer applies", cluster, backupv1alpha1.AnnotationRestoreAsOf)
 }
 
 // quiesce stops the workloads spec.quiesce lists, before the run does
@@ -2019,7 +2046,18 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 //  5. It releases the namespace's quiesce Lease, which the stored status now
 //     shows is no longer needed.
 //  6. It removes the run's finalizer.
+//
+// A Cluster item still in phase Deleted fails with the note from
+// clusterLeftDeleted, which says how the webhook recovers that Cluster now
+// that no run waits for it.
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
+	// abort has already failed a Deleted Cluster item with the note; any
+	// other caller that ends a run with one gets the note here.
+	for i := range run.Status.Items {
+		if item := &run.Status.Items[i]; item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemDeleted {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, clusterLeftDeleted(item.Name)
+		}
+	}
 	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
@@ -2079,6 +2117,11 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 // finalizer and its Leases while it waits or retries: a Lease released
 // before the finalizer is dropped would let another run take the claim over
 // while this run repeats its restart.
+//
+// Right before it drops the finalizer, finalize records a Warning event with
+// reason ClusterLeftDeleted for each Cluster item still in phase Deleted,
+// with the note from clusterLeftDeleted. The run is about to go, so the
+// event is the only place that note can appear.
 func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
@@ -2098,6 +2141,13 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	}
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err), false)
+	}
+	if r.Recorder != nil {
+		for _, item := range run.Status.Items {
+			if item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemDeleted {
+				r.Recorder.Eventf(run, nil, corev1.EventTypeWarning, "ClusterLeftDeleted", "Restore", "%s", fitNote(clusterLeftDeleted(item.Name)))
+			}
+		}
 	}
 	if err := dropFinalizer(ctx, r.Client, run); err != nil {
 		return ctrl.Result{}, err

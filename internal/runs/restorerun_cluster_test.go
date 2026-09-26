@@ -4,12 +4,15 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -422,5 +425,66 @@ func TestARunChecksForAnotherRunAgainBeforeItDeletesTheCluster(t *testing.T) {
 	item := readRestoreRun(t, c).Status.Items[0]
 	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "RestoreRun second is restoring Cluster "+pgN) {
 		t.Errorf("item = %+v, want Failed naming RestoreRun second", item)
+	}
+}
+
+// deletedDatabaseRun is a mutate function for restoreRun that makes it a
+// database restore of pgN, started at frozen, whose item is Deleted: the run
+// deleted the old Cluster and waits for its owner to create it again.
+func deletedDatabaseRun(r *backupv1alpha1.RestoreRun) {
+	started := metav1.NewTime(frozen)
+	r.Spec.Database = pgN
+	r.Finalizers = []string{Finalizer}
+	r.Status.Phase = backupv1alpha1.RunPhaseWaiting
+	r.Status.StartedAt = &started
+	r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "Cluster", Name: pgN, Phase: backupv1alpha1.ItemDeleted,
+		ClusterUID: "old-cluster-uid", BaseBackup: saturday.ID}}
+}
+
+// endedBeforeRecreate is what the message of a Deleted Cluster item says
+// once its run has ended: the webhook recovers the next creation of the
+// Cluster without the run.
+const endedBeforeRecreate = "recovers it to the end of its archive, or to the time in its own backup.wlz.li/restore-as-of annotation"
+
+// A run that times out while it waits for its deleted Cluster to be created
+// again says, on the item, what the webhook does with that Cluster now: once
+// the run has ended, no run waits for the Cluster, so its next creation
+// recovers to the end of its archive or to its own annotation.
+func TestATimedOutRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, restoreRun(deletedDatabaseRun), objectStore(), storeSecret())
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Fatalf("phase = %q, want Failed", run.Status.Phase)
+	}
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, endedBeforeRecreate) {
+		t.Errorf("item = %+v, want Failed saying %q", item, endedBeforeRecreate)
+	}
+	if !strings.Contains(readyMessage(run.Status.Conditions), endedBeforeRecreate) {
+		t.Errorf("ready message = %q, want it to say %q", readyMessage(run.Status.Conditions), endedBeforeRecreate)
+	}
+}
+
+// A run deleted while it waits for its deleted Cluster records an event that
+// says the same.
+func TestADeletedRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday}, restoreRun(deletedDatabaseRun), objectStore(), storeSecret())
+	recorder := events.NewFakeRecorder(10)
+	r.Recorder = recorder
+	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreStep(t, r)
+
+	var found bool
+	for _, event := range recorded(recorder) {
+		found = found || strings.Contains(event, endedBeforeRecreate)
+	}
+	if !found {
+		t.Errorf("events = %q, want one saying %q", recorded(recorder), endedBeforeRecreate)
 	}
 }

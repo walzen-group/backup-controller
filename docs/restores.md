@@ -422,6 +422,24 @@ unfinished backup on its own: its retention deletes only DONE backups that
 have become obsolete. A RestoreRun's checks against a store with no DONE
 backup fail before the run deletes anything.
 
+The webhook recovers a Cluster for a RestoreRun only while that run is
+unfinished and not being deleted. A run can time out, fail or be deleted after
+it deleted a Cluster and before Flux or tofu created it again. When the owner
+then creates the Cluster, the webhook applies the second or the fourth row of
+the table: the Cluster recovers to the end of its archive, or to the time in
+its own `backup.wlz.li/restore-as-of` annotation, and the moment the run chose
+no longer applies. The run's item says so, after the reason the run ended, and
+a run that was deleted records a Warning event with reason ClusterLeftDeleted
+that says the same:
+
+```text
+Cluster notes-pg was deleted, and the run ended before it was created again. No run waits for it now, so when Flux or tofu creates it, the bootstrap webhook recovers it to the end of its archive, or to the time in its own backup.wlz.li/restore-as-of annotation; the moment this run chose no longer applies
+```
+
+To recover the Cluster to the run's moment after all, set
+`backup.wlz.li/restore-as-of` on the Cluster's manifest to that moment before
+its owner creates it.
+
 The webhook lists base/ with the `/` delimiter, which gives one entry per
 backup directory, the way barman's own catalog reads it. When base/ holds no
 directory, the webhook lists one key under `<prefix>/` to learn whether
