@@ -146,3 +146,32 @@ func TestAnInPlaceRestoreWaitsForAnotherDestinationOfItsClaim(t *testing.T) {
 		t.Errorf("item = %+v once the other destination is gone, want Running", item)
 	}
 }
+
+// An in-place restore whose item is Pending waits with reason SourceBusy,
+// naming the other run, while another live RestoreRun holds the claim's
+// Lease and has not created its destination yet. Nothing else shows that run:
+// no destination writes into the claim and no backup has its trigger on a
+// ReplicationSource, so only the Lease keeps the two movers apart, and the
+// waiting run creates no destination.
+func TestARestoreWaitsForTheClaimLeaseOfARunThatHasNotStarted(t *testing.T) {
+	other := secondClaimRestore()
+	other.Status.Phase = backupv1alpha1.RunPhaseRunning
+	other.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN, Phase: backupv1alpha1.ItemPending}}
+	r, c := restoreReconciler(t, nil, checkedRestore(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
+		other, claim(), volumeRestore(), repository(), heldClaimLease(other, claimN))
+
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy ||
+		!strings.Contains(readyMessage(run.Status.Conditions), "RestoreRun second") {
+		t.Errorf("reason = %q, message = %q; want SourceBusy naming RestoreRun second",
+			readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
+	}
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemPending || item.Destination != "" {
+		t.Errorf("item = %+v, want Pending with no destination", item)
+	}
+	if names := destinations(t, c); len(names) != 0 {
+		t.Errorf("destinations = %v, want none while the other run holds the claim Lease", names)
+	}
+}
