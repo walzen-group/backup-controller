@@ -311,7 +311,9 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // restart fails, the pass reports it at once with reason RestartFailed (see
 // releaseFailed) and returns the error, so the restart is retried. A pass that
 // finds status.restartPending set repeats the restart and keeps the recorded
-// moment. Times in the status are whole seconds. Last, it collects the result
+// moment. The pass that records the moment restarts even when the installed
+// CRD dropped status.restartPending from its write, as the v0.7.2 CRD does.
+// Times in the status are whole seconds. Last, it collects the result
 // of every Running item.
 //
 // The workloads stay stopped for at most the namespace's
@@ -406,6 +408,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		}
 	}
 
+	restart := false
 	if run.Spec.All && run.Status.RestartedAt == nil && r.clonesCut(ctx, run) {
 		// The moment is written before the workloads start, so a pass that
 		// starts them and then loses its status write is retried with it.
@@ -413,8 +416,14 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		if err := r.writeStatus(ctx, run); err != nil {
 			return ctrl.Result{}, err
 		}
+		// An installed BackupRun CRD that lacks status.restartPending drops
+		// it from the write, and the write decodes the stored object back
+		// into run. The schema checks run only before the workloads stop,
+		// so a run an older controller stopped them for reaches this point
+		// unchecked, and this pass restarts on its own knowledge.
+		restart = true
 	}
-	if run.Status.RestartPending {
+	if restart || run.Status.RestartPending {
 		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 			// The run says why the app is still down at once, rather than
 			// only at its timeout, and the error makes the pass run again.

@@ -205,3 +205,53 @@ func (f forbidCRDs) Get(ctx context.Context, key client.ObjectKey, obj client.Ob
 	}
 	return f.Reader.Get(ctx, key, obj, opts...)
 }
+
+// A run that v0.8.1 quiesced under the v0.7.2 BackupRun CRD before the
+// upgrade is past both schema checks, since they run only before the run
+// stops anything. The CRD drops status.restartPending from the pass that
+// records the restart moment, and the status write decodes the stored
+// object back into the run. The pass still gives the app back and resumes
+// its Kustomization, and the run finishes with the app running.
+func TestARunQuiescedUnderAnOldCRDStillGivesTheAppBack(t *testing.T) {
+	c := newClientWithCRDs(t, withOldCRD("backup.wlz.li_backupruns.yaml"),
+		backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	r := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}
+	// v0.8.1 had no schema check: mark the CRD as walked with no gaps, so
+	// the run plans and quiesces as it did then.
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(crdGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{Name: backupRunsCRD}, crd); err != nil {
+		t.Fatalf("read the CRD: %v", err)
+	}
+	r.schemas.store(backupRunsCRD, crd.GetResourceVersion(), nil)
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // start
+	if got := replicasOf(t, c); got != 0 || !suspended(t, c) {
+		t.Fatalf("replicas = %d, suspended = %t before the upgrade, want the app stopped", got, suspended(t, c))
+	}
+
+	// The upgraded controller starts with no cached check.
+	r = &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: func() time.Time { return frozen }}
+	cutClone(t, c)
+	step(t, r) // restart
+	run := readBackupRun(t, c)
+	if run.Status.RestartedAt == nil {
+		t.Fatal("restartedAt is unset after the clone was cut")
+	}
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d after the restart pass, want 2 back", got)
+	}
+	if suspended(t, c) {
+		t.Error("the Kustomization is still suspended after the restart pass")
+	}
+
+	complete(t, c, "snapshot 6e473100 saved")
+	step(t, r) // collect
+	run = readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || replicasOf(t, c) != 2 {
+		t.Errorf("phase = %q, replicas = %d; want Succeeded with the app at 2", run.Status.Phase, replicasOf(t, c))
+	}
+}
