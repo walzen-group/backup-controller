@@ -71,6 +71,22 @@ func (b webhookBlind) message() string {
 		strings.Join(b.versions, ", "), webhookClusterKind.GroupVersion(), webhookClusterKind.GroupVersion())
 }
 
+// recreateMessage returns the Ready message for a run that has deleted the
+// Clusters named in recreate and waits for their owner to create them again
+// while b is blind.
+//
+// By then the run has given back what it stopped and resumed the
+// Kustomizations it suspended, so nothing holds a creation back. The message
+// says what a creation while v1 is not served does, and how to restore a
+// Cluster that came back empty.
+func (b webhookBlind) recreateMessage(recreate []string) string {
+	names := strings.Join(recreate, ", ")
+	return fmt.Sprintf("%s. The run has deleted %s and holds nothing back that creates it again. A Cluster created while %s "+
+		"is not served starts as an empty database, and its item then fails; restore it with a new RestoreRun once %s is served "+
+		"again or a backup-controller release that registers the new version is installed. A Cluster created after that is "+
+		"recovered", b.message(), names, webhookClusterKind.GroupVersion(), webhookClusterKind.GroupVersion())
+}
+
 // clusterWebhookBlind looks up whether the API server serves CloudNativePG's
 // Cluster at another version and no longer at v1, the version the bootstrap
 // webhook's rules name.

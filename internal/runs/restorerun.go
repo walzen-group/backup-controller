@@ -850,7 +850,7 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // Cluster item (see failBlindClusters), a run that ends in the pass that
 // failed such an item ends with reason ClusterVersionUnsupported (see
 // failedReason), and a run that waits for a deleted Cluster waits with that
-// reason, its message asking to hold the creation back.
+// reason and the message from recreateMessage.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if deadline, over := r.overdue(run); over {
 		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, restoreTimedOut(run, deadline))
@@ -1013,7 +1013,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 			fmt.Sprintf("waiting for %s of the deleted Cluster to be gone before anything creates it again", strings.Join(shuttingDown, ", "))))
 	case len(recreate) > 0 && blind.blind():
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonClusterVersionUnsupported,
-			fmt.Sprintf("%s. Hold back the creation of %s: the webhook would not recover it", blind.message(), strings.Join(recreate, ", "))))
+			blind.recreateMessage(recreate)))
 	case len(recreate) > 0:
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonRecreate,
 			fmt.Sprintf("recreate %s to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it", strings.Join(recreate, ", "))))

@@ -140,7 +140,9 @@ func TestAPlannedRestoreDeletesNoClusterTheWebhookCannotSee(t *testing.T) {
 
 // A run that already deleted the Cluster and waits for its owner to create
 // it again says, with reason ClusterVersionUnsupported, that the webhook
-// would not see that creation, so a person holds it back.
+// would not see that creation. The run holds nothing back by then, so the
+// message says what a creation then does and how to restore the Cluster,
+// and asks nobody to hold the creation back.
 func TestARestoreWaitingForAClusterTheWebhookCannotSeeSaysSo(t *testing.T) {
 	started := metav1.NewTime(frozen)
 	run := restoreRun(func(r *backupv1alpha1.RestoreRun) {
@@ -162,6 +164,9 @@ func TestARestoreWaitingForAClusterTheWebhookCannotSeeSaysSo(t *testing.T) {
 			backupv1alpha1.ReasonClusterVersionUnsupported)
 	}
 	checkClusterUnsupported(t, readyMessage(after.Status.Conditions))
+	if message := readyMessage(after.Status.Conditions); strings.Contains(message, "Hold back") || !strings.Contains(message, "new RestoreRun") {
+		t.Errorf("message = %q, want it to say how to restore the Cluster without asking to hold its creation back", message)
+	}
 	if after.Status.Phase.Finished() {
 		t.Errorf("phase = %q, want the run still waiting for the Cluster", after.Status.Phase)
 	}

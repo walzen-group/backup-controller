@@ -163,9 +163,10 @@ const (
 	// name. The API server then creates a Cluster without calling the
 	// webhook, and the Cluster starts as an empty database. The run deletes
 	// no Cluster: a run that has not deleted one ends Failed with this
-	// reason, and a run that already deleted one waits with it, its message
-	// saying to hold the creation back until v1 is served again or a
-	// controller release registers the new version.
+	// reason, and a run that already deleted one waits with it. Its message
+	// says that a Cluster created while v1 is not served starts empty and
+	// fails its item, and that a new RestoreRun restores it once v1 is
+	// served again or a controller release registers the new version.
 	ReasonClusterVersionUnsupported = "ClusterVersionUnsupported"
 )
 
