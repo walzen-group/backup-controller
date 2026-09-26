@@ -15,11 +15,23 @@ import (
 
 // TestAnIntoRestoreFromAClaimFillsAPlainClaimOnTheSourcesNode checks what an
 // into restore from a claim relies on, with the real CSI driver, scheduler,
-// Kueue and VolSync 0.16.0: the run creates a plain claim with the source
-// claim's size, class and volume.kubernetes.io/selected-node and no data
-// source, and a ReplicationDestination in the app's namespace, built the way
-// scratchClaim and directDestination build them. The class binds
-// WaitForFirstConsumer and no pod but the mover ever uses the new claim.
+// Kueue and VolSync 0.16.0: a plain claim with the source claim's size, class
+// and volume.kubernetes.io/selected-node and no data source, and a
+// ReplicationDestination in the app's namespace with copyMethod Direct that
+// writes into it. The class binds WaitForFirstConsumer and no pod but the
+// mover ever uses the new claim.
+//
+// No controller runs here. The test builds every object by hand, the backup
+// included: a ReplicationSource with a manual trigger stands in for a
+// BackupRun, and there is no RestoreRun and no VolumeRestore. The claim and
+// the destination carry the spec fields scratchClaim and directDestination
+// write, with a fixed destination name, restore-copy-0, and trigger,
+// restore-1, where the controller uses restore-<first 8 characters of the
+// run's UID>-0 and the run's UID, and the claim has no ownerReference to a
+// run. So the test shows what VolSync, the scheduler and the CSI driver do
+// with those objects. The run's own steps for an into restore (its checks,
+// Leases, log check and cleanup) are covered by the unit tests only: the
+// e2e tests that create a RestoreRun restore in place.
 //
 // The test backs up a claim a running writer mounts, then restores the
 // snapshot into the new claim while the writer keeps running. The mover must
@@ -130,8 +142,9 @@ spec:
 	pin := snap.Time.UTC().Format(time.RFC3339)
 	t.Logf("snapshot %s at %s", snap.ShortID, snap.Time.Format(time.RFC3339Nano))
 
-	// The claim and the destination as scratchClaim and directDestination
-	// build them for spec.claim: data, spec.into: copy.
+	// The claim and the destination with the spec fields scratchClaim and
+	// directDestination write for spec.claim: data, spec.into: copy, built
+	// by hand under a fixed name and trigger (see the test's comment).
 	apply(t, fmt.Sprintf(`apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

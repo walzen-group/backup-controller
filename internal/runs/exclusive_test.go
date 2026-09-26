@@ -348,3 +348,33 @@ func TestABackupWaitsWhileAnIntoRestoreFromTheClaimRuns(t *testing.T) {
 		t.Error("the backup wrote its trigger while the restore ran")
 	}
 }
+
+// A restore whose item has finished no longer holds the claim or the
+// repository against a backup, even while its ReplicationDestination is still
+// there: the run records the item's end before it deletes the destination, so
+// the destination outlives the restore for a pass or more. A restore whose
+// item is still Running holds them.
+func TestAFinishedRestoreItemsDestinationDoesNotHoldABackup(t *testing.T) {
+	for _, tc := range []struct {
+		phase backupv1alpha1.ItemPhase
+		holds bool
+	}{
+		{backupv1alpha1.ItemRunning, true},
+		{backupv1alpha1.ItemSucceeded, false},
+		{backupv1alpha1.ItemFailed, false},
+	} {
+		t.Run(string(tc.phase), func(t *testing.T) {
+			run, destination := restoring()
+			run.Status.Items[0].Phase = tc.phase
+			c := newClient(t, run, destination)
+
+			busy, err := restoreInProgress(context.Background(), c, ns, claimN, repoN)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if held := busy != ""; held != tc.holds {
+				t.Errorf("restoreInProgress = %q, want held = %t", busy, tc.holds)
+			}
+		})
+	}
+}
