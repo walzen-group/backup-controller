@@ -413,7 +413,8 @@ func (r *BackupRunReconciler) awaitAdmission(ctx context.Context, run *backupv1a
 //
 // The run finishes once every item is done and, on a run with spec.all set,
 // the workloads are running again. It finishes Succeeded when no item failed
-// and Failed otherwise. A run past its timeout is aborted.
+// and Failed otherwise. A run past its timeout ends as Failed through
+// timeOut, which fails every unfinished item with reason TimedOut.
 func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
 	// The status keeps times in whole seconds. A snapshot moved in this pass
 	// must carry the restartedAt that later passes read back.
@@ -851,6 +852,19 @@ func (r *BackupRunReconciler) startPending(ctx context.Context, run *backupv1alp
 
 // startItem starts the backup of one Pending item and sets the item's phase.
 //
+// Parameters:
+//   - run is the admitted BackupRun, for its namespace, its UID and the
+//     trigger tag built from it.
+//   - item is the Pending item to start. It is changed in place, and the
+//     caller writes the status.
+//
+// It returns a message for the run's Ready condition when the item has to
+// wait, and an empty string otherwise. It returns an error for any failed
+// read or write a later pass may not get, such as a timeout from the API
+// server or a 500 from a webhook it cannot reach, with the item left
+// Pending. The caller, startPending, records that error in
+// status.items[].lastStartError and tries the item again on its next pass.
+//
 // For a volume, it writes the claim's ReplicationSource with the run's manual
 // trigger tag and moves the item to Running. For a database, it creates a
 // CloudNativePG Backup and moves the item to Running, or skips the item when
@@ -860,17 +874,12 @@ func (r *BackupRunReconciler) startPending(ctx context.Context, run *backupv1alp
 // reason and says why in its message. The same goes for a Backup the API
 // server rejects as invalid.
 //
-// It returns a message for the run's Ready condition when the item has to
-// wait, which happens when the volume's ReplicationSource is still completing
-// the backup of another run that waits for it, or when a RestoreRun's mover
+// An item waits when the volume's ReplicationSource is still completing the
+// backup of another run that waits for it, or when a RestoreRun's mover
 // works on the claim or its repository (see otherMover). The message names
 // that run, and the item stays Pending. When the source is busy with a
 // backup no run waits for (see holder), the item fails at once with a
 // message that says what a person can do, and the source is left alone.
-// Otherwise it returns an empty string. Any other failed read or write, such
-// as a timeout from the API server or a 500 from a webhook it cannot reach,
-// comes back as an error with the item left Pending. The caller records the
-// error in the item's message and tries the item again on its next pass.
 func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) (string, error) {
 	switch item.Kind {
 	case "ReplicationSource":
