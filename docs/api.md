@@ -157,7 +157,7 @@ spec:
 | --- | --- | --- |
 | `source` | one of the three | the claim to back up, which has to carry `backup.wlz.li/enabled: "true"`; its ReplicationSource has the same name |
 | `database` | one of the three | the CloudNativePG Cluster to take a base backup of |
-| `all` | one of the three | every enabled claim and Cluster in the namespace, with the workloads marked `backup.wlz.li/quiesce` stopped until the clones are cut, and for at most the namespace's `backup.wlz.li/max-quiesce`, ten minutes by default |
+| `all` | one of the three | every enabled claim and Cluster in the namespace, with the workloads marked `backup.wlz.li/quiesce` stopped until the clones are cut, one run at a time in the namespace, and for at most the namespace's `backup.wlz.li/max-quiesce`, ten minutes by default |
 | `timeout` | no | how long the run may work once admitted, e.g. `10h`. Omitted, the namespace's `backup.wlz.li/timeout`, and 6h without one |
 | `ttlSecondsAfterFinished` | no | delete the run that long after it finishes. Omitted, it stays as the record |
 
@@ -198,14 +198,14 @@ doing it.
 | --- | --- |
 | Queued | the run waits for Kueue to admit it |
 | Running | work is under way; the message is `backing up` |
-| SourceBusy | another run holds the run's claim or repository; the message names that run and what it holds, and every item that has to wait |
+| SourceBusy | another run holds the run's claim or repository, has stopped this namespace's workloads and has not given them back, holds a Kustomization this run's plan needs, or has deleted a Cluster this run waits to see created again; the message names that run, what it holds, and every wait |
 | Retrying | an item could not start with an error a retry may fix, such as a Backup a CloudNativePG webhook refuses; the message names every such item and its error |
 | RestartFailed | the run could not give a stopped workload its replicas back or resume a Kustomization it suspended, so the app is still down; when the Lease release or the Workload delete failed as well, the reason stays RestartFailed and the message names both |
 | ReleaseFailed | the app is back, and the run cannot finish because it could not release its Leases or delete its Kueue Workload |
 | CRDOutdated | the run ended before it changed anything, because the installed CRD of its kind lacks a field the controller writes |
 | Invalid | the spec names something no retry can fix, such as a claim that is not marked `backup.wlz.li/enabled` |
 | Succeeded | the run finished with every item done |
-| Failed | the run finished with a failed item, or past its timeout |
+| Failed | the run finished with a failed item, or past its timeout; a run that passed its deadline while waiting for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |
 
 Whenever a run's Ready condition moves to a new reason, the controller records
 an event on the run with that reason, and the condition's message as its note.
@@ -240,7 +240,7 @@ spec:
 | `restoreAsOf` | no | the moment to restore to. A volume restores the newest snapshot at or before it, a database replays WAL to it exactly. Omitted, the newest snapshot and the end of the archive |
 | `previous` | no | how many snapshots further back than the selected one; one volume only |
 | `syncDatabaseToVolume` | no | with `all` only: recover the databases to the moment of the volumes' newest `quiesced` snapshot at or before `restoreAsOf`, so the files and the rows agree. Refused when a volume has no such snapshot, or two volumes' snapshots are from different moments |
-| `quiesce` | no | Deployments and StatefulSets, as `{kind, name}`, to stop while the run restores; not with `into`. The run gives them back once the volumes are restored and the databases deleted |
+| `quiesce` | no | Deployments and StatefulSets, as `{kind, name}`, to stop while the run restores; not with `into`. The run waits, with the workloads still running, while a backup of one of its claims uploads, another run holds the Lease of one of its claims or of a Kustomization its plan needs, or another run has stopped this namespace's workloads; it gives the workloads back once the volumes are restored and the databases deleted |
 | `timeout` | no | how long to wait for the movers and the recovered databases, counted from when the run passes its checks, or from its creation while its checks keep failing; defaults to `4h` |
 | `moverSecurityContext` | no | passed to the restore's ReplicationDestination; omitted, the source claim's VolumeRestore supplies it |
 | `ttlSecondsAfterFinished` | no | delete the run that long after it finishes; an `into` claim goes with it, and so does the VolumeRestore a v0.8.1 controller created for an `into` restore |
@@ -253,7 +253,7 @@ spec:
 | `syncedTo` | the moment a `syncDatabaseToVolume` run restores the volumes and recovers the databases to |
 | `quiescedAt`, `restartedAt`, `quiesced[]`, `suspendedKustomizations[]` | when the run stopped and gave back the workloads `quiesce` lists, the replicas it gave each back, and the Flux Kustomizations it suspended and resumed |
 | `items[]` | one per volume and per database: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message, the `destination` while it exists, the `snapshot` and `snapshotTime` a volume restores, the `baseBackup` a recovery starts from, and the `clusterUID` of the Cluster a database item deletes |
-| `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, SourceBusy, ClaimInUse, Retrying, or `recreate <cluster> to finish the restore` |
+| `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, SourceBusy, ClaimInUse, Retrying, TimedOut, or `recreate <cluster> to finish the restore`; a run that ran out of time while waiting for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |
 
 `items[].snapshotTime` is the time of the snapshot the run's checks selected,
 and the mover gets it as `restoreAsOf`;
