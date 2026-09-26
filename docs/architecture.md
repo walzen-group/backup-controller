@@ -76,8 +76,8 @@ Two runs never stop one namespace's workloads at once, either. A run that is
 about to record a stop plan takes the namespace's Lease
 `backup-controller-quiesce` and one Lease per Kustomization its plan needs in
 the same way, and holds them until its stored status shows every workload back
-and every Kustomization resumed, so a second run waits with the app running
-rather than recording the zero replicas the first stopped it at. A run waits
+and every Kustomization resumed, so a second run waits with the app running, and records its plan
+only once that run has given the workloads back. A run waits
 for a run that v0.8.x left in flight without a Lease as well, and for a
 RestoreRun that has deleted a Cluster and not yet seen it created again.
 [namespace-backups.md](namespace-backups.md#one-quiesce-at-a-time) has the

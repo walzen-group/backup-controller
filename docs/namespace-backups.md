@@ -747,8 +747,8 @@ recreate canary-namespace-backup-pg to finish the restore: resume the app's Flux
 ```
 
 While the item stands Deleted and the Cluster has not been created again, a
-BackupRun with `all: true` in this namespace waits before it stops workloads
-rather than suspending the Kustomization that creates the Cluster
+BackupRun with `all: true` in this namespace waits before it stops workloads,
+so the Kustomization that creates the Cluster stays as Flux has it
 ([One quiesce at a time](#one-quiesce-at-a-time)).
 
 When Flux or tofu creates the Cluster again, the bootstrap webhook finds the
