@@ -148,6 +148,7 @@ repositories and barman archives the two tools already write.
 | [docs/namespace-backups.md](docs/namespace-backups.md) | the annotations, the scheduler, the runs, quiesce and the metrics, measured on the prod canary |
 | [docs/restores.md](docs/restores.md) | what fills a claim, what overwrites one, how a database restores, and which to reach for |
 | [docs/packaging.md](docs/packaging.md) | the release: image, rendered manifests, Helm chart, RBAC |
+| [docs/releasing.md](docs/releasing.md) | how to make a release: the local e2e cluster, the checks before every tag, the tag and push |
 | [docs/integration.md](docs/integration.md) | how the infrastructure repository installs and uses it |
 | [docs/decisions.md](docs/decisions.md) | why this shape rather than the alternatives that were rejected |
 | [docs/implementation-plan.md](docs/implementation-plan.md) | the original build plan for v0.1, kept as a record |

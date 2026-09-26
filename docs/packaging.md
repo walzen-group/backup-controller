@@ -5,6 +5,8 @@ release pipeline is modelled on kuport's, which the walzen-group infrastructure
 already consumes, so copy that shape rather than inventing one.
 [walzen-group/kuport](https://github.com/walzen-group/kuport), file
 `.github/workflows/release.yaml`, is the reference implementation.
+[releasing.md](releasing.md) gives the checks a maintainer runs on the local
+e2e cluster before pushing a tag, and the tag and push commands.
 
 ## What a release has to attach
 

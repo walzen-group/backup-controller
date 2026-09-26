@@ -8,6 +8,7 @@
 | [namespace-backups.md](namespace-backups.md) | the annotations, the scheduler, the runs, quiesce and the metrics, measured on the prod canary |
 | [restores.md](restores.md) | what fills a claim, what overwrites one, how a database restores, and which to reach for |
 | [packaging.md](packaging.md) | the release assets, the repository layout, the RBAC, and the workflow |
+| [releasing.md](releasing.md) | the local e2e cluster, the checks to run before every tag, and how to tag and publish a release |
 | [integration.md](integration.md) | how the infrastructure repository installs the release and declares backups |
 | [compatibility.md](compatibility.md) | the dependency versions the controller is tested against, each behaviour it relies on with the source line, and what to do when infra bumps one |
 | [decisions.md](decisions.md) | what was chosen, what was rejected, and what would have gone wrong |

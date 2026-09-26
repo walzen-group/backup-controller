@@ -12,5 +12,10 @@ the bumped dependency against the new version's source.
 
 ## Releases
 
-A release requires `make e2e` passing locally, after `make e2e-up` against the
-docker-desktop cluster.
+A release follows docs/releasing.md. Before every tag, on the commit being
+tagged, `make check`, `make verify`, `make envtest`,
+`hack/e2e/backup-controller/backup-controller.sh rebuild`, `make e2e` and
+`make demo` all pass, the last three against the docker-desktop cluster after
+`make e2e-up`. CI runs only the fast tier, and nothing runs the e2e tier on a
+schedule. After a dependency bump, the docs/compatibility.md procedure comes
+first.
