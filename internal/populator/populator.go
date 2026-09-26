@@ -5,6 +5,7 @@ package populator
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
@@ -126,18 +127,18 @@ func (c *Callbacks) pinnedOutOfReach(ctx context.Context, vr *backupv1alpha1.Vol
 //
 // Before it creates the destination, it checks a pinned restore with
 // pinnedOutOfReach. When no snapshot reaches the pinned moment, it marks the
-// claim Failed and sets Ready to False with reason NoBackupInReach in the
-// VolumeRestore's status. Then it returns an error and creates no
-// destination.
+// claim Failed and sets Ready to False with reason NoBackupInReach and a
+// message that starts with "claim <name>: ", and writes the status when that
+// changed something. Then it returns an error and creates no destination.
 //
 // When the destination already exists and its latest mover run failed, it
 // leaves the status alone and returns nil. Complete, which the library calls
 // next, reports that failure, and the status stays Failed with the mover's
 // logs until a later sync succeeds.
 //
-// Otherwise it marks the claim Restoring and sets Ready to False with reason
-// Restoring and a message that names the destination and its namespace. It
-// writes the status only when that changed something, and returns nil.
+// Otherwise it marks the claim Restoring and sets Ready with summarize, which
+// leaves Ready alone while another claim's entry is Failed. It writes the
+// status only when that changed something, and returns nil.
 func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.PopulatorParams) error {
 	if err := validateParams(params); err != nil {
 		return err
@@ -191,10 +192,13 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 			// VolumeRestore's spec.restoreAsOf, or recreates the claim without
 			// the pin, a later call creates the destination and the claim
 			// fills.
+			before := vr.Status.DeepCopy()
 			setClaimStatus(vr, claim, backupv1alpha1.RestorePhaseFailed)
-			backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonNoBackupInReach, reason)
-			if err := c.operations.SetStatus(ctx, vr); err != nil {
-				return fmt.Errorf("set VolumeRestore status: %w", err)
+			backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonNoBackupInReach, claimMessage(claim, reason))
+			if !equality.Semantic.DeepEqual(before, &vr.Status) {
+				if err := c.operations.SetStatus(ctx, vr); err != nil {
+					return fmt.Errorf("set VolumeRestore status: %w", err)
+				}
 			}
 			return fmt.Errorf("claim %s/%s: %s", claim.Namespace, claim.Name, reason)
 		}
@@ -206,11 +210,7 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 
 	before := vr.Status.DeepCopy()
 	setClaimStatus(vr, claim, backupv1alpha1.RestorePhaseRestoring)
-	// The message names the namespace too. The destination is in the
-	// controller's namespace, and a reader who looks in the app's namespace
-	// won't find it.
-	waiting := fmt.Sprintf("waiting for ReplicationDestination %s in %s", destinationName, c.namespace)
-	backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoring, waiting)
+	c.summarize(vr)
 	if equality.Semantic.DeepEqual(before, &vr.Status) {
 		return nil
 	}
@@ -226,8 +226,9 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 // destination.
 //
 // When the destination's latest mover run failed, Complete marks the claim
-// Failed and sets Ready to False with reason RestoreFailed and the mover's
-// logs as the message. It writes that status and returns false.
+// Failed and sets Ready to False with reason RestoreFailed and a message of
+// "claim <name>: " followed by the mover's logs. It writes that status when
+// it changed something, and returns false.
 func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.PopulatorParams) (bool, error) {
 	if err := validateParams(params); err != nil {
 		return false, err
@@ -242,8 +243,12 @@ func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.Popu
 		if err != nil {
 			return false, err
 		}
+		before := vr.Status.DeepCopy()
 		setClaimStatus(vr, params.Pvc, backupv1alpha1.RestorePhaseFailed)
-		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoreFailed, reason)
+		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoreFailed, claimMessage(params.Pvc, reason))
+		if equality.Semantic.DeepEqual(before, &vr.Status) {
+			return false, nil
+		}
 		if err := c.operations.SetStatus(ctx, vr); err != nil {
 			return false, fmt.Errorf("set failed VolumeRestore status: %w", err)
 		}
@@ -257,9 +262,10 @@ func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.Popu
 // and skips any that are already gone.
 //
 // It then removes the claim's entry from the VolumeRestore's status.claims.
-// It sets Ready to True with reason Restored when no claim is left, and to
-// False with reason Restoring while other claims are still being filled. It
-// writes the status only when that changed something. When the VolumeRestore
+// It sets Ready from the entries that remain with summarize: Restored when no
+// claim is left, Restoring while other claims are being filled, and
+// unchanged while another claim's entry is Failed. It writes the status only
+// when that changed something. When the VolumeRestore
 // is gone by then, it returns nil, because nothing is left to report on.
 //
 // Once no claim is left in status.claims, it removes Finalizer from the
@@ -287,11 +293,7 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 	before := vr.Status.DeepCopy()
 
 	retireClaimStatus(vr, claim)
-	if len(vr.Status.Claims) == 0 {
-		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionTrue, backupv1alpha1.ReasonRestored, "no claim is being restored")
-	} else {
-		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoring, fmt.Sprintf("%d claim(s) still restoring", len(vr.Status.Claims)))
-	}
+	c.summarize(vr)
 
 	// The library has no early return for a claim it has already populated. It
 	// walks the whole path on every resync, reaches the completion branch and
@@ -321,6 +323,45 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 		}
 	}
 	return nil
+}
+
+// summarize sets the VolumeRestore's Ready condition from every entry in its
+// status.claims. Populate and Cleanup call it, so every claim that shares the
+// VolumeRestore computes the same condition. It changes the status in memory
+// only, and the caller writes it.
+//
+// With no entry, Ready is True with reason Restored. While any entry is
+// Failed, it leaves Ready as it is: the failed claim's own pass writes its
+// failure, RestoreFailed with the mover's logs from Complete or
+// NoBackupInReach from Populate, and another claim's pass must not overwrite
+// it. Otherwise Ready is False with reason Restoring, and the message lists
+// the ReplicationDestination of every entry, in status.claims order, and the
+// controller namespace they live in, since a reader who looks in the app's
+// namespace won't find them.
+func (c *Callbacks) summarize(vr *backupv1alpha1.VolumeRestore) {
+	if len(vr.Status.Claims) == 0 {
+		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionTrue, backupv1alpha1.ReasonRestored, "no claim is being restored")
+		return
+	}
+	destinations := make([]string, 0, len(vr.Status.Claims))
+	for _, status := range vr.Status.Claims {
+		if status.Phase == backupv1alpha1.RestorePhaseFailed {
+			return
+		}
+		destinations = append(destinations, "restore-"+string(status.UID))
+	}
+	noun := "ReplicationDestination"
+	if len(destinations) > 1 {
+		noun = "ReplicationDestinations"
+	}
+	waiting := fmt.Sprintf("waiting for %s %s in %s", noun, strings.Join(destinations, ", "), c.namespace)
+	backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoring, waiting)
+}
+
+// claimMessage prefixes a failure message with "claim <name>: ", so a
+// VolumeRestore that fills several claims says which claim failed.
+func claimMessage(claim *corev1.PersistentVolumeClaim, message string) string {
+	return fmt.Sprintf("claim %s: %s", claim.Name, message)
 }
 
 // holdVolumeRestore adds Finalizer to the VolumeRestore that vr holds, and

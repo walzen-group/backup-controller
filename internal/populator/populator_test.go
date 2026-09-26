@@ -245,7 +245,7 @@ func TestCompleteReportsFailedMover(t *testing.T) {
 	}
 	status := ops.statuses[0]
 	condition := findCondition(status.Status.Conditions, backupv1alpha1.ConditionReady)
-	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != backupv1alpha1.ReasonRestoreFailed || condition.Message != "mover logs" {
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != backupv1alpha1.ReasonRestoreFailed || condition.Message != "claim notes: mover logs" {
 		t.Fatalf("Ready condition = %#v, want False/RestoreFailed with mover logs", condition)
 	}
 	if len(status.Status.Claims) != 1 || status.Status.Claims[0].Phase != backupv1alpha1.RestorePhaseFailed {
