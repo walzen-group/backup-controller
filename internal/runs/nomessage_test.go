@@ -71,8 +71,19 @@ var messageComparisonAllowlist = []messageRuleEntry{}
 // Part 1 fails on any text matcher outside the allowlist, since a message
 // read through a local looks like any other string. Part 2 fails on a
 // comparison (==, !=, a switch) of a .Message or .Logs field, an Error()
-// string, or a local assigned from one of those. An entry on a list that
-// matches nothing fails too, so the lists stay exact.
+// string, an index, slice or concatenation of one, or a local assigned from
+// any of those. An entry on a list that matches nothing fails too, so the
+// lists stay exact.
+//
+// The rule reads each declaration on its own and without types, so two
+// ways around it stay open, and a reviewer still checks for them:
+//   - A helper in a file the scope does not read yet, or in another
+//     package, can match a message the scope passes to it. The scope
+//     shrinks this as later steps widen it; a helper in another package,
+//     such as internal/volsync, is never seen.
+//   - A helper in the scope that compares its own string parameters, as in
+//     sameText(a, b string) bool { return a == b }, is not seen, because a
+//     parameter is never taken for a message.
 func TestNoDecisionReadsAMessage(t *testing.T) {
 	var findings []messageFinding
 	for _, scope := range messageRuleScope {
@@ -92,9 +103,10 @@ func TestNoDecisionReadsAMessage(t *testing.T) {
 }
 
 // The rule catches each shape of a message read in its fixture: a matcher
-// on a field, on a local and in a package-level var, a regexp method, a
-// comparison of a field, of an Error() string and of locals assigned from
-// them, and a switch on a message. A declaration on the allowlist is let
+// on a field, on a local and in a package-level var, a split, a Compare, a
+// bytes.Equal, a regexp method, a comparison of a field, of an Error()
+// string, of an index, a slice or a concatenation of one and of locals
+// assigned from them, and a switch on a message. A declaration on the allowlist is let
 // through, and an entry that matches nothing is reported.
 func TestTheMessageRuleCatchesEveryShape(t *testing.T) {
 	findings := scanMessageRule(t, messageRuleDir{dir: "testdata/nomessage"})
@@ -249,14 +261,17 @@ type messagePackage struct {
 }
 
 // textMatchers are the functions of packages strings and bytes the rule
-// forbids: every one that matches, cuts or trims by content.
+// forbids: every one that matches, compares, cuts, splits or trims by
+// content.
 var textMatchers = map[string]bool{
 	"HasPrefix": true, "HasSuffix": true, "Contains": true, "ContainsAny": true, "ContainsRune": true,
 	"ContainsFunc": true, "Cut": true, "CutPrefix": true, "CutSuffix": true, "Trim": true, "TrimPrefix": true,
 	"TrimSuffix": true, "TrimSpace": true, "TrimLeft": true, "TrimRight": true, "TrimFunc": true,
 	"TrimLeftFunc": true, "TrimRightFunc": true, "Index": true, "IndexAny": true, "IndexByte": true,
 	"IndexFunc": true, "IndexRune": true, "LastIndex": true, "LastIndexAny": true, "LastIndexByte": true,
-	"LastIndexFunc": true, "EqualFold": true, "Count": true,
+	"LastIndexFunc": true, "EqualFold": true, "Count": true, "Compare": true, "Equal": true, "Split": true,
+	"SplitN": true, "SplitAfter": true, "SplitAfterN": true, "SplitSeq": true, "SplitAfterSeq": true, "Fields": true,
+	"FieldsFunc": true, "FieldsSeq": true, "FieldsFuncSeq": true,
 }
 
 // regexpNames returns every name assigned from an expression that uses
@@ -493,11 +508,18 @@ func taintedLocals(node ast.Node) map[string]bool {
 
 // isMessage reports whether an expression is text a component wrote for a
 // person: a field .Message or .Logs, an Error() call, a string conversion
-// of one, or a tainted local.
+// of one, a tainted local, or anything cut from one: an index, a slice, or
+// a + concatenation with a message on either side.
 func isMessage(e ast.Expr, tainted map[string]bool) bool {
 	switch e := ast.Unparen(e).(type) {
 	case *ast.SelectorExpr:
 		return e.Sel.Name == "Message" || e.Sel.Name == "Logs"
+	case *ast.IndexExpr:
+		return isMessage(e.X, tainted)
+	case *ast.SliceExpr:
+		return isMessage(e.X, tainted)
+	case *ast.BinaryExpr:
+		return e.Op == token.ADD && (isMessage(e.X, tainted) || isMessage(e.Y, tainted))
 	case *ast.CallExpr:
 		if sel, ok := e.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Error" && len(e.Args) == 0 {
 			return true
