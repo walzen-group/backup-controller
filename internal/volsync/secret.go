@@ -1,6 +1,9 @@
 package volsync
 
 import (
+	"fmt"
+	"hash/crc32"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -15,12 +18,24 @@ func SecretCopyName(claimUID types.UID) string {
 }
 
 // MoverJobName returns the name of the Job VolSync runs for the restic mover
-// of the ReplicationDestination named destination. VolSync names it
-// "volsync-dst-" followed by the destination's name and owns it by the
-// destination (volsync v0.16.0 internal/controller/mover/restic/mover.go:333-341).
-// The Job's pods carry the label job-name with this value.
+// of a ReplicationDestination.
+//
+// Parameters:
+//   - destination is the name of the ReplicationDestination.
+//
+// The name is "volsync-dst-" followed by the destination's name while that
+// fits in 63 characters. A longer one is "volsync-dst-" followed by the crc32
+// (IEEE) of the destination's name as eight hex digits, the way VolSync
+// shortens it (volsync v0.16.0 internal/controller/utils/utils.go:386-399,
+// called from internal/controller/mover/restic/mover.go:333-341). VolSync
+// owns the Job by the destination, and the Job's pods carry the label
+// job-name with this value.
 func MoverJobName(destination string) string {
-	return "volsync-dst-" + destination
+	const prefix = "volsync-dst-"
+	if name := prefix + destination; len(name) <= 63 {
+		return name
+	}
+	return prefix + fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(destination)))
 }
 
 // SecretCopy builds a copy of a claim's repository Secret for the controller

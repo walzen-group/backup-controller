@@ -1,7 +1,10 @@
 package volsync
 
 import (
+	"fmt"
+	"hash/crc32"
 	"reflect"
+	"strings"
 	"testing"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
@@ -143,5 +146,22 @@ func TestSecretCopyPreservesDataAndType(t *testing.T) {
 	copy.Data["password"][0] = 'X'
 	if string(repo.Data["password"]) != "secret" {
 		t.Fatal("SecretCopy aliases repository data")
+	}
+}
+
+// TestMoverJobNameFollowsVolSyncsShortening checks the Job name against
+// VolSync's own rule (utils.GetJobName, volsync v0.16.0
+// internal/controller/utils/utils.go:386-399): "volsync-dst-" and the
+// destination's name while that fits in 63 characters, and otherwise
+// "volsync-dst-" and the crc32 (IEEE) of the name as eight hex digits.
+func TestMoverJobNameFollowsVolSyncsShortening(t *testing.T) {
+	fits := strings.Repeat("a", 63-len("volsync-dst-"))
+	if got := MoverJobName(fits); got != "volsync-dst-"+fits {
+		t.Errorf("MoverJobName(%d characters) = %q, want the name kept", len(fits), got)
+	}
+	long := fits + "b"
+	want := fmt.Sprintf("volsync-dst-%08x", crc32.ChecksumIEEE([]byte(long)))
+	if got := MoverJobName(long); got != want {
+		t.Errorf("MoverJobName(%d characters) = %q, want %q", len(long), got, want)
 	}
 }

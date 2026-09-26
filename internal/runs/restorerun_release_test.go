@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -209,5 +210,53 @@ func TestARestoreThatCannotReadItsVolumeRestoreAfterTheRestartSaysReleaseFailed(
 		if !strings.Contains(message, want) {
 			t.Errorf("message %q does not name %q", message, want)
 		}
+	}
+}
+
+// A Conflict on the update that releases the VolumeRestore means another
+// writer changed it since the run read it. The run retries on the next pass
+// with a fresh read, and reports nothing: a Conflict is no failure a person
+// has to act on.
+func TestAConflictOnTheVolumeRestoreReleaseRetriesQuietly(t *testing.T) {
+	run := populatorRun()
+	r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(), populatorRestore(run, populator.Finalizer))
+	restoreStep(t, r) // ends Upgraded and keeps the finalizer
+	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
+		t.Fatal(err)
+	}
+	conflicted := false
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*backupv1alpha1.VolumeRestore); ok && !conflicted {
+				conflicted = true
+				return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("volumerestores").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+	})
+	recorder := events.NewFakeRecorder(10)
+	r.Recorder = recorder
+	before := readyReason(readRestoreRun(t, c).Status.Conditions)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
+	if err != nil || result.RequeueAfter == 0 {
+		t.Fatalf("result = %+v, err = %v; want a quiet requeue", result, err)
+	}
+	if !conflicted {
+		t.Fatal("the pass did not try to release the VolumeRestore")
+	}
+	if got := readyReason(readRestoreRun(t, c).Status.Conditions); got != before {
+		t.Errorf("reason = %q after the Conflict, want %q left as it was", got, before)
+	}
+	if got := recorded(recorder); len(got) != 0 {
+		t.Errorf("events = %q, want none for a Conflict", got)
+	}
+
+	restoreStep(t, r)
+
+	vr := &backupv1alpha1.VolumeRestore{}
+	get(t, c, ns, run.Spec.Into, vr)
+	if slices.Contains(vr.Finalizers, populator.Finalizer) {
+		t.Errorf("VolumeRestore finalizers = %v, want %s released on the retry", vr.Finalizers, populator.Finalizer)
 	}
 }

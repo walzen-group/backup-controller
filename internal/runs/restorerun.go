@@ -1861,7 +1861,12 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if waiting := left.message(); waiting != "" {
 		return r.waitForStopped(ctx, run, waiting)
 	}
-	if waiting, err := r.releaseVolumeRestore(ctx, run); err != nil {
+	if waiting, err := r.releaseVolumeRestore(ctx, run); apierrors.IsConflict(err) {
+		// Another writer changed the VolumeRestore or the claim since the
+		// read. The next pass reads both again, and a Conflict is nothing a
+		// person has to act on, so nothing is reported.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	} else if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
 	} else if waiting != "" {
 		return r.waitForStopped(ctx, run, waiting)
@@ -2392,7 +2397,7 @@ func (r *RestoreRunReconciler) releaseVolumeRestore(ctx context.Context, run *ba
 	if err := r.Update(ctx, vr); err != nil && !apierrors.IsNotFound(err) {
 		return "", &releaseError{
 			action: fmt.Sprintf("remove finalizer %s from VolumeRestore %s", populator.Finalizer, key.Name),
-			advice: fmt.Sprintf("Fix the cause, or remove that finalizer yourself; either way the deletion then completes by itself."),
+			advice: "Fix the cause, or remove that finalizer yourself; either way the deletion then completes by itself.",
 			err:    err,
 		}
 	}
