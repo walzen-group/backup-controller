@@ -27,8 +27,8 @@ In the app's namespace:
 | CloudNativePG Backup `<cluster>-<suffix>` | each BackupRun, one per Cluster marked `backup.wlz.li/enabled` | stays, as CloudNativePG's backup record |
 | ReplicationDestination | a RestoreRun that restores a volume: in place, or with `claim:` and `into:`, or with `repository:` and `into:` | deleted once the item's end is in the run's status |
 | Lease `backup-controller-claim-<claim uid>` and `backup-controller-repo-<secret uid>` | a run, right before it creates its mover object for an item | released once the item's end is in the run's status, and taken over by another run when its holder is gone or finished |
-| Lease `backup-controller-quiesce` in the run's namespace, and `backup-controller-kustomization-<Kustomization uid>` in each Kustomization's namespace | a run, before it records the plan that stops the workloads of a BackupRun with `all: true`, or of a RestoreRun that lists `quiesce` | released once the run's stored status shows the workloads back and the plan reads back; taken over when its holder has finished, is gone or has given the workloads back |
-| VolumeRestore named by `into:`, with the finalizer `backup.wlz.li/volume-populator` | a v0.8.1 or older controller, for an `into` restore from a claim, owned by the run | deleted with the RestoreRun; v0.9.0 creates none, and the run removes the finalizer itself when the populator never took the VolumeRestore on |
+| Lease `backup-controller-quiesce` in the run's namespace | a run, before it records the plan that stops the workloads of a BackupRun with `all: true`, or of a RestoreRun that lists `quiesce` | released once the run's stored status shows the workloads back; taken over when its holder has finished, is gone or has given the workloads back |
+| VolumeRestore named by `into:`, with the finalizer `backup.wlz.li/volume-populator` | a v0.8.1 or older controller, for an `into` restore from a claim, owned by the run | deleted with the RestoreRun, which v0.9.0 ends with reason Upgraded; v0.9.0 creates none, and when the run is deleted it removes the finalizer itself once the claim is gone |
 | a scratch claim named by `into:` | a RestoreRun with `into:`, owned by the run; it carries no data source, and the run's ReplicationDestination fills it | deleted with the RestoreRun, the claim's dataset included |
 
 In the controller's namespace, for each claim the populator fills: a copy of the
@@ -57,9 +57,7 @@ run's kind straight from the API server and compares its schema with the fields
 the Go type writes. A run whose CRD lacks one of those fields ends Failed with
 reason CRDOutdated before it stops or creates anything, because the API server
 would drop that field from every write: a run that lost `status.quiesced` would
-stop an app and record nothing to start it again. A run that v0.8.x planned
-under an older CRD meets the check again right before it stops the workloads.
-The same reason covers a controller that may not read the CRD, and one whose
+stop an app and record nothing to start it again. The same reason covers a controller that may not read the CRD, and one whose
 CRD is not installed. Applying the CRDs of the controller's release fixes each;
 Helm upgrades no CRD on its own. [packaging.md](packaging.md#rbac-the-controller-needs)
 lists the rule this needs.
@@ -74,14 +72,20 @@ messages and the takeover rule.
 
 Two runs never stop one namespace's workloads at once, either. A run that is
 about to record a stop plan takes the namespace's Lease
-`backup-controller-quiesce` and one Lease per Kustomization its plan needs in
-the same way, and holds them until its stored status shows every workload back
-and every Kustomization resumed, so a second run waits with the app running, and records its plan
-only once that run has given the workloads back. A run waits
-for a run that v0.8.x left in flight without a Lease as well, and for a
-RestoreRun that has deleted a Cluster and not yet seen it created again.
+`backup-controller-quiesce` in the same way and holds it until its stored
+status shows every workload back and every Kustomization resumed. A second run
+waits with the app running, and records its plan only once the first has given
+the workloads back. Before it acquires the Lease, a run also waits for a run that
+an older version planned and v0.9.0 is still ending, and for a RestoreRun that
+has deleted a Cluster and not yet seen it created again.
 [namespace-backups.md](namespace-backups.md#one-quiesce-at-a-time) has the
 messages and the release rule.
+
+v0.9.0 does not continue a run an older version planned. Each run records
+`status.plannedBy` with its plan, and an unfinished run whose `plannedBy` is not
+`v0.9` ends Failed with reason Upgraded on its first reconcile, through the
+same finish as any failed run
+([decisions.md](decisions.md#end-the-runs-an-older-version-started)).
 
 Its own BackupRuns and RestoreRuns carry a finalizer, which releases whatever a
 run changed when the run fails, times out or is deleted. The sources it writes
@@ -203,8 +207,8 @@ The UID settles what the annotation alone cannot. The webhook's
 created again under the same name would find it on the old Cluster too, and
 take the old database for its recovery. A run deletes only the Cluster it
 recorded, so a Cluster that comes back without that run's recovery is reported
-and left alone, and so is every Cluster an item without a `clusterUID`, from a
-run that started under v0.7.2, finds.
+and left alone, and so is every Cluster that an item without a `clusterUID`,
+from a run that found no Cluster at its start, finds.
 [namespace-backups.md](namespace-backups.md#a-database-restore) has those
 messages. A recovered Cluster deleted before it turns healthy fails the item.
 

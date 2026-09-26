@@ -400,38 +400,87 @@ either run back otherwise: it names its holder by UID, so a run created again
 under the same name does not inherit it, and a Lease whose holder has finished
 or is gone is taken over by the next run that wants it.
 
-## Take one quiesce Lease per namespace and Kustomization
+## Take one quiesce Lease per namespace
 
 From v0.9.0 a run that is about to stop a namespace's workloads takes the
-`coordination.k8s.io` Lease `backup-controller-quiesce` in that namespace, and
-one Lease per Flux Kustomization its plan needs, before it records the plan in
-its status. A Lease is held until the run's stored status shows every workload
-back and every Kustomization resumed, and a run that finds one held waits with
-reason SourceBusy and the workloads running. A run that v0.8.x left in flight
-holds no Lease, so a run also waits while another unfinished run of the
-namespace still owes a restart.
+`coordination.k8s.io` Lease `backup-controller-quiesce` in that namespace
+before it records the plan in its status. The run holds the Lease until its
+stored status shows every workload back and every Kustomization resumed, and a
+run that finds the Lease held waits with reason SourceBusy and the workloads
+running.
 
 The alternative was a check of the other runs' status alone, which is what the
-controller did first: a BackupRun and a RestoreRun reconcile at the same time,
+controller did first. A BackupRun and a RestoreRun reconcile at the same time,
 so both can read the workloads' replicas as unchanged, write a plan, and stop
 them. The second then records the zero replicas the first stopped them at, and
 whichever restarts last decides whether the app comes back; both runs end
-Succeeded. A Lease decides it in the API server. A Lease per workload instead
-of per namespace needs an ordering among them and buys only the rare case of
-two runs whose workloads do not overlap, while a namespace run stops every
-workload the namespace marks and a restore's list overlaps it in the ordinary
-case. The Lease per Kustomization covers one Kustomization that applies
-workloads in two namespaces: the second run would otherwise stop its workloads
-without suspending the Kustomization, and the first run's resume would let
-Flux scale them back up under it.
+Succeeded. A Lease settles the race in the API server, which admits one create.
+A Lease per workload would need an ordering among the Leases and would only let
+two runs whose workloads do not overlap run side by side, while a namespace run
+stops every workload the namespace marks and a restore's list overlaps it in
+the ordinary case.
 
-The quiesce Lease is not released with the claim and repository Leases: it goes
-once the stored status shows the workloads back and the plan reads back, at the
-top of a later pass, in finish after the terminal status write, and in finalize
-after the finalizer is dropped. Releasing it with the restart would let another
-run stop the workloads while this run's status write that clears
-`restartPending` was still lost, and this run would then scale them to zero
-again under the other run.
+The quiesce Lease stays when the claim and repository Leases go. The run
+deletes it once the stored status shows the restart done: at the top of a
+later pass, in finish after the terminal status write, and in finalize after
+the finalizer is dropped. A release together with the restart would let
+another run stop the workloads while this run's status write that clears
+`restartPending` was still lost, and this run would then scale them back up
+under the other run's stop.
+
+A run judges its own restart, and another run's, by the stored status alone.
+During v0.9.0's development the run also read its plan back and repeated a
+restart whose workloads stood below their recorded counts. That repeat scaled
+up an app a second run had stopped since, and the second run, which held the
+Lease by then, found its app running mid-backup. A workload someone scales to
+zero after a run's restart now stays at zero.
+
+## Refuse a Kustomization that applies two namespaces
+
+From v0.9.0 a run ends with reason Invalid, before it stops anything, when the
+Flux Kustomization of one of its workloads also lists a Deployment or a
+StatefulSet in another namespace in its inventory.
+
+A run suspends a workload's Kustomization so that Flux does not scale the
+workload back up while it is stopped. With one Kustomization applying two
+namespaces, a run in the first namespace suspends it, and the second
+namespace's workloads are left without drift correction for that time. A run
+in the second namespace would find the Kustomization already suspended and
+leave it out of its plan; the first run's resume then lets Flux scale the
+second namespace's app back up in the middle of that run's backup or restore.
+A Lease per Kustomization, taken in a fixed order across namespaces, kept the
+two runs apart, but a run whose set of targets changed between two passes could
+hold one Lease while waiting for another, and two runs could then wait on each
+other until both timed out. Every app on the walzen cluster has a Kustomization
+of its own, so the refusal asks for the layout the cluster already uses.
+
+## End the runs an older version started
+
+From v0.9.0 the controller does not continue a BackupRun or RestoreRun that an
+older version planned. Every plan records `status.plannedBy`, `v0.9` for
+v0.9.x, and an unfinished run with another value, or none, ends Failed with
+reason Upgraded on its first reconcile. The ending runs the finish every failed
+run runs: it gives back the workloads the run stopped, deletes its
+ReplicationDestinations, and releases its Leases and its Kueue Workload.
+
+The alternative was to continue each older run under the new code. A run's
+status records what the release that wrote it meant, and v0.9.0 changed that
+meaning in places. v0.7.2 and v0.8.x took no Leases, so the new quiesce
+exclusion had to read other runs' plans back from the workloads to decide
+whether they still held an app stopped. v0.7.2 recorded no snapshot time on a
+restore item, so the mover had to be pinned from a snapshot listed later.
+v0.8.1 ran an `into` restore through the VolumeRestore populator, whose mover
+log nothing can read. Each of those paths needed code of its own that no new
+run used, and the read-back path repeated restarts under another run's stop.
+Runs last minutes to hours, and everything else a run touches belongs to it or
+to a user who keeps it across versions, so ending a run and asking for a new
+one loses no state the controller needs.
+
+`plannedBy` changes only when a release changes what an unfinished run's
+status means, and a patch release keeps it. VolumeRestores, schedules,
+repositories, snapshots and Clusters carry across versions as before.
+[upgrading.md](upgrading.md#step-1-let-the-old-controller-finish-its-runs) has
+the steps before an upgrade.
 
 ## Confirm a restore from the mover's log
 

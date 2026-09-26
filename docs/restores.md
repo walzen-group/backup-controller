@@ -119,11 +119,11 @@ another run holds on either, makes it wait in phase Waiting with reason
 SourceBusy and the workloads still running, and a read that fails comes back
 as an error and stops nothing. The check at the mover object remains the one
 that counts ([One mover at a time](namespace-backups.md#one-mover-at-a-time)).
-The run also waits for another run that has stopped this namespace's workloads,
-and for the run holding the Lease of a Kustomization its plan needs, so a
-Kustomization that applies workloads in two namespaces is suspended by one run
-at a time
-([One quiesce at a time](namespace-backups.md#one-quiesce-at-a-time)).
+The run also waits for another run that has stopped this namespace's workloads
+([One quiesce at a time](namespace-backups.md#one-quiesce-at-a-time)). A
+Kustomization that applies Deployments or StatefulSets in two namespaces ends
+the run with reason `Invalid` before anything is stopped
+([Which Kustomization a run suspends](namespace-backups.md#which-kustomization-a-run-suspends)).
 
 ## Back up before you discard
 
@@ -203,13 +203,6 @@ the run, and so does a claim of that name that appears after the checks:
 claim canary-backup-friday already exists and this run did not create it. spec.into names a new claim for the run to create, and a restore never writes into a claim it did not create. Choose a name no claim in this namespace has. To overwrite an existing claim, restore it in place with spec.claim.
 ```
 
-An `into` restore that a v0.8.1 or older controller started through the
-VolumeRestore populator ends Failed, because nothing can tell which snapshot the
-populator restored: its mover ran in the controller's namespace, and the
-populator deletes its ReplicationDestination, and with it the mover's log,
-before the claim binds. The message says what the claim now holds and that a
-new RestoreRun either with another `into` name, or after this one is deleted,
-restores it again with a run whose mover's log is checked.
 
 Before it creates anything, a run lists the repository's snapshots and fails
 with reason NoBackupInReach when none is at or before `restoreAsOf`. VolSync's
@@ -299,10 +292,6 @@ snapshot 6e473100 (2026-09-26T09:03:53Z), which the checks selected, is no longe
 snapshot 6e473100, which the checks selected, was rewritten as 2edf5bab at 2026-09-26T09:05:00Z by a quiesced backup after the checks
 ```
 
-An item that a v0.7.2 controller planned records no snapshot time. Its re-check
-goes by the recorded snapshot's own second, and its mover is handed the run's
-own `restoreAsOf`, so such an item still counts as restored only when the
-mover's log names the snapshot the item recorded.
 
 One kind of snapshot holds data older than its time. When a BackupRun fails a
 volume item, VolSync keeps retrying that sync with the clone it cut when the

@@ -6,7 +6,61 @@ what to do during and after the upgrade. The Releases table in the
 
 ## v0.9.0
 
-### Step 1: Check that no two Clusters share an archive
+### Step 1: Let the old controller finish its runs
+
+v0.9.0 does not continue a BackupRun or RestoreRun that an older version
+started ([decisions.md](decisions.md#end-the-runs-an-older-version-started)).
+Finish those runs under the old controller before you move the image.
+
+List the runs that have not finished:
+
+```
+kubectl get backupruns,restoreruns -A -o json | jq -r '.items[] | select(.status.phase != "Succeeded" and .status.phase != "Failed") | "\(.kind)\t\(.metadata.namespace)/\(.metadata.name)\t\(.status.phase // "not planned")"'
+```
+
+Expected result: no output.
+
+For each line, wait until the run finishes, or delete it:
+
+```
+kubectl -n <namespace> delete backuprun <name>
+```
+
+Delete a RestoreRun with `restorerun` in place of `backuprun`. The old
+controller's finalizer scales the workloads the run stopped back up, resumes
+the Kustomizations it suspended and deletes the objects it created, and the
+deletion completes once it has. Run the listing again until it prints nothing,
+then move to the next step while the old controller's pod is still the one
+running. A namespace schedule can start a new run in the meantime; move the
+image between two ticks of the schedules you know about.
+
+A run that is still unfinished when v0.9.0 starts, or that the old pod plans
+while it shuts down, ends Failed with reason `Upgraded` and a Warning event on
+its first reconcile. Ending it runs the same steps as any failed run: v0.9.0
+gives back the workloads it stopped and resumes its Kustomizations, deletes its
+ReplicationDestinations once their mover pods are gone, and releases its Leases
+and its Kueue Workload. The message says to create a new run:
+
+```text
+this run was started by an older version of backup-controller, which this version does not continue. The run gave back the workloads it had stopped. Create a new BackupRun to run it again.
+```
+
+The message adds one sentence per Cluster that a RestoreRun deleted and that
+has not been recovered, `Cluster <name> was deleted by this run and has not
+been recovered; create a new RestoreRun for it.` A BackupRun whose status
+already records its restart gives nothing back, and its message asks you to
+check that each workload in `status.quiesced` runs with the recorded replicas;
+under the v0.7.2 CRD that status can record a restart that failed (step 4).
+Ending the run deletes only what any failed run deletes. The claim and the
+VolumeRestore that a v0.8.1 `into` restore from a claim created stay owned by
+the run. When you delete the run, v0.9.0 deletes the claim, then removes the
+`backup.wlz.li/volume-populator` finalizer from the VolumeRestore, and the
+garbage collector deletes the VolumeRestore with the run.
+
+v0.9.0 records `status.plannedBy: v0.9` on every run it plans. A run without
+it, or with another value, is one an older version planned.
+
+### Step 2: Check that no two Clusters share an archive
 
 From v0.9.0 the webhook compares only bucket and prefix when it looks for a
 shared archive, whatever endpointURL each ObjectStore names
@@ -51,7 +105,7 @@ prefix in destinationPath before you upgrade. Either way, move the Cluster
 whose archive matters less, since the one that moves starts a new archive
 ([restores.md](restores.md#refusing-a-shared-archive)).
 
-### Step 2: Check the S3 credentials
+### Step 3: Check the S3 credentials
 
 The webhook now lists the whole server prefix `<prefix>/`, where v0.8.x listed
 only `<prefix>/base/`. Each ObjectStore's credential needs `s3:ListBucket` on
@@ -61,7 +115,7 @@ ending in `(HTTP 403 AccessDenied)`.
 [architecture.md](architecture.md#where-a-databases-backups-are) lists the
 permissions.
 
-### Step 3: Apply the CRDs, the RBAC and the image together
+### Step 4: Apply the CRDs, the RBAC and the image together
 
 Three rules are added, and one of them refuses work until it is applied:
 
@@ -106,29 +160,36 @@ kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o json | jq -r '.item
 ```
 
 Expected result: only workloads and Kustomizations you stopped by hand. Scale
-each one back up and resume each Kustomization; v0.9.0 gives back the ones its
-own runs stopped, a run an older version quiesced under the v0.7.2 CRD
-included.
+each one back up and resume each Kustomization. v0.9.0 gives back what its own
+runs stopped, and an older run it ends with reason `Upgraded` gives back only
+what its status records as still stopped (step 1), so this listing is where an
+app that a failed restart left at zero shows up.
 
-### Step 4: Check the runs in flight and how long an app may stay down
+### Step 5: Check how long an app may stay down
 
 A run with `all: true` now keeps an app stopped for at most the namespace's
 `backup.wlz.li/max-quiesce`, ten minutes without it, counted from the run's
 `status.quiescedAt`. A namespace whose mover regularly needs longer should set
 the annotation before the upgrade, or the run gives the app back and fails the
 volume item whose clone VolSync had not cut by then, with the clone named in
-the message. The annotation takes a Go duration, such as `20m`.
+the message. The annotation holds a Go duration, such as `20m`.
 
-A RestoreRun with `claim:` and `into:` that a v0.8.1 or older controller started
-ends Failed at its next pass, because that path ran its mover through the
-VolumeRestore populator and nothing can tell which snapshot the populator
-restored. The message says what the claim holds and how to restore again:
-compare the claim with the data you expect, or delete the run and create a new
-one, which deletes the claim and restores it again through a mover the run
-checks. This does not apply to an `into` restore from `repository:`, which
-always used the direct path.
+### Step 6: Check for Kustomizations that apply two namespaces
 
-### Step 5: Check what VolSync keeps of a restore mover's log
+A run that stops workloads now refuses, with reason `Invalid` and before it
+stops anything, when the Flux Kustomization of one of its workloads also
+applies a Deployment or a StatefulSet in another namespace
+([namespace-backups.md](namespace-backups.md#flux-kustomizations)). List such
+Kustomizations:
+
+```
+kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o json | jq -r '.items[] | ([.status.inventory.entries[]?.id | split("_") | select(length == 4 and .[2] == "apps" and (.[3] == "Deployment" or .[3] == "StatefulSet")) | .[0]] | unique) as $ns | select($ns | length > 1) | "\(.metadata.namespace)/\(.metadata.name)\t\($ns | join(", "))"'
+```
+
+Expected result: no output, or only Kustomizations whose workloads no run
+stops. Give each namespace whose workloads a run stops its own Kustomization.
+
+### Step 7: Check what VolSync keeps of a restore mover's log
 
 A volume restore now succeeds only when the log of the mover that completed its
 trigger names the snapshot the run's checks selected, so a VolSync that cuts
@@ -138,7 +199,7 @@ default. Leave the default, or set it to at least a few kilobytes; a value of 0
 leaves the log empty and every restore then fails with `the mover finished, but
 its logs name no snapshot, so the run cannot confirm what claim <claim> holds`.
 
-### Step 6: Find Clusters v0.8.x admitted over an old archive
+### Step 8: Find Clusters v0.8.x admitted over an old archive
 
 v0.8.x admitted a Cluster as `initdb` over a prefix holding WAL but no
 completed base backup, and over any prefix when it carried
@@ -203,13 +264,13 @@ with CloudNativePG 1.30.0, plugin-barman-cloud 0.15.0 and barman 3.20.0: 1
 when the check refused a prefix that holds WAL, 2 when it could not reach
 the endpoint, and 4 for the store's other answers and for a refused upload.
 
-Step 7 repairs only a Cluster whose log shows the `Expected empty archive`
+Step 9 repairs only a Cluster whose log shows the `Expected empty archive`
 line. For any other failure, repair the cause and read the log again: a
 Cluster that has never archived keeps the marker file in PGDATA, so once the
 store answers, the check prints its verdict on the prefix, and a line with
-`Expected empty archive` means the Cluster needs step 7 after all.
+`Expected empty archive` means the Cluster needs step 9 after all.
 
-### Step 7: Give each such Cluster an empty archive
+### Step 9: Give each such Cluster an empty archive
 
 The database in such a Cluster holds writes no backup has captured, so
 deleting the Cluster loses them. Repair the Cluster in place. It archives to
@@ -260,7 +321,7 @@ after initdb. The instance deletes the marker once ContinuousArchiving is
 True. On the e2e cluster, a Cluster recovered from the repaired archive held
 every row written before the repair.
 
-### Step 8: Take a base backup
+### Step 10: Take a base backup
 
 The new archive holds WAL but no base backup, so a recovery has nothing to
 start from yet. Create a BackupRun naming the database:
@@ -309,5 +370,5 @@ spec.configuration.serverName: Forbidden: use the 'serverName' plugin parameter 
 ```
 
 hack/e2e/cnpg/empty-archive-repair.sh starts a Cluster over an old archive on
-the e2e cluster, repairs it either way step 7 gives, runs step 8, and recovers
+the e2e cluster, repairs it either way step 9 gives, runs step 10, and recovers
 a second Cluster from the repaired archive to count its rows.
