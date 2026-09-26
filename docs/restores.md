@@ -112,6 +112,20 @@ what deployed it. In the walzen infrastructure repository a Flux app is
 suspended and scaled down by hand, and a terragrunt unit is applied with its
 workload at zero; that repository's docs/cluster/backups/ has both procedures.
 
+Two in-place restores of one claim run one after the other. Before it creates
+its ReplicationDestination, a run lists the destinations in its namespace, and
+while the restic mover of another destination writes into the claim, the run
+waits with reason ClaimInUse:
+
+```text
+ReplicationDestination restore-1a2b3c4d-0 is restoring into claim notes-data
+```
+
+That check also catches a destination someone created by hand. Once the first
+run has deleted its destination, it keeps the claim's Lease until its mover's
+Job and pods are gone, and the second run waits with reason SourceBusy and a
+message naming the first run. The second run then starts on its own.
+
 A run takes the app down only when it can go on. On the pass that records its
 plan, before it stops anything, it checks every volume item it has not started:
 a backup of the claim or of its repository that is uploading, or a Lease
@@ -119,7 +133,10 @@ another run holds on either, makes it wait in phase Waiting with reason
 SourceBusy and the workloads still running, and a read that fails comes back
 as an error and stops nothing. The check at the mover object remains the one
 that counts ([One mover at a time](namespace-backups.md#one-mover-at-a-time)).
-The run also waits for another run that has stopped this namespace's workloads
+A volume item whose repository Secret is gone fails in that same check, with
+the message shown under [Which snapshot a run restores](#which-snapshot-a-run-restores),
+and a run left with no item to restore stops nothing and ends. The run also
+waits for another run that has stopped this namespace's workloads
 ([One quiesce at a time](namespace-backups.md#one-quiesce-at-a-time)). A
 Kustomization that applies Deployments or StatefulSets in two namespaces ends
 the run with reason `Invalid` before anything is stopped
@@ -684,7 +701,7 @@ A RestoreRun leaves an opted-out Cluster alone too:
 
 | Run | What happens to the opted-out Cluster |
 | --- | --- |
-| `all: true` | its item is Skipped with `the Cluster carries backup.wlz.li/bootstrap: initdb, which asks for an empty database, so the run leaves it alone`, and the run restores everything else |
+| `all: true` | its item is Skipped with `the Cluster carries backup.wlz.li/bootstrap: initdb, which asks for an empty database, so the run leaves it alone`, and the run restores everything else. A run with nothing else to restore ends Failed with reason NoBackupInReach and `nothing was restored: Cluster <name>: <the item's message>` |
 | `database: <cluster>` | the run ends Invalid before it touches anything |
 | a Cluster that gains the annotation after the run marked it Deleted | its item is Skipped, and the run never deletes it again |
 | a Cluster that is created again with the annotation after the run deleted it | its item is Failed: `Cluster <name> came back carrying backup.wlz.li/bootstrap: initdb after this run deleted it, so it started empty and nothing was restored. Remove the annotation from its manifest and create a new RestoreRun to recover it. The run leaves the Cluster alone` |
@@ -695,6 +712,18 @@ fails the item with what the Cluster is doing instead, such as `it archives
 nowhere`, `RestoreRun <name> recovered it`, or one of the two messages above;
 [namespace-backups.md](namespace-backups.md#a-database-restore) has the
 messages.
+
+One Cluster is restored by one run at a time. A RestoreRun whose `database`, or
+whose `all`, covers a Cluster that another unfinished RestoreRun has an item
+for in phase Pending, Deleted or Recovering ends at its checks with reason
+Invalid, before it deletes anything:
+
+```text
+RestoreRun back-to-monday is restoring Cluster notes-pg. Create this RestoreRun again once that run has finished
+```
+
+Without that refusal both runs would delete the Cluster, the webhook would
+recover it for the first run it lists, and the other run would fail.
 
 The webhook never recovers an opted-out Cluster and never marks it as a run's
 recovery. A run that deleted one would find it refused over its old archive,

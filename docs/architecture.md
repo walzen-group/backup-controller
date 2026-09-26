@@ -471,7 +471,10 @@ uncached reads from the API server, and goes on only when the API server answers
 NotFound for the VolumeRestore. A VolumeRestore that exists in any state leaves
 the claim to the library. Then, in the controller's namespace, it:
 
-1. deletes the ReplicationDestination `restore-<uid>`;
+1. deletes the ReplicationDestination `restore-<uid>`; when that delete finds
+   the destination there, it records WaitingForMover and looks again 30
+   seconds later, because VolSync may create the mover Job for that
+   destination after any look the same pass could take;
 2. lists the pods of the mover Job `volsync-dst-restore-<uid>`, and once no pod
    is left reads the Job itself; while a pod or the Job is left, it records
    WaitingForMover on the claim and looks again 30 seconds later;
@@ -484,11 +487,12 @@ pod and its Job are gone. A restic restore killed half way leaves its lock in
 the repository, and a Job with no pod, before its first pod or between two
 retries, can still start one. Every delete accepts an object that is already
 gone, and the finalizer goes last, so a pass that fails part way starts again
-from step 1 and finishes on a later pass.
+from step 1 and finishes on a later pass. Only a pass whose delete in step 1
+finds the destination already gone goes on to step 2.
 
 | Event | Type | Message |
 | --- | --- | --- |
-| WaitingForMover | Normal | `VolumeRestore <name> is gone; waiting for mover pod <namespace>/<pod> (phase <phase>) of ReplicationDestination restore-<uid> to go before the cleanup finishes`, or `mover Job <namespace>/volsync-dst-restore-<uid>` in place of the pod once only the Job is left |
+| WaitingForMover | Normal | `VolumeRestore <name> is gone; deleted ReplicationDestination restore-<uid>, and the next pass looks for its mover before the cleanup goes on` on the pass that deletes the destination; after it, `VolumeRestore <name> is gone; waiting for mover pod <namespace>/<pod> (phase <phase>) of ReplicationDestination restore-<uid> to go before the cleanup finishes`, or `mover Job <namespace>/volsync-dst-restore-<uid>` in place of the pod once only the Job is left |
 | DataSourceGone | Warning | `VolumeRestore <name> was deleted before the populator finished with this claim; deleted ReplicationDestination restore-<uid>, Secret copy <secret> and prime claim prime-<uid> in <namespace>, and removed finalizer backup.wlz.li/populate-target-protection` |
 
 To follow one claim's cleanup, read the claim's events:
