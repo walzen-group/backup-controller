@@ -310,10 +310,11 @@ func envtestReason(err error) string {
 // a third-party kind whose version declares a status subresource, and adds
 // what it observed to o: the generation, whether the object carries a status
 // key and the stored phase after the create, after the finalizer write and
-// after the delete that the finalizer holds in place, the outcome of a status
-// write and of a plain update while the object is being deleted, from the
-// stored object and from the object as it was before the delete, and what
-// happens when the last finalizer goes.
+// after the delete that the finalizer holds in place, whether a second delete
+// leaves the deletionTimestamp and the resourceVersion alone, the outcome of
+// a status write and of a plain update while the object is being deleted,
+// from the stored object and from the object as it was before the delete, and
+// what happens when the last finalizer goes.
 func clusterBeingDeletedOps(t *testing.T, c client.Client, o map[string]string) {
 	t.Helper()
 	ctx := context.Background()
@@ -359,6 +360,20 @@ func clusterBeingDeletedOps(t *testing.T, c client.Client, o map[string]string) 
 	o["Cluster delete: deletionTimestamp"] = fmt.Sprint(after.GetDeletionTimestamp() != nil)
 	o["Cluster delete: caller kept"] = fmt.Sprint(u.GetDeletionTimestamp() == nil)
 	record("delete", after)
+
+	// A second delete of the object the finalizer holds in place stores
+	// nothing: the deletionTimestamp and the resourceVersion stay as they
+	// were after the first delete. A metav1.Time serialises as RFC 3339, so
+	// wait past the next second boundary before the second delete, which
+	// makes a timestamp the fake moved visible.
+	firstStamp, firstRV := after.GetDeletionTimestamp(), after.GetResourceVersion()
+	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second + 100*time.Millisecond)))
+	if err := c.Delete(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	after = read()
+	o["Cluster second delete: deletionTimestamp kept"] = fmt.Sprint(after.GetDeletionTimestamp().Equal(firstStamp))
+	o["Cluster second delete: resourceVersion kept"] = fmt.Sprint(after.GetResourceVersion() == firstRV)
 
 	// A status write from the stored object is admitted, and the status is
 	// readable afterwards.

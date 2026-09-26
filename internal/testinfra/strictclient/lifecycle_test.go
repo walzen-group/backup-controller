@@ -226,6 +226,58 @@ func TestDeleteWithFinalizersBumpsTheGeneration(t *testing.T) {
 	}
 }
 
+// TestSecondDeleteKeepsTheFirstDeletionTimestamp checks that a second delete
+// of an object a finalizer holds in place changes nothing, as on
+// kube-apiserver 1.36.3: markAsDeleting keeps a deletionTimestamp that is
+// already set
+// (k8s.io/apiserver@v0.36.3/pkg/registry/generic/registry/store.go:1030-1034)
+// and the guaranteed update that follows serialises the stored object, so the
+// etcd3 store returns without a write
+// (k8s.io/apiserver@v0.36.3/pkg/storage/etcd3/store.go:553-570). The fake
+// client sets a new deletionTimestamp on every delete of such an object
+// (sigs.k8s.io/controller-runtime@v0.24.1/pkg/client/fake/client.go:1198-1200).
+func TestSecondDeleteKeepsTheFirstDeletionTimestamp(t *testing.T) {
+	ctx := context.Background()
+	c := newCRDClient(t, []string{cnpgClusterCRD})
+
+	cluster := clusterObject("kept")
+	if err := c.Create(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	cluster.SetFinalizers([]string{"example.com/hold"})
+	if err := c.Update(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	first := readCluster(t, c, "kept")
+	if first.GetDeletionTimestamp() == nil {
+		t.Fatal("the finalizer did not hold the Cluster in deletion")
+	}
+	firstStamp, firstRV := first.GetDeletionTimestamp(), first.GetResourceVersion()
+
+	// The fake stamps a new deletionTimestamp from the wall clock, and an
+	// unstructured object stores one as RFC 3339, so the stored value has
+	// whole seconds. Wait past the next second boundary, so that a timestamp
+	// the fake moved is visible against the first one.
+	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second + 100*time.Millisecond)))
+
+	if err := c.Delete(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	second := readCluster(t, c, "kept")
+	if stamp := second.GetDeletionTimestamp(); !stamp.Equal(firstStamp) {
+		t.Errorf("deletionTimestamp after a second delete = %v, want the first %v", stamp, firstStamp)
+	}
+	if rv := second.GetResourceVersion(); rv != firstRV {
+		t.Errorf("resourceVersion after a second delete = %s, want the first %s, since the second delete stores nothing", rv, firstRV)
+	}
+	if second.GetGeneration() != 2 {
+		t.Errorf("generation after a second delete = %d, want 2", second.GetGeneration())
+	}
+}
+
 func TestDeleteChecksUIDAndResourceVersionPreconditions(t *testing.T) {
 	ctx := context.Background()
 	c := newClient(t)
