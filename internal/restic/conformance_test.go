@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,6 +254,7 @@ func TestPinningASnapshotsSecondMakesTheMoverRestoreIt(t *testing.T) {
 						selected[row.RestoreAsOf] = row.Selected
 					}
 				}
+				var r5 []string
 				for i, s := range snapshots {
 					pin := s.Time.UTC().Truncate(time.Second).Format(time.RFC3339)
 					got, ok := selected[pin]
@@ -262,10 +265,14 @@ func TestPinningASnapshotsSecondMakesTheMoverRestoreIt(t *testing.T) {
 						continue
 					}
 					if i+1 < len(snapshots) && snapshots[i+1].Time.Unix() == s.Time.Unix() {
-						t.Skipf("R5 (designs/restorerun.md C, same second; designs/tests.md section 4, phase 1 item 1): "+
-							"pinning %s restores %s, taken later in the same second", pin, got)
+						r5 = append(r5, fmt.Sprintf("pinning %s restores %s, taken later in the same second", pin, got))
+						continue
 					}
 					t.Errorf("RESTORE_AS_OF %s restored %q, want the snapshot taken then, %s", pin, got, s.ShortID)
+				}
+				if len(r5) > 0 && !t.Failed() {
+					t.Skipf("R5 (designs/restorerun.md C, same second; designs/tests.md section 4, phase 1 item 1): %s",
+						strings.Join(r5, "; "))
 				}
 			})
 		}
