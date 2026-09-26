@@ -155,9 +155,10 @@ func TestAQueuedRunThatKueueNeverAdmitsFails(t *testing.T) {
 
 // A Backup whose status.phase is none of the phases CloudNativePG 1.30 sets,
 // as after a release that adds a harmless phase, leaves its item Running:
-// the run waits, naming status.phase and the value in its Ready message,
-// and goes on once CloudNativePG reports completed. A run that reaches its
-// timeout in such a phase names it in the item's message.
+// the run waits, naming status.phase and the value in its Ready message and
+// in the item's message, and goes on once CloudNativePG reports completed,
+// which makes the item Succeeded and clears its message. A run that reaches
+// its timeout in such a phase names it in the item's message.
 func TestABackupInAPhaseTheControllerDoesNotKnowWaitsNamingIt(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
 	step(t, r)
@@ -167,8 +168,12 @@ func TestABackupInAPhaseTheControllerDoesNotKnowWaitsNamingIt(t *testing.T) {
 	step(t, r)
 
 	run := readBackupRun(t, c)
-	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
+	item := run.Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemRunning {
 		t.Fatalf("item = %+v, want it still Running", item)
+	}
+	if !strings.Contains(item.Message, "status.phase") || !strings.Contains(item.Message, `"uploading"`) {
+		t.Errorf("item message = %q, want it to name status.phase and \"uploading\"", item.Message)
 	}
 	if message := readyMessage(run.Status.Conditions); !strings.Contains(message, "status.phase") || !strings.Contains(message, `"uploading"`) {
 		t.Errorf("Ready message = %q, want it to name status.phase and \"uploading\"", message)
@@ -176,8 +181,8 @@ func TestABackupInAPhaseTheControllerDoesNotKnowWaitsNamingIt(t *testing.T) {
 
 	setBackupPhase(t, c, "completed")
 	step(t, r)
-	if run := readBackupRun(t, c); run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
-		t.Errorf("item = %+v, want it Succeeded once the Backup completed", run.Status.Items[0])
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemSucceeded || item.Message != "" {
+		t.Errorf("item = %+v, want it Succeeded with no message once the Backup completed", item)
 	}
 }
 
