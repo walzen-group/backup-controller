@@ -23,7 +23,8 @@
 //     With a status subresource the fake keeps the stored status on a plain
 //     update, so only spec changes count, as on the real server.
 //   - Delete honours a UID precondition with a Conflict (the fake already
-//     honours a ResourceVersion one). See Client.Delete.
+//     honours a ResourceVersion one) and raises the generation of an object a
+//     finalizer holds in place, as the server does. See Client.Delete.
 //   - An update or patch cannot add a finalizer to an object that has a
 //     deletionTimestamp; removing the last one deletes the object and the
 //     write still succeeds. See checkNoNewFinalizers.
@@ -31,6 +32,12 @@
 //     creationTimestamp. See Client.Status.
 //   - An update or status update whose object carries a uid other than the
 //     stored one fails with a Conflict. See checkUID.
+//   - An update or status update whose object carries a resourceVersion other
+//     than the stored one fails with the Conflict the server builds, which
+//     the fake client misses for an unstructured object. See
+//     checkResourceVersion.
+//   - A read answers without a status key where the stored object has none,
+//     since the server never stores a null status. See Client.Get.
 //   - A patch whose result carries another uid fails with an Invalid error;
 //     a status patch of a custom resource drops the uid and succeeds. See
 //     checkPatchedUID.
@@ -64,11 +71,13 @@
 // wrapper keeps the stored value; a PersistentVolumeClaim's stays 0 on a real
 // server too), validation of built-in kinds (a Pending claim's spec is
 // immutable on a real server and writable here), the finalizer check for
-// server-side apply patches, CRD metadata coercion, per-kind
-// default propagation policies other than Job's, and a collector that runs
-// again later (see Client.deleteCascading). Those are separate behaviours;
-// each one is added as a method or an Options field of Client, the way
-// Create, Update and Patch are here.
+// server-side apply patches, the resourceVersion a patch body may carry, CRD
+// metadata coercion, per-kind default propagation policies other than Job's,
+// and a collector that runs again later (see Client.deleteCascading). The
+// fake's storage keeps the null status its write path adds to an unstructured
+// object; reads do not show it (see Client.Get). Those are separate
+// behaviours; each one is added as a method or an Options field of Client,
+// the way Create, Update and Patch are here.
 //
 // A write that changes the generation after a patch or update is stored in two
 // steps (the fake's write, then one update that sets the generation), so the
@@ -82,12 +91,14 @@ package strictclient
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -231,6 +242,9 @@ func (c *Client) Update(ctx context.Context, obj client.Object, opts ...client.U
 	if err := c.checkUID(obj, old); err != nil {
 		return err
 	}
+	if err := c.checkResourceVersion(obj, old); err != nil {
+		return err
+	}
 	if err := c.checkNoNewFinalizers(obj, old); err != nil {
 		return err
 	}
@@ -303,6 +317,69 @@ func (c *Client) stored(ctx context.Context, obj client.Object) (client.Object, 
 		return nil, err
 	}
 	return old, nil
+}
+
+// Get reads obj and drops a null status from it.
+//
+// The fake client adds a null status to an unstructured object of a kind with
+// a status subresource whose stored object has no status: it copies the
+// stored status over the request object on every plain write, and a missing
+// status arrives as a nil value. kube-apiserver 1.36.3 prunes a null the
+// schema does not allow when it decodes an object, so a stored object without
+// a status has no status key at all
+// (k8s.io/apiextensions-apiserver@v0.36.0/pkg/apiserver/customresource_handler.go:1430-1440),
+// and every read answers without it. The wrapper removes the key, so a test
+// sees what the server would store and can build a status with
+// unstructured.SetNestedField on an object it read. Errors are the fake
+// client's.
+func (c *Client) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := c.WithWatch.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	dropNullStatus(obj)
+	return nil
+}
+
+// List reads the list and drops a null status from every unstructured item,
+// for the same reason Get does. Items of a typed kind keep their content: the
+// fake client's copy of the stored object goes through JSON, which drops a
+// status the Go type has no field for. Errors are the fake client's.
+func (c *Client) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if err := c.WithWatch.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	if items, ok := list.(*unstructured.UnstructuredList); ok {
+		for i := range items.Items {
+			dropNullStatus(&items.Items[i])
+		}
+	}
+	return nil
+}
+
+// dropNullStatus removes a status key whose value is nil from an unstructured
+// object, as the server's decoding does (see Get).
+func dropNullStatus(obj client.Object) {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok || u.Object == nil {
+		return
+	}
+	if status, found := u.Object["status"]; found && isNull(status) {
+		delete(u.Object, "status")
+	}
+}
+
+// isNull reports whether v is a nil value of any kind: the nil a missing JSON
+// value decodes to, a nil map, slice or pointer.
+func isNull(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Pointer, reflect.Interface:
+		return rv.IsNil()
+	}
+	return false
 }
 
 // settleGeneration compares the object the fake just stored (in obj) with

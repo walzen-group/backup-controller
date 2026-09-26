@@ -3,6 +3,7 @@ package strictclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -37,7 +38,9 @@ import (
 //
 // Every delete that is not a dry run is recorded with the dependents of the
 // object (see Cascades), and with Options.GarbageCollect those dependents are
-// handled the way the garbage collector would; see deleteCascading.
+// handled the way the garbage collector would; see deleteCascading. A delete
+// that a finalizer holds in place raises the object's generation by one, as
+// the server does; see bumpGenerationOnDelete.
 func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
 	o := &client.DeleteOptions{}
 	o.ApplyOptions(opts)
@@ -57,7 +60,45 @@ func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.D
 	if err != nil {
 		return c.WithWatch.Delete(ctx, obj, opts...)
 	}
-	return c.deleteCascading(ctx, owner, o, opts)
+	if err := c.deleteCascading(ctx, owner, o, opts); err != nil {
+		return err
+	}
+	return c.bumpGenerationOnDelete(ctx, owner)
+}
+
+// bumpGenerationOnDelete raises the generation of an object that the delete
+// left in place with a deletionTimestamp, the way kube-apiserver 1.36.3 does.
+//
+// Parameters:
+//   - owner is the stored object as it was before the delete, from Delete.
+//
+// It returns nil when the delete removed the object, when the object was
+// already being deleted, when its generation is 0, and when the follow-up
+// write succeeds. Its error is that write's.
+//
+// The server raises the generation once, on the delete that sets the
+// deletionTimestamp: markAsDeleting does it for an object whose kind does not
+// support graceful deletion, which is every custom resource, when the
+// generation is above 0
+// (k8s.io/apiserver@v0.36.3/pkg/registry/generic/registry/store.go:1024-1029),
+// and rest.BeforeDelete does it for the other kinds
+// (k8s.io/apiserver@v0.36.3/pkg/registry/rest/delete.go:168-172). The fake
+// client leaves the generation alone, so the wrapper writes the stored object
+// back with one more, as it does for the generation of an update (see
+// settleGeneration).
+func (c *Client) bumpGenerationOnDelete(ctx context.Context, owner client.Object) error {
+	if owner.GetDeletionTimestamp() != nil {
+		return nil
+	}
+	stored, err := c.stored(ctx, owner)
+	if err != nil {
+		return nil
+	}
+	if stored.GetDeletionTimestamp() == nil || stored.GetGeneration() == 0 {
+		return nil
+	}
+	stored.SetGeneration(stored.GetGeneration() + 1)
+	return c.WithWatch.Update(ctx, stored)
 }
 
 // checkNoNewFinalizers refuses a write that would add a finalizer to an
@@ -202,6 +243,9 @@ func (w *statusWriter) Update(ctx context.Context, obj client.Object, opts ...cl
 	if err := w.c.checkUID(obj, old); err != nil {
 		return err
 	}
+	if err := w.c.checkResourceVersion(obj, old); err != nil {
+		return err
+	}
 	if err := w.c.coerce(obj, false); err != nil {
 		return err
 	}
@@ -278,6 +322,40 @@ func decodeFrom(dst, src client.Object) error {
 		return err
 	}
 	return decodeInto(dst, data)
+}
+
+// checkResourceVersion refuses an update or status update whose object
+// carries a resourceVersion other than the stored one.
+//
+// Parameters:
+//   - obj is the object the write sends.
+//   - old is the stored object.
+//
+// It returns nil when obj carries no resourceVersion or the stored one, and
+// otherwise the 409 Conflict kube-apiserver 1.36.3 returns, with the message
+// the registry store builds. The store compares the resourceVersion of the
+// object to update with the stored one and answers a mismatch with a
+// Conflict carrying OptimisticLockErrorMsg, for a status update through the
+// same path
+// (k8s.io/apiserver@v0.36.3/pkg/registry/generic/registry/store.go:743-745,
+// pkg/registry/generic/registry/store.go:263). The fake client compares the
+// two itself, but for an unstructured object it copies the stored object over
+// the request object before that comparison, which loses the request's
+// resourceVersion and admits a stale write; this check runs first and refuses
+// it. A patch is not checked: its body carries no resourceVersion unless the
+// test sets one there.
+func (c *Client) checkResourceVersion(obj, old client.Object) error {
+	rv := obj.GetResourceVersion()
+	if rv == "" || rv == old.GetResourceVersion() {
+		return nil
+	}
+	gvk, err := apiutil.GVKForObject(obj, c.Scheme())
+	if err != nil {
+		return err
+	}
+	gvr, _ := meta.UnsafeGuessKindToResource(gvk)
+	return apierrors.NewConflict(gvr.GroupResource(), obj.GetName(),
+		errors.New("the object has been modified; please apply your changes to the latest version and try again"))
 }
 
 // checkUID refuses an update whose object carries a uid other than the
