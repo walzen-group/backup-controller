@@ -280,7 +280,8 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 //
 // A spec that can't work ends the run as Failed with reason Invalid: a
 // restoreAsOf that doesn't parse, a spec.quiesce entry the namespace does not
-// hold, or a synced run with no claim to take the moment from. plan returns
+// hold, a synced run with no claim to take the moment from, or a Cluster that
+// another unfinished RestoreRun is restoring (see items). plan returns
 // an error, and writes nothing, when listing the snapshots or the base
 // backups fails, and when a read fails in a way a retry may fix, such as a
 // timeout from the API server. Reconcile hands such an error to planFailed.
@@ -401,9 +402,10 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 // because a restore in place needs a claim to write into; the refusal sends
 // the user to spec.into with a name no claim has, or to spec.claim to
 // overwrite an existing claim in place. It also returns a refusal when
-// nothing in the namespace is marked, and when spec.database names a Cluster
-// that opts out of the bootstrap webhook. A failed read comes back as a plain
-// error.
+// nothing in the namespace is marked, when spec.database names a Cluster
+// that opts out of the bootstrap webhook, and when another unfinished
+// RestoreRun is restoring a Cluster the run would restore (see
+// clustersRestoredElsewhere). A failed read comes back as a plain error.
 func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	pending := func(kind, name string) backupv1alpha1.RestoreItem {
 		return backupv1alpha1.RestoreItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
@@ -424,7 +426,11 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 				return nil, refuse("Cluster %s: %s", run.Spec.Database, why)
 			}
 		}
-		return []backupv1alpha1.RestoreItem{pending("Cluster", run.Spec.Database)}, nil
+		items := []backupv1alpha1.RestoreItem{pending("Cluster", run.Spec.Database)}
+		if err := r.clustersRestoredElsewhere(ctx, run, items); err != nil {
+			return nil, err
+		}
+		return items, nil
 	}
 
 	claims, err := enabledClaims(ctx, r.Reader, run.Namespace)
@@ -451,7 +457,60 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	if len(items) == 0 {
 		return nil, refuse("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
 	}
+	if err := r.clustersRestoredElsewhere(ctx, run, items); err != nil {
+		return nil, err
+	}
 	return items, nil
+}
+
+// clustersRestoredElsewhere refuses a run that would restore a Cluster
+// another unfinished RestoreRun is restoring.
+//
+// Parameters:
+//   - run is the run being planned. A RestoreRun with its UID is skipped.
+//   - items are the run's items as planned. Only a Cluster item that is
+//     Pending counts, since the run leaves a Skipped one alone.
+//
+// It returns a refusal naming the other run and the Cluster when another
+// RestoreRun in the namespace that has not finished holds an item for one of
+// those Clusters in phase Pending, Deleted or Recovering, and nil otherwise.
+// A failed list of the RestoreRuns comes back as a plain error, and the
+// caller retries.
+//
+// Two runs that both delete one Cluster race for its recovery: the webhook
+// recovers it for the first run it lists, and the other run fails. Refused
+// at its checks, the second run deletes nothing. The refusal names the other
+// run, so the user knows which run to wait for.
+func (r *RestoreRunReconciler) clustersRestoredElsewhere(ctx context.Context, run *backupv1alpha1.RestoreRun, items []backupv1alpha1.RestoreItem) error {
+	var clusters []string
+	for _, item := range items {
+		if item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemPending {
+			clusters = append(clusters, item.Name)
+		}
+	}
+	if len(clusters) == 0 {
+		return nil
+	}
+	restores := &backupv1alpha1.RestoreRunList{}
+	if err := r.Reader.List(ctx, restores, client.InNamespace(run.Namespace)); err != nil {
+		return fmt.Errorf("list RestoreRuns in %s: %w", run.Namespace, err)
+	}
+	for i := range restores.Items {
+		other := &restores.Items[i]
+		if other.UID == run.UID || other.Status.Phase.Finished() {
+			continue
+		}
+		for _, item := range other.Status.Items {
+			if item.Kind != "Cluster" || !slices.Contains(clusters, item.Name) {
+				continue
+			}
+			switch item.Phase {
+			case backupv1alpha1.ItemPending, backupv1alpha1.ItemDeleted, backupv1alpha1.ItemRecovering:
+				return refuse("RestoreRun %s is restoring Cluster %s. Create this RestoreRun again once that run has finished", other.Name, item.Name)
+			}
+		}
+	}
+	return nil
 }
 
 // checkVolume finds the snapshot that a restore of the claim named claimName
@@ -725,7 +784,9 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // the stopped workloads again and resume the Kustomizations it suspended. It
 // then waits with reason WaitingForRecreate, whose message asks for the
 // Cluster to be created again. The run finishes once every item is
-// Succeeded, Failed or Skipped. A run past spec.timeout is aborted.
+// Succeeded, Failed or Skipped: Failed when an item failed, Failed with
+// reason NoBackupInReach when every item was Skipped (see nothingRestored),
+// and Succeeded otherwise. A run past spec.timeout is aborted.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if deadline, over := r.overdue(run); over {
 		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, timedOutMessage(deadline, run.Status.Conditions))
@@ -867,6 +928,9 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 		if failed := restoreFailures(run.Status.Items); failed != "" {
 			return r.finish(ctx, run, backupv1alpha1.ReasonFailed, failed)
 		}
+		if skipped := nothingRestored(run.Status.Items); skipped != "" {
+			return r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, skipped)
+		}
 		return r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, "every item holds the restored data")
 	}
 
@@ -915,7 +979,9 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // afterwards touches it.
 //
 // It returns reason ClaimInUse and a message naming the pod while a pod
-// mounts the claim, and reason SourceBusy and a message naming the other run
+// mounts the claim, reason ClaimInUse and a message naming the destination
+// while another ReplicationDestination writes into the claim (see
+// claimWriter), and reason SourceBusy and a message naming the other run
 // while another run holds the Lease of the claim or its repository (see
 // acquireLeases) or a backup of either is in progress (see
 // otherMover); the item stays Pending in both cases. It returns empty strings
@@ -931,6 +997,14 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 		if holder != "" {
 			return backupv1alpha1.ReasonClaimInUse,
 				fmt.Sprintf("claim %s is mounted by pod %s; stop the workload and this restore starts on its own", item.Name, holder), nil
+		}
+		writer, err := r.claimWriter(ctx, run, item.Name, destinationName(run.UID, index))
+		if err != nil {
+			return "", "", err
+		}
+		if writer != "" {
+			return backupv1alpha1.ReasonClaimInUse,
+				fmt.Sprintf("ReplicationDestination %s is restoring into claim %s", writer, item.Name), nil
 		}
 		settings, err := repositoryFor(ctx, r.Reader, run.Namespace, item.Name, run.Spec.Repository, run.Spec.MoverSecurityContext)
 		if err != nil {
@@ -1026,6 +1100,42 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 		}
 	}
 	return "", "", nil
+}
+
+// claimWriter returns the name of a ReplicationDestination, other than the
+// item's own, whose mover writes into the claim, or "" when there is none.
+//
+// Parameters:
+//   - claimName names the claim an in-place restore is about to write into.
+//   - own is the name the item's ReplicationDestination has (see
+//     destinationName). That destination is left out: an earlier pass may
+//     have created it and lost the status write that recorded it.
+//
+// It lists the ReplicationDestinations in the run's namespace through the
+// uncached Reader, and returns the first one, in the order the list gives,
+// whose restic mover's destinationPVC is the claim. A destination being
+// deleted counts too, since its mover may still write. A destination of
+// another mover type has no restic spec and is ignored; the walzen cluster
+// runs only restic movers. A failed list comes back as an error, and the
+// caller retries with nothing created.
+//
+// The Leases keep the movers of two runs of this controller apart. A
+// destination that something else created takes no Lease, so the
+// destination itself is what shows that the claim is being written.
+func (r *RestoreRunReconciler) claimWriter(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName, own string) (string, error) {
+	list := &volsyncv1alpha1.ReplicationDestinationList{}
+	if err := r.Reader.List(ctx, list, client.InNamespace(run.Namespace)); err != nil {
+		return "", fmt.Errorf("list the ReplicationDestinations in %s: %w", run.Namespace, err)
+	}
+	for _, destination := range list.Items {
+		if destination.Name == own || destination.Spec.Restic == nil || destination.Spec.Restic.DestinationPVC == nil {
+			continue
+		}
+		if *destination.Spec.Restic.DestinationPVC == claimName {
+			return destination.Name, nil
+		}
+	}
+	return "", nil
 }
 
 // restoreDatabase moves one database restore a step further. A Pending item
@@ -2254,6 +2364,27 @@ func restoreFailures(items []backupv1alpha1.RestoreItem) string {
 		}
 	}
 	return strings.Join(failed, "; ")
+}
+
+// nothingRestored returns the Ready message of a run none of whose items
+// succeeded, and "" when at least one did.
+//
+// Parameters:
+//   - items are the run's finished items. The caller has ruled out a failed
+//     one, so an item that did not succeed was Skipped.
+//
+// The message says nothing was restored and gives each item's kind, name and
+// message, joined with "; ", so the user sees why each one was left alone.
+// A run that restored nothing must not end Succeeded.
+func nothingRestored(items []backupv1alpha1.RestoreItem) string {
+	var skipped []string
+	for _, item := range items {
+		if item.Phase == backupv1alpha1.ItemSucceeded {
+			return ""
+		}
+		skipped = append(skipped, fmt.Sprintf("%s %s: %s", item.Kind, item.Name, item.Message))
+	}
+	return "nothing was restored: " + strings.Join(skipped, "; ")
 }
 
 // failedMover reports whether the destination's latest mover failed, and

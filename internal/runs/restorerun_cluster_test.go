@@ -268,11 +268,10 @@ func TestARunWithoutAClusterUIDDeletesNothing(t *testing.T) {
 }
 
 // A Cluster the webhook recovered for the run is replaced during the
-// recovery, or is being deleted (the fake client keeps no status on a Cluster
-// being deleted, so that one stays unhealthy). The replacement carries no annotation naming
-// the run, since the webhook recovers only for a run whose item says Deleted.
-// The run fails instead of reporting Succeeded once the replacement is
-// healthy.
+// recovery, or is being deleted while it reports itself healthy. The
+// replacement carries no annotation naming the run, since the webhook
+// recovers only for a run whose item says Deleted. The run fails instead of
+// reporting Succeeded once either Cluster is healthy.
 func TestARecoveredClusterReplacedDuringRecoveryFailsTheRun(t *testing.T) {
 	recovering := func(t *testing.T) (*RestoreRunReconciler, client.Client, *unstructured.Unstructured) {
 		t.Helper()
@@ -316,9 +315,11 @@ func TestARecoveredClusterReplacedDuringRecoveryFailsTheRun(t *testing.T) {
 		if err := c.Delete(context.Background(), recovered); err != nil {
 			t.Fatal(err)
 		}
-		if u, _ := getUnstructured(t, c, ClusterGVK, ns, pgN); u.GetDeletionTimestamp() == nil {
+		deleting, _ := getUnstructured(t, c, ClusterGVK, ns, pgN)
+		if deleting.GetDeletionTimestamp() == nil {
 			t.Fatal("the Cluster is not being deleted")
 		}
+		markHealthy(t, c, deleting)
 		restoreStep(t, r)
 		restoreStep(t, r)
 
@@ -329,9 +330,10 @@ func TestARecoveredClusterReplacedDuringRecoveryFailsTheRun(t *testing.T) {
 	})
 }
 
-// Two runs wait on one Cluster, and the webhook recovers it for the first.
-// The second run fails naming the first, and leaves the first run's recovery
-// alone, which then goes on to succeed.
+// A second run for a Cluster that another unfinished run is restoring is
+// refused at its checks with reason Invalid, naming the first run, and
+// deletes nothing. The first run deletes the Cluster, the webhook recovers
+// it for that run, and the first run succeeds with its recovery untouched.
 func TestTwoRunsWaitingOnOneClusterDoNotDeleteEachOthersRecovery(t *testing.T) {
 	second := restoreRun(func(r *backupv1alpha1.RestoreRun) {
 		r.Name, r.UID, r.Spec.Database = "second", "9b7d4e21-0000-4000-8000-00000000000a", pgN
@@ -340,14 +342,49 @@ func TestTwoRunsWaitingOnOneClusterDoNotDeleteEachOthersRecovery(t *testing.T) {
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), second,
 		cluster(), objectStore(), storeSecret())
 	stepRestore(t, r, "back-to-monday") // plan
-	stepRestore(t, r, "second")         // plan
-	stepRestore(t, r, "back-to-monday") // delete
-	stepRestore(t, r, "second")         // nothing to delete, Deleted
+	stepRestore(t, r, "second")         // plan: refused
 
+	run := &backupv1alpha1.RestoreRun{}
+	get(t, c, ns, "second", run)
+	want := "RestoreRun back-to-monday is restoring Cluster " + pgN
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
+		!strings.HasPrefix(readyMessage(run.Status.Conditions), want) {
+		t.Fatalf("second run: phase = %q, reason = %q, message = %q; want Failed, Invalid, starting %q",
+			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), want)
+	}
+	if uid := clusterUID(t, c); uid != "old-cluster-uid" {
+		t.Fatalf("Cluster UID = %q after the refusal, want the old Cluster untouched", uid)
+	}
+
+	stepRestore(t, r, "back-to-monday") // delete
+	recovered := createCluster(t, c, recoveredBy("back-to-monday"))
+	stepRestore(t, r, "second")
+	stepRestore(t, r, "back-to-monday")
+	if uid := clusterUID(t, c); uid != recovered.GetUID() {
+		t.Fatalf("Cluster UID = %q, want back-to-monday's recovery (%s) left alone", uid, recovered.GetUID())
+	}
+	markHealthy(t, c, recovered)
+	stepRestore(t, r, "back-to-monday")
+	if first := readRestoreRun(t, c); first.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+		t.Errorf("first run phase = %q, items = %+v; want Succeeded", first.Status.Phase, first.Status.Items)
+	}
+}
+
+// A Deleted item that finds the Cluster recovered for another run fails,
+// naming that run, and leaves the recovery alone. The refusal at the checks
+// keeps two runs from both deleting one Cluster; this is what the run does
+// should they get there all the same.
+func TestADeletedItemLeavesAnotherRunsRecoveryAlone(t *testing.T) {
+	second := restoreRun(func(r *backupv1alpha1.RestoreRun) {
+		r.Name, r.UID, r.Spec.Database = "second", "9b7d4e21-0000-4000-8000-00000000000a", pgN
+		r.Finalizers = []string{Finalizer}
+		r.Status.Phase = backupv1alpha1.RunPhaseRunning
+		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "Cluster", Name: pgN, Phase: backupv1alpha1.ItemDeleted}}
+	})
+	r, c := restoreReconciler(t, prober{saturday}, second, objectStore(), storeSecret())
 	recovered := createCluster(t, c, recoveredBy("back-to-monday"))
 	stepRestore(t, r, "second")
 	stepRestore(t, r, "second")
-	stepRestore(t, r, "back-to-monday")
 
 	run := &backupv1alpha1.RestoreRun{}
 	get(t, c, ns, "second", run)
@@ -355,12 +392,6 @@ func TestTwoRunsWaitingOnOneClusterDoNotDeleteEachOthersRecovery(t *testing.T) {
 		t.Errorf("second run's item = %+v (%s), want Failed naming back-to-monday", item, readyMessage(run.Status.Conditions))
 	}
 	if uid := clusterUID(t, c); uid != recovered.GetUID() {
-		t.Fatalf("Cluster UID = %q, want back-to-monday's recovery (%s) left alone", uid, recovered.GetUID())
-	}
-
-	markHealthy(t, c, recovered)
-	stepRestore(t, r, "back-to-monday")
-	if first := readRestoreRun(t, c); first.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
-		t.Errorf("first run phase = %q, items = %+v; want Succeeded", first.Status.Phase, first.Status.Items)
+		t.Errorf("Cluster UID = %q, want back-to-monday's recovery (%s) left alone", uid, recovered.GetUID())
 	}
 }

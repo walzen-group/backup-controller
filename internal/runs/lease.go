@@ -99,7 +99,7 @@ func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-
 // A Lease another run holds is taken over when that run is stale: it no
 // longer exists (or its name now belongs to a run with another UID), it has
 // finished, or none of the items the Lease names is Pending or Running any
-// more. The takeover is an update carrying the resourceVersion that was read,
+// more and none has a stopped mover left (see holderLive). The takeover is an update carrying the resourceVersion that was read,
 // so of two runs taking over the same Lease one gets a Conflict and waits. A
 // live holder's Lease is never taken over, and a run being deleted counts as
 // live until its finalizer has released its Leases.
@@ -311,7 +311,10 @@ const (
 //
 // A claim or repository Lease is live while the run exists with the UID the
 // Lease names, has not finished, and has an item the Lease names that is
-// Pending or Running. Only an item of the kind that takes Leases counts (see
+// Pending or Running. A RestoreRun's item also keeps it live once it has
+// finished, for as long as it names its ReplicationDestination: the run has
+// stopped that mover and not yet seen it gone (rule X2, see
+// removeDestinations). Only an item of the kind that takes Leases counts (see
 // backupLeaseItemKind), so a Cluster item with the claim's name does not
 // keep the claim's Lease. A quiesce Lease is live while the holder's stored
 // status does not show the workloads given back (see durablyRestarted): the
@@ -360,7 +363,10 @@ func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1
 			return !durablyRestarted(run), nil
 		}
 		for _, item := range run.Status.Items {
-			if item.Kind == restoreLeaseItemKind && slices.Contains(items, item.Name) && !finished(item) {
+			// A finished item that still names its ReplicationDestination
+			// has a mover the run has stopped and not yet seen gone (rule
+			// X2), and that mover may still write.
+			if item.Kind == restoreLeaseItemKind && slices.Contains(items, item.Name) && (!finished(item) || item.Destination != "") {
 				return true, nil
 			}
 		}

@@ -95,12 +95,15 @@ spec:
                 type: string
               into:
                 description: |-
-                  Into is the name of a new claim to create and fill. The source claim
-                  stays untouched. When omitted, the restore overwrites Claim in place,
-                  and the workload that mounts it has to stop first. With Claim, the new
-                  claim is filled through a VolumeRestore on the source claim's node. With
-                  Repository alone, the run creates an empty claim and a mover that
-                  writes into it, and the scheduler places the claim with the mover pod.
+                  Into is the name of a new claim for the run to create and fill. No
+                  claim of that name may exist yet, and the source claim stays untouched.
+                  When omitted, the restore overwrites Claim in place, and the workload
+                  that mounts it has to stop first. The run creates the claim itself and
+                  writes the selected snapshot into it with its own mover, from the
+                  backups of Claim or from Repository, and creates no VolumeRestore. With
+                  Claim, the new claim takes the source claim's size and storage class
+                  and is placed on the source claim's node. With Repository alone, the
+                  scheduler places the claim where the mover pod runs.
                 maxLength: 253
                 type: string
               intoSize:
@@ -422,8 +425,12 @@ spec:
               timeout:
                 default: 4h
                 description: |-
-                  Timeout is how long the run waits for its movers and recovered databases
-                  before it gives up. The clock starts when the run passes its checks.
+                  Timeout bounds each of the run's two waits. A run whose checks keep
+                  failing, or that waits for a backup of its repository to finish before
+                  it selects a snapshot, gives up once Timeout has passed since its
+                  creation. A run past its checks gives up once Timeout has passed since
+                  status.startedAt, while it waits for its movers and its recovered
+                  databases.
                 type: string
               ttlSecondsAfterFinished:
                 description: |-
@@ -557,15 +564,18 @@ spec:
                       description: Phase is how far this item got.
                       type: string
                     snapshot:
-                      description: Snapshot is the short ID of the restic snapshot
-                        a volume restores.
+                      description: |-
+                        Snapshot is the short ID of the restic snapshot the run's checks
+                        selected for a volume. The item succeeds only when the mover's log
+                        names this snapshot as the one it restored.
                       type: string
                     snapshotTime:
                       description: |-
                         SnapshotTime is the time of that snapshot. The run hands it to the mover
                         as restoreAsOf, in whole seconds and with no previous, so the mover
-                        restores the snapshot the run's checks selected even when a backup lands
-                        in between.
+                        picks the snapshot the checks selected. Right before the mover starts,
+                        the run lists the repository again, and the item fails when the mover
+                        would pick another snapshot at that time.
                       format: date-time
                       type: string
                   required:

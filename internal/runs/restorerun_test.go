@@ -990,6 +990,28 @@ func TestANamespaceRestoreLeavesAnOptedOutClusterAlone(t *testing.T) {
 	}
 }
 
+// A namespace restore whose every item is Skipped restores nothing, and ends
+// Failed with reason NoBackupInReach and a message that says so and gives
+// each item's reason. Before, it ended Succeeded saying every item holds the
+// restored data (finding H).
+func TestARestoreThatSkippedEveryItemFails(t *testing.T) {
+	r, c := restoreReconciler(t, prober{saturday},
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }), cluster(optedOut), objectStore(), storeSecret())
+	restoreStep(t, r) // plan
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	want := "nothing was restored: Cluster " + pgN + ": " + run.Status.Items[0].Message
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonNoBackupInReach ||
+		readyMessage(run.Status.Conditions) != want {
+		t.Errorf("phase = %q, reason = %q, message = %q; want Failed, NoBackupInReach, %q",
+			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), want)
+	}
+	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+		t.Error("the opted-out Cluster was deleted")
+	}
+}
+
 // A restore of one database that opts out of the bootstrap webhook ends as
 // Invalid at its checks, naming the annotation, and leaves the Cluster alone.
 func TestARestoreOfAnOptedOutDatabaseIsInvalid(t *testing.T) {
