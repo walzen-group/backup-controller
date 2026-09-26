@@ -1657,6 +1657,26 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 			}
 			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 		}
+		// A backup of one of the run's claims or repositories that is in
+		// progress would make the restore wait with the app down, from
+		// restoreVolume on. The run waits here instead, with the workloads
+		// still running. restoreVolume keeps its own check: this one is
+		// advisory, and the check at the mover object is the one that
+		// counts. A refusal is left to restoreVolume, which fails the item
+		// with it.
+		for i := range run.Status.Items {
+			item := &run.Status.Items[i]
+			if item.Kind != "PersistentVolumeClaim" || item.Phase != backupv1alpha1.ItemPending {
+				continue
+			}
+			held, err := r.backupHeldElsewhere(ctx, run, item.Name)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if held != "" {
+				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, held))
+			}
+		}
 		// The namespace's quiesce Lease lets one run at a time stop its
 		// workloads. It is taken before the plan and held until the stored
 		// status shows the workloads back, so a second run waits here with
@@ -1701,6 +1721,41 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, stopErr.Error())
 	}
 	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+}
+
+// backupHeldElsewhere returns a message naming the run that holds the claim
+// or its repository, or "" when neither is held. A restore calls it before it
+// stops any workload, so that it waits with the app running where
+// restoreVolume would wait with the app down.
+//
+// Parameters:
+//   - run is the asking run; its namespace and UID are read. spec.repository
+//     and spec.moverSecurityContext are used the way repositoryFor uses them.
+//   - claimName names the claim the item restores.
+//
+// A refusal from repositoryFor gives "": restoreVolume fails the item with it
+// later. Any other failed read comes back as an error, and the pass retries
+// with nothing stopped.
+//
+// The check is advisory. A run that starts its mover between this read and
+// the stop still goes first under the Leases and otherMover, which run right
+// before the mover object is written.
+func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (string, error) {
+	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
+	if err != nil {
+		if isRefusal(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	backing, err := otherMover(ctx, r.Reader, run.Namespace, claimName, settings.Secret, backupMover)
+	if err != nil {
+		return "", err
+	}
+	if backing != "" {
+		return backing, nil
+	}
+	return leaseHeldElsewhere(ctx, r.Reader, r.RESTMapper(), run, run.Namespace, claimName, settings.Secret)
 }
 
 // restart gives the stopped workloads their replicas back, resumes the

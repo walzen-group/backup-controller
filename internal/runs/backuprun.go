@@ -536,7 +536,9 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		// backup no run waits for fails its item here, before anything is
 		// stopped, and the rest of the namespace goes on; the status write
 		// below records it. A source the controller didn't write is left
-		// to startItem, which refuses it.
+		// to startItem, which refuses it. A read that fails is not evidence
+		// that the volume is idle, so it comes back as an error and nothing
+		// is stopped.
 		for i := range run.Status.Items {
 			item := &run.Status.Items[i]
 			if item.Kind != "ReplicationSource" || item.Phase != backupv1alpha1.ItemPending {
@@ -544,7 +546,7 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			}
 			// A restore of the claim or its repository holds the item the
 			// same way, and startItem would wait for it with the app down.
-			restoring, err := r.restoreOf(ctx, run.Namespace, item.Name)
+			restoring, err := r.heldElsewhere(ctx, run, item.Name)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -553,7 +555,14 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			}
 			source := &volsyncv1alpha1.ReplicationSource{}
 			err = r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
-			if err != nil || !inUse(source) || manualTag(source) == TriggerFor(run.UID) ||
+			switch {
+			case apierrors.IsNotFound(err):
+				// The claim has no source yet, so nothing can be in use.
+				continue
+			case err != nil:
+				return ctrl.Result{}, fmt.Errorf("get ReplicationSource %s/%s: %w", run.Namespace, item.Name, err)
+			}
+			if !inUse(source) || manualTag(source) == TriggerFor(run.UID) ||
 				source.Labels[backupv1alpha1.LabelManagedBy] != backupv1alpha1.ManagedByValue {
 				continue
 			}
@@ -622,21 +631,46 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 	return ctrl.Result{RequeueAfter: time.Second}, nil
 }
 
-// restoreOf returns a message naming the RestoreRun whose mover writes the
-// claim claimName or reads its repository (see otherMover), or "" when there
-// is none. A claim or VolumeRestore that can't be read gives "": startItem
-// fails or retries its item, and ensureSource checks again right before it
-// writes the trigger. A failed list comes back as an error.
-func (r *BackupRunReconciler) restoreOf(ctx context.Context, namespace, claimName string) (string, error) {
+// heldElsewhere returns a message naming the run that holds the claim or its
+// repository, or "" when neither is held. A backup calls it before it stops
+// any workload, so that it waits with the app running where startItem would
+// wait with the app down.
+//
+// Parameters:
+//   - run is the asking run; its namespace and UID are read.
+//   - claimName names the claim the run is about to back up.
+//
+// A claim that does not exist and a VolumeRestore the claim does not have
+// give "": startItem fails or retries the item, and ensureSource checks again
+// right before it writes the trigger. Any other failed read comes back as an
+// error, and the pass retries with nothing stopped.
+//
+// The check is advisory. A run that starts its mover between this read and
+// the stop still goes first under the Leases and otherMover, which run right
+// before the mover object is written.
+func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) (string, error) {
 	claim := &corev1.PersistentVolumeClaim{}
-	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: claimName}, claim); err != nil {
-		return "", nil
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
 	}
 	vr, err := volumeRestoreFor(ctx, r.Reader, claim)
 	if err != nil {
-		return "", nil
+		if isRefusal(err) {
+			return "", nil
+		}
+		return "", err
 	}
-	return otherMover(ctx, r.Reader, namespace, claimName, vr.Spec.Repository, restoreMover)
+	restoring, err := otherMover(ctx, r.Reader, run.Namespace, claimName, vr.Spec.Repository, restoreMover)
+	if err != nil {
+		return "", err
+	}
+	if restoring != "" {
+		return restoring, nil
+	}
+	return leaseHeldElsewhere(ctx, r.Reader, r.RESTMapper(), run, run.Namespace, claimName, vr.Spec.Repository)
 }
 
 // startItem starts the backup of one Pending item and sets the item's phase.

@@ -469,11 +469,18 @@ func TestAnOldCRDRunThatFailedItsRestartKeepsANewRunWaiting(t *testing.T) {
 			readyReason(restore.Status.Conditions), readyMessage(restore.Status.Conditions))
 	}
 
-	// The old run repeats its restart because its plan does not read back,
-	// and only then does the restore plan the count it gave back.
+	// The old run repeats its restart because its plan does not read back.
 	step(t, br)
 	if got := replicasOf(t, c); got != 2 {
 		t.Fatalf("replicas = %d after the old run's repeated restart, want 2", got)
+	}
+	// The run goes on to start its backup, so the restore waits for that
+	// mover as well. Once the backup has finished, the restore plans the
+	// count the old run gave back.
+	complete(t, c, "snapshot 6e473100 saved")
+	step(t, br)
+	if backup := readBackupRun(t, c); backup.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+		t.Fatalf("the old run ended %s: %s", backup.Status.Phase, readyMessage(backup.Status.Conditions))
 	}
 	restoreStep(t, rr)
 	restore = readRestoreRun(t, c)
