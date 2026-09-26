@@ -120,7 +120,7 @@ func (e *NotServedError) Status() metav1.Status {
 
 // Is makes errors.Is, and with it meta.IsNoMatchError, match a
 // *meta.NoKindMatchError, the error the RESTMapper returns for the same case.
-func (e *NotServedError) Is(target error) bool {
+func (*NotServedError) Is(target error) bool {
 	_, ok := target.(*meta.NoKindMatchError)
 	return ok
 }

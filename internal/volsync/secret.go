@@ -53,7 +53,7 @@ func MoverJobName(destination string) string {
 // The copy carries the Secret's type and a deep copy of its data, and no
 // labels or annotations.
 func SecretCopy(repo *corev1.Secret, claimUID types.UID, namespace string) *corev1.Secret {
-	copy := &corev1.Secret{
+	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      SecretCopyName(claimUID),
 			Namespace: namespace,
@@ -62,7 +62,7 @@ func SecretCopy(repo *corev1.Secret, claimUID types.UID, namespace string) *core
 		Data: make(map[string][]byte, len(repo.Data)),
 	}
 	for key, value := range repo.Data {
-		copy.Data[key] = append([]byte(nil), value...)
+		secret.Data[key] = append([]byte(nil), value...)
 	}
-	return copy
+	return secret
 }

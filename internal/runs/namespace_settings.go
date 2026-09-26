@@ -29,7 +29,7 @@ const (
 // invalidSetting is the error for a namespace annotation that doesn't parse.
 // The run or the item fails with a message that names the annotation, and
 // the run doesn't retry, because no retry can fix the value.
-type invalidSetting struct{ message string }
+type invalidSetting struct{ message string } //nolint:errname // D0 renames it invalidSettingError
 
 // Error returns the message, which names the namespace, the annotation and
 // its value.

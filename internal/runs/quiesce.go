@@ -125,14 +125,14 @@ func readStop(ctx context.Context, reader client.Reader, run client.Object) (bac
 	}
 	switch r := run.(type) {
 	case *backupv1alpha1.BackupRun:
-		s := stored.(*backupv1alpha1.BackupRun)
+		s := stored.(*backupv1alpha1.BackupRun) //nolint:forcetypeassert // stored is built above as the run's own type; H1 rewrites readStop
 		if s.ResourceVersion != r.ResourceVersion {
 			r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
 			r.Status.RestartedAt, r.Status.RestartPending = s.Status.RestartedAt, s.Status.RestartPending
 		}
 		return s.Status.Phase, nil
 	case *backupv1alpha1.RestoreRun:
-		s := stored.(*backupv1alpha1.RestoreRun)
+		s := stored.(*backupv1alpha1.RestoreRun) //nolint:forcetypeassert // stored is built above as the run's own type; H1 rewrites readStop
 		if s.ResourceVersion != r.ResourceVersion {
 			r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
 			r.Status.RestartedAt = s.Status.RestartedAt

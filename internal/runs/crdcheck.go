@@ -203,6 +203,9 @@ func walkSchema(t reflect.Type, node map[string]any, path string, onPath map[ref
 			return
 		}
 		walkSchema(t.Elem(), values, path+"{}", onPath, gaps)
+	default:
+		// Any other kind, a scalar or an interface, has no fields or
+		// elements the walk could check.
 	}
 }
 
@@ -210,7 +213,7 @@ func walkSchema(t reflect.Type, node map[string]any, path string, onPath map[ref
 // properties of the schema node at path. An embedded struct with an inline
 // or empty json name adds its fields to the same node.
 func walkFields(t reflect.Type, properties map[string]any, path string, onPath map[reflect.Type]bool, gaps *[]string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		f := t.Field(i)
 		if !f.IsExported() {
 			continue

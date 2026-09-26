@@ -226,7 +226,7 @@ func (s *Scheduler) create(ctx context.Context, namespace string, tick time.Time
 // when the namespace first asked for backups, and a namespace created a
 // minute ago doesn't fire it. The interval is the time between the next two
 // ticks after now.
-func (s *Scheduler) exportSchedule(namespace *corev1.Namespace, schedule cron.Schedule, runs []backupv1alpha1.BackupRun, now time.Time) {
+func (*Scheduler) exportSchedule(namespace *corev1.Namespace, schedule cron.Schedule, runs []backupv1alpha1.BackupRun, now time.Time) {
 	last := namespace.CreationTimestamp.Time
 	for _, run := range runs {
 		if run.Spec.All && run.Status.Phase == backupv1alpha1.RunPhaseSucceeded && run.Status.CompletedAt != nil && run.Status.CompletedAt.After(last) {

@@ -266,7 +266,7 @@ type errorDocument struct {
 // for a reader of the code; RustFS leaves them out of the document. A HEAD
 // request gets the status and the Content-Type alone, as RustFS sends no body
 // with a HEAD.
-func (s *Server) fail(w http.ResponseWriter, r *http.Request, status int, code, message, _, _ string) {
+func (*Server) fail(w http.ResponseWriter, r *http.Request, status int, code, message, _, _ string) {
 	w.Header().Set("Content-Type", "application/xml")
 	if r.Method == http.MethodHead {
 		w.WriteHeader(status)

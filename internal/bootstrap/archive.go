@@ -299,7 +299,7 @@ func endpointCA(
 ) ([]byte, error) {
 	name, found, err := unstructured.NestedString(store.Object, "spec", "configuration", "endpointCA", "name")
 	if err != nil || !found || name == "" {
-		return nil, nil
+		return nil, nil //nolint:nilerr // a malformed endpointCA reads as none today; T2 decides it
 	}
 	key, found, err := unstructured.NestedString(store.Object, "spec", "configuration", "endpointCA", "key")
 	if err != nil || !found || key == "" {

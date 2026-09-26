@@ -78,7 +78,7 @@ func main() {
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
 	if err := startRunControllers(runs, kubeconfig(), *namespace, *runsMetrics, *healthAddr, hook, exitOnFailure); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:gocritic // exitAfterDefer: the exit ends all stopRuns would stop; T3 moves the exit
 	}
 
 	// The library registers its own handler for SIGTERM and interrupt, and it
@@ -117,7 +117,7 @@ func main() {
 func exitOnFailure(err error) {
 	klog.Errorf("the run controllers stopped, exiting so the pod restarts: %v", err)
 	klog.Flush()
-	os.Exit(1)
+	os.Exit(1) //nolint:revive // deep-exit: the pod restarts only when the process ends; T3 moves the exit into main
 }
 
 // newClientOperations builds the cluster operations the populator callbacks

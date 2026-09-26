@@ -137,7 +137,7 @@ func (c *Client) bumpGenerationOnDelete(ctx context.Context, owner client.Object
 	}
 	stored, err := c.stored(ctx, owner)
 	if err != nil {
-		return nil
+		return nil //nolint:nilerr // an owner the fake cannot read has no generation to raise; T4
 	}
 	if stored.GetDeletionTimestamp() == nil || stored.GetGeneration() == 0 {
 		return nil
@@ -190,7 +190,7 @@ func (c *Client) checkNoNewFinalizers(obj, old client.Object) error {
 // returns nil for a server-side apply patch, which it does not model. Merge,
 // JSON and strategic merge patches are applied as the real server applies
 // them to the stored object.
-func (c *Client) patchedObject(obj, old client.Object, patch client.Patch) (client.Object, error) {
+func (*Client) patchedObject(obj, old client.Object, patch client.Patch) (client.Object, error) {
 	if patch.Type() == types.ApplyPatchType || patch.Type() == types.ApplyCBORPatchType {
 		return nil, nil
 	}

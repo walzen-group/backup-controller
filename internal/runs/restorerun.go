@@ -564,6 +564,9 @@ func (r *RestoreRunReconciler) clustersRestoredElsewhere(ctx context.Context, ru
 			switch item.Phase {
 			case backupv1alpha1.ItemPending, backupv1alpha1.ItemDeleted, backupv1alpha1.ItemRecovering:
 				return refuse("RestoreRun %s is restoring Cluster %s. Create this RestoreRun again once that run has finished", other.Name, item.Name)
+			default:
+				// An item in any other phase has let go of the Cluster or
+				// never deleted it, so it holds no recovery.
 			}
 		}
 	}
@@ -919,6 +922,9 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 			volumesDone = false
 		case backupv1alpha1.ItemFailed:
 			volumesFailed = true
+		default:
+			// A volume item in any other phase has finished without a
+			// failure, so it changes neither flag.
 		}
 	}
 
@@ -1215,6 +1221,9 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 				item.Phase, item.Message = backupv1alpha1.ItemFailed, lost
 			}
 		}
+	default:
+		// An item in any other phase has finished, so there is nothing
+		// left to restore.
 	}
 	return "", "", nil
 }
@@ -1482,6 +1491,9 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		case clusterPhase(cluster) == healthyPhase:
 			item.Phase = backupv1alpha1.ItemSucceeded
 		}
+	default:
+		// An item in any other phase has finished, so there is nothing
+		// left to restore.
 	}
 	return nil
 }
@@ -1724,6 +1736,9 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 			return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, item.Message)
 		}
 		return r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
+	default:
+		// An item in any other phase has not ended, so the restore goes on
+		// below.
 	}
 
 	destination := &volsyncv1alpha1.ReplicationDestination{}
@@ -2013,6 +2028,9 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message+". "+clusterLeftDeleted(item.Name)
 		case backupv1alpha1.ItemPending, backupv1alpha1.ItemRunning, backupv1alpha1.ItemRecovering:
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+		default:
+			// An item in any other phase has already ended, and keeps its
+			// phase and message.
 		}
 		if item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemFailed && strings.HasSuffix(item.Message, clusterLeftDeleted(item.Name)) {
 			ready += ". " + clusterLeftDeleted(item.Name)
@@ -2313,7 +2331,7 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
 	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
+		return ctrl.Result{}, r.releaseFailed(ctx, run, err)
 	}
 	if waiting := left.message(); waiting != "" {
 		return r.waitForStopped(ctx, run, waiting)
@@ -2323,11 +2341,11 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 	// can, so no other run's mover starts on them meanwhile.
 	if stopped(run) {
 		if err := r.restart(ctx, run); err != nil {
-			return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
+			return ctrl.Result{}, r.releaseFailed(ctx, run, err)
 		}
 	}
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err), false)
+		return ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err))
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
@@ -2385,7 +2403,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	}
 	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
+		return ctrl.Result{}, r.releaseFailed(ctx, run, err)
 	}
 	if waiting := left.message(); waiting != "" {
 		return r.waitForStopped(ctx, run, waiting)
@@ -2393,11 +2411,11 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	// The app is given back before the Leases go, as in finish.
 	if stopped(run) {
 		if err := r.restart(ctx, run); err != nil {
-			return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
+			return ctrl.Result{}, r.releaseFailed(ctx, run, err)
 		}
 	}
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err), false)
+		return ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err))
 	}
 	if r.Recorder != nil {
 		for _, item := range run.Status.Items {
@@ -2410,7 +2428,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			if !found || cluster.GetUID() == types.UID(item.ClusterUID) {
+			if !found || cluster.GetUID() == item.ClusterUID {
 				r.Recorder.Eventf(run, nil, corev1.EventTypeWarning, "ClusterLeftDeleted", "Restore", "%s", fitNote(clusterLeftDeleted(item.Name)))
 			}
 		}
@@ -2938,6 +2956,8 @@ func finished(item backupv1alpha1.RestoreItem) bool {
 	switch item.Phase {
 	case backupv1alpha1.ItemSucceeded, backupv1alpha1.ItemFailed, backupv1alpha1.ItemSkipped:
 		return true
+	case backupv1alpha1.ItemPending, backupv1alpha1.ItemRunning, backupv1alpha1.ItemDeleted, backupv1alpha1.ItemRecovering:
+		return false
 	}
 	return false
 }
@@ -2994,11 +3014,13 @@ func destinationReleaseError(name string, err error) error {
 //   - err is the error from finish or finalize: the *releaseError of a mover
 //     the run could not stop or of a Lease it could not read or release, or
 //     the *restartError of a restart that failed.
-//   - working is true while the run is still restoring. finish and finalize
-//     pass false, which lets the advice say the run can be deleted.
 //
 // It returns err, so the reconcile runs again with controller-runtime's
 // backoff.
+//
+// Only finish and finalize call it, once the run has stopped restoring, so
+// the plan it hands releaseFailure says the run is not working, and the
+// advice may say the run can be deleted.
 //
 // The Ready condition takes the reason and message from releaseFailure. The
 // reason is RestartFailed while the run still holds workloads stopped (see
@@ -3008,10 +3030,10 @@ func destinationReleaseError(name string, err error) error {
 // by the next pass that fails. The run never gives up. A run that finished
 // while it still held a claim, a repository or the app would lose the only
 // record of what it has to put back.
-func (r *RestoreRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.RestoreRun, err error, working bool) error {
+func (r *RestoreRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.RestoreRun, err error) error {
 	reason, message := releaseFailure(err, releasePlan{
 		stopped: run.Status.Quiesced, suspended: run.Status.SuspendedKustomizations,
-		kind: "RestoreRun", working: working, deleting: !run.DeletionTimestamp.IsZero(), appDown: stopped(run),
+		kind: "RestoreRun", deleting: !run.DeletionTimestamp.IsZero(), appDown: stopped(run),
 	})
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
 	_ = r.writeStatus(ctx, run)

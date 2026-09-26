@@ -311,7 +311,7 @@ func (c *Client) dropOwnerRefs(ctx context.Context, dep client.Object, drop func
 // a list kind, whose ownerReferences name owner's uid. A namespaced owner
 // only has dependents in its own namespace, since the collector does not
 // follow references across namespaces.
-func (c *Client) dependents(ctx context.Context, owner client.Object) ([]client.Object, error) {
+func (c *Client) dependents(ctx context.Context, owner client.Object) ([]client.Object, error) { //nolint:unparam // a list failure is skipped today, so the error is always nil; T4
 	var out []client.Object
 	seen := map[types.UID]bool{}
 	for _, gvk := range c.listableKinds() {

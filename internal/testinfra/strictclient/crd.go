@@ -64,7 +64,7 @@ type crdCacheEntry struct {
 // It is safe for concurrent use.
 func cachedCRDs(paths []string) (*crdSet, error) {
 	e, _ := crdCache.LoadOrStore(crdCacheKey(paths), &crdCacheEntry{})
-	entry := e.(*crdCacheEntry)
+	entry := e.(*crdCacheEntry) //nolint:forcetypeassert // the cache stores only *crdCacheEntry; T4
 	entry.once.Do(func() {
 		entry.set, entry.err = loadCRDs(paths)
 	})
@@ -197,7 +197,7 @@ func Build(b *fake.ClientBuilder, scheme *runtime.Scheme, opts Options) *Client 
 			if err != nil {
 				panic(err)
 			}
-			obj = o.(client.Object)
+			obj = o.(client.Object) //nolint:forcetypeassert // a registered kind is a client.Object; T4
 			// A kind registered as unstructured comes back without its
 			// kind, which the fake builder needs.
 			if u, ok := obj.(*unstructured.Unstructured); ok {
@@ -477,13 +477,13 @@ func (c *Client) seed(b *fake.ClientBuilder) {
 		}
 		return reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface()
 	}
-	for _, o := range field("initObject").([]client.Object) {
+	for _, o := range field("initObject").([]client.Object) { //nolint:forcetypeassert // the fake builder's field has this type; T4
 		c.seedObject(o)
 	}
-	for _, o := range field("initRuntimeObjects").([]runtime.Object) {
+	for _, o := range field("initRuntimeObjects").([]runtime.Object) { //nolint:forcetypeassert // the fake builder's field has this type; T4
 		c.seedObject(o)
 	}
-	for _, l := range field("initLists").([]client.ObjectList) {
+	for _, l := range field("initLists").([]client.ObjectList) { //nolint:forcetypeassert // the fake builder's field has this type; T4
 		if err := apimeta.EachListItem(l, func(o runtime.Object) error {
 			c.seedObject(o)
 			return nil

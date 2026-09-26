@@ -380,6 +380,8 @@ func isNull(v any) bool {
 	switch rv.Kind() {
 	case reflect.Map, reflect.Slice, reflect.Pointer, reflect.Interface:
 		return rv.IsNil()
+	default:
+		// A value of any other kind has no nil form.
 	}
 	return false
 }
@@ -537,6 +539,8 @@ func (r generationRule) changed(old, cur client.Object) (bool, error) {
 		}
 		return r == generationSpecOrAnnotations &&
 			!equality.Semantic.DeepEqual(old.GetAnnotations(), cur.GetAnnotations()), nil
+	case generationKept:
+		return false, nil
 	}
 	return false, nil
 }

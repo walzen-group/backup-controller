@@ -101,7 +101,7 @@ func (c *Callbacks) pinnedOutOfReach(ctx context.Context, vr *backupv1alpha1.Vol
 	}
 	at, err := time.Parse(time.RFC3339, value)
 	if err != nil {
-		return fmt.Sprintf("%s is %q, which is not an RFC 3339 time", source, value), nil
+		return fmt.Sprintf("%s is %q, which is not an RFC 3339 time", source, value), nil //nolint:nilerr // the parse error is the refusal, returned as its reason; restic-jobs step 9 types it
 	}
 	snapshots, err := c.snapshots.Snapshots(ctx, repo)
 	if err != nil {

@@ -3,19 +3,203 @@
 # split out of linters. A v1 config on a v2 binary is rejected, not silently
 # half-applied, so if this file ever fails to load the fix is here, not in the
 # tool version.
+#
+# The set is strict: small functions, typed errors, exhaustive switches,
+# checked type assertions. Test files and the test infrastructure (hack/,
+# internal/testinfra/) skip only the size and structure checks. Code written
+# before the strict set is waived for the size and structure checks alone in
+# the legacy block below, one entry per function, line or file; every
+# correctness linter applies to every file. A //nolint names its linter, why,
+# and the step that removes it (nolintlint enforces the form).
 version: "2"
-
+run:
+  relative-path-mode: gitroot
 linters:
-  # default: standard is errcheck, govet, ineffassign, staticcheck, unused.
-  # The entries below add the rest of the set this project requires.
   default: standard
   enable:
     - bodyclose
     - errorlint
     - misspell
-
+    - funlen
+    - gocognit
+    - nestif
+    - goconst
+    - revive
+    - dupl
+    - unparam
+    - nakedret
+    - nolintlint
+    - errname
+    - exhaustive
+    - gocritic
+    - nilerr
+    - forcetypeassert
+    - contextcheck
+    - unconvert
+    - predeclared
+    - copyloopvar
+    - intrange
+    - usestdlibvars
+    - loggercheck
+  settings:
+    funlen:
+      lines: 60
+      statements: 40
+      ignore-comments: true
+    gocognit:
+      min-complexity: 15
+    nestif:
+      min-complexity: 4
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+      ignore-string-values: ['^(spec|status|metadata|name|namespace)$']
+    dupl:
+      threshold: 120
+    nakedret:
+      max-func-lines: 0
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    exhaustive:
+      default-signifies-exhaustive: true
+    revive:
+      enable-default-rules: true
+      rules:
+        - name: file-length-limit
+          arguments: [{max: 300, skipComments: true, skipBlankLines: true}]
+        - name: function-result-limit
+          arguments: [3]
+        - name: argument-limit
+          arguments: [6]
+        - name: max-control-nesting
+          arguments: [4]
+        - name: confusing-results
+        - name: early-return
+        - name: unused-receiver
+        - name: bare-return
+        - name: deep-exit
+        - name: defer
+        - name: identical-branches
+        - name: modifies-value-receiver
+        - name: unconditional-recursion
+        - name: datarace
+  exclusions:
+    rules:
+      - path: '_test\.go$'
+        linters: [funlen, gocognit, nestif, goconst, dupl, forcetypeassert, unparam, contextcheck]
+      - path: '_test\.go$'
+        linters: [revive]
+        text: '^(file-length-limit|function-result-limit|argument-limit|max-control-nesting|confusing-results)'
+      - path: '^(hack/|internal/testinfra/)'
+        linters: [funlen, gocognit, nestif, goconst, dupl]
+      - path: '^(hack/|internal/testinfra/)'
+        linters: [revive]
+        text: '^(file-length-limit|function-result-limit|argument-limit|max-control-nesting|confusing-results)'
+      # legacy:begin
+      # Code written before the strict set. Only the size and structure
+      # checks are waived, each for the named function, line or file; every
+      # correctness linter applies everywhere. A step that brings a function
+      # under the thresholds deletes its name here; a step that changes a
+      # listed function's signature or a listed line either brings it under
+      # the thresholds or updates the entry in the same change. Empty at v0.9.0.
+      - path: '^cmd/backup-controller/runs\.go$'
+        linters: [funlen, gocognit]
+        source: '^func startRunControllers\('
+      - path: '^cmd/backup-controller/runs\.go$'
+        linters: [revive]
+        text: '^argument-limit:'
+        source: '^func startRunControllers\('
+      - path: '^internal/bootstrap/survey\.go$'
+        linters: [funlen, gocognit]
+        source: '^func (\(p S3Prober\) Survey|readInfos)\('
+      - path: '^internal/bootstrap/webhook\.go$'
+        linters: [funlen, gocognit]
+        source: '^func (\(d \*Decider\) Handle|archiveHolder|setRecovery)\('
+      - path: '^internal/bootstrap/webhook\.go$'
+        linters: [revive]
+        text: '^file-length-limit:'
+      - path: '^internal/populator/orphans\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(r \*OrphanReconciler\) Reconcile\('
+      - path: '^internal/populator/populator\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(c \*Callbacks\) (Populate|Cleanup)\('
+      - path: '^internal/populator/populator\.go$'
+        linters: [nestif]
+        source: '^\s*if err == nil \{$'
+      - path: '^internal/restic/retime\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(r \*Repository\) (retime|checkLocks)\('
+      - path: '^internal/runs/backuprun\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(r \*BackupRunReconciler\) (items|admit|work|quiesce|startItem|collectItem)\('
+      - path: '^internal/runs/backuprun\.go$'
+        linters: [nestif]
+        source: '^\s*if (queue != "" |run\.Spec\.All && run\.Status\.RestartedAt == nil && len\(run\.Status\.Quiesced\) > 0 |len\(run\.Status\.Quiesced\) == 0 |lastManual\(source\) != item\.Trigger )\{$'
+      - path: '^internal/runs/backuprun\.go$'
+        linters: [revive]
+        text: '^max-control-nesting:'
+        source: '^\s*if !strings\.Contains\(logs, alreadyLocked\) \{$'
+      - path: '^internal/runs/(backuprun|clusterwebhook|cnpg|exclusive|kueue|lease|objects|quiesce|restorerun|sources)\.go$'
+        linters: [goconst]
+      - path: '^internal/runs/(backuprun|quiesce|restorerun|sources)\.go$'
+        linters: [revive]
+        text: '^file-length-limit:'
+      - path: '^internal/runs/cnpg\.go$'
+        linters: [revive]
+        text: '^function-result-limit:'
+        source: '^func backupResult\('
+      - path: '^internal/runs/crdcheck\.go$'
+        linters: [funlen, gocognit]
+        source: '^func walkFields\('
+      - path: '^internal/runs/exclusive\.go$'
+        linters: [funlen, gocognit]
+        source: '^func (backupInProgress|restoreInProgress)\('
+      - path: '^internal/runs/lease\.go$'
+        linters: [funlen, gocognit]
+        source: '^func holderLive\('
+      - path: '^internal/runs/lease\.go$'
+        linters: [revive]
+        text: '^argument-limit:'
+        source: '^func acquireLeases\('
+      - path: '^internal/runs/moverpick\.go$'
+        linters: [funlen, gocognit]
+        source: '^func unpinnable\('
+      - path: '^internal/runs/quiesce\.go$'
+        linters: [funlen, gocognit]
+        source: '^func (planStop|restartWorkloads)\('
+      - path: '^internal/runs/quiesce\.go$'
+        linters: [revive]
+        text: '^confusing-results:'
+        source: '^func releaseFailure\('
+      - path: '^internal/runs/restorerun\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(r \*RestoreRunReconciler\) (Reconcile|plan|items|clustersRestoredElsewhere|selectSnapshot|work|restoreVolume|restoreDatabase|restoreIntoEmptyClaim|quiesce|finalize|removeDestinations)\('
+      - path: '^internal/runs/restorerun\.go$'
+        linters: [revive]
+        text: '^confusing-results:'
+        source: '^func \(r \*RestoreRunReconciler\) (checkDatabase|restoreVolume)\('
+      - path: '^internal/runs/restorerun\.go$'
+        linters: [nestif]
+        source: '^\s*if (run\.Status\.Phase == "" |stopped\(run\) && anyRestorePending\(run\.Status\.Items\) |volumesDone |reason, failed := failedMover\(destination\); failed |readErr == nil |len\(run\.Status\.Quiesced\) == 0 )\{$'
+      - path: '^internal/runs/restorerun\.go$'
+        linters: [revive]
+        text: '^max-control-nesting:'
+        source: '^\s*\} else if lost != "" \{$'
+      - path: '^internal/runs/schedule\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(s \*Scheduler\) Reconcile\('
+      - path: '^internal/runs/schedule\.go$'
+        linters: [nestif]
+        source: '^\s*if !due\.After\(now\) \{$'
+      - path: '^internal/runs/sources\.go$'
+        linters: [funlen, gocognit]
+        source: '^func ensureSource\('
+      # legacy:end
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false
 formatters:
-  # gofmt and goimports moved from linters to formatters in the v2 schema.
-  enable:
-    - gofmt
-    - goimports
+  enable: [gofmt, goimports]

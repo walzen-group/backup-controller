@@ -957,6 +957,9 @@ func (r *BackupRunReconciler) clonesCut(ctx context.Context, run *backupv1alpha1
 			if !r.cloneCut(ctx, run, item) {
 				return false
 			}
+		default:
+			// An item in any other phase ended or never started a sync, so
+			// it has no clone to wait for.
 		}
 	}
 	return true
@@ -1023,6 +1026,9 @@ func (r *BackupRunReconciler) giveUpUncut(ctx context.Context, run *backupv1alph
 				message += ". " + note
 			}
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+		default:
+			// An item in any other phase has already ended, so the limit
+			// changes nothing about it.
 		}
 	}
 }

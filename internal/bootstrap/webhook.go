@@ -37,12 +37,12 @@ const (
 	// setRecovery sets it to "enabled".
 	SkipCheckAnnotation = "cnpg.io/skipEmptyWalArchiveCheck"
 
-	// OptOutAnnotation, set to OptOutValue on a Cluster, asks for an empty
-	// database. Without it there is no way to discard a database, because
-	// deleting the Cluster would restore it again. Handle admits it only over
-	// an empty prefix: discarding a database also means deleting its archive
-	// or choosing a new serverName, since CloudNativePG never archives a new
-	// database into a prefix that holds WAL.
+	// OptOutAnnotation asks for an empty database when a Cluster carries it
+	// set to OptOutValue. Without it there is no way to discard a database,
+	// because deleting the Cluster would restore it again. Handle admits it
+	// only over an empty prefix: discarding a database also means deleting
+	// its archive or choosing a new serverName, since CloudNativePG never
+	// archives a new database into a prefix that holds WAL.
 	OptOutAnnotation = "backup.wlz.li/bootstrap"
 
 	// OptOutValue is the value OptOutAnnotation must have to opt out. The

@@ -267,7 +267,7 @@ var errSourceAbandoned = errors.New("the ReplicationSource is still retrying a b
 // ReplicationSource: another run waits for its tag (it matches errSourceBusy),
 // or no run does (it matches errSourceAbandoned). Its message is written for
 // the run's Ready condition or the item's message.
-type sourceHeld struct {
+type sourceHeld struct { //nolint:errname // D0 renames it sourceHeldError
 	abandoned bool
 	message   string
 }
