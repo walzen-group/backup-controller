@@ -133,9 +133,10 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 // plan records one Pending item for each thing the run backs up and moves the
-// run to Queued. When items returns a refusal, plan ends the run as Failed
-// with reason Invalid and the refusal as the message. Any other error, such as
-// a timeout from the API server, is returned so the reconcile runs again.
+// run to Queued. When items refuses the run (see asRunRefusal), plan ends
+// the run as Failed with reason Invalid and the refusal as the message. Any
+// other error, such as a timeout from the API server, is returned so the
+// reconcile runs again.
 //
 // Before anything else, plan checks the installed BackupRun CRD (see
 // schemaOutdated) and ends a run it refuses with reason CRDOutdated.
@@ -144,11 +145,11 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, err
 	}
 	items, err := r.items(ctx, run)
-	if err != nil {
-		if !isRefusal(err) {
-			return ctrl.Result{}, err
-		}
+	if asRunRefusal(err) {
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	run.Status.Items = items
 	run.Status.Phase = backupv1alpha1.RunPhaseQueued
@@ -186,10 +187,11 @@ func (r *BackupRunReconciler) schemaOutdated(ctx context.Context, run *backupv1a
 // has kind ReplicationSource, after the VolSync object that backs it up.
 //
 // Everything the run backs up has to be marked backup.wlz.li/enabled: "true",
-// so a run and a schedule cover the same set. items returns a refusal when a
-// named claim or Cluster is missing or not marked, and when nothing in the
-// namespace is marked. A cluster without the CloudNativePG CRDs holds no
-// Cluster. Any other failed read comes back as a plain error.
+// so a run and a schedule cover the same set. items returns an
+// *invalidSpecError when a named claim or Cluster is missing or not marked,
+// and when nothing in the namespace is marked. A cluster without the
+// CloudNativePG CRDs holds no Cluster. Any other failed read comes back as a
+// plain error.
 func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.BackupRun) ([]backupv1alpha1.BackupItem, error) {
 	pending := func(kind, name string) backupv1alpha1.BackupItem {
 		return backupv1alpha1.BackupItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
@@ -200,12 +202,12 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 		claim := &corev1.PersistentVolumeClaim{}
 		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Source}, claim); err != nil {
 			if apierrors.IsNotFound(err) {
-				return nil, refuse("no claim %s in this namespace", run.Spec.Source)
+				return nil, invalidSpec("no claim %s in this namespace", run.Spec.Source)
 			}
 			return nil, fmt.Errorf("get claim %s: %w", run.Spec.Source, err)
 		}
 		if !backupv1alpha1.Enabled(claim.Annotations) {
-			return nil, refuse("claim %s is not marked %s: \"true\"", claim.Name, backupv1alpha1.AnnotationEnabled)
+			return nil, invalidSpec("claim %s is not marked %s: \"true\"", claim.Name, backupv1alpha1.AnnotationEnabled)
 		}
 		return []backupv1alpha1.BackupItem{pending("ReplicationSource", claim.Name)}, nil
 
@@ -213,15 +215,15 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Spec.Database)
 		if err != nil {
 			if meta.IsNoMatchError(err) {
-				return nil, refuse("no Cluster %s in this namespace; the cluster has no CloudNativePG CRDs", run.Spec.Database)
+				return nil, invalidSpec("no Cluster %s in this namespace; the cluster has no CloudNativePG CRDs", run.Spec.Database)
 			}
 			return nil, err
 		}
 		if !found {
-			return nil, refuse("no Cluster %s in this namespace", run.Spec.Database)
+			return nil, invalidSpec("no Cluster %s in this namespace", run.Spec.Database)
 		}
 		if !backupv1alpha1.Enabled(cluster.GetAnnotations()) {
-			return nil, refuse("the Cluster %s is not marked %s: \"true\"", cluster.GetName(), backupv1alpha1.AnnotationEnabled)
+			return nil, invalidSpec("the Cluster %s is not marked %s: \"true\"", cluster.GetName(), backupv1alpha1.AnnotationEnabled)
 		}
 		return []backupv1alpha1.BackupItem{pending("Cluster", cluster.GetName())}, nil
 
@@ -242,7 +244,7 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 			items = append(items, pending("Cluster", cluster.GetName()))
 		}
 		if len(items) == 0 {
-			return nil, refuse("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
+			return nil, invalidSpec("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
 		}
 		return items, nil
 	}
@@ -285,7 +287,7 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 	// run here, before it stops or starts anything, because the run would
 	// have no deadline to keep.
 	if _, err := timeoutFor(ctx, r.Reader, run); err != nil {
-		var bad invalidSetting
+		var bad invalidSettingError
 		if errors.As(err, &bad) {
 			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, bad.Error())
 		}
@@ -296,7 +298,7 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 	// down.
 	if run.Spec.All {
 		if _, err := maxQuiesceFor(ctx, r.Reader, run.Namespace); err != nil {
-			var bad invalidSetting
+			var bad invalidSettingError
 			if errors.As(err, &bad) {
 				return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, bad.Error())
 			}
@@ -332,7 +334,7 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 func (r *BackupRunReconciler) awaitAdmission(ctx context.Context, run *backupv1alpha1.BackupRun, workload *unstructured.Unstructured, queue string) (ctrl.Result, error) {
 	timeout, err := timeoutFor(ctx, r.Reader, run)
 	if err != nil {
-		var bad invalidSetting
+		var bad invalidSettingError
 		if errors.As(err, &bad) {
 			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, bad.Error())
 		}
@@ -443,7 +445,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		if err != nil {
 			// A limit that no longer parses fails the run, which starts the
 			// workloads again, so they are never held without a limit.
-			var bad invalidSetting
+			var bad invalidSettingError
 			if errors.As(err, &bad) {
 				return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, bad.Error())
 			}
@@ -613,21 +615,19 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			if item.Kind != "ReplicationSource" || item.Phase != backupv1alpha1.ItemPending {
 				continue
 			}
-			refused, err := r.startRefusal(ctx, run, item.Name)
+			err := r.startRefusal(ctx, run, item.Name)
+			if failBackupItem(item, err) {
+				continue
+			}
 			if err != nil {
 				return ctrl.Result{}, err
-			}
-			if refused != "" {
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, refused
-				continue
 			}
 			// A restore of the claim or its repository holds the item the
 			// same way, and startItem would wait for it with the app down.
 			restoring, err := r.heldElsewhere(ctx, run, item.Name)
-			if isRefusal(err) {
+			if failBackupItem(item, err) {
 				// A repository Secret that is gone fails the item now, so the
 				// app is not stopped for a backup that cannot start.
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
 				continue
 			}
 			if err != nil {
@@ -646,7 +646,7 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 				return ctrl.Result{}, fmt.Errorf("get ReplicationSource %s/%s: %w", run.Namespace, item.Name, err)
 			}
 			if source.Labels[backupv1alpha1.LabelManagedBy] != backupv1alpha1.ManagedByValue {
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, foreignSource(item.Name).Error()
+				failBackupItem(item, foreignSource(item.Name))
 				continue
 			}
 			if !inUse(source) || manualTag(source) == TriggerFor(run.UID) {
@@ -655,7 +655,7 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			held := holder(ctx, r.Reader, source)
 			switch {
 			case errors.Is(held, errSourceAbandoned):
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, held.Error()
+				failBackupItem(item, held)
 			case errors.Is(held, errSourceBusy):
 				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, held.Error()))
 			default:
@@ -697,7 +697,7 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		// A Kustomization that also applies workloads of another namespace
 		// is refused before anything is stopped (see planStop).
 		stop, suspend, err := planStop(ctx, r.Reader, r.RESTMapper(), run.Namespace, targets)
-		if isRefusal(err) {
+		if asRunRefusal(err) {
 			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 		}
 		if err != nil {
@@ -735,40 +735,40 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 	return ctrl.Result{RequeueAfter: time.Second}, nil
 }
 
-// startRefusal returns the message startItem would fail a volume item with
-// before it writes anything, or "" when startItem would go on. A namespace
-// run calls it in its quiesce pre-check, so an item that cannot start fails
-// before the app is stopped for it.
+// startRefusal checks, before anything is written, whether startItem would
+// refuse a volume item. A namespace run calls it in its quiesce pre-check,
+// so an item that cannot start fails before the app is stopped for it.
 //
 // Parameters:
 //   - run is the asking run; its namespace is read.
 //   - claimName names the item's claim.
 //
-// The message is the one startItem gives: the claim is gone (see
-// claimGone), or ensureSource refuses the claim's settings (see
-// sourceSettingsFor). A failed read comes back as an error, and the pass
-// retries with nothing stopped.
-func (r *BackupRunReconciler) startRefusal(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) (string, error) {
+// It returns nil when startItem would go on, and the refusal startItem
+// would fail the item with otherwise: the claim is gone (see claimGone), or
+// ensureSource refuses the claim's settings (see sourceSettingsFor). The
+// caller fails the item with it through failBackupItem. A failed read comes
+// back as a plain error, and the pass retries with nothing stopped.
+func (r *BackupRunReconciler) startRefusal(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) error {
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
 		if apierrors.IsNotFound(err) {
-			return claimGone(claimName), nil
+			return claimGone(claimName)
 		}
-		return "", fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
+		return fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
 	}
-	if _, err := sourceSettingsFor(ctx, r.Reader, claim); err != nil {
-		if isRefusal(err) {
-			return err.Error(), nil
-		}
-		return "", err
-	}
-	return "", nil
+	_, err := sourceSettingsFor(ctx, r.Reader, claim)
+	return err
 }
 
-// claimGone returns the message of a volume item whose claim no longer
-// exists. claimName is the item's claim.
-func claimGone(claimName string) string {
-	return fmt.Sprintf("the claim %s no longer exists", claimName)
+// claimGone returns the refusal of a volume item whose claim no longer
+// exists.
+//
+// Parameters:
+//   - claimName is the item's claim, which the message names.
+//
+// It returns a *refusalError with reason ClaimMissing.
+func claimGone(claimName string) error {
+	return refuse(backupv1alpha1.ItemReasonClaimMissing, "the claim %s no longer exists", claimName)
 }
 
 // heldElsewhere returns a message naming the run that holds the claim or its
@@ -784,9 +784,9 @@ func claimGone(claimName string) string {
 // give "": quiesce has failed such an item through startRefusal before it
 // asks, and ensureSource checks again right before it writes the trigger.
 // A repository Secret that does not exist comes back as the refusal
-// leaseNamesFor gives (see isRefusal), and quiesce fails the item with it
-// before anything is stopped. Any other failed read comes back as an
-// error, and the pass retries with nothing stopped.
+// leaseNamesFor gives, and quiesce fails the item with it (see
+// failBackupItem) before anything is stopped. Any other failed read comes
+// back as an error, and the pass retries with nothing stopped.
 //
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right
@@ -801,7 +801,7 @@ func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1al
 	}
 	vr, err := volumeRestoreFor(ctx, r.Reader, claim)
 	if err != nil {
-		if isRefusal(err) {
+		if _, refused := asItemFailure(err); refused {
 			return "", nil
 		}
 		return "", err
@@ -861,10 +861,11 @@ func backupTimedOut(run *backupv1alpha1.BackupRun, deadline time.Time) string {
 // For a volume, it writes the claim's ReplicationSource with the run's manual
 // trigger tag and moves the item to Running. For a database, it creates a
 // CloudNativePG Backup and moves the item to Running, or skips the item when
-// the Cluster is hibernated. When the claim or the Cluster is gone, or the
-// claim's settings are refused, startItem marks the item Failed with the
-// reason in its message. The same goes for a Backup the API server rejects as
-// invalid.
+// the Cluster is hibernated, with reason ClusterHibernated. When the claim or
+// the Cluster is gone, or the claim's settings are refused, startItem fails
+// the item with the refusal (see failBackupItem), which records the item's
+// reason and says why in its message. The same goes for a Backup the API
+// server rejects as invalid.
 //
 // It returns a message for the run's Ready condition when the item has to
 // wait, which happens when the volume's ReplicationSource is still completing
@@ -885,7 +886,7 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 			if !apierrors.IsNotFound(err) {
 				return "", fmt.Errorf("get claim %s: %w", item.Name, err)
 			}
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, claimGone(item.Name)
+			failBackupItem(item, claimGone(item.Name))
 			return "", nil
 		}
 		tag := TriggerFor(run.UID)
@@ -893,16 +894,13 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 		if errors.Is(err, errSourceBusy) {
 			return err.Error(), nil
 		}
-		if errors.Is(err, errSourceAbandoned) {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
+		// A source no run waits for any more and a refused claim fail the
+		// item; any other error leaves it Pending for the next pass.
+		if failBackupItem(item, err) {
 			return "", nil
 		}
 		if err != nil {
-			if !isRefusal(err) {
-				return "", err
-			}
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
-			return "", nil
+			return "", err
 		}
 		item.Phase, item.Trigger = backupv1alpha1.ItemRunning, tag
 
@@ -912,17 +910,18 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 		case err != nil:
 			return "", err
 		case !found:
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, fmt.Sprintf("the Cluster %s no longer exists", item.Name)
+			failBackupItem(item, refuse(backupv1alpha1.ItemReasonClusterMissing, "the Cluster %s no longer exists", item.Name))
 		case hibernated(cluster):
-			item.Phase, item.Message = backupv1alpha1.ItemSkipped, "the Cluster is hibernated; CloudNativePG fails a Backup of a hibernated Cluster"
+			item.Phase, item.Reason = backupv1alpha1.ItemSkipped, backupv1alpha1.ItemReasonClusterHibernated
+			item.Message = "the Cluster is hibernated; CloudNativePG fails a Backup of a hibernated Cluster"
 		default:
 			name, err := ensureBackup(ctx, r.Client, run.Namespace, item.Name, run.UID)
-			if err != nil {
-				if !apierrors.IsInvalid(err) {
-					return "", err
-				}
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
+			if apierrors.IsInvalid(err) {
+				failBackupItem(item, refuse(backupv1alpha1.ItemReasonBackupRefused, "%v", err))
 				return "", nil
+			}
+			if err != nil {
+				return "", err
 			}
 			item.Phase, item.Backup = backupv1alpha1.ItemRunning, name
 		}

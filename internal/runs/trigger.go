@@ -15,15 +15,17 @@ import (
 	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
+	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// FieldOwner is the field manager name, backup-controller, that the run
-// controllers send with their patches to workloads and Kustomizations.
-const FieldOwner = client.FieldOwner("backup-controller")
+// FieldOwner is the field manager name, backupv1alpha1.FieldManager, that
+// the run controllers send with their patches to workloads and
+// Kustomizations.
+const FieldOwner = client.FieldOwner(backupv1alpha1.FieldManager)
 
 // Finalizer keeps a deleted run in place until the controller has put back
 // whatever the run changed: a stopped workload, a suspended Kustomization, or

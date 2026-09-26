@@ -24,7 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// errSourceBusy is the error ensureSource returns, wrapped in a sourceHeld,
+// errSourceBusy is the error ensureSource returns, wrapped in a sourceHeldError,
 // when the claim's ReplicationSource is in use (see inUse) with a tag other
 // than the run's that a live run waits for (see holder).
 // The run waits and tries again later. If it wrote its own tag at that point,
@@ -32,32 +32,6 @@ import (
 // older one, and a change to the mover's spec would make VolSync replace the
 // running mover Job, which kills restic and leaves its lock in the repository.
 var errSourceBusy = errors.New("the ReplicationSource is still completing another run's backup")
-
-// refusal is an error that no retry can fix: something a run names is
-// missing or not marked for backup, or a claim's settings don't give a
-// source that VolSync can run. A BackupRun that meets one while it plans ends
-// with reason Invalid, and an item that meets one fails. Any other error,
-// such as a timeout from the API server, is returned so the reconcile runs
-// again.
-type refusal struct{ message string }
-
-// Error returns the message, which names the object and what is wrong
-// with it.
-func (e refusal) Error() string { return e.message }
-
-// refuse returns a refusal whose message is built from format and args the
-// way fmt.Sprintf builds it.
-func refuse(format string, args ...any) error {
-	return refusal{fmt.Sprintf(format, args...)}
-}
-
-// isRefusal reports whether err, or an error it wraps, is a refusal or an
-// invalidSetting, which no retry can fix either.
-func isRefusal(err error) bool {
-	var refused refusal
-	var bad invalidSetting
-	return errors.As(err, &refused) || errors.As(err, &bad)
-}
 
 // retryable reports whether an error from a read may go away when the read is
 // tried again. That is a failed call to the API server, other than one that
@@ -128,7 +102,7 @@ func volumeRestoreFor(ctx context.Context, c client.Reader, claim *corev1.Persis
 	vr := &backupv1alpha1.VolumeRestore{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: claim.Namespace, Name: name}, vr); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, refuse("claim %s has no VolumeRestore %s to name its repository", claim.Name, name)
+			return nil, refuse(backupv1alpha1.ItemReasonVolumeRestoreMissing, "claim %s has no VolumeRestore %s to name its repository", claim.Name, name)
 		}
 		return nil, fmt.Errorf("get VolumeRestore %s/%s: %w", claim.Namespace, name, err)
 	}
@@ -146,17 +120,17 @@ func volumeRestoreFor(ctx context.Context, c client.Reader, claim *corev1.Persis
 // a plain error, which the caller retries.
 func volumeAffinity(ctx context.Context, c client.Reader, claim *corev1.PersistentVolumeClaim) (*corev1.Affinity, error) {
 	if claim.Spec.VolumeName == "" || claim.Status.Phase != corev1.ClaimBound {
-		return nil, refuse("claim %s is not bound to a volume yet", claim.Name)
+		return nil, refuse(backupv1alpha1.ItemReasonClaimNotBound, "claim %s is not bound to a volume yet", claim.Name)
 	}
 	pv := &corev1.PersistentVolume{}
 	if err := c.Get(ctx, types.NamespacedName{Name: claim.Spec.VolumeName}, pv); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, refuse("claim %s is bound to the PersistentVolume %s, which does not exist", claim.Name, claim.Spec.VolumeName)
+			return nil, refuse(backupv1alpha1.ItemReasonVolumeMissing, "claim %s is bound to the PersistentVolume %s, which does not exist", claim.Name, claim.Spec.VolumeName)
 		}
 		return nil, fmt.Errorf("get PersistentVolume %s: %w", claim.Spec.VolumeName, err)
 	}
 	if pv.Spec.NodeAffinity == nil || pv.Spec.NodeAffinity.Required == nil {
-		return nil, refuse("the PersistentVolume %s declares no node affinity to place the mover by", pv.Name)
+		return nil, refuse(backupv1alpha1.ItemReasonNoNodeAffinity, "the PersistentVolume %s declares no node affinity to place the mover by", pv.Name)
 	}
 	return &corev1.Affinity{
 		NodeAffinity: &corev1.NodeAffinity{
@@ -197,7 +171,7 @@ func retention(claim *corev1.PersistentVolumeClaim) (*volsyncv1alpha1.ResticReta
 	// the annotation wrote it.
 	if value, ok := claim.Annotations[backupv1alpha1.AnnotationRetainLast]; ok {
 		if _, err := positiveCount(value); err != nil {
-			return nil, refuse("claim %s has %s %q, which is not a positive count", claim.Name, backupv1alpha1.AnnotationRetainLast, value)
+			return nil, refuse(backupv1alpha1.ItemReasonSettingsInvalid, "claim %s has %s %q, which is not a positive count", claim.Name, backupv1alpha1.AnnotationRetainLast, value)
 		}
 		policy.Last = &value
 		set = true
@@ -209,21 +183,21 @@ func retention(claim *corev1.PersistentVolumeClaim) (*volsyncv1alpha1.ResticReta
 		}
 		n, err := positiveCount(value)
 		if err != nil {
-			return nil, refuse("claim %s has %s %q, which is not a positive count", claim.Name, c.annotation, value)
+			return nil, refuse(backupv1alpha1.ItemReasonSettingsInvalid, "claim %s has %s %q, which is not a positive count", claim.Name, c.annotation, value)
 		}
 		*c.field = &n
 		set = true
 	}
 	if value, ok := claim.Annotations[backupv1alpha1.AnnotationRetainWithin]; ok {
 		if !resticSpan.MatchString(value) {
-			return nil, refuse("claim %s has %s %q, which is not a span such as 30d or 1y6m", claim.Name, backupv1alpha1.AnnotationRetainWithin, value)
+			return nil, refuse(backupv1alpha1.ItemReasonSettingsInvalid, "claim %s has %s %q, which is not a span such as 30d or 1y6m", claim.Name, backupv1alpha1.AnnotationRetainWithin, value)
 		}
 		policy.Within = &value
 		set = true
 	}
 
 	if !set {
-		return nil, refuse("claim %s names no retention; set at least one of %s, %s, %s, %s, %s, %s or %s",
+		return nil, refuse(backupv1alpha1.ItemReasonSettingsInvalid, "claim %s names no retention; set at least one of %s, %s, %s, %s, %s, %s or %s",
 			claim.Name, backupv1alpha1.AnnotationRetainLast, backupv1alpha1.AnnotationRetainHourly,
 			backupv1alpha1.AnnotationRetainDaily, backupv1alpha1.AnnotationRetainWeekly,
 			backupv1alpha1.AnnotationRetainMonthly, backupv1alpha1.AnnotationRetainYearly,
@@ -258,27 +232,27 @@ func inUse(source *volsyncv1alpha1.ReplicationSource) bool {
 }
 
 // errSourceAbandoned is the error ensureSource returns, wrapped in a
-// sourceHeld, when the claim's ReplicationSource is busy with a tag that no
+// sourceHeldError, when the claim's ReplicationSource is busy with a tag that no
 // run waits for any more. The item fails at once: waiting would not end, and
 // writing a new tag would have VolSync complete it with the older sync.
 var errSourceAbandoned = errors.New("the ReplicationSource is still retrying a backup no run waits for")
 
-// sourceHeld is the error that says why a run may not write the claim's
+// sourceHeldError is the error that says why a run may not write the claim's
 // ReplicationSource: another run waits for its tag (it matches errSourceBusy),
 // or no run does (it matches errSourceAbandoned). Its message is written for
 // the run's Ready condition or the item's message.
-type sourceHeld struct { //nolint:errname // D0 renames it sourceHeldError
+type sourceHeldError struct {
 	abandoned bool
 	message   string
 }
 
 // Error returns the message, which names the source and the run or tag that
 // holds it.
-func (e *sourceHeld) Error() string { return e.message }
+func (e *sourceHeldError) Error() string { return e.message }
 
 // Is makes errors.Is match errSourceBusy for a source a live run holds, and
 // errSourceAbandoned for one no run waits for.
-func (e *sourceHeld) Is(target error) bool {
+func (e *sourceHeldError) Is(target error) bool {
 	if e.abandoned {
 		return target == errSourceAbandoned
 	}
@@ -296,7 +270,7 @@ func (e *sourceHeld) Is(target error) bool {
 //   - source is the source as stored.
 //
 // A source whose open tag (see busy) belongs to a live run, and a source
-// VolSync syncs with no open tag, give a sourceHeld that matches
+// VolSync syncs with no open tag, give a sourceHeldError that matches
 // errSourceBusy; the run waits. A source whose open tag no live run holds
 // gives one that matches errSourceAbandoned; the item fails. A tag is live
 // when the namespace holds a BackupRun whose UID is the tag without its
@@ -308,7 +282,7 @@ func (e *sourceHeld) Is(target error) bool {
 // error, and the caller retries; no decision is made on it.
 func holder(ctx context.Context, reader client.Reader, source *volsyncv1alpha1.ReplicationSource) error {
 	if !busy(source) {
-		return &sourceHeld{message: fmt.Sprintf("ReplicationSource %s is still syncing; VolSync has not recorded the end of its last sync", source.Name)}
+		return &sourceHeldError{message: fmt.Sprintf("ReplicationSource %s is still syncing; VolSync has not recorded the end of its last sync", source.Name)}
 	}
 	open := manualTag(source)
 	runs := &backupv1alpha1.BackupRunList{}
@@ -328,12 +302,12 @@ func holder(ctx context.Context, reader client.Reader, source *volsyncv1alpha1.R
 		for _, item := range run.Status.Items {
 			if item.Kind == "ReplicationSource" && item.Name == source.Name &&
 				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
-				return &sourceHeld{message: fmt.Sprintf("ReplicationSource %s is still completing the backup of BackupRun %s", source.Name, run.Name)}
+				return &sourceHeldError{message: fmt.Sprintf("ReplicationSource %s is still completing the backup of BackupRun %s", source.Name, run.Name)}
 			}
 		}
 		break
 	}
-	return &sourceHeld{abandoned: true, message: abandonedMessage(source, owner)}
+	return &sourceHeldError{abandoned: true, message: abandonedMessage(source, owner)}
 }
 
 // abandonedMessage returns the item's message for a source busy with a tag
@@ -447,10 +421,14 @@ func sourceSettingsFor(ctx context.Context, reader client.Reader, claim *corev1.
 }
 
 // foreignSource returns the refusal for a ReplicationSource of the claim's
-// name that this controller did not write, which it never writes over. name
-// is the claim's name, which the source shares.
+// name that this controller did not write, which it never writes over.
+//
+// Parameters:
+//   - name is the claim's name, which the source shares.
+//
+// It returns a *refusalError with reason SourceNotManaged.
 func foreignSource(name string) error {
-	return refuse("the ReplicationSource %s exists and was not written by backup-controller; remove it so the controller can write its own", name)
+	return refuse(backupv1alpha1.ItemReasonSourceNotManaged, "the ReplicationSource %s exists and was not written by backup-controller; remove it so the controller can write its own", name)
 }
 
 // ensureSource creates or updates the ReplicationSource that backs up a claim,
@@ -472,12 +450,12 @@ func foreignSource(name string) error {
 //   - The source already carries tag, whether VolSync is still syncing it or
 //     has completed it. A lost status write after the first write gets here.
 //   - The source is in use (see inUse) with another tag, or with none. It
-//     then also returns the sourceHeld from holder: one that matches
+//     then also returns the sourceHeldError from holder: one that matches
 //     errSourceBusy while a live run waits for that tag, or one that matches
 //     errSourceAbandoned when no run does.
 //   - Another live run holds the Lease of the claim or its repository (see
 //     acquireLeases), or a live RestoreRun's mover works on either (see
-//     otherMover). It then also returns a sourceHeld that matches
+//     otherMover). It then also returns a sourceHeldError that matches
 //     errSourceBusy and names that run; the run waits.
 //
 // It returns a refusal, and writes nothing, when a ReplicationSource of the
@@ -542,7 +520,7 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 			return err
 		}
 		if busy != "" {
-			return &sourceHeld{message: busy}
+			return &sourceHeldError{message: busy}
 		}
 		// A restore of the claim or its repository that already has its
 		// ReplicationDestination goes first, as one started before the
@@ -554,7 +532,7 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 			return err
 		}
 		if restoring != "" {
-			return &sourceHeld{message: restoring}
+			return &sourceHeldError{message: restoring}
 		}
 		if source.Labels == nil {
 			source.Labels = map[string]string{}
@@ -603,13 +581,14 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 		}
 		return nil
 	})
+	_, refused := asItemFailure(err)
 	switch {
 	case errors.Is(err, errSourceBusy), errors.Is(err, errSourceAbandoned):
 		return source, err
-	case isRefusal(err):
+	case refused:
 		return nil, err
 	case apierrors.IsInvalid(err):
-		return nil, refuse("the API server refused ReplicationSource %s/%s: %v", claim.Namespace, claim.Name, err)
+		return nil, refuse(backupv1alpha1.ItemReasonSourceRefused, "the API server refused ReplicationSource %s/%s: %v", claim.Namespace, claim.Name, err)
 	case err != nil:
 		return nil, fmt.Errorf("write ReplicationSource %s/%s: %w", claim.Namespace, claim.Name, err)
 	}

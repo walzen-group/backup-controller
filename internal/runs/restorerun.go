@@ -319,11 +319,11 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 // message, and every other Pending item is Skipped.
 func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	items, err := r.items(ctx, run)
-	if err != nil {
-		if !isRefusal(err) {
-			return ctrl.Result{}, err
-		}
+	if asRunRefusal(err) {
 		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	at, err := target(run)
 	if err != nil {
@@ -401,12 +401,16 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 			}
 			item.BaseBackup, reason, err = r.checkDatabase(ctx, run.Namespace, item.Name, moment)
 		}
-		if err != nil {
+		// A refusal fails the item with its reason; a reason still given as
+		// a string fails it with none.
+		if err != nil && !failRestoreItem(item, err) {
 			return ctrl.Result{}, err
 		}
 		if reason != "" {
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, reason
-			unreachable = append(unreachable, fmt.Sprintf("%s %s: %s", item.Kind, item.Name, reason))
+		}
+		if item.Phase == backupv1alpha1.ItemFailed {
+			unreachable = append(unreachable, fmt.Sprintf("%s %s: %s", item.Kind, item.Name, item.Message))
 		}
 	}
 
@@ -452,14 +456,15 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 // out Skipped. So does a Cluster that opts out of the bootstrap webhook, or
 // whose owner declares its own bootstrap method (see leftAlone).
 //
-// It returns a refusal (see isRefusal), which plan turns into reason Invalid:
-// when spec.repository is set and spec.claim is not, since a restore in
-// place needs a claim to write into, and the refusal sends the user to
-// spec.into with a name no claim has, or to spec.claim to overwrite an
-// existing claim in place; when nothing in the namespace is marked; when
-// spec.database names a Cluster that opts out of the bootstrap webhook or
-// declares its own bootstrap; and when another unfinished RestoreRun is
-// restoring a Cluster the run would restore (see clustersRestoredElsewhere).
+// It returns an *invalidSpecError, which plan turns into reason Invalid: when
+// spec.repository is set and spec.claim is not, since a restore in place
+// needs a claim to write into, and the refusal sends the user to spec.into
+// with a name no claim has, or to spec.claim to overwrite an existing claim
+// in place; when nothing in the namespace is marked; and when spec.database
+// names a Cluster that opts out of the bootstrap webhook or declares its own
+// bootstrap. It returns the *refusalError of clustersRestoredElsewhere, which
+// plan turns into reason Invalid as well, when another unfinished RestoreRun
+// is restoring a Cluster the run would restore.
 // A failed read comes back as a plain error, and the caller retries.
 func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	pending := func(kind, name string) backupv1alpha1.RestoreItem {
@@ -469,7 +474,7 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	case run.Spec.Claim != "":
 		return []backupv1alpha1.RestoreItem{pending("PersistentVolumeClaim", run.Spec.Claim)}, nil
 	case run.Spec.Repository != "":
-		return nil, refuse("spec.repository alone restores into a new claim, so spec.into is required, and it must name a claim that does not exist yet. " +
+		return nil, invalidSpec("spec.repository alone restores into a new claim, so spec.into is required, and it must name a claim that does not exist yet. " +
 			"To overwrite an existing claim from this repository, set spec.claim to it as well; the run then restores it in place once no pod mounts it.")
 	case run.Spec.Database != "":
 		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Spec.Database)
@@ -478,7 +483,7 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 		}
 		if found {
 			if why := leftAlone(cluster); why != "" {
-				return nil, refuse("Cluster %s: %s", run.Spec.Database, why)
+				return nil, invalidSpec("Cluster %s: %s", run.Spec.Database, why)
 			}
 		}
 		items := []backupv1alpha1.RestoreItem{pending("Cluster", run.Spec.Database)}
@@ -510,7 +515,7 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 		items = append(items, item)
 	}
 	if len(items) == 0 {
-		return nil, refuse("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
+		return nil, invalidSpec("nothing in this namespace is marked %s: \"true\"", backupv1alpha1.AnnotationEnabled)
 	}
 	if err := r.clustersRestoredElsewhere(ctx, run, items); err != nil {
 		return nil, err
@@ -526,9 +531,10 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 //   - items are the run's items as planned. Only a Cluster item that is
 //     Pending counts, since the run leaves a Skipped one alone.
 //
-// It returns a refusal naming the other run and the Cluster when another
-// RestoreRun in the namespace that has not finished holds an item for one of
-// those Clusters in phase Pending, Deleted or Recovering, and nil otherwise.
+// It returns a *refusalError with reason ClusterRestoredElsewhere, naming
+// the other run and the Cluster, when another RestoreRun in the namespace
+// that has not finished holds an item for one of those Clusters in phase
+// Pending, Deleted or Recovering, and nil otherwise.
 // A failed list of the RestoreRuns comes back as a plain error, and the
 // caller retries.
 //
@@ -563,7 +569,7 @@ func (r *RestoreRunReconciler) clustersRestoredElsewhere(ctx context.Context, ru
 			}
 			switch item.Phase {
 			case backupv1alpha1.ItemPending, backupv1alpha1.ItemDeleted, backupv1alpha1.ItemRecovering:
-				return refuse("RestoreRun %s is restoring Cluster %s. Create this RestoreRun again once that run has finished", other.Name, item.Name)
+				return refuse(backupv1alpha1.ItemReasonClusterRestoredElsewhere, "RestoreRun %s is restoring Cluster %s. Create this RestoreRun again once that run has finished", other.Name, item.Name)
 			default:
 				// An item in any other phase has let go of the Cluster or
 				// never deleted it, so it holds no recovery.
@@ -581,20 +587,18 @@ func (r *RestoreRunReconciler) clustersRestoredElsewhere(ctx context.Context, ru
 //   - quiescedOnly limits the choice to snapshots tagged quiesced. plan sets
 //     it on a run with spec.syncDatabaseToVolume.
 //
-// It returns the snapshot, or a reason when there is none. It also returns a
-// reason when repositoryFor refuses the claim, because the claim or its
-// VolumeRestore is missing. It returns an error when listing the repository
-// fails, and when a read fails for any other reason.
+// It returns the snapshot, or a reason when there is none. When
+// repositoryFor refuses the claim, because the claim or its VolumeRestore is
+// missing, it returns that *refusalError, and plan fails the item with it
+// (see failRestoreItem). It returns a plain error when listing the
+// repository fails, and when a read fails for any other reason.
 //
 // This is the only place a missing snapshot is caught. VolSync restores
 // nothing and still reports success when no snapshot matches.
 func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
-		if !isRefusal(err) {
-			return restic.Snapshot{}, "", err
-		}
-		return restic.Snapshot{}, err.Error(), nil
+		return restic.Snapshot{}, "", err
 	}
 	return r.selectSnapshot(ctx, run, settings.Secret, at, quiescedOnly)
 }
@@ -604,12 +608,13 @@ func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alp
 // progress, and "" when there is none.
 //
 // It reads the repository the way checkVolume does. When repositoryFor
-// refuses the claim, it returns "", so that checkVolume reports the refusal
-// as the item's reason. Any other failed read comes back as an error.
+// refuses the claim, it returns "", so that checkVolume returns the refusal
+// and plan fails the item with it. Any other failed read comes back as an
+// error.
 func (r *RestoreRunReconciler) volumeBackedUp(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (string, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
-		if isRefusal(err) {
+		if _, refused := asItemFailure(err); refused {
 			return "", nil
 		}
 		return "", err
@@ -742,18 +747,20 @@ func (r *RestoreRunReconciler) recheckSnapshot(ctx context.Context, run *backupv
 // Parameters:
 //   - claim is the name of the claim the item restores, which the message
 //     names.
-//   - why says why the item fails, such as a snapshot that changed since the
-//     checks or a repository Secret that is gone.
+//   - why says why the item fails: a snapshot that changed since the checks,
+//     from recheckSnapshot. The start checks' refusals get the same ending
+//     from nothingWrittenTo instead.
 //
 // It returns why followed by nothingWritten's end: nothing was written to
 // the claim, and a new RestoreRun selects again.
 //
-// No mover of the item can have run at that point. quiesce calls it before
-// any destination exists. restoreVolume calls it only after lostDestination
-// found no destination the run owns under the item's name: a pass that
-// created one and lost the status write that recorded it leaves the item
-// Pending, and restoreVolume takes that destination over and moves the item
-// to Running before any of the checks that fail an item.
+// No mover of the item can have run at that point. restoreVolume calls it,
+// and marks the start checks' refusals with nothingWrittenTo, only after
+// lostDestination found no destination the run owns under the item's name:
+// a pass that created one and lost the status write that recorded it leaves
+// the item Pending, and restoreVolume takes that destination over and moves
+// the item to Running before any of the checks that fail an item. quiesce
+// marks its refusals before any destination exists.
 func failBeforeStart(claim, why string) string {
 	return why + nothingWritten(claim)
 }
@@ -1087,10 +1094,10 @@ func restoreTimedOut(run *backupv1alpha1.RestoreRun, deadline time.Time) string 
 // mover would no longer restore, because it was forgotten, retimed or
 // shadowed in its second since the checks, fails the item before the
 // destination exists, with a message that says nothing was written (see
-// failBeforeStart). A destination with the item's name that
-// the run did not create (see ownsDestination), found at the create or on a
-// later pass, fails the item too; the item then names no destination, so
-// nothing the run does afterwards touches it.
+// nothingWrittenTo and failBeforeStart). A destination with the item's name
+// that the run did not create (see ownsDestination), found at the create or
+// on a later pass, fails the item too; the item then names no destination,
+// so nothing the run does afterwards touches it.
 //
 // A Running item fails with the mover's logs when the mover failed, and
 // fails when its destination is gone. Once the destination has completed the
@@ -1132,22 +1139,19 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			return backupv1alpha1.ReasonClaimInUse,
 				fmt.Sprintf("ReplicationDestination %s is restoring into claim %s", writer, item.Name), nil
 		}
-		settings, refused, err := r.startRefusal(ctx, run, item.Name)
+		settings, err := r.startRefusal(ctx, run, item.Name)
+		if failRestoreItem(item, err) {
+			return "", "", nil
+		}
 		if err != nil {
 			return "", "", err
-		}
-		if refused != "" {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, refused
-			return "", "", nil
 		}
 		// The Leases make the restore and a backup of the claim or its
 		// repository exclusive: of two runs that get here in the same
 		// instant, only one creates each Lease.
 		busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: "RestoreRun", run: run, item: item.Name},
 			run.Namespace, item.Name, settings.Secret)
-		if isRefusal(err) {
-			message := failBeforeStart(item.Name, err.Error())
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+		if failRestoreItem(item, nothingWrittenTo(item.Name, err)) {
 			return "", "", nil
 		}
 		if err != nil {
@@ -1228,11 +1232,11 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 	return "", "", nil
 }
 
-// startRefusal returns the message restoreVolume fails a Pending in-place
-// item with when the item's claim or repository settings refuse the restore,
-// or "" when the restore can go on. restoreVolume calls it before it takes
-// the Leases, and quiesce calls it in its pre-check, so an item that cannot
-// start fails before the app is stopped for it.
+// startRefusal checks whether the item's claim or repository settings refuse
+// a Pending in-place restore, and reads those settings when they don't.
+// restoreVolume calls it before it takes the Leases, and quiesce calls it in
+// its pre-check, so an item that cannot start fails before the app is
+// stopped for it.
 //
 // Parameters:
 //   - run is the asking run; its namespace is read, and spec.repository and
@@ -1240,33 +1244,29 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 //   - claimName names the item's claim, which is also the item's name.
 //
 // It returns the settings from repositoryFor when the restore can go on. A
-// claim that is being deleted, and a refusal from repositoryFor (a claim
-// that is gone, or a VolumeRestore that is missing when the run names no
-// repository), give a message from failBeforeStart, which says nothing was
-// written to the claim. A claim being deleted is refused because the mover
-// would write into a claim that is about to go, and the scheduler does not
-// place a pod whose claim is being deleted (podHasPVCs, in the PreFilter
-// of the volumebinding plugin). A failed read comes back as an error, and
-// the caller leaves the item Pending.
-func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (restoreSettings, string, error) {
+// claim that is being deleted (reason ClaimDeleting), and a refusal from
+// repositoryFor (a claim that is gone, or a VolumeRestore that is missing
+// when the run names no repository), come back as a *refusalError that
+// says nothing was written to the claim (see nothingWrittenTo); the caller
+// fails the item with it through failRestoreItem. A claim being deleted is
+// refused because the mover would write into a claim that is about to go,
+// and the scheduler does not place a pod whose claim is being deleted
+// (podHasPVCs, in the PreFilter of the volumebinding plugin). A failed read
+// comes back as a plain error, and the caller leaves the item Pending.
+func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (restoreSettings, error) {
 	claim := &corev1.PersistentVolumeClaim{}
 	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim)
 	switch {
 	case apierrors.IsNotFound(err):
 		// repositoryFor refuses the claim that is gone with its message.
 	case err != nil:
-		return restoreSettings{}, "", fmt.Errorf("get PersistentVolumeClaim %s/%s: %w", run.Namespace, claimName, err)
+		return restoreSettings{}, fmt.Errorf("get PersistentVolumeClaim %s/%s: %w", run.Namespace, claimName, err)
 	case claim.DeletionTimestamp != nil:
-		return restoreSettings{}, failBeforeStart(claimName, fmt.Sprintf("claim %s is being deleted", claimName)), nil
+		return restoreSettings{}, nothingWrittenTo(claimName,
+			refuse(backupv1alpha1.ItemReasonClaimDeleting, "claim %s is being deleted", claimName))
 	}
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
-	if err != nil {
-		if isRefusal(err) {
-			return settings, failBeforeStart(claimName, err.Error()), nil
-		}
-		return settings, "", err
-	}
-	return settings, "", nil
+	return settings, nothingWrittenTo(claimName, err)
 }
 
 // inPlaceClaimLost returns a message when the claim an in-place item
@@ -1436,12 +1436,12 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		// run finds the first one's item Pending or Deleted and deletes
 		// nothing; of two runs that get here together, each finds the other
 		// Pending and neither deletes.
-		if err := r.clustersRestoredElsewhere(ctx, run, []backupv1alpha1.RestoreItem{*item}); err != nil {
-			if !isRefusal(err) {
-				return err
-			}
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()+". The run deleted nothing"
+		err = r.clustersRestoredElsewhere(ctx, run, []backupv1alpha1.RestoreItem{*item})
+		if failRestoreItem(item, nothingDeleted(err)) {
 			return nil
+		}
+		if err != nil {
+			return err
 		}
 		if found {
 			item.ClusterUID = cluster.GetUID()
@@ -1623,11 +1623,11 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, refusal)
 	}
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
-	if err != nil {
-		if !isRefusal(err) {
-			return ctrl.Result{}, err
-		}
+	if asRunRefusal(err) {
 		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	if settings.Capacity == nil && run.Spec.IntoSize == nil {
 		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid,
@@ -1800,11 +1800,11 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	}
 
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
-	if err != nil {
-		if !isRefusal(err) {
-			return ctrl.Result{}, err
-		}
+	if asRunRefusal(err) {
 		return r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error())
+	}
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	// A claim that appeared since the checks ends the run before it waits
 	// for anything: it is not the run's to write into.
@@ -1822,7 +1822,7 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 		leased = run.Spec.Into
 	}
 	waiting, err := r.waitForBackup(ctx, run, leased, settings.Secret)
-	if isRefusal(err) {
+	if asRunRefusal(err) {
 		return r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error()+nothingWritten(run.Spec.Into))
 	}
 	if waiting || err != nil {
@@ -2118,18 +2118,15 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 			if item.Kind != "PersistentVolumeClaim" || item.Phase != backupv1alpha1.ItemPending {
 				continue
 			}
-			_, refused, err := r.startRefusal(ctx, run, item.Name)
+			_, err := r.startRefusal(ctx, run, item.Name)
+			if failRestoreItem(item, err) {
+				continue
+			}
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			if refused != "" {
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, refused
-				continue
-			}
 			held, err := r.backupHeldElsewhere(ctx, run, item.Name)
-			if isRefusal(err) {
-				message := failBeforeStart(item.Name, err.Error())
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+			if failRestoreItem(item, nothingWrittenTo(item.Name, err)) {
 				continue
 			}
 			if err != nil {
@@ -2173,7 +2170,7 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		// A Kustomization that also applies workloads of another namespace
 		// is refused before anything is stopped (see planStop).
 		stop, suspend, err := planStop(ctx, r.Reader, r.RESTMapper(), run.Namespace, targets)
-		if isRefusal(err) {
+		if asRunRefusal(err) {
 			return r.abort(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 		}
 		if err != nil {
@@ -2224,8 +2221,8 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 // A refusal from repositoryFor, for a claim or a VolumeRestore that is gone,
 // gives "": quiesce has failed such an item with startRefusal just before,
 // and restoreVolume fails an item that became one since. A repository
-// Secret that does not exist comes back as the refusal leaseNamesFor gives
-// (see isRefusal), and quiesce fails the item with it before anything is
+// Secret that does not exist comes back as the refusal leaseNamesFor gives,
+// and quiesce fails the item with it (see failRestoreItem) before anything is
 // stopped. Any other failed read comes back as an error, and the pass
 // retries with nothing stopped.
 //
@@ -2235,7 +2232,7 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (string, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
-		if isRefusal(err) {
+		if _, refused := asItemFailure(err); refused {
 			return "", nil
 		}
 		return "", err

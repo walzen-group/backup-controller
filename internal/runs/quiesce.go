@@ -110,9 +110,9 @@ func readStop(ctx context.Context, reader client.Reader, run client.Object) (bac
 	kind := ""
 	switch run.(type) {
 	case *backupv1alpha1.BackupRun:
-		stored, kind = &backupv1alpha1.BackupRun{}, "BackupRun"
+		stored, kind = &backupv1alpha1.BackupRun{}, backupv1alpha1.KindBackupRun
 	case *backupv1alpha1.RestoreRun:
-		stored, kind = &backupv1alpha1.RestoreRun{}, "RestoreRun"
+		stored, kind = &backupv1alpha1.RestoreRun{}, backupv1alpha1.KindRestoreRun
 	default:
 		return "", fmt.Errorf("read the stop of %T: not a run", run)
 	}
@@ -400,12 +400,13 @@ func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 //
 // It returns each workload with the replica count it has now, which is the
 // count restartWorkloads gives back, and the Kustomizations to suspend as
-// "namespace/name" keys. It returns a refusal (see isRefusal) when a
-// Kustomization that applies a target also applies a Deployment or a
-// StatefulSet in another namespace (see otherNamespaces), or whose
-// status.inventory.entries is missing or does not parse (see inventoryIDs),
-// and an error when a Kustomization can't be read. On a cluster that serves no version of
-// Kustomization, every Kustomization counts as gone.
+// "namespace/name" keys. It returns an *invalidSpecError, which ends the run
+// (see asRunRefusal), when a Kustomization that applies a target also
+// applies a Deployment or a StatefulSet in another namespace (see
+// otherNamespaces), or whose status.inventory.entries is missing or does not
+// parse (see inventoryIDs), and an error when a Kustomization can't be read.
+// On a cluster that serves no version of Kustomization, every Kustomization
+// counts as gone.
 //
 // The kustomize-controller labels on a target name its Kustomization, and
 // that Kustomization is suspended only when its status.inventory lists the
@@ -444,13 +445,13 @@ func planStop(ctx context.Context, reader client.Reader, mapper meta.RESTMapper,
 			continue
 		}
 		if _, err := inventoryIDs(kustomization); err != nil {
-			return nil, nil, refuse("%s", err.Error())
+			return nil, nil, invalidSpec("%v", err)
 		}
 		if !inventoryLists(kustomization, t) {
 			continue
 		}
 		if namespaces := otherNamespaces(kustomization, runNamespace); len(namespaces) > 1 {
-			return nil, nil, refuse("Kustomization %s applies workloads in namespaces %s; a run suspends the Kustomization while it stops workloads, "+
+			return nil, nil, invalidSpec("Kustomization %s applies workloads in namespaces %s; a run suspends the Kustomization while it stops workloads, "+
 				"which would leave the other namespace's workloads unmanaged by Flux, so it refuses. Give each namespace its own Kustomization",
 				key, joinAnd(namespaces))
 		}

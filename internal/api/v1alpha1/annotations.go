@@ -73,6 +73,11 @@ const (
 
 	// ManagedByValue is the value LabelManagedBy carries on those objects.
 	ManagedByValue = "backup-controller"
+
+	// FieldManager is the field manager name the controller writes with.
+	// It is the name ManagedByValue gives the label, so a person reading an
+	// object's managedFields finds the controller under the same name.
+	FieldManager = "backup-controller"
 )
 
 // Enabled reports whether an object's annotations set backup.wlz.li/enabled to

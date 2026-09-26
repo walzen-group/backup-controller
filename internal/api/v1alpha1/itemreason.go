@@ -42,6 +42,68 @@ const (
 	// ItemReasonNoMoverSnapshot is a volume backup whose mover finished, but
 	// the run found no snapshot the mover wrote in the repository.
 	ItemReasonNoMoverSnapshot ItemReason = "NoMoverSnapshot"
+
+	// ItemReasonClaimMissing is an item whose claim does not exist when the
+	// run checks it or starts it.
+	ItemReasonClaimMissing ItemReason = "ClaimMissing"
+
+	// ItemReasonClaimDeleting is a volume restore whose claim is being
+	// deleted when the run would start it. Nothing was written to the claim.
+	ItemReasonClaimDeleting ItemReason = "ClaimDeleting"
+
+	// ItemReasonClaimNotBound is a volume backup whose claim is not bound to
+	// a volume yet, so there is no node to place the mover on.
+	ItemReasonClaimNotBound ItemReason = "ClaimNotBound"
+
+	// ItemReasonVolumeMissing is a volume backup whose claim is bound to a
+	// PersistentVolume that does not exist.
+	ItemReasonVolumeMissing ItemReason = "VolumeMissing"
+
+	// ItemReasonNoNodeAffinity is a volume backup whose PersistentVolume
+	// declares no node affinity to place the mover by.
+	ItemReasonNoNodeAffinity ItemReason = "NoNodeAffinity"
+
+	// ItemReasonVolumeRestoreMissing is an item whose claim has no
+	// VolumeRestore to name its restic repository.
+	ItemReasonVolumeRestoreMissing ItemReason = "VolumeRestoreMissing"
+
+	// ItemReasonRepositorySecretMissing is an item whose restic repository
+	// Secret does not exist, so the run can't take the Lease that keeps
+	// other runs' movers off the repository.
+	ItemReasonRepositorySecretMissing ItemReason = "RepositorySecretMissing"
+
+	// ItemReasonSettingsInvalid is an item whose settings don't parse: a
+	// retention annotation on its claim, or a setting on its namespace.
+	ItemReasonSettingsInvalid ItemReason = "SettingsInvalid"
+
+	// ItemReasonSourceNotManaged is a volume backup whose claim has a
+	// ReplicationSource the controller did not write, which it never writes
+	// over.
+	ItemReasonSourceNotManaged ItemReason = "SourceNotManaged"
+
+	// ItemReasonSourceRefused is a volume backup whose ReplicationSource the
+	// API server refused as invalid.
+	ItemReasonSourceRefused ItemReason = "SourceRefused"
+
+	// ItemReasonSourceAbandoned is a volume backup whose ReplicationSource
+	// is still retrying a backup that no run waits for any more.
+	ItemReasonSourceAbandoned ItemReason = "SourceAbandoned"
+
+	// ItemReasonClusterMissing is a database backup whose Cluster does not
+	// exist when the run starts it.
+	ItemReasonClusterMissing ItemReason = "ClusterMissing"
+
+	// ItemReasonClusterHibernated is a database backup the run skipped
+	// because its Cluster is hibernated.
+	ItemReasonClusterHibernated ItemReason = "ClusterHibernated"
+
+	// ItemReasonBackupRefused is a database backup whose CloudNativePG
+	// Backup the API server refused as invalid.
+	ItemReasonBackupRefused ItemReason = "BackupRefused"
+
+	// ItemReasonClusterRestoredElsewhere is a database restore whose Cluster
+	// another unfinished RestoreRun is restoring. The run deleted nothing.
+	ItemReasonClusterRestoredElsewhere ItemReason = "ClusterRestoredElsewhere"
 )
 
 // RunEnding records why a run ended, from the moment the run decided to end

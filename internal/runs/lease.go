@@ -134,9 +134,10 @@ func acquireLeases(ctx context.Context, c client.Client, reader client.Reader, h
 // It returns the Lease names, and an error when a read fails or the Secret
 // is missing. A claim that reads NotFound gets no Lease, because nothing can
 // write to it. A repository Secret that reads NotFound comes back as a
-// refusal (see isRefusal): a mover started without the repository Lease
-// would be unguarded once the Secret appears, so the caller fails the item
-// with nothing started. Any other failed read comes back as an error.
+// *refusalError with reason RepositorySecretMissing: a mover started
+// without the repository Lease would be unguarded once the Secret appears, so
+// the caller fails the item with nothing started. Any other failed read
+// comes back as an error.
 func leaseNamesFor(ctx context.Context, reader client.Reader, namespace, claim, secret string) ([]string, error) {
 	var names []string
 	if claim != "" {
@@ -156,7 +157,7 @@ func leaseNamesFor(ctx context.Context, reader client.Reader, namespace, claim, 
 		case err == nil:
 			names = append(names, repositoryLeaseName(s.UID))
 		case apierrors.IsNotFound(err):
-			return nil, refuse("repository Secret %s does not exist in this namespace, so the run can't take the Lease that keeps other runs' movers off the repository",
+			return nil, refuse(backupv1alpha1.ItemReasonRepositorySecretMissing, "repository Secret %s does not exist in this namespace, so the run can't take the Lease that keeps other runs' movers off the repository",
 				secret)
 		default:
 			return nil, fmt.Errorf("get repository Secret %s/%s: %w", namespace, secret, err)
@@ -295,15 +296,6 @@ func leaseItems(lease *coordinationv1.Lease) []string {
 	return strings.Split(value, ",")
 }
 
-// backupLeaseItemKind and restoreLeaseItemKind are the kinds of the items
-// that take Leases: a BackupRun's volume item and a RestoreRun's claim item.
-// A Lease names its items by name alone, and a run's Cluster item can share a
-// claim's name, so holderLive matches the kind as well.
-const (
-	backupLeaseItemKind  = "ReplicationSource"
-	restoreLeaseItemKind = "PersistentVolumeClaim"
-)
-
 // holderLive reports whether the run that holds a Lease still needs it.
 //
 // Parameters:
@@ -318,20 +310,22 @@ const (
 // Pending or Running. A RestoreRun's item also keeps it live once it has
 // finished, for as long as it names its ReplicationDestination: the run has
 // stopped that mover and not yet seen it gone (rule X2, see
-// removeDestinations). Only an item of the kind that takes Leases counts (see
-// backupLeaseItemKind), so a Cluster item with the claim's name does not
-// keep the claim's Lease. A quiesce Lease is live while the holder's stored
-// status does not show the workloads given back (see durablyRestarted): the
-// holder exists with the UID the Lease names, has not finished, and has no
-// plan yet or has not recorded its restart as done. A run being deleted
-// counts as live until its finalizer has released the Lease. A Lease that
-// names no run kind this controller knows is left alone, and counts as live.
+// removeDestinations). Only an item of the kind that takes Leases counts, a
+// BackupRun's ReplicationSource item or a RestoreRun's PersistentVolumeClaim
+// item: a Lease names its items by name alone, and a Cluster item with the
+// claim's name does not keep the claim's Lease. A quiesce Lease is live
+// while the holder's stored status does not show the workloads given back
+// (see durablyRestarted): the holder exists with the UID the Lease names, has
+// not finished, and has no plan yet or has not recorded its restart as done.
+// A run being deleted counts as live until its finalizer has released the
+// Lease. A Lease that names no run kind this controller knows is left alone,
+// and counts as live.
 func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1.Lease) (bool, error) {
 	key := types.NamespacedName{Namespace: lease.Namespace, Name: lease.Annotations[annotationLeaseHolderName]}
 	items := leaseItems(lease)
 	quiesce := lease.Labels[labelLeaseScope] == scopeQuiesce
 	switch lease.Labels[labelLeaseHolderKind] {
-	case "BackupRun":
+	case backupv1alpha1.KindBackupRun:
 		run := &backupv1alpha1.BackupRun{}
 		if err := reader.Get(ctx, key, run); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -346,13 +340,13 @@ func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1
 			return !durablyRestarted(run), nil
 		}
 		for _, item := range run.Status.Items {
-			if item.Kind == backupLeaseItemKind && slices.Contains(items, item.Name) &&
+			if item.Kind == backupv1alpha1.ItemKindSource && slices.Contains(items, item.Name) &&
 				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
 				return true, nil
 			}
 		}
 		return false, nil
-	case "RestoreRun":
+	case backupv1alpha1.KindRestoreRun:
 		run := &backupv1alpha1.RestoreRun{}
 		if err := reader.Get(ctx, key, run); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -370,7 +364,7 @@ func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1
 			// A finished item that still names its ReplicationDestination
 			// has a mover the run has stopped and not yet seen gone (rule
 			// X2), and that mover may still write.
-			if item.Kind == restoreLeaseItemKind && slices.Contains(items, item.Name) && (!finished(item) || item.Destination != "") {
+			if item.Kind == backupv1alpha1.ItemKindClaim && slices.Contains(items, item.Name) && (!finished(item) || item.Destination != "") {
 				return true, nil
 			}
 		}
