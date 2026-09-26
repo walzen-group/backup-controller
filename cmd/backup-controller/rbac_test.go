@@ -230,12 +230,14 @@ func readChartRules(t *testing.T, path string) []rbacv1.PolicyRule {
 
 // ownCRDs are the CustomResourceDefinitions the controller may read, and the
 // only ones.
-var ownCRDs = []string{"backupruns.backup.wlz.li", "restoreruns.backup.wlz.li", "volumerestores.backup.wlz.li"}
+var ownCRDs = []string{"backupruns.backup.wlz.li", "restoreruns.backup.wlz.li"}
 
 // TestTheCRDReadIsLimitedToThisProjectsCRDs checks that every rule on
 // customresourcedefinitions, in deploy/ and in the chart, allows get only and
-// names exactly this project's three CRDs in resourceNames. A rule without
-// resourceNames would let the controller read every CRD in the cluster.
+// names exactly the two CRDs a run checks (see crdOutdated in internal/runs)
+// in resourceNames. A rule without resourceNames would let the controller
+// read every CRD in the cluster, and a name no check reads would be a grant
+// nothing uses.
 func TestTheCRDReadIsLimitedToThisProjectsCRDs(t *testing.T) {
 	role := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
 	found := false
@@ -256,7 +258,7 @@ func TestTheCRDReadIsLimitedToThisProjectsCRDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the chart's rbac: %v", err)
 	}
-	want := fmt.Sprintf("resourceNames: [%q, %q, %q]", ownCRDs[0], ownCRDs[1], ownCRDs[2])
+	want := fmt.Sprintf("resourceNames: [%q, %q]", ownCRDs[0], ownCRDs[1])
 	if strings.Count(string(chart), "customresourcedefinitions") != 1 || !strings.Contains(string(chart), want) {
 		t.Errorf("the chart does not hold one rule on customresourcedefinitions limited with %s", want)
 	}

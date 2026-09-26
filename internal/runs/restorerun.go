@@ -92,9 +92,9 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //
 // A new run starts in plan, which checks that every item has a backup in reach
 // before anything is changed, or in planIntoNewClaim when spec.into is set. An
-// error that either of them returns for a retry goes through planFailed, which reports it
-// on the Ready condition and ends the run once spec.timeout has passed since
-// its creation. A run past its checks continues in work, or in
+// error that either of them returns for a retry goes through planFailed,
+// which reports it on the Ready condition and ends the run once spec.timeout
+// has passed since its creation. A run past its checks continues in work, or in
 // restoreIntoEmptyClaim for an into restore. Before any of these, Reconcile
 // adds the run's finalizer. A run being deleted gets its changes put back by
 // finalize, and a finished run is deleted once spec.ttlSecondsAfterFinished
@@ -1346,10 +1346,10 @@ func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster client
 // or VolumeRestore that is missing, a restoreAsOf that doesn't parse, or a
 // restore from spec.repository alone without spec.intoSize. The run writes
 // only into a claim it creates itself, so it never overwrites or takes over
-// one it finds. A run with no
-// snapshot in reach, or whose snapshot VolSync's mover would not restore when
-// pinned to its second, ends with reason NoBackupInReach. Any other failed read,
-// and a failed listing of the repository, is returned for a retry.
+// one it finds. A run with no snapshot in reach, or whose snapshot VolSync's
+// mover would not restore when pinned to its second, ends with reason
+// NoBackupInReach. Any other failed read, and a failed listing of the
+// repository, is returned for a retry.
 //
 // Before it selects the snapshot, planIntoNewClaim waits, as plan does, while
 // a backup of the source claim or the repository is in progress (see
@@ -1750,9 +1750,9 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 // status.quiescedAt. After a failed stop, it narrows the plan with
 // appliedPart to what is stopped now, and aborts the run with reason Failed,
 // which starts those workloads again and resumes the Kustomizations, the
-// same as a BackupRun does. A spec.quiesce entry the namespace does not hold ends the run as
-// Failed with reason Invalid before anything is stopped, and a failed read of
-// an entry or a Kustomization is returned for a retry.
+// same as a BackupRun does. A spec.quiesce entry the namespace does not hold
+// ends the run as Failed with reason Invalid before anything is stopped, and
+// a failed read of an entry or a Kustomization is returned for a retry.
 //
 // Before it records a plan, with nothing stopped, quiesce waits with reason
 // SourceBusy while a backup holds one of the run's claims or repositories,
@@ -2307,10 +2307,10 @@ func (r *RestoreRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.
 //     claim, or the new claim for a restore from spec.repository alone.
 //   - secret is the name of the repository Secret.
 //
-// The run calls it right before it creates its first object. It first takes the Leases of
-// the claim and the repository for the run's item (see acquireLeases), then
-// looks for a backup's mover object (see otherMover), which catches a backup
-// started before the controller took Leases.
+// The run calls it right before it creates its first object. It first takes
+// the Leases of the claim and the repository for the run's item (see
+// acquireLeases), then looks for a backup's mover object (see otherMover),
+// which catches a backup started before the controller took Leases.
 //
 // It returns true when the run has to wait. It has then moved the run to
 // Waiting with reason SourceBusy and a message naming the run that holds a
@@ -2576,7 +2576,8 @@ func destinationReleaseError(name string, err error) error {
 //   - run is the RestoreRun that failed. Its Ready condition is set and its
 //     status written.
 //   - err is the error from finish or finalize: the *releaseError of a mover
-//     the run could not stop or of a Lease it could not read or release, or the *restartError of a restart that failed.
+//     the run could not stop or of a Lease it could not read or release, or
+//     the *restartError of a restart that failed.
 //   - working is true while the run is still restoring. finish and finalize
 //     pass false, which lets the advice say the run can be deleted.
 //

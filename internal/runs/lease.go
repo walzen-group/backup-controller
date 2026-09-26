@@ -99,10 +99,11 @@ func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-
 // A Lease another run holds is taken over when that run is stale: it no
 // longer exists (or its name now belongs to a run with another UID), it has
 // finished, or none of the items the Lease names is Pending or Running any
-// more and none has a stopped mover left (see holderLive). The takeover is an update carrying the resourceVersion that was read,
-// so of two runs taking over the same Lease one gets a Conflict and waits. A
-// live holder's Lease is never taken over, and a run being deleted counts as
-// live until its finalizer has released its Leases.
+// more and none has a stopped mover left (see holderLive). The takeover is
+// an update carrying the resourceVersion that was read, so of two runs taking
+// over the same Lease one gets a Conflict and waits. A live holder's Lease is
+// never taken over, and a run being deleted counts as live until its
+// finalizer has released its Leases.
 func acquireLeases(ctx context.Context, c client.Client, reader client.Reader, holder leaseHolder, namespace, claim, secret string) (string, error) {
 	names, err := leaseNamesFor(ctx, reader, namespace, claim, secret)
 	if err != nil {

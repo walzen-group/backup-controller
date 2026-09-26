@@ -148,8 +148,8 @@ func (r *OrphanReconciler) orphaned(claim *corev1.PersistentVolumeClaim) bool {
 //
 // Every delete ignores NotFound and the finalizer goes last, so a pass that
 // fails anywhere is repeated from the start and converges. It returns an
-// error when a read, a delete, the pod list, the Job read or the patch fails; a conflict on
-// the patch is returned the same way.
+// error when a read, a delete, the pod list, the Job read or the patch fails;
+// a conflict on the patch is returned the same way.
 func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, req.NamespacedName, claim); err != nil {

@@ -109,8 +109,8 @@ webhook refuses every Cluster create while any other Cluster archives:
 - `list` on `objectstores.barmancloud.cnpg.io`, which the webhook's
   shared-archive check uses to read every ObjectStore in one call;
 - `get` on `customresourcedefinitions.apiextensions.k8s.io`, named
-  `backupruns.backup.wlz.li`, `restoreruns.backup.wlz.li` and
-  `volumerestores.backup.wlz.li`, for the CRD check below;
+  `backupruns.backup.wlz.li` and `restoreruns.backup.wlz.li`, for the CRD
+  check below;
 - get, list, create, update and delete on `leases` in `coordination.k8s.io`,
   for the Lease a run acquires on a claim and its repository before it starts a
   mover, and the Lease `backup-controller-quiesce` it acquires before it stops

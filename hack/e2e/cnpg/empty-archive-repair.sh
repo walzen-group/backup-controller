@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # empty-archive-repair.sh reproduces a CloudNativePG Cluster that started as
 # initdb over a prefix already holding WAL, the state backup-controller v0.8.x
-# admitted, and runs one of the two repairs docs/upgrading.md (v0.9.0, step 4)
-# gives for it, on the docker-desktop e2e cluster.
+# admitted, and runs one of the two repairs docs/upgrading.md gives for it
+# (v0.9.0, "Step 8: Find Clusters v0.8.x admitted over an old archive" and
+# "Step 9: Give each such Cluster an empty archive"), on the docker-desktop
+# e2e cluster.
 #
 # Usage: empty-archive-repair.sh server-name|empty-prefix
 #
