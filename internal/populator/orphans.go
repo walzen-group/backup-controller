@@ -131,7 +131,12 @@ func (r *OrphanReconciler) orphaned(claim *corev1.PersistentVolumeClaim) bool {
 // VolumeRestore and cleans up itself. Only an authoritative NotFound for the
 // VolumeRestore lets it go on. It then, in the controller namespace:
 //
-//  1. deletes the ReplicationDestination DestinationName(uid);
+//  1. deletes the ReplicationDestination DestinationName(uid). When the
+//     delete finds it there, the pass records a Normal WaitingForMover event
+//     naming the destination and requeues after MoverPoll, and goes no
+//     further: VolSync may be in the middle of a reconcile of that
+//     destination and create its mover Job after any look this pass could
+//     take. Only a pass whose delete finds the destination gone goes on;
 //  2. lists the pods of that destination's mover Job, and reads the Job
 //     itself once no pod is left, and while a pod or the Job is still there
 //     records a Normal WaitingForMover event and requeues after MoverPoll,
@@ -164,8 +169,22 @@ func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	destination := DestinationName(claim.UID)
+	poll := r.MoverPoll
+	if poll <= 0 {
+		poll = defaultMoverPoll
+	}
+	// A destination this pass deletes may be in the middle of a VolSync
+	// reconcile that creates its mover Job after any look this pass could
+	// take, so only the next pass looks for the mover.
 	rd := &volsyncv1alpha1.ReplicationDestination{ObjectMeta: metav1.ObjectMeta{Name: destination, Namespace: r.Namespace}}
-	if err := r.Client.Delete(ctx, rd); err != nil && !apierrors.IsNotFound(err) {
+	err = r.Client.Delete(ctx, rd)
+	switch {
+	case err == nil:
+		r.Recorder.Eventf(claim, nil, corev1.EventTypeNormal, "WaitingForMover", "Cleanup",
+			"VolumeRestore %s is gone; deleted ReplicationDestination %s, and the next pass looks for its mover before the cleanup goes on",
+			vrKey.Name, destination)
+		return ctrl.Result{RequeueAfter: poll}, nil
+	case !apierrors.IsNotFound(err):
 		return ctrl.Result{}, fmt.Errorf("delete ReplicationDestination %s/%s: %w", r.Namespace, destination, err)
 	}
 
@@ -191,10 +210,6 @@ func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		r.Recorder.Eventf(claim, nil, corev1.EventTypeNormal, "WaitingForMover", "Cleanup",
 			"VolumeRestore %s is gone; waiting for %s of ReplicationDestination %s to go before the cleanup finishes",
 			vrKey.Name, left, destination)
-		poll := r.MoverPoll
-		if poll <= 0 {
-			poll = defaultMoverPoll
-		}
 		return ctrl.Result{RequeueAfter: poll}, nil
 	}
 

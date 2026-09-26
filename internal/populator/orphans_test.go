@@ -140,6 +140,22 @@ func drain(recorder *events.FakeRecorder) []string {
 	}
 }
 
+// deleteDestinationPass runs the pass that deletes the ReplicationDestination
+// of stuckClaim, and checks that it requeues and goes no further. It drops
+// the events that pass recorded, so a test reads only those of the passes
+// after it.
+func deleteDestinationPass(t *testing.T, r *OrphanReconciler, recorder *events.FakeRecorder) {
+	t.Helper()
+	res, err := reconcileClaim(t, r)
+	if err != nil {
+		t.Fatalf("reconcile that deletes the destination: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("result of the pass that deletes the destination = %+v, want a requeue", res)
+	}
+	drain(recorder)
+}
+
 func assertLeftovers(t *testing.T, c client.Reader, want bool) {
 	t.Helper()
 	for _, obj := range leftovers() {
@@ -151,13 +167,16 @@ func assertLeftovers(t *testing.T, c client.Reader, want bool) {
 
 // A claim being deleted whose VolumeRestore is gone gets the destination, the
 // Secret copy and the prime deleted, then loses the library's finalizer, and
-// a Warning event says so. Before the reconciler the claim stayed Terminating
-// for good, because the library returns on the data source's NotFound before
-// its cleanup (lib-volume-populator v3.3.0 controller.go:661-671).
+// a Warning event says so. The destination goes in the first pass, and the
+// rest in the pass after it. Before the reconciler the claim stayed
+// Terminating for good, because the library returns on the data source's
+// NotFound before its cleanup (lib-volume-populator v3.3.0
+// controller.go:661-671).
 func TestAClaimWhoseVolumeRestoreIsGoneIsCleanedUp(t *testing.T) {
 	c := newOrphanClient(t, append(leftovers(), stuckClaim())...)
 	r, recorder := newOrphanReconciler(c, c)
 
+	deleteDestinationPass(t, r, recorder)
 	if _, err := reconcileClaim(t, r); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -240,7 +259,8 @@ func TestAFailedVolumeRestoreReadDeletesNothing(t *testing.T) {
 
 // X2: the destination is deleted, and while its mover pod is still there the
 // Secret copy, the prime and the finalizer stay and the claim is requeued
-// with a WaitingForMover event. Once the pod is gone the cleanup finishes.
+// with a WaitingForMover event naming the pod. Once the pod is gone the
+// cleanup finishes.
 func TestAMoverStillThereIsWaitedFor(t *testing.T) {
 	for _, phase := range []corev1.PodPhase{corev1.PodRunning, corev1.PodPending, corev1.PodSucceeded} {
 		t.Run(string(phase), func(t *testing.T) {
@@ -248,6 +268,7 @@ func TestAMoverStillThereIsWaitedFor(t *testing.T) {
 			c := newOrphanClient(t, append(leftovers(), stuckClaim(), pod)...)
 			r, recorder := newOrphanReconciler(c, c)
 
+			deleteDestinationPass(t, r, recorder)
 			res, err := reconcileClaim(t, r)
 			if err != nil {
 				t.Fatalf("reconcile: %v", err)
@@ -296,6 +317,7 @@ func TestAMoverJobWithoutAPodIsWaitedFor(t *testing.T) {
 	c := newOrphanClient(t, append(leftovers(), stuckClaim(), job)...)
 	r, recorder := newOrphanReconciler(c, c)
 
+	deleteDestinationPass(t, r, recorder)
 	res, err := reconcileClaim(t, r)
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -328,13 +350,57 @@ func TestAMoverJobWithoutAPodIsWaitedFor(t *testing.T) {
 	}
 }
 
+// X2: the pass that deletes the destination finishes nothing, even when it
+// sees no mover pod and no mover Job. VolSync may be in the middle of a
+// reconcile of that destination and create the Job after the look, so only
+// the next pass looks. The Secret copy, the prime and the finalizer stay, the
+// claim is requeued, and a WaitingForMover event names the destination.
+// Before, that pass went straight on to the rest of the cleanup.
+func TestThePassThatDeletesTheDestinationFinishesNothing(t *testing.T) {
+	c := newOrphanClient(t, append(leftovers(), stuckClaim())...)
+	r, recorder := newOrphanReconciler(c, c)
+
+	res, err := reconcileClaim(t, r)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("result = %+v, want a requeue", res)
+	}
+	objs := leftovers()
+	if present(t, c, objs[0]) {
+		t.Error("the ReplicationDestination is still there")
+	}
+	for _, obj := range objs[1:] {
+		if !present(t, c, obj) {
+			t.Errorf("%T %s deleted in the pass that deleted the destination", obj, obj.GetName())
+		}
+	}
+	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
+		t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
+	}
+	got := drain(recorder)
+	if len(got) != 1 || !strings.HasPrefix(got[0], "Normal WaitingForMover") || !strings.Contains(got[0], "deleted ReplicationDestination "+DestinationName(orphanClaimUID)) {
+		t.Errorf("events = %q, want one Normal WaitingForMover naming the deleted destination", got)
+	}
+
+	if _, err := reconcileClaim(t, r); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	assertLeftovers(t, c, false)
+	if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
+		t.Errorf("claim finalizers = %v, want %s removed", got, ClaimFinalizer)
+	}
+}
+
 // A pod of another claim's mover does not hold this claim.
 func TestAnotherClaimsMoverDoesNotBlock(t *testing.T) {
 	other := moverPod(corev1.PodRunning)
 	other.Name = "volsync-dst-restore-other-abcde"
 	other.Labels = map[string]string{"job-name": "volsync-dst-restore-other"}
 	c := newOrphanClient(t, append(leftovers(), stuckClaim(), other)...)
-	r, _ := newOrphanReconciler(c, c)
+	r, recorder := newOrphanReconciler(c, c)
+	deleteDestinationPass(t, r, recorder)
 	if _, err := reconcileClaim(t, r); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -400,7 +466,8 @@ func TestTheFinalizerPatchConverges(t *testing.T) {
 				return cl.Patch(ctx, obj, patch, opts...)
 			},
 		})
-		r, _ := newOrphanReconciler(c, inner)
+		r, recorder := newOrphanReconciler(c, inner)
+		deleteDestinationPass(t, r, recorder)
 		if _, err := reconcileClaim(t, r); !apierrors.IsConflict(err) {
 			t.Fatalf("reconcile = %v, want the conflict", err)
 		}
@@ -430,6 +497,7 @@ func TestTheFinalizerPatchConverges(t *testing.T) {
 			},
 		})
 		r, recorder := newOrphanReconciler(c, inner)
+		deleteDestinationPass(t, r, recorder)
 		if _, err := reconcileClaim(t, r); err == nil {
 			t.Fatal("reconcile returned no error for the lost response")
 		}
