@@ -282,6 +282,26 @@ func TestDropResponse(t *testing.T) {
 	}
 }
 
+// waitForHits waits until the rule behind h has applied to n requests. For a
+// held rule that means the requests have reached the hold, since the proxy
+// counts a request when it picks the rule, before it waits.
+//
+// It fails the test when a request finishes on done first, or when 5 seconds
+// pass.
+func waitForHits(t *testing.T, h *s3fault.Handle, n int, done <-chan error) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for h.Hits() < n {
+		select {
+		case err := <-done:
+			t.Fatalf("held request finished before it reached the hold: %v", err)
+		case <-deadline:
+			t.Fatalf("hits %d after 5s, want %d", h.Hits(), n)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 func TestHold(t *testing.T) {
 	f := newFixture(t)
 	c := f.client(t, f.front.URL, 1)
@@ -292,10 +312,11 @@ func TestHold(t *testing.T) {
 		_, err := get(t, c, "cluster/base/backup.info")
 		done <- err
 	}()
+	waitForHits(t, h, 1, done)
 	select {
 	case err := <-done:
 		t.Fatalf("held GET finished before the release: %v", err)
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond):
 	}
 	if h.Hits() != 1 {
 		t.Errorf("hits %d while held, want 1", h.Hits())
@@ -317,7 +338,7 @@ func TestHold(t *testing.T) {
 		_, err := get(t, c, "cluster/base/backup.info")
 		done <- err
 	}()
-	time.Sleep(100 * time.Millisecond)
+	waitForHits(t, h, 1, done)
 	h.Remove()
 	select {
 	case err := <-done:
