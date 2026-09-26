@@ -732,3 +732,35 @@ func TestAnEndingRunCountsItsStoppedMoverGoneOnlyAPollIntervalAfterTheDelete(t *
 		t.Errorf("replicas = %d a poll interval after the delete, want the 2 the app had", got)
 	}
 }
+
+// A run that times out while it waits for another run, and then waits for
+// its own stopped mover, ends with the wait it timed out on in its Ready
+// message, as its items carry it. The mover wait replaced the SourceBusy
+// condition in between, and the final message used to lose the wait.
+func TestATimedOutRunKeepsTheWaitItTimedOutOn(t *testing.T) {
+	run, destination := quiescedMidRestore()
+	wait := "BackupRun manual-notes holds Lease backup-controller-repo-secret-uid for notes-data; this run starts once that run has finished with it"
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonSourceBusy, wait)
+	pod := moverPod(destination.Name, corev1.PodRunning)
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination, pod)
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+
+	restoreStep(t, r)
+	if readRestoreRun(t, c).Status.Phase.Finished() {
+		t.Fatal("the run finished with its mover pod still there, want it waiting")
+	}
+	if err := c.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	done := readRestoreRun(t, c)
+	if readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut || !strings.Contains(readyMessage(done.Status.Conditions), "it was waiting: "+wait) {
+		t.Errorf("reason = %q, message = %q; want %s keeping the wait %q", readyReason(done.Status.Conditions), readyMessage(done.Status.Conditions),
+			backupv1alpha1.ReasonTimedOut, wait)
+	}
+	if item := done.Status.Items[0]; !strings.Contains(item.Message, "it was waiting: "+wait) {
+		t.Errorf("item message = %q, want it to keep the wait", item.Message)
+	}
+}

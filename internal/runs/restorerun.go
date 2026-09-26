@@ -782,7 +782,7 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // and Succeeded otherwise. A run past spec.timeout is aborted.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if deadline, over := r.overdue(run); over {
-		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, timedOutMessage(deadline, run.Status.Conditions))
+		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, restoreTimedOut(run, deadline))
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
 	// backup of that claim need not wait for the rest of the run. An item
@@ -940,6 +940,32 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "restoring")
 	return after(pollInterval, r.writeStatus(ctx, run))
+}
+
+// restoreTimedOut returns the Ready message of a run that work aborts
+// because its deadline passed.
+//
+// Parameters:
+//   - run is the RestoreRun. Its items and its Ready condition are read.
+//   - deadline is the run's deadline as overdue returns it.
+//
+// The first pass past the deadline builds the message with timedOutMessage,
+// which adds the SourceBusy wait the run was in, and abort puts it on every
+// unfinished item. When the run then waits for a mover it stopped, its Ready
+// condition says WaitingForShutdown, and a later pass would build the message
+// without that wait. So when an item already failed with a message for this
+// deadline, restoreTimedOut returns that message, without the note
+// clusterLeftDeleted adds to a Cluster item, and the run ends with the same
+// message its items carry.
+func restoreTimedOut(run *backupv1alpha1.RestoreRun, deadline time.Time) string {
+	base := timedOutMessage(deadline, nil)
+	for _, item := range run.Status.Items {
+		if item.Phase != backupv1alpha1.ItemFailed || !strings.HasPrefix(item.Message, base) {
+			continue
+		}
+		return strings.TrimSuffix(item.Message, ". "+clusterLeftDeleted(item.Name))
+	}
+	return timedOutMessage(deadline, run.Status.Conditions)
 }
 
 // restoreVolume moves one in-place volume restore a step further.
