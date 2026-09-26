@@ -1,0 +1,23 @@
+# The flavor and ClusterQueue the e2e tests queue into. As in prod: one flavor
+# with no node labels, quota counted in pods only, BestEffortFIFO, every
+# namespace allowed. The quota is higher than prod's 5 so parallel tests fit.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: default
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: e2e
+spec:
+  namespaceSelector: {}
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+  - coveredResources: ["pods"]
+    flavors:
+    - name: default
+      resources:
+      - name: pods
+        nominalQuota: 50

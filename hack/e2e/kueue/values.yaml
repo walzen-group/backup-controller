@@ -1,0 +1,41 @@
+# Values for the e2e Kueue install, mirroring prod's
+# (~/repos/infra/modules/cluster/kueue/opentofu/main.tf) in what the controller
+# depends on: opt-in namespaces labelled kueue-managed=true, only objects with a
+# queue-name label, the pod/job/deployment/statefulset integrations, quota in
+# pods with undeclared resources ignored, and waitForPodsReady at 5m.
+#
+# Left out: cert-manager (enableCertManager and internalCertManagement off in
+# prod; here Kueue manages its own webhook certificate), Prometheus metrics, and
+# prod's replica count and topology spread. The image is set by kueue.sh.
+controllerManager:
+  replicas: 1
+managerConfig:
+  controllerManagerConfigYaml: |-
+    apiVersion: config.kueue.x-k8s.io/v1beta2
+    kind: Configuration
+    health:
+      healthProbeBindAddress: :8081
+    metrics:
+      bindAddress: :8443
+    webhook:
+      port: 9443
+    leaderElection:
+      leaderElect: true
+      resourceName: c1f6bfd2.kueue.x-k8s.io
+    internalCertManagement:
+      enable: true
+    manageJobsWithoutQueueName: false
+    managedJobsNamespaceSelector:
+      matchLabels:
+        kueue-managed: "true"
+    integrations:
+      frameworks:
+      - batch/job
+      - pod
+      - deployment
+      - statefulset
+    resources:
+      quotaCheckStrategy: IgnoreUndeclared
+    waitForPodsReady:
+      timeout: 5m
+      blockAdmission: false

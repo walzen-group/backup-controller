@@ -1,0 +1,19 @@
+{
+  "kueue": {
+    "chart": {
+      "name": "kueue",
+      "repository": "oci://registry.k8s.io/kueue/charts/kueue",
+      "version": "0.19.5",
+      "digest": "sha256:570cdfce9f9928a8cf36ea814278e2e56651d2e7f2dac3363ebf3e0cda303bc2",
+      "file": "kueue-0.19.5.tgz",
+      "sha256": "212e1f5b013acde435f9d6a55682c815722184942b480c8780d683bee73c1fd9"
+    },
+    "image": {
+      "repository": "registry.k8s.io/kueue/kueue",
+      "tag": "v0.19.5",
+      "digest": "sha256:a55949705d7ab1fe38034da56c5af95deecec3da0abebb209a372f7a5c414a2d"
+    },
+    "namespace": "kueue-system",
+    "clusterQueue": "e2e"
+  }
+}
