@@ -81,11 +81,12 @@ func checkVolSyncUnsupported(t *testing.T, conditions []metav1.Condition, kind s
 	}
 }
 
-// A BackupRun on a cluster whose VolSync no longer serves v1alpha1 waits
-// with reason VolSyncUnsupported, whose message names ReplicationSource, the
-// version the controller needs and the version served, and never creates a
-// ReplicationSource or stops anything on a guess.
-func TestABackupWaitsWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
+// A BackupRun on a cluster whose VolSync no longer serves v1alpha1 ends
+// Failed with reason VolSyncUnsupported, whose message names
+// ReplicationSource, the version the controller needs and the version
+// served, and never creates a ReplicationSource or stops anything on a
+// guess.
+func TestABackupEndsWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
 	c := newClientWithCRDs(t, crdsWithVolSyncAt(t, "v1beta1"), backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment())
 	served := servingOnly(c)
@@ -100,14 +101,14 @@ func TestABackupWaitsWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
 	if len(run.Status.Quiesced) != 0 || replicasOf(t, c) != 2 {
 		t.Errorf("quiesced = %v, replicas = %d; want nothing stopped", run.Status.Quiesced, replicasOf(t, c))
 	}
-	if run.Status.Phase.Finished() {
-		t.Errorf("phase = %q, want the run waiting", run.Status.Phase)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Errorf("phase = %q, want Failed", run.Status.Phase)
 	}
 }
 
-// A RestoreRun on such a cluster waits the same way, naming
-// ReplicationDestination, and creates nothing.
-func TestARestoreWaitsWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
+// A RestoreRun on such a cluster that has created nothing ends the same
+// way, naming ReplicationDestination, and creates nothing.
+func TestARestoreEndsWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
 	c := newClientWithCRDs(t, crdsWithVolSyncAt(t, "v1beta1"),
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
 		claim(), volumeRestore(), repository())
@@ -120,8 +121,8 @@ func TestARestoreWaitsWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
 
 	run := readRestoreRun(t, c)
 	checkVolSyncUnsupported(t, run.Status.Conditions, "ReplicationDestination")
-	if run.Status.Phase.Finished() {
-		t.Errorf("phase = %q, want the run waiting", run.Status.Phase)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Errorf("phase = %q, want Failed", run.Status.Phase)
 	}
 }
 

@@ -46,14 +46,16 @@ loudly only when it meets a real incompatibility.
 | Kinds | How the controller finds the version | When the version it used is gone |
 | --- | --- | --- |
 | Flux Kustomization; Kueue Workload and LocalQueue; CloudNativePG Cluster and Backup; barman-cloud ObjectStore | served.Kind looks the kind up by group and kind in the manager's RESTMapper, which caches the answer, and every request goes out at that version (internal/served/served.go). | The API server answers "404 page not found". served.VersionGone turns that into an error the run retries, makes the mapper read discovery again, and the next pass uses the new version. The 404 never counts as a missing object. |
-| VolSync ReplicationSource and ReplicationDestination | The controller has Go types for volsync.backube/v1alpha1 only, from github.com/backube/volsync v0.16.0. | holdForVolSync (internal/runs/volsynccheck.go) holds every unfinished run that is not a database-only run, with Ready reason VolSyncUnsupported and a message that names each kind and the versions served. The run creates, deletes and stops nothing until v1alpha1 is served again or a controller release that knows the new version is installed. The controller also logs the message once at startup. |
+| VolSync ReplicationSource and ReplicationDestination | The controller has Go types for volsync.backube/v1alpha1 only, from github.com/backube/volsync v0.16.0. | volsyncUnsupported (internal/runs/volsynccheck.go) checks every unfinished run that is not a database-only run. A BackupRun ends Failed with Ready reason VolSyncUnsupported and a message that names each kind and the versions served; it starts the workloads it stopped first, since that needs no VolSync object. A RestoreRun ends the same way once no mover of its own can write, and holds with that reason while its ReplicationDestination, the mover's Job or a pod of it is still there (see [restores](restores.md#when-volsync-stops-serving-v1alpha1)). No run creates or deletes a VolSync object until v1alpha1 is served again or a controller release that knows the new version is installed. The controller also logs the message once at startup. |
+
 | Core Kubernetes kinds (apps/v1, v1, batch/v1, coordination/v1, apiextensions.k8s.io/v1) | Fixed. These versions are GA and Kubernetes keeps serving them. | served.Client and served.Reader turn the 404 into a retried error for every kind, typed ones included. |
 
 VolSync has published only v1alpha1, in every tag up to v0.16.0 and on its
 main branch as of 2026-09-26 (api/ holds v1alpha1 alone, and the CRDs under
 config/crd/bases serve that version only). The controller therefore has no
-other version to fall back to. It waits, and it never sends a request at a
-version it guessed.
+other version to fall back to. It ends or holds the run as the table says, and
+reads a ReplicationDestination at the served version only to learn whether it
+exists. It never sends a request at a version it guessed.
 
 Every create, update and patch the controller sends carries
 fieldValidation=Strict (clientOptions in cmd/backup-controller/main.go).
@@ -246,7 +248,7 @@ waits ends at the run's timeout, so none of them can report success.
 | Flux | Kustomization spec.suspend | setSuspend and planStop, internal/runs/quiesce.go | Loud: setSuspend reads the value back from the patch's answer and fails when it differs from the value it set. |
 | Kueue | Workload status.conditions Admitted and PodsReady | admitted and markPodsReady, internal/runs/kueue.go | Legitimate while the Workload waits in its queue. Loud once the run's timeout has passed since its creation: awaitAdmission fails the run naming Kueue, the Workload and the LocalQueue. |
 | Kueue | LocalQueue metadata.name | localQueue, internal/runs/kueue.go | Legitimate: a namespace with no LocalQueue runs without admission. Kueue 0.19.5 serves v1beta1 and v1beta2, and every field the controller uses is the same in both. |
-| VolSync | ReplicationSource status.lastSyncStartTime | inUse, internal/runs/sources.go; syncGoesOn, internal/runs/backuprun.go | Legitimate: no sync is running. The field comes from the v1alpha1 Go type, and a rename would arrive as a new version, which holdForVolSync catches. |
+| VolSync | ReplicationSource status.lastSyncStartTime | inUse, internal/runs/sources.go; syncGoesOn, internal/runs/backuprun.go | Legitimate: no sync is running. The field comes from the v1alpha1 Go type, and a rename would arrive as a new version, which volsyncUnsupported catches. |
 | VolSync | ReplicationSource and ReplicationDestination status.lastManualSync | lastManual, internal/runs/trigger.go; internal/runs/restorerun.go; internal/volsync/volsync.go | Legitimate: VolSync writes it only when a manual sync completes. A run waits for its own tag there. |
 | VolSync | status.latestMoverStatus.result and .logs | internal/runs/trigger.go, moverpick.go, restorerun.go; internal/volsync/volsync.go | Legitimate: no mover has finished yet. |
 | VolSync | ReplicationSource status.restic.lastUnlocked | internal/runs/trigger.go | Legitimate: the next mover runs restic unlock again, which removes only stale locks. |

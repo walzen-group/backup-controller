@@ -89,9 +89,11 @@ func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // spec.ttlSecondsAfterFinished has passed. Whenever the Ready reason changes
 // during a reconcile, Reconcile records an event on the run.
 //
-// An unfinished run with no spec.database, being deleted or not, first goes
-// through holdForVolSync, which holds it with reason VolSyncUnsupported while
-// VolSync serves its kinds only at a version other than v1alpha1.
+// An unfinished run with no spec.database that is not being deleted first
+// goes through volsyncUnsupported. While VolSync serves its kinds only at a
+// version other than v1alpha1, the run ends through endForVolSync with
+// reason VolSyncUnsupported, which gives the app back: that needs no
+// VolSync object. A run being deleted goes to finalize as usual.
 func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.BackupRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -99,13 +101,12 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	before := readyReason(run.Status.Conditions)
 	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Backup") }()
-	// A run that may touch VolSync objects waits, changing nothing, while
-	// VolSync serves its kinds only at a version this controller has no
-	// Go types for (see holdForVolSync). A database-only run needs no
-	// VolSync object and goes on.
-	if !run.Status.Phase.Finished() && run.Spec.Database == "" {
-		if held, result, err := holdForVolSync(ctx, r.Client, run, &run.Status.Conditions, run.Generation); held {
-			return result, err
+	// A run that may touch VolSync objects can't go on while VolSync serves
+	// its kinds only at a version this controller has no Go types for, and
+	// ends. A database-only run needs no VolSync object and goes on.
+	if !run.Status.Phase.Finished() && run.DeletionTimestamp.IsZero() && run.Spec.Database == "" {
+		if message := volsyncUnsupported(r.RESTMapper()); message != "" {
+			return ctrl.Result{}, r.endForVolSync(ctx, run, message)
 		}
 	}
 	if !run.DeletionTimestamp.IsZero() {

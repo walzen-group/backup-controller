@@ -277,7 +277,7 @@ func (d *fluxDiscovery) mapper(t *testing.T) meta.RESTMapper {
 }
 
 // volsyncGV is the VolSync API version the discovery endpoint serves beside
-// Flux, as every cluster the controller runs on does. holdForVolSync looks
+// Flux, as every cluster the controller runs on does. volsyncUnsupported looks
 // it up on every pass.
 var volsyncGV = volsyncv1alpha1.GroupVersion
 

@@ -145,19 +145,19 @@ const (
 	// when it first reports this.
 	ReasonReleaseFailed = "ReleaseFailed"
 
-	// ReasonVolSyncUnsupported reports a BackupRun or RestoreRun the
-	// controller holds where it is, because the API server does not serve
-	// VolSync's ReplicationSource or ReplicationDestination at
-	// volsync.backube/v1alpha1, the one version this controller reads and
-	// writes, while it serves the kind at another version. The message names
-	// the kind, v1alpha1 and the versions served. The run changes nothing
-	// while it waits: it creates no VolSync object, stops no workload, and
-	// gives back nothing it cannot confirm is safe to give back, since it can
-	// read neither its movers nor their clones. It checks again on every
-	// reconcile, and goes on by itself once v1alpha1 is served again or a
-	// controller release that reads the new version is installed. A workload
-	// the run stopped stays at 0 replicas meanwhile; the run's
-	// status.quiesced lists each one with the replica count it is owed.
+	// ReasonVolSyncUnsupported reports a BackupRun or RestoreRun that met
+	// an API server that does not serve VolSync's ReplicationSource or
+	// ReplicationDestination at volsync.backube/v1alpha1, the one version
+	// this controller reads and writes, while it serves the kind at another
+	// version. The message names the kind, v1alpha1 and the versions served.
+	// Giving the app back needs no VolSync object, so a BackupRun ends
+	// Failed with this reason, after it starts the workloads it stopped. A
+	// RestoreRun ends the same way once no mover of its own can write, and
+	// until then holds with Ready False and this reason, naming the
+	// ReplicationDestination or the mover's Job or pod it waits for: it can
+	// neither stop that mover nor read how it ended, and the app stays
+	// stopped so nothing reads a half-restored claim. A person who deletes
+	// the ReplicationDestination lets the run end.
 	ReasonVolSyncUnsupported = "VolSyncUnsupported"
 )
 

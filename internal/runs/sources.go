@@ -251,8 +251,8 @@ func positiveCount(value string) (int32, error) {
 // A missing status or lastSyncStartTime is a legitimate state: no sync has
 // started, or the last one finished. The field comes from VolSync's
 // v1alpha1 Go type, and the controller reads a source only while the API
-// server serves v1alpha1 (see holdForVolSync), whose schema VolSync keeps:
-// a rename would be a new API version, which holds the run instead.
+// server serves v1alpha1 (see volsyncUnsupported), whose schema VolSync keeps:
+// a rename would be a new API version, which ends or holds the run instead.
 func inUse(source *volsyncv1alpha1.ReplicationSource) bool {
 	return busy(source) || (source.Status != nil && source.Status.LastSyncStartTime != nil)
 }
