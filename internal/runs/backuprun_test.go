@@ -1035,7 +1035,7 @@ func TestADatabaseThatCannotStartDoesNotHoldTheApp(t *testing.T) {
 		t.Fatal("no Backup after the webhook came back")
 	}
 	for _, item := range readBackupRun(t, c).Status.Items {
-		if item.Kind == "Cluster" && (item.Phase != backupv1alpha1.ItemRunning || item.Message != "") {
+		if item.Kind == "Cluster" && (item.Phase != backupv1alpha1.ItemRunning || item.Message != "" || item.LastStartError != "") {
 			t.Errorf("database item = %+v, want it Running with the old error cleared", item)
 		}
 	}
@@ -1250,12 +1250,42 @@ func TestAFailedMoverFailsTheItem(t *testing.T) {
 	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "unable to open config file") {
 		t.Errorf("item = %+v, want it Failed with the mover's logs", item)
 	}
+	if item := run.Status.Items[0]; item.Reason != backupv1alpha1.ItemReasonMoverFailed {
+		t.Errorf("reason = %q, want MoverFailed", item.Reason)
+	}
 	source := &volsyncv1alpha1.ReplicationSource{}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: claimN}, source); err != nil {
 		t.Fatalf("the source is gone (%v); deleting it kills the mover VolSync has already started again, and restic's lock stays behind", err)
 	}
 	if got := manualTag(source); got != run.Status.Items[0].Trigger {
 		t.Errorf("source trigger = %q, want the run's %q left for VolSync to retry", got, run.Status.Items[0].Trigger)
+	}
+}
+
+// A source whose tag VolSync reports completed while its latest mover
+// failed fails the item with the mover's logs and reason MoverFailed.
+func TestACompletedTagWithAFailedMoverFailsTheItem(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore(), repository())
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // start
+
+	source := &volsyncv1alpha1.ReplicationSource{}
+	get(t, c, ns, claimN, source)
+	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{
+		LastManualSync:    manualTag(source),
+		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "Fatal: unable to open config file"},
+	}
+	if err := c.Status().Update(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	step(t, r)
+
+	item := readBackupRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonMoverFailed ||
+		!strings.Contains(item.Message, "unable to open config file") {
+		t.Errorf("item = %+v, want it Failed with reason MoverFailed and the mover's logs", item)
 	}
 }
 
@@ -1457,9 +1487,12 @@ func TestAFailedReadWhileStartingAnItemIsRetried(t *testing.T) {
 	if reason := readyReason(run.Status.Conditions); reason != backupv1alpha1.ReasonRetrying {
 		t.Errorf("Ready reason = %s after a failed read, want Retrying", reason)
 	}
+	if got := run.Status.Items[0].LastStartError; !strings.Contains(got, "etcd leader changed") {
+		t.Errorf("lastStartError = %q after a failed start, want the error", got)
+	}
 	r.Reader = reader
 	step(t, r)
-	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Message != "" {
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Message != "" || item.LastStartError != "" {
 		t.Errorf("item = %+v, want it Running with the old error cleared", item)
 	}
 }
@@ -1493,6 +1526,9 @@ func TestATimedOutRunKeepsAnItemsLastStartError(t *testing.T) {
 	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "had not finished by") ||
 		!strings.Contains(item.Message, "; last error: ") || !strings.Contains(item.Message, "etcd leader changed") {
 		t.Errorf("item = %+v, want it Failed naming the timeout and, after \"; last error: \", the start error", item)
+	}
+	if item.Reason != backupv1alpha1.ItemReasonTimedOut || !strings.Contains(item.LastStartError, "etcd leader changed") {
+		t.Errorf("reason = %q, lastStartError = %q; want TimedOut and the start error kept", item.Reason, item.LastStartError)
 	}
 }
 

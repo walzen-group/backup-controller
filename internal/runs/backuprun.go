@@ -94,6 +94,10 @@ func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // version other than v1alpha1, the run ends through endForVolSync with
 // reason VolSyncUnsupported, which gives the app back: that needs no
 // VolSync object. A run being deleted goes to finalize as usual.
+//
+// A run that recorded status.ending has decided to end, and every later pass
+// only finishes it with that reason and message (see finish), also one that
+// retries a failed restart after the run timed out.
 func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.BackupRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -120,6 +124,9 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err := r.Update(ctx, run); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add the finalizer to BackupRun %s/%s: %w", run.Namespace, run.Name, err)
 		}
+	}
+	if ending := run.Status.Ending; ending != nil {
+		return ctrl.Result{}, r.finish(ctx, run, ending.Reason, ending.Message)
 	}
 
 	switch run.Status.Phase {
@@ -372,13 +379,16 @@ func (r *BackupRunReconciler) awaitAdmission(ctx context.Context, run *backupv1a
 // workloads marked backup.wlz.li/quiesce and does nothing else. Later passes
 // start no item until every pod of those workloads is gone.
 //
-// work then starts every Pending item. An item that fails to start with an
-// error other than a refusal stays Pending with "not started yet: " and the
-// error in its message, the Ready condition takes reason Retrying and names
-// each such item, and the pass goes on; the next pass tries the item again.
-// Items that wait for another run are named as well: the Retrying message
-// names every such wait, and without a retry the run waits with reason
-// SourceBusy and a message that names every wait.
+// work then starts every Pending item (see startPending). An item that
+// fails to start with an error other than a refusal stays Pending and
+// records the error in status.items[].lastStartError, the Ready condition
+// takes reason Retrying and names each such item, and the pass goes on; the
+// next pass tries the item again. Items that wait for another run are named
+// as well: the Retrying message names every such wait, and without a retry
+// the run waits with reason SourceBusy and a message that names every wait
+// and nothing else. A note on a Running item, such as a Backup phase
+// CloudNativePG 1.30 does not have, goes into a Running or Retrying message
+// and onto the item's own message.
 //
 // Once every volume's clone is cut, work records the time of the pass in
 // status.restartedAt with status.restartPending set, and writes the status.
@@ -413,7 +423,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, err
 	}
 	if over {
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, backupTimedOut(run, deadline))
+		return ctrl.Result{}, r.timeOut(ctx, run, deadline)
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
 	// restore of that claim need not wait for the rest of the run. This is
@@ -476,26 +486,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	// giving keeps its place and is tried again on the next pass. The pass
 	// goes on, because the restart below looks only at volume items, and a
 	// database whose Backup cannot be created must not keep the app down.
-	var waits []string
-	var retrying []string
-	for i := range run.Status.Items {
-		item := &run.Status.Items[i]
-		if item.Phase != backupv1alpha1.ItemPending {
-			continue
-		}
-		message, err := r.startItem(ctx, run, item)
-		if err != nil {
-			item.Message = notStartedYet + err.Error()
-			retrying = append(retrying, fmt.Sprintf("%s %s: %v", item.Kind, item.Name, err))
-			continue
-		}
-		if strings.HasPrefix(item.Message, notStartedYet) {
-			item.Message = ""
-		}
-		if message != "" {
-			waits = append(waits, message)
-		}
-	}
+	waits, retrying := r.startPending(ctx, run)
 
 	restart := false
 	if run.Spec.All && run.Status.RestartedAt == nil && r.clonesCut(ctx, run) {
@@ -557,7 +548,9 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		}
 	case len(waits) > 0:
 		// Every wait is named, so one item's wait does not hide another's.
-		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, strings.Join(append(waits, notes...), "; ")))
+		// A note stays on its own item's message, so a timeout that copies
+		// this wait does not repeat it.
+		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, strings.Join(waits, "; ")))
 	}
 	if len(notes) > 0 {
 		// A Backup in a phase that needs naming says why the run goes on.
@@ -816,44 +809,44 @@ func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1al
 	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, vr.Spec.Repository)
 }
 
-// backupTimedOut returns the Ready message of a run that work aborts because
-// its deadline passed.
+// startPending tries to start every Pending item of the run, and returns
+// what keeps the items that stay Pending from starting.
 //
 // Parameters:
-//   - run is the BackupRun. Its items and its Ready condition are read.
-//   - deadline is the run's deadline as overdue returns it.
+//   - run is the admitted BackupRun. Its items are changed in place, and the
+//     caller writes the status.
 //
-// The first pass past the deadline builds the message with timedOutMessage,
-// which adds the SourceBusy wait the run was in, and abort puts it on every
-// unfinished item. When that pass cannot give the app back, releaseFailed
-// replaces the SourceBusy condition with RestartFailed or ReleaseFailed, and
-// a later pass would build the message without the wait. So when an item
-// already failed with a message for this deadline, backupTimedOut returns
-// that message without the parts abort added for the item alone: the last
-// start error of a Pending item ("; last error: ") and the sentence
-// runningNote adds for a Running one. Of several such items it returns the
-// shortest result, and with none it builds the message afresh.
-func backupTimedOut(run *backupv1alpha1.BackupRun, deadline time.Time) string {
-	base := timedOutMessage(deadline, nil)
-	found := ""
-	for _, item := range run.Status.Items {
-		if item.Phase != backupv1alpha1.ItemFailed || !strings.HasPrefix(item.Message, base) {
+// It returns the waits, one sentence for each item that waits for another
+// run (see startItem), and the retries, one line for each item whose start
+// failed with an error a later pass may not get, naming the item and the
+// error.
+//
+// An item whose start fails that way records the error in
+// status.items[].lastStartError, and its message says it has not started
+// yet and why. Before each attempt, startPending clears what an earlier
+// failed attempt left on the item, so an item that starts, waits, or is
+// refused carries no stale error.
+func (r *BackupRunReconciler) startPending(ctx context.Context, run *backupv1alpha1.BackupRun) (waits, retrying []string) {
+	for i := range run.Status.Items {
+		item := &run.Status.Items[i]
+		if item.Phase != backupv1alpha1.ItemPending {
 			continue
 		}
-		message := item.Message
-		for _, tail := range []string{"; last error: ", ". VolSync keeps retrying the sync ", ". VolSync goes on with the sync ", ". CloudNativePG reports status.phase "} {
-			if at := strings.Index(message[len(base):], tail); at >= 0 {
-				message = message[:len(base)+at]
-			}
+		if item.LastStartError != "" {
+			item.LastStartError, item.Message = "", ""
 		}
-		if found == "" || len(message) < len(found) {
-			found = message
+		wait, err := r.startItem(ctx, run, item)
+		if err != nil {
+			item.LastStartError = err.Error()
+			item.Message = "not started yet: " + item.LastStartError
+			retrying = append(retrying, fmt.Sprintf("%s %s: %v", item.Kind, item.Name, err))
+			continue
+		}
+		if wait != "" {
+			waits = append(waits, wait)
 		}
 	}
-	if found != "" {
-		return found
-	}
-	return timedOutMessage(deadline, run.Status.Conditions)
+	return waits, retrying
 }
 
 // startItem starts the backup of one Pending item and sets the item's phase.
@@ -992,9 +985,9 @@ func cloneName(claim string) string { return "volsync-" + claim + "-src" }
 //   - now is the time of the pass, which becomes status.restartedAt.
 //
 // A Pending item fails with a message that says it never started, with the
-// error of its last start attempt when it has one. A Running item whose clone
-// is not cut fails with a message that names the missing clone. A Running
-// item whose clone is cut goes on. A Running item's message also says what
+// error of its last start attempt (status.items[].lastStartError) when it
+// has one. A Running item whose clone is not cut fails with a message that
+// names the missing clone. A Running item whose clone is cut goes on. A Running item's message also says what
 // data a snapshot of the sync VolSync goes on with holds (see syncGoesOn).
 // Afterwards clonesCut is true, so the
 // caller's restart path records status.restartedAt and starts the workloads.
@@ -1004,15 +997,15 @@ func (r *BackupRunReconciler) giveUpUncut(ctx context.Context, run *backupv1alph
 	at := now.UTC().Format(time.RFC3339)
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
-		if item.Kind != "ReplicationSource" {
+		if item.Kind != backupv1alpha1.ItemKindSource {
 			continue
 		}
 		switch item.Phase {
 		case backupv1alpha1.ItemPending:
 			message := fmt.Sprintf("not started before the workloads were given back at %s, when the %s limit of %s ran out, so the clone %s was never cut",
 				at, backupv1alpha1.AnnotationMaxQuiesce, limit, cloneName(item.Name))
-			if last, ok := strings.CutPrefix(item.Message, notStartedYet); ok {
-				message += ": " + last
+			if item.LastStartError != "" {
+				message += ": " + item.LastStartError
 			}
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 		case backupv1alpha1.ItemRunning:
@@ -1102,14 +1095,17 @@ func (r *BackupRunReconciler) syncGoesOn(ctx context.Context, run *backupv1alpha
 // item stays Running until that rewrite succeeds.
 //
 // A database item follows the phase of its CloudNativePG Backup (see
-// backupResult).
+// collectDatabase).
 //
 // It returns a sentence for the run's Ready message while the item waits in
 // a Backup phase that needs naming, such as one CloudNativePG 1.30 does not
 // have, and "" otherwise.
+//
+// A volume item that fails because its mover failed records reason
+// MoverFailed.
 func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) string {
 	switch item.Kind {
-	case "ReplicationSource":
+	case backupv1alpha1.ItemKindSource:
 		source := &volsyncv1alpha1.ReplicationSource{}
 		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source); err != nil {
 			return ""
@@ -1127,12 +1123,12 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 					}
 					message = note + " " + message
 				}
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+				failBackupItem(item, refuse(backupv1alpha1.ItemReasonMoverFailed, "%s", message))
 			}
 			return ""
 		}
 		if source.Status.LatestMoverStatus != nil && source.Status.LatestMoverStatus.Result == volsyncv1alpha1.MoverResultFailed {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, moverFailure(source, source.Status.LatestMoverStatus.Logs)
+			failBackupItem(item, refuse(backupv1alpha1.ItemReasonMoverFailed, "%s", moverFailure(source, source.Status.LatestMoverStatus.Logs)))
 			return ""
 		}
 		snapshot, empty := moverOutcome(source)
@@ -1162,17 +1158,40 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 			item.SnapshotTime = at
 		}
 
-	case "Cluster":
-		done, ok, message, err := backupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
-		switch {
-		case err != nil:
-		case !done:
-			return message
-		case ok:
-			item.Phase = backupv1alpha1.ItemSucceeded
-		default:
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
-		}
+	case backupv1alpha1.ItemKindCluster:
+		return r.collectDatabase(ctx, run, item)
+	}
+	return ""
+}
+
+// collectDatabase records the result of a Running database item once its
+// CloudNativePG Backup has one (see backupResult).
+//
+// Parameters:
+//   - run is the BackupRun, for its namespace.
+//   - item is the Running database item, which names its Backup. It is
+//     changed in place.
+//
+// It returns a sentence for the run's Ready message while the Backup waits
+// in a phase that needs naming, such as one CloudNativePG 1.30 does not
+// have, and "" otherwise.
+//
+// While the Backup runs, the item's message is that sentence, so it names
+// the phase on the item itself; the SourceBusy message leaves it out (see
+// work). A completed Backup makes the item Succeeded with no message, and a
+// failed one makes it Failed with CloudNativePG's error. A failed read
+// leaves the item as it was, for the next pass.
+func (r *BackupRunReconciler) collectDatabase(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) string {
+	done, ok, message, err := backupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
+	switch {
+	case err != nil:
+	case !done:
+		item.Message = message
+		return message
+	case ok:
+		item.Phase, item.Message = backupv1alpha1.ItemSucceeded, ""
+	default:
+		item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 	}
 	return ""
 }
@@ -1278,65 +1297,126 @@ func (r *BackupRunReconciler) runningNote(ctx context.Context, run *backupv1alph
 	return note
 }
 
-// abort ends a run early as Failed. It marks every Pending or Running item as
-// Failed with the given message, then calls finish, which starts the stopped
-// workloads again and deletes the run's Workload so the queue gets its slot
-// back.
+// abort ends a run early as Failed. It fails every Pending or Running item
+// with the given message (see failUnfinished), then calls finish, which
+// records the ending, starts the stopped workloads again and deletes the
+// run's Workload so the queue gets its slot back.
 //
 // Parameters:
 //   - reason is the Ready reason the run ends with: ReasonFailed for a run
-//     that hit something it can't get past, such as its timeout, and
-//     ReasonInvalid for a run whose targets it refuses.
-//   - message is the Ready message, and each unfinished item's message.
+//     that hit something it can't get past, ReasonInvalid for a run whose
+//     targets it refuses, and ReasonVolSyncUnsupported for a VolSync this
+//     controller cannot use.
+//   - message is the Ready message, and the start of each unfinished item's
+//     message.
 //
-// A Pending item whose last start attempt failed keeps that error: its
-// message becomes the given message, "; last error: " and the error. A
-// Running volume item's message also says what data a snapshot of the sync
-// VolSync goes on with holds (see syncGoesOn), and a Running database
-// item's message names a Backup phase CloudNativePG 1.30 does not have
-// (see runningNote).
+// The items it fails record no reason; the run's ending says why. A run
+// past its deadline ends through timeOut instead.
 func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
-	for i := range run.Status.Items {
-		item := &run.Status.Items[i]
-		if item.Phase != backupv1alpha1.ItemPending && item.Phase != backupv1alpha1.ItemRunning {
-			continue
-		}
-		failed := message
-		if last, ok := strings.CutPrefix(item.Message, notStartedYet); ok && item.Phase == backupv1alpha1.ItemPending {
-			failed += "; last error: " + last
-		}
-		if item.Phase == backupv1alpha1.ItemRunning {
-			if note := r.runningNote(ctx, run, *item); note != "" {
-				failed += ". " + note
-			}
-		}
-		item.Phase, item.Message = backupv1alpha1.ItemFailed, failed
-	}
+	r.failUnfinished(ctx, run, message, func(item *backupv1alpha1.BackupItem, text string) {
+		item.Phase, item.Message = backupv1alpha1.ItemFailed, text
+	})
 	return r.finish(ctx, run, reason, message)
 }
 
-// finish ends the run. It starts any workload the run still holds stopped,
-// deletes the run's Workload, and records the terminal phase: Succeeded when
-// reason is ReasonSucceeded and Failed for any other reason. It sets the
-// Ready condition to reason and message, records status.completedAt, and
-// removes the finalizer.
+// timeOut ends a run whose deadline has passed, as Failed.
 //
-// When release fails, finish records nothing of the ending: releaseFailed
-// reports the failure on the run with reason RestartFailed or ReleaseFailed,
-// and the error it returns makes the reconcile run again. The run stays
-// unfinished until release succeeds.
+// Parameters:
+//   - run is the BackupRun past its deadline, with no ending recorded yet.
+//   - deadline is the run's deadline as overdue returns it.
+//
+// It returns what finish returns: nil once the run has ended, or the error
+// of a restart or release that failed, for a retry.
+//
+// The message is timedOutMessage's, which names the SourceBusy wait the run
+// was in. Every Pending or Running item fails with reason TimedOut and that
+// message (see failUnfinished), and finish records the message in
+// status.ending in the same status write. A later pass, such as one that
+// retries a failed restart after releaseFailed replaced the SourceBusy
+// condition, ends with the recorded ending and builds no message again.
+func (r *BackupRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.BackupRun, deadline time.Time) error {
+	message := timedOutMessage(deadline, run.Status.Conditions)
+	r.failUnfinished(ctx, run, message, func(item *backupv1alpha1.BackupItem, text string) {
+		failBackupItem(item, refuse(backupv1alpha1.ItemReasonTimedOut, "%s", text))
+	})
+	return r.finish(ctx, run, backupv1alpha1.ReasonFailed, message)
+}
+
+// failUnfinished fails every Pending or Running item of a run that ends
+// early, each with a message that starts with the run's.
+//
+// Parameters:
+//   - run is the BackupRun that ends. Its items are changed in place, and
+//     the caller writes the status.
+//   - message is the run's Ready message.
+//   - fail sets an item Failed with its message; the caller decides which
+//     reason the item records.
+//
+// A Pending item whose last start attempt failed adds "; last error: " and
+// status.items[].lastStartError to the message. A Running volume item adds
+// what data a snapshot of the sync VolSync goes on with holds (see
+// syncGoesOn), and a Running database item names a Backup phase
+// CloudNativePG 1.30 does not have (see runningNote).
+func (r *BackupRunReconciler) failUnfinished(ctx context.Context, run *backupv1alpha1.BackupRun, message string,
+	fail func(item *backupv1alpha1.BackupItem, text string)) {
+	for i := range run.Status.Items {
+		item := &run.Status.Items[i]
+		text := message
+		switch item.Phase {
+		case backupv1alpha1.ItemPending:
+			if item.LastStartError != "" {
+				text += "; last error: " + item.LastStartError
+			}
+		case backupv1alpha1.ItemRunning:
+			if note := r.runningNote(ctx, run, *item); note != "" {
+				text += ". " + note
+			}
+		default:
+			// An item that has ended keeps how it ended.
+			continue
+		}
+		fail(item, text)
+	}
+}
+
+// finish ends the run. It records the ending, starts any workload the run
+// still holds stopped, deletes the run's Workload, and records the terminal
+// phase: Succeeded when the ending's reason is ReasonSucceeded and Failed
+// for any other reason. It sets the Ready condition to the ending's reason
+// and message, records status.completedAt, and removes the finalizer.
+//
+// Parameters:
+//   - reason and message are the Ready reason and message the run ends
+//     with. A run that already recorded status.ending ends with that one,
+//     and these are not used.
+//
+// It returns nil once the run has ended, the error of a release that
+// failed, or the error of a status write.
+//
+// finish records reason and message in status.ending before release, so
+// every status write from then on carries them, and the items the caller
+// failed go in the same write. When release fails, releaseFailed reports
+// the failure on the run with reason RestartFailed or ReleaseFailed and
+// writes the status, ending included, and the error it returns makes the
+// reconcile run again. That pass finds status.ending and calls finish with
+// it (see Reconcile), so the run ends as it decided to, whatever it waited
+// for when it decided. The run stays unfinished until release succeeds.
 func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
+	if run.Status.Ending == nil {
+		run.Status.Ending = &backupv1alpha1.RunEnding{Reason: reason, Message: message}
+	}
+	ending := *run.Status.Ending
 	if err := r.release(ctx, run); err != nil {
 		return r.releaseFailed(ctx, run, err, false)
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
-	if reason != backupv1alpha1.ReasonSucceeded {
+	if ending.Reason != backupv1alpha1.ReasonSucceeded {
 		run.Status.Phase = backupv1alpha1.RunPhaseFailed
 	}
 	run.Status.CompletedAt = &now
 	run.Status.Workload = ""
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, reason, message)
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, ending.Reason, ending.Message)
 	if err := r.writeStatus(ctx, run); err != nil {
 		return err
 	}
@@ -1514,11 +1594,6 @@ func (r *BackupRunReconciler) writeStatus(ctx context.Context, run *backupv1alph
 	}
 	return nil
 }
-
-// notStartedYet prefixes the message of a Pending item whose start failed
-// with an error the run tries again. A later pass that starts the item, or
-// leaves it waiting for another run, removes the message.
-const notStartedYet = "not started yet: "
 
 // anyPending reports whether any item is still Pending, which means the run
 // has not started it yet.

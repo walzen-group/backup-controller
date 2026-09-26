@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +15,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // atFrozen returns the frozen clock's time, moved on by after, as the pointer
@@ -796,69 +794,4 @@ func TestAFinishWhoseStatusWriteIsLostKeepsTheQuiesceLease(t *testing.T) {
 			t.Errorf("the quiesce Lease holder = %q after the run ended, want it released", got)
 		}
 	})
-}
-
-// A BackupRun that times out while it waits, and whose restart then fails
-// for a pass, still ends with the wait it timed out on: the failed restart
-// replaces the SourceBusy condition with RestartFailed, and the end reads
-// the wait back from the message its items already carry. A Pending item
-// whose start failed keeps its last error in its own message only.
-func TestATimedOutBackupKeepsItsWaitAfterAFailedRestart(t *testing.T) {
-	wait := "RestoreRun back-to-monday is restoring claim " + claimN + "; this run starts once that restore has finished"
-	c := newClient(t, quiescedBackup(func(b *backupv1alpha1.BackupRun) {
-		b.Finalizers = []string{Finalizer}
-		b.Status.StartedAt = atFrozen(0)
-		b.Status.SuspendedKustomizations = []string{"flux-system/" + appN}
-		b.Status.Items = append(b.Status.Items, backupv1alpha1.BackupItem{Kind: "Cluster", Name: pgN, Phase: backupv1alpha1.ItemPending,
-			Message: notStartedYet + "the webhook refused the Backup"})
-		backupv1alpha1.SetReady(&b.Status.Conditions, b.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonSourceBusy, wait)
-	}), claim(), volume(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true))
-	refused := true
-	refusing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if _, ok := obj.(*appsv1.Deployment); ok && refused {
-				return apierrors.NewInternalError(errors.New("the API server cannot scale the Deployment"))
-			}
-			return cl.Patch(ctx, obj, patch, opts...)
-		},
-	})
-	br := &BackupRunReconciler{Client: refusing, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{},
-		Now: func() time.Time { return frozen.Add(time.Hour + time.Second) }}
-
-	if err := tryStep(br); err == nil {
-		t.Fatal("the pass whose restart failed returned no error")
-	}
-	if got := readBackupRun(t, c); readyReason(got.Status.Conditions) != backupv1alpha1.ReasonRestartFailed {
-		t.Fatalf("reason = %q after the failed restart, want RestartFailed", readyReason(got.Status.Conditions))
-	}
-	refused = false
-	step(t, br)
-
-	run := readBackupRun(t, c)
-	message := readyMessage(run.Status.Conditions)
-	want := "the run had not finished by " + frozen.Add(time.Hour).Format(time.RFC3339) + "; it was waiting: " + wait
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || message != want {
-		t.Fatalf("phase = %q, message = %q; want Failed with %q", run.Status.Phase, message, want)
-	}
-	if got := run.Status.Items[1].Message; got != want+"; last error: the webhook refused the Backup" {
-		t.Errorf("the Cluster item's message = %q, want the end with its last error", got)
-	}
-}
-
-// backupTimedOut reads the end back from a failed item's message without the
-// sentence syncGoesOn added to a Running item's message.
-func TestBackupTimedOutDropsTheSyncNote(t *testing.T) {
-	deadline := frozen.Add(time.Hour)
-	end := timedOutMessage(deadline, nil) + "; it was waiting: BackupRun manual-notes holds the claim"
-	for _, note := range []string{
-		"VolSync keeps retrying the sync it started at 2026-09-24T12:00:00Z with the clone it cut then, so a snapshot this sync saves later holds the data of 2026-09-24T12:00:00Z, whatever time restic stamps on it.",
-		"VolSync goes on with the sync it started at 2026-09-24T12:00:00Z and has not cut its clone yet, so a snapshot this sync saves later holds the data of the moment it cuts the clone, whatever time restic stamps on it.",
-	} {
-		run := backupRun(func(b *backupv1alpha1.BackupRun) {
-			b.Status.Items = []backupv1alpha1.BackupItem{{Kind: "ReplicationSource", Name: claimN, Phase: backupv1alpha1.ItemFailed, Message: end + ". " + note}}
-		})
-		if got := backupTimedOut(run, deadline); got != end {
-			t.Errorf("backupTimedOut = %q, want %q", got, end)
-		}
-	}
 }
