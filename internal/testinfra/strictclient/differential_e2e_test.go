@@ -8,8 +8,8 @@
 //
 // It works in one temporary namespace, which it deletes at the end. Objects
 // are ConfigMaps, workloads scaled to zero or suspended, a Pending claim of
-// 10Mi on local-path (WaitForFirstConsumer, so no volume is made) and one
-// pause Pod.
+// 10Mi on StorageClass standard (the rancher.io/local-path provisioner with
+// WaitForFirstConsumer, so no volume is made) and one pause Pod.
 //
 //	nix develop -c go test -tags e2e ./internal/testinfra/strictclient/
 package strictclient_test
@@ -225,7 +225,7 @@ func claim(ns, name string) *corev1.PersistentVolumeClaim {
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-			StorageClassName: ptrTo("local-path"),
+			StorageClassName: ptrTo("standard"),
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Mi")},
 			},

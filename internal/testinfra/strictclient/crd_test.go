@@ -10,6 +10,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -321,5 +322,113 @@ func TestBuildTakesKindsRegisteredAsUnstructured(t *testing.T) {
 	}
 	if phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase"); phase != "" {
 		t.Errorf("a plain update stored status.phase %q, want it dropped by the status subresource", phase)
+	}
+}
+
+// TestCRDDefaultsAreApplied checks that RestoreRun's spec.timeout default
+// (4h in the pinned v0.8.1 CRD) is filled in on create and on an update or
+// patch that clears it, and that a value the writer sets is kept.
+func TestCRDDefaultsAreApplied(t *testing.T) {
+	ctx := context.Background()
+	c := newCRDClient(t, crdFiles(t, "v0.8.1"))
+	r := &backupv1alpha1.RestoreRun{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "r"},
+		Spec:       backupv1alpha1.RestoreRunSpec{Claim: "data"},
+	}
+	if err := c.Create(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Spec.Timeout == nil || r.Spec.Timeout.Duration != 4*time.Hour {
+		t.Errorf("create: timeout = %v, want the 4h default", r.Spec.Timeout)
+	}
+	r.Spec.Timeout = &metav1.Duration{Duration: time.Minute}
+	if err := c.Update(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Spec.Timeout == nil || r.Spec.Timeout.Duration != time.Minute {
+		t.Errorf("update: timeout = %v, want the 1m the writer set", r.Spec.Timeout)
+	}
+	r.Spec.Timeout = nil
+	if err := c.Update(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Spec.Timeout == nil || r.Spec.Timeout.Duration != 4*time.Hour {
+		t.Errorf("update clearing it: timeout = %v, want the 4h default", r.Spec.Timeout)
+	}
+	patch := client.RawPatch(types.MergePatchType, []byte(`{"spec":{"timeout":null}}`))
+	if err := c.Patch(ctx, r, patch); err != nil {
+		t.Fatal(err)
+	}
+	stored := &backupv1alpha1.RestoreRun{ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "r"}}
+	get(t, c, stored)
+	if stored.Spec.Timeout == nil || stored.Spec.Timeout.Duration != 4*time.Hour {
+		t.Errorf("patch removing it: stored timeout = %v, want the 4h default", stored.Spec.Timeout)
+	}
+}
+
+// TestBuildCoercesSeededObjects checks that Build brings seeded objects to
+// a state the server could have stored: an unknown field is pruned, a
+// default is filled in, the status is kept, and the uid, creationTimestamp
+// and generation get server values when the test left them empty and keep
+// the test's values otherwise.
+func TestBuildCoercesSeededObjects(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, backupv1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bare := &backupv1alpha1.RestoreRun{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "bare"},
+		Spec:       backupv1alpha1.RestoreRunSpec{Claim: "data"},
+		Status:     backupv1alpha1.RestoreRunStatus{Phase: "Running"},
+	}
+	old := metav1.NewTime(serverTime.Add(-time.Hour).Truncate(time.Second))
+	set := &backupv1alpha1.RestoreRun{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "set", UID: "fixed", Generation: 3, CreationTimestamp: old},
+		Spec:       backupv1alpha1.RestoreRunSpec{Claim: "data"},
+	}
+	third := &unstructured.Unstructured{}
+	third.SetGroupVersionKind(backupv1alpha1.GroupVersion.WithKind("BackupRun"))
+	third.SetNamespace("app")
+	third.SetName("unknown-field")
+	third.Object["spec"] = map[string]any{"source": "data", "notInSchema": "dropped"}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "p"}}
+	c := strictclient.Build(fake.NewClientBuilder().WithObjects(bare, set, third, pod), scheme, strictclient.Options{
+		Clock: func() time.Time { return serverTime },
+		CRDs:  crdFiles(t, "v0.8.1"),
+	})
+
+	got := &backupv1alpha1.RestoreRun{ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "bare"}}
+	get(t, c, got)
+	if got.Generation != 1 || got.UID == "" || !got.CreationTimestamp.Time.Equal(serverTime.Truncate(time.Second)) {
+		t.Errorf("bare: generation %d, uid %q, created %v; want 1, a fresh uid, the server clock",
+			got.Generation, got.UID, got.CreationTimestamp)
+	}
+	if got.Spec.Timeout == nil || got.Spec.Timeout.Duration != 4*time.Hour {
+		t.Errorf("bare: timeout = %v, want the 4h default", got.Spec.Timeout)
+	}
+	if got.Status.Phase != "Running" {
+		t.Errorf("bare: status phase = %q, want the seeded Running kept", got.Status.Phase)
+	}
+	got = &backupv1alpha1.RestoreRun{ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "set"}}
+	get(t, c, got)
+	if got.Generation != 3 || got.UID != "fixed" || !got.CreationTimestamp.Equal(&old) {
+		t.Errorf("set: generation %d, uid %q, created %v; want the seeded 3, fixed, %v",
+			got.Generation, got.UID, got.CreationTimestamp, old)
+	}
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(backupv1alpha1.GroupVersion.WithKind("BackupRun"))
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "app", Name: "unknown-field"}, u); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedString(u.Object, "spec", "notInSchema"); found {
+		t.Errorf("unknown-field: spec.notInSchema kept, want it pruned")
+	}
+	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "p"}}
+	get(t, c, p)
+	if p.UID == "" {
+		t.Errorf("pod: uid is empty, want a fresh one")
 	}
 }

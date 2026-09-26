@@ -4,7 +4,8 @@
 // client against envtest's kube-apiserver 1.36.3, with this repository's
 // BackupRun CRD at v0.7.2 and at v0.8.1 from internal/testinfra/crds and
 // VolSync's ReplicationSource CRD from the same folder (written as an
-// unstructured object), and compares what a client observes. Each version gets its own control plane,
+// unstructured object), and compares what a client observes, the RestoreRun
+// defaults included. Each version gets its own control plane,
 // which is stopped at the end, so the CRDs go with it.
 //
 //	nix develop .#envtest -c go test -tags envtest ./internal/testinfra/strictclient/
@@ -188,8 +189,54 @@ func envtestOps(t *testing.T, c client.Client) map[string]string {
 	if err := c.Delete(ctx, stored); err != nil {
 		t.Fatal(err)
 	}
+	restoreRunDefaultOps(t, c, o)
 	replicationSourceOps(t, c, o)
 	return o
+}
+
+// restoreRunDefaultOps writes RestoreRuns with c and adds to o what the CRD's
+// default for spec.timeout (4h in both pinned versions) left in the object:
+// on a create without it, on a create that sets it, and after an update
+// that clears it.
+func restoreRunDefaultOps(t *testing.T, c client.Client, o map[string]string) {
+	t.Helper()
+	ctx := context.Background()
+	timeout := func(r *backupv1alpha1.RestoreRun) string {
+		if r.Spec.Timeout == nil {
+			return "<nil>"
+		}
+		return r.Spec.Timeout.Duration.String()
+	}
+	for _, tc := range []struct {
+		name    string
+		timeout *metav1.Duration
+	}{
+		{name: "defaulted", timeout: nil},
+		{name: "explicit", timeout: &metav1.Duration{Duration: 30 * time.Minute}},
+	} {
+		r := &backupv1alpha1.RestoreRun{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: tc.name},
+			Spec:       backupv1alpha1.RestoreRunSpec{Claim: "data", Timeout: tc.timeout},
+		}
+		if err := c.Create(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		o["RestoreRun "+tc.name+" create: returned timeout"] = timeout(r)
+		stored := &backupv1alpha1.RestoreRun{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: tc.name}}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(stored), stored); err != nil {
+			t.Fatal(err)
+		}
+		o["RestoreRun "+tc.name+" create: stored timeout"] = timeout(stored)
+		stored.Spec.Timeout = nil
+		if err := c.Update(ctx, stored); err != nil {
+			t.Fatal(err)
+		}
+		o["RestoreRun "+tc.name+" update clearing timeout: returned timeout"] = timeout(stored)
+		o["RestoreRun "+tc.name+" update clearing timeout: generation"] = fmt.Sprint(stored.Generation)
+		if err := c.Delete(ctx, stored); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // replicationSourceOps writes an unstructured VolSync ReplicationSource with

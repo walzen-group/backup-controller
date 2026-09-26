@@ -35,9 +35,14 @@
 //     a status patch of a custom resource drops the uid and succeeds. See
 //     checkPatchedUID.
 //   - Objects of a kind defined by a CRD in Options.CRDs are pruned against
-//     that CRD's schema on every write, with the apiextensions pruning code.
-//     See Client.coerce. Build registers the status subresources those CRDs
+//     that CRD's schema and given its defaults on every write, with the
+//     apiextensions pruning code and a copy of its defaulting code. See
+//     Client.coerce. Build registers the status subresources those CRDs
 //     declare, and Create drops the status of such a kind.
+//   - Build brings the objects seeded with the builder to a state the server
+//     could have stored: pruned and defaulted, with a uid, a
+//     creationTimestamp and, where the strategy sets it, generation 1 when
+//     the test left them empty. See Client.seed.
 //   - apps Deployment and StatefulSet and batch Job get generation 1 on create
 //     and one more on every write that changes their spec (and, for a
 //     Deployment, its annotations). See Client.generationRule.
@@ -59,7 +64,7 @@
 // wrapper keeps the stored value; a PersistentVolumeClaim's stays 0 on a real
 // server too), validation of built-in kinds (a Pending claim's spec is
 // immutable on a real server and writable here), the finalizer check for
-// server-side apply patches, CRD defaulting and metadata coercion, per-kind
+// server-side apply patches, CRD metadata coercion, per-kind
 // default propagation policies other than Job's, and a collector that runs
 // again later (see Client.deleteCascading). Those are separate behaviours;
 // each one is added as a method or an Options field of Client, the way
@@ -104,7 +109,7 @@ type Options struct {
 
 	// CRDs are CustomResourceDefinition manifests, normally the pinned copies
 	// in internal/testinfra/crds. Objects of a kind one of them defines are
-	// pruned against that version's schema on every write (see
+	// pruned and defaulted against that version's schema on every write (see
 	// Client.coerce). Build also registers their status subresources.
 	CRDs []string
 
@@ -120,8 +125,9 @@ type Options struct {
 type Client struct {
 	client.WithWatch
 
-	opts Options
-	crds *crdSet
+	opts   Options
+	crds   *crdSet
+	scheme *runtime.Scheme
 
 	mu       sync.Mutex
 	cascades []Cascade
@@ -132,7 +138,8 @@ type Client struct {
 // Parameters:
 //   - inner is the client to wrap, normally built with fake.NewClientBuilder.
 //     Objects seeded into it through the builder keep the metadata the test
-//     gave them, as objects restored from etcd would.
+//     gave them and are not pruned or defaulted; use Build to have them
+//     brought to a state the server could have stored.
 //   - opts sets the server clock, the custom resource test and the CRD
 //     files to prune against.
 //
@@ -162,7 +169,7 @@ func newClient(inner client.WithWatch, opts Options, set *crdSet) *Client {
 	if opts.IsCustomResource == nil {
 		opts.IsCustomResource = DefaultIsCustomResource
 	}
-	c := &Client{WithWatch: inner, opts: opts}
+	c := &Client{WithWatch: inner, opts: opts, scheme: inner.Scheme()}
 	if len(opts.CRDs) > 0 {
 		c.crds = set
 	}
@@ -414,7 +421,7 @@ const (
 // annotation and status writes, which is generationKept. Other built-in
 // kinds are not covered by the suite and keep their stored generation.
 func (c *Client) generationRule(obj client.Object) (generationRule, error) {
-	gvk, err := apiutil.GVKForObject(obj, c.Scheme())
+	gvk, err := apiutil.GVKForObject(obj, c.scheme)
 	if err != nil {
 		return generationKept, err
 	}
