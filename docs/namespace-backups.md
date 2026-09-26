@@ -166,11 +166,15 @@ restartedAt: "2026-09-24T22:15:45Z"
 2. It writes its plan into the status before it changes anything: every
    workload marked `backup.wlz.li/quiesce` in `status.quiesced`, with the
    replicas it has now, and the Flux Kustomizations to suspend in
-   `status.suspendedKustomizations`. Then it suspends those Kustomizations and
-   scales the workloads to zero, and waits until none of their pods is left,
-   terminating ones included: a pod shutting down can still write. A pod in
-   phase Succeeded or Failed, such as an evicted one, does not count, because
-   its containers have ended.
+   `status.suspendedKustomizations`. Before that write it takes the
+   namespace's quiesce Lease and one Lease per planned Kustomization, and waits
+   with reason SourceBusy while another run holds one or still owes this
+   namespace's workloads their replicas
+   ([One quiesce at a time](#one-quiesce-at-a-time)). Then it suspends those
+   Kustomizations and scales the workloads to zero, and waits until none of
+   their pods is left, terminating ones included: a pod shutting down can
+   still write. A pod in phase Succeeded or Failed, such as an evicted one,
+   does not count, because its containers have ended.
 3. It writes each enabled claim's ReplicationSource with the run's manual tag,
    and creates a CloudNativePG Backup for each enabled Cluster. A Cluster
    carrying `cnpg.io/hibernation: "on"` is skipped.
@@ -257,9 +261,12 @@ that applied it. The run suspends that Kustomization only when its
 who can edit a workload can set its labels, and suspending a Kustomization is a
 write in another namespace, so the labels alone are not enough. A workload
 without the labels, whose Kustomization is gone, or whose Kustomization does
-does not list it, is scaled down with nothing suspended. A Kustomization that is
+not list it, is scaled down with nothing suspended. A Kustomization that is
 already suspended is left out, because the run did not suspend it and must not
-resume it. A failed read of a Kustomization is retried at the next pass, and a
+resume it; one another run holds a quiesce Lease for makes this run wait
+instead, even when this run would leave it out
+([One quiesce at a time](#one-quiesce-at-a-time)). A failed read of a
+Kustomization is retried at the next pass, and a
 version Flux stops serving is never read as a deleted Kustomization: the run
 reports `the API server no longer serves Kustomization at kustomize.toolkit.fluxcd.io/v1 (...);
 the controller looks up the served version again and retries, and a restart of
@@ -538,16 +545,111 @@ one a v0.8.1 controller planned, is found through its VolumeRestore instead:
 `RestoreRun notes-back-to-friday is restoring the backups of claim notes-data
 from repository notes-restic-data into claim notes-back-to-friday through
 VolumeRestore notes-back-to-friday; this run starts once that restore has
-finished`. A namespace run checks every claim this way
-before it stops anything, so an app is never stopped for a backup that then
-waits.
+finished`. A namespace run checks every claim this way, and for the Lease of the
+claim and its repository, before it stops anything, and a read that fails there
+comes back as an error and stops nothing: an app is never stopped for a backup
+that then waits, or on a read that could not be made.
 
-A claim's repository Secret that does not exist leaves the item Pending and
-retried: the run reports the missing Secret on the Ready condition, and tries
-again on the next pass. The Lease of an item that has finished is released on
-the run's next pass, and that release is best effort: a failure is logged and
-the run goes on, so it never holds the app past the quiesce limit, and the run
-releases every Lease it still holds when it finishes.
+A claim or a repository Secret that does not exist takes no Lease: the reads
+that resolve the Lease names treat NotFound as no Lease and every other
+failure as an error, which is retried with nothing stopped. The item goes on
+and reports the missing object itself: a claim that is gone fails the backup's
+item with `the claim <name> no longer exists`, and a repository Secret that is
+gone fails the mover, whose failure the run reports with the mover's logs. The
+Lease of an item that has finished is released on the run's next pass, and that
+release is best effort: a failure is logged and the run goes on, so it never
+holds the app past the quiesce limit, and the run releases every claim and
+repository Lease it still holds when it finishes. The quiesce Leases go as
+[One quiesce at a time](#one-quiesce-at-a-time) describes.
+
+## One quiesce at a time
+
+Two runs never stop one namespace's workloads at once. A run that is about to
+write a stop plan first takes the `coordination.k8s.io` Lease
+`backup-controller-quiesce` in the run's own namespace, and one Lease per Flux
+Kustomization its plan needs, named
+`backup-controller-kustomization-<Kustomization uid>` in the Kustomization's
+namespace. Only a BackupRun with `all: true` that has at least one target takes
+the namespace's Lease, and only a RestoreRun whose `spec.quiesce` lists a
+workload takes one; a run with `source:` or `database:` takes none, and neither
+does one that already has a plan in `status.quiesced`, which is what lets a run
+a v0.8.x controller left in flight finish without a Lease.
+
+The run takes the Kustomization Leases after the namespace's Lease and in
+`namespace/name` order, for every Kustomization whose `status.inventory.entries`
+lists one of its targets, and on that pass it releases the Kustomization Leases
+it holds that the set no longer names. A Kustomization another run holds makes
+this run wait even when this run would leave it out because it is already
+suspended, which is the fail-closed direction: the workloads this run needs
+stopped stay up until the holder has resumed it.
+
+The Leases carry the holder labels the claim and repository Leases carry
+(`backup.wlz.li/lease-holder-kind`, `backup.wlz.li/lease-holder-uid` and
+`app.kubernetes.io/managed-by: backup-controller`) and, in
+`backup.wlz.li/lease-scope: quiesce`, the mark that tells them apart. The
+holder's name and namespace are in the `backup.wlz.li/lease-holder-name` and
+`backup.wlz.li/lease-holder-namespace` annotations, because a Kustomization
+Lease lives in the Kustomization's namespace, and `spec.holderIdentity` holds
+the holder's UID. They carry no ownerReferences. A Lease whose holder has
+finished, is gone, or has stored the restart that gave the workloads back is
+stale, and the next run takes it over with an update carrying the
+resourceVersion it read.
+
+A run that finds another run holding the namespace's Lease waits with reason
+SourceBusy:
+
+```text
+BackupRun scheduled-20260926-0300 has stopped the workloads of this namespace (Lease backup-controller-quiesce); this run stops them once that run has given them back
+```
+
+A run about to stop workloads also waits for another unfinished run of its
+namespace whose plan is not given back, which covers a run a v0.8.x controller
+left without a Lease. The message names the workload that run mentions first,
+and says `stopped this namespace's workloads and has not given them back yet`
+when its plan names none:
+
+```text
+RestoreRun back-to-monday stopped Deployment notes and has not given it back yet; this run stops the workloads once that run has given them back
+```
+
+A run about to stop workloads waits while an unfinished RestoreRun in the
+namespace has a Cluster item in phase Deleted as well, because the
+Kustomization this run would suspend may be the one Flux needs to create that
+Cluster again:
+
+```text
+RestoreRun notes-back-to-friday has deleted Cluster notes-pg and waits for it to be created again; this run stops the workloads once that Cluster is back
+```
+
+A Kustomization Lease another run holds is reported the same way, naming the
+workload this run needs it for:
+
+```text
+BackupRun wiki/scheduled-20260926-0300 has suspended Kustomization flux-system/apps, which also applies Deployment notes; this run stops its workloads once that run has resumed it
+```
+
+A run that runs out of time while it waits ends with nothing stopped, and the
+message names the wait:
+
+```text
+the run had not finished by 2026-09-26T10:00:00Z; it was waiting: RestoreRun back-to-monday stopped Deployment notes and has not given it back yet; this run stops the workloads once that run has given them back
+```
+
+The quiesce Leases are not released with the claim and repository Leases. They
+go on the pass that finds the stored status showing every workload back and
+the plan reading back, in `finish` after the terminal status write, and in
+`finalize` after the finalizer is dropped. Each release is best effort: a
+failure is logged and the run goes on, and a Lease left behind is stale under
+the rule above and is taken over by the next run that wants it. Deleting one
+by hand while its holder is still running reopens the bug the Leases prevent:
+the next run takes the Lease, records the zero replicas the holder stopped,
+and both runs can end with the app still at zero.
+
+A run left in flight by v0.8.x holds no Lease and continues without one, and a
+new run waits for it through the status check above. During the controller
+upgrade itself, an old pod that is still terminating takes no Lease either, so
+wait until it is gone before creating runs in a namespace. A run that finds
+the workloads already stopped records the counts it finds.
 
 ## Restore
 
@@ -641,6 +743,11 @@ Cluster to be created again:
 ```text
 recreate canary-namespace-backup-pg to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it
 ```
+
+While the item stands Deleted and the Cluster has not been created again, a
+BackupRun with `all: true` in this namespace waits before it stops workloads
+rather than suspending the Kustomization that creates the Cluster
+([One quiesce at a time](#one-quiesce-at-a-time)).
 
 When Flux or tofu creates the Cluster again, the bootstrap webhook finds the
 run, writes the run's moment as the recovery target and names the run on the

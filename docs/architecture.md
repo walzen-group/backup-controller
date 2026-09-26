@@ -27,6 +27,7 @@ In the app's namespace:
 | CloudNativePG Backup `<cluster>-<suffix>` | each BackupRun, one per Cluster marked `backup.wlz.li/enabled` | stays, as CloudNativePG's backup record |
 | ReplicationDestination | a RestoreRun that restores a volume: in place, or with `claim:` and `into:`, or with `repository:` and `into:` | deleted once the item's end is in the run's status |
 | Lease `backup-controller-claim-<claim uid>` and `backup-controller-repo-<secret uid>` | a run, right before it creates its mover object for an item | released once the item's end is in the run's status, and taken over by another run when its holder is gone or finished |
+| Lease `backup-controller-quiesce` in the run's namespace, and `backup-controller-kustomization-<Kustomization uid>` in each Kustomization's namespace | a run, before it records the plan that stops the workloads of a BackupRun with `all: true`, or of a RestoreRun that lists `quiesce` | released once the run's stored status shows the workloads back and the plan reads back; taken over when its holder has finished, is gone or has given the workloads back |
 | VolumeRestore named by `into:`, with the finalizer `backup.wlz.li/volume-populator` | a v0.8.1 or older controller, for an `into` restore from a claim, owned by the run | deleted with the RestoreRun; v0.9.0 creates none, and the run removes the finalizer itself when the populator never took the VolumeRestore on |
 | a scratch claim named by `into:` | a RestoreRun with `into:`, owned by the run; it carries no data source, and the run's ReplicationDestination fills it | deleted with the RestoreRun, the claim's dataset included |
 
@@ -70,6 +71,17 @@ runs that reach that moment together, and a run that finds a Lease held waits
 with reason SourceBusy.
 [namespace-backups.md](namespace-backups.md#one-mover-at-a-time) has the
 messages and the takeover rule.
+
+Two runs never stop one namespace's workloads at once, either. A run that is
+about to record a stop plan takes the namespace's Lease
+`backup-controller-quiesce` and one Lease per Kustomization its plan needs in
+the same way, and holds them until its stored status shows every workload back
+and every Kustomization resumed, so a second run waits with the app running
+rather than recording the zero replicas the first stopped it at. A run waits
+for a run that v0.8.x left in flight without a Lease as well, and for a
+RestoreRun that has deleted a Cluster and not yet seen it created again.
+[namespace-backups.md](namespace-backups.md#one-quiesce-at-a-time) has the
+messages and the release rule.
 
 Its own BackupRuns and RestoreRuns carry a finalizer, which releases whatever a
 run changed when the run fails, times out or is deleted. The sources it writes

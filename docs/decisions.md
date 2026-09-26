@@ -400,6 +400,39 @@ either run back otherwise: it names its holder by UID, so a run created again
 under the same name does not inherit it, and a Lease whose holder has finished
 or is gone is taken over by the next run that wants it.
 
+## Take one quiesce Lease per namespace and Kustomization
+
+From v0.9.0 a run that is about to stop a namespace's workloads takes the
+`coordination.k8s.io` Lease `backup-controller-quiesce` in that namespace, and
+one Lease per Flux Kustomization its plan needs, before it records the plan in
+its status. A Lease is held until the run's stored status shows every workload
+back and every Kustomization resumed, and a run that finds one held waits with
+reason SourceBusy and the workloads running. A run that v0.8.x left in flight
+holds no Lease, so a run also waits while another unfinished run of the
+namespace still owes a restart.
+
+The alternative was a check of the other runs' status alone, which is what the
+controller did first: a BackupRun and a RestoreRun reconcile at the same time,
+so both can read the workloads' replicas as unchanged, write a plan, and stop
+them. The second then records the zero replicas the first stopped them at, and
+whichever restarts last decides whether the app comes back; both runs end
+Succeeded. A Lease decides it in the API server. A Lease per workload instead
+of per namespace needs an ordering among them and buys only the rare case of
+two runs whose workloads do not overlap, while a namespace run stops every
+workload the namespace marks and a restore's list overlaps it in the ordinary
+case. The Lease per Kustomization covers one Kustomization that applies
+workloads in two namespaces: the second run would otherwise stop its workloads
+without suspending the Kustomization, and the first run's resume would let
+Flux scale them back up under it.
+
+The quiesce Lease is not released with the claim and repository Leases: it goes
+once the stored status shows the workloads back and the plan reads back, at the
+top of a later pass, in finish after the terminal status write, and in finalize
+after the finalizer is dropped. Releasing it with the restart would let another
+run stop the workloads while this run's status write that clears
+`restartPending` was still lost, and this run would then scale them to zero
+again under the other run.
+
 ## Confirm a restore from the mover's log
 
 VolSync completes a restore trigger whatever its mover did: a mover that found

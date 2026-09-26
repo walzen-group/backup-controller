@@ -112,6 +112,19 @@ what deployed it. In the walzen infrastructure repository a Flux app is
 suspended and scaled down by hand, and a terragrunt unit is applied with its
 workload at zero; that repository's docs/cluster/backups/ has both procedures.
 
+A run takes the app down only when it can go on. On the pass that records its
+plan, before it stops anything, it checks every volume item it has not started:
+a backup of the claim or of its repository that is uploading, or a Lease
+another run holds on either, makes it wait in phase Waiting with reason
+SourceBusy and the workloads still running, and a read that fails comes back
+as an error and stops nothing. The check at the mover object remains the one
+that counts ([One mover at a time](namespace-backups.md#one-mover-at-a-time)).
+The run also waits for another run that has stopped this namespace's workloads,
+and for the run holding the Lease of a Kustomization its plan needs, so a
+Kustomization that applies workloads in two namespaces is suspended by one run
+at a time
+([One quiesce at a time](namespace-backups.md#one-quiesce-at-a-time)).
+
 ## Back up before you discard
 
 Two of the three operations discard what the volume holds. Whatever has not
