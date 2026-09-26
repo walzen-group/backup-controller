@@ -85,7 +85,10 @@ const (
 	// ReasonRetrying reports a RestoreRun whose checks failed with an error it
 	// tries again, such as a repository it can't open. The condition's
 	// message holds the error. A run still retrying once spec.timeout has
-	// passed since it was created ends with reason TimedOut.
+	// passed since it was created ends with reason TimedOut. It also reports
+	// a BackupRun with an item it failed to start and tries again, such as a
+	// Backup that a CloudNativePG webhook it cannot reach refuses; the message
+	// names each such item and its error.
 	ReasonRetrying = "Retrying"
 )
 

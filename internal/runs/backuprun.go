@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
@@ -252,8 +253,12 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // On a run with spec.all set, the first pass calls quiesce to stop the
 // workloads marked backup.wlz.li/quiesce and does nothing else. Later passes
 // start no item until every pod of those workloads is gone. work then starts
-// every Pending item. Once every volume's clone is cut, it records the time
-// of the pass in status.restartedAt with status.restartPending set, and
+// every Pending item. An item that fails to start with an error other than a
+// refusal stays Pending with "not started yet: " and the error in its
+// message, the Ready condition takes reason Retrying and names each such
+// item, and the pass goes on; the next pass tries the item again. Once
+// every volume's clone is cut, it records the time of the pass in
+// status.restartedAt with status.restartPending set, and
 // writes the status. It then scales the workloads back up, resumes the
 // Kustomizations it suspended, and clears status.restartPending. A pass that
 // finds status.restartPending set repeats the restart and keeps the recorded
@@ -296,7 +301,12 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		}
 	}
 
+	// An item that fails to start with an error the API server may stop
+	// giving keeps its place and is tried again on the next pass. The pass
+	// goes on, because the restart below looks only at volume items, and a
+	// database whose Backup cannot be created must not keep the app down.
 	waiting := ""
+	var retrying []string
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		if item.Phase != backupv1alpha1.ItemPending {
@@ -304,7 +314,12 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		}
 		message, err := r.startItem(ctx, run, item)
 		if err != nil {
-			return ctrl.Result{}, err
+			item.Message = notStartedYet + err.Error()
+			retrying = append(retrying, fmt.Sprintf("%s %s: %v", item.Kind, item.Name, err))
+			continue
+		}
+		if strings.HasPrefix(item.Message, notStartedYet) {
+			item.Message = ""
 		}
 		if message != "" {
 			waiting = message
@@ -341,11 +356,15 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, failed)
 	}
 
-	if waiting != "" {
+	reason, message := backupv1alpha1.ReasonRunning, "backing up"
+	switch {
+	case len(retrying) > 0:
+		reason, message = backupv1alpha1.ReasonRetrying, "retrying the start of "+strings.Join(retrying, "; ")
+	case waiting != "":
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, waiting))
 	}
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "backing up")
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
 	interval := pollInterval
 	if run.Spec.All && run.Status.RestartedAt == nil {
 		// The app stays down until every clone is cut, so the run looks
@@ -449,8 +468,9 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 // waits for (see holder), the item fails at once with a message that says
 // what a person can do, and the source is left alone. Otherwise it returns an
 // empty string. Any other failed read or write, such as a timeout from the
-// API server, comes back as an error with the item left Pending, and the
-// caller returns it so the reconcile runs again.
+// API server or a 500 from a webhook it cannot reach, comes back as an error
+// with the item left Pending. The caller records the error in the item's
+// message and tries the item again on its next pass.
 func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) (string, error) {
 	switch item.Kind {
 	case "ReplicationSource":
@@ -813,6 +833,11 @@ func (r *BackupRunReconciler) writeStatus(ctx context.Context, run *backupv1alph
 	}
 	return nil
 }
+
+// notStartedYet prefixes the message of a Pending item whose start failed
+// with an error the run tries again. A later pass that starts the item, or
+// leaves it waiting for another run, removes the message.
+const notStartedYet = "not started yet: "
 
 // anyPending reports whether any item is still Pending, which means the run
 // has not started it yet.

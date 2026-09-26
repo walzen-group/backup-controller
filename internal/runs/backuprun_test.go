@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -975,6 +976,72 @@ func TestATimedOutRunRestartsTheApp(t *testing.T) {
 	}
 }
 
+// A database whose Backup the API server refuses on every create does not
+// keep the stopped app down. CloudNativePG's webhook is unreachable, and
+// under failurePolicy: Fail the API server answers each create with a 500.
+// The pass goes on past the database item: once the clone is cut, the app
+// gets its replicas back, and the database item stays Pending with the error
+// in its message. A later pass whose create goes through starts the Backup.
+func TestADatabaseThatCannotStartDoesNotHoldTheApp(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
+	webhook := `failed calling webhook "vbackup.cnpg.io": failed to call webhook: Post "https://cnpg-webhook-service.cnpg-system.svc:443/validate-postgresql-cnpg-io-v1-backup": dial tcp 10.96.12.7:443: connect: connection refused`
+	healthy := r.Client
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == BackupGVK {
+				return apierrors.NewInternalError(errors.New(webhook))
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	pass := func() {
+		t.Helper()
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+	pass() // plan
+	pass() // admit, no queue
+	pass() // quiesce
+	pass() // start: the source is triggered, the Backup create fails
+	cutClone(t, c)
+	pass()
+
+	d := &appsv1.Deployment{}
+	get(t, c, ns, appN, d)
+	if *d.Spec.Replicas != 2 {
+		t.Fatalf("replicas = %d once the clone is cut, want 2 back while the database waits", *d.Spec.Replicas)
+	}
+	run := readBackupRun(t, c)
+	if run.Status.RestartedAt == nil {
+		t.Fatal("restartedAt is unset after the app was started again")
+	}
+	var db backupv1alpha1.BackupItem
+	for _, item := range run.Status.Items {
+		if item.Kind == "Cluster" {
+			db = item
+		}
+	}
+	if db.Phase != backupv1alpha1.ItemPending || !strings.Contains(db.Message, "connection refused") {
+		t.Errorf("database item = %+v, want it Pending with the webhook error in its message", db)
+	}
+	if reason, message := readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions); reason != backupv1alpha1.ReasonRetrying || !strings.Contains(message, pgN) {
+		t.Errorf("Ready = %s: %s, want Retrying naming the Cluster %s", reason, message, pgN)
+	}
+
+	r.Client = healthy
+	pass()
+	if _, ok := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID)); !ok {
+		t.Fatal("no Backup after the webhook came back")
+	}
+	for _, item := range readBackupRun(t, c).Status.Items {
+		if item.Kind == "Cluster" && (item.Phase != backupv1alpha1.ItemRunning || item.Message != "") {
+			t.Errorf("database item = %+v, want it Running with the old error cleared", item)
+		}
+	}
+}
+
 // cutClone stands in for VolSync cutting the clone of the claim: it creates
 // the Bound claim volsync-<claim>-src, five seconds after the frozen clock's
 // time, which is after the run stopped the app.
@@ -1369,8 +1436,8 @@ func TestAFailedReadWhilePlanningIsRetried(t *testing.T) {
 	}
 }
 
-// A failed read while a run starts a volume's backup is returned for a retry,
-// and the item stays Pending until the next pass starts it.
+// A failed read while a run starts a volume's backup leaves the item Pending
+// with the error in its message, and the next pass starts it.
 func TestAFailedReadWhileStartingAnItemIsRetried(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
@@ -1379,16 +1446,21 @@ func TestAFailedReadWhileStartingAnItemIsRetried(t *testing.T) {
 	reader := r.Reader
 	r.Reader = failOnce(c, func(object any) bool { _, ok := object.(*corev1.PersistentVolume); return ok })
 
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err == nil {
-		t.Error("reconcile succeeded, want the read error returned for a retry")
+	if result := step(t, r); result.RequeueAfter == 0 {
+		t.Error("the pass with the failed read asked for no requeue, want the item tried again")
 	}
-	if run := readBackupRun(t, c); run.Status.Phase.Finished() || run.Status.Items[0].Phase != backupv1alpha1.ItemPending {
-		t.Fatalf("run = %q, item = %+v after a failed read, want the item still Pending", run.Status.Phase, run.Status.Items[0])
+	run := readBackupRun(t, c)
+	if run.Status.Phase.Finished() || run.Status.Items[0].Phase != backupv1alpha1.ItemPending ||
+		!strings.Contains(run.Status.Items[0].Message, "etcd leader changed") {
+		t.Fatalf("run = %q, item = %+v after a failed read, want the item still Pending with the error in its message", run.Status.Phase, run.Status.Items[0])
+	}
+	if reason := readyReason(run.Status.Conditions); reason != backupv1alpha1.ReasonRetrying {
+		t.Errorf("Ready reason = %s after a failed read, want Retrying", reason)
 	}
 	r.Reader = reader
 	step(t, r)
-	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
-		t.Errorf("item = %+v, want it Running", item)
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Message != "" {
+		t.Errorf("item = %+v, want it Running with the old error cleared", item)
 	}
 }
 
