@@ -49,6 +49,7 @@ metadata:
 | --- | --- | --- |
 | backup.wlz.li/schedule | Namespace | when the namespace's backups run, five-field cron in UTC, or on a zone's clock with a prefix such as `CRON_TZ=Europe/Berlin 0 4 * * *` |
 | backup.wlz.li/timeout | Namespace | how long a run there may work once admitted, a Go duration such as `10h`; 6h without it, and a run's own `spec.timeout` wins |
+| backup.wlz.li/max-quiesce | Namespace | how long a run with `all: true` may keep the workloads it stopped stopped, a Go duration such as `20m`; 10m without it, counted from the run's `status.quiescedAt` |
 | backup.wlz.li/prune-interval-days | Namespace | days between prunes of each repository the namespace's sources write; 1 without it |
 | backup.wlz.li/enabled | claim, Cluster | whether a run includes it; nothing else is read to find what to back up |
 | backup.wlz.li/retain-last and the six other retain- annotations | claim | which snapshots the volume's repository keeps; see [Retention](#retention) |
@@ -117,7 +118,9 @@ a manual run without one does: `backup.wlz.li/timeout` on the Namespace, or six
 hours after Kueue admits it. The clock starts at admission, so the time a run
 spends in Queued does not count. On the deadline the run marks its unfinished
 items Failed, restarts what it quiesced and releases its Workload; a VolSync
-mover or a CloudNativePG Backup still in progress keeps running.
+mover or a CloudNativePG Backup still in progress keeps running. An item whose
+start kept failing ends with the deadline message and its last error after it:
+`<deadline message>; last error: <error>`.
 
 The canary's first scheduled run, on a `*/15` schedule, sampled every three
 seconds; lines repeating the one before are left out:
@@ -174,15 +177,32 @@ restartedAt: "2026-09-24T22:15:45Z"
 4. Once every volume's clone is cut, it records `restartedAt` with
    `restartPending: true` and writes the status. Then it gives each workload its
    replicas back, resumes only the Kustomizations it suspended, and clears
-   `restartPending`. The upload continues from the clone.
+   `restartPending`. The upload continues from the clone. A restart that fails
+   is reported at once, with reason RestartFailed and a Warning event, and the
+   pass runs again with controller-runtime's backoff. The message says that the
+   run is still backing up and must not be deleted, and lists what to scale and
+   resume by hand: `The run is still backing up; do not delete it. To give the
+   app back now, scale Deployment notes to 2 and resume Kustomization
+   flux-system/notes yourself; the run then goes on by itself.` A restart skips
+   a workload that already stands at its recorded count and a Kustomization
+   that is not suspended, so doing that by hand lets the run go on.
 5. It reads the snapshot each mover logged, `snapshot d1cb7739 saved`, and the
    time restic stamped on it from the repository itself. When step 2 stopped a
    workload, it writes the snapshot again at `restartedAt`, as the next section
    describes. Then it deletes the Workload.
 
 A finalizer performs step 4 and deletes the Workload on failure, on timeout and
-when the run is deleted. The canary's writer was down 34 seconds, most of it the
-pod's 30-second termination grace, because its shell loop does not handle
+when the run is deleted. A failure there is reported with reason RestartFailed
+while the app is still down, and with reason ReleaseFailed when the app is back
+and only a Lease or the Workload is left: `could not release the Leases it holds
+on its claims and repositories: ... Fix the cause, or delete the Leases labelled
+backup.wlz.li/lease-holder-uid=<uid> yourself; either way the run then finishes
+by itself.` The Leases go before the Workload, so the run keeps its place in the
+queue while it still owes the app its replicas. A run being deleted says that
+the deletion completes by itself, and that a person can remove the finalizer
+`backup.wlz.li/run-cleanup` if it does not once the app runs again. The canary's
+writer was down 34 seconds, most of it
+the pod's 30-second termination grace, because its shell loop does not handle
 SIGTERM.
 
 The run writes each plan before it acts on it, so a pass that stops the
@@ -190,10 +210,33 @@ workloads and then loses its status write is retried from the recorded plan.
 Reading the workloads again at that point would find them at zero replicas, and
 the run would give back nothing. For the same reason `restartedAt` is written
 before the restart, and a pass that finds `restartPending` set repeats the
-restart with the recorded moment. When a stop fails partway, the run cuts the
-plan down to the workloads that stand at zero and the Kustomizations that are
-suspended, starts those again, and ends Failed. `quiescedAt` and `restartedAt`
-are whole seconds.
+restart with the recorded moment. A run that v0.8.x stopped under the v0.7.2
+BackupRun CRD, which stored no `restartPending`, still gives the app back: the
+pass that records the moment restarts in any case. When a stop fails partway,
+the run cuts the plan down to the workloads that stand at zero and the
+Kustomizations that are suspended, starts those again, and ends Failed.
+`quiescedAt` and `restartedAt` are whole seconds.
+
+The workloads stay stopped for at most the namespace's
+`backup.wlz.li/max-quiesce`, ten minutes without it, counted from
+`quiescedAt`. When that runs out, the run gives the workloads back and fails
+every volume item whose clone VolSync had not cut:
+
+```text
+VolSync had not cut the clone volsync-notes-data-src by 2026-09-26T09:41:00Z, when the backup.wlz.li/max-quiesce limit of 10m ran out and the workloads were given back
+```
+
+An item whose start never got that far is failed too, with `not started before
+the workloads were given back at <time>, when the backup.wlz.li/max-quiesce
+limit of 10m ran out, so the clone volsync-notes-data-src was never cut`
+followed by its last start error when it has one. The rest of the run goes on,
+the upload continues for every clone that was cut, and a stopped workload is
+never held for longer than the limit by a VolSync that cuts no clone. An
+annotation that is not a positive Go duration fails a run with `all: true`
+before it stops anything: `namespace notes has backup.wlz.li/max-quiesce
+"soon", which is not a duration such as 20m`. A value changed to one that no
+longer parses while the app is down aborts the run, which gives the workloads
+back.
 
 A clone claim `volsync-<claim>-src` counts as cut in step 4 when it is Bound,
 not being deleted, and was created after `quiescedAt`. VolSync marks a sync
@@ -211,9 +254,16 @@ that applied it. The run suspends that Kustomization only when its
 who can edit a workload can set its labels, and suspending a Kustomization is a
 write in another namespace, so the labels alone are not enough. A workload
 without the labels, whose Kustomization is gone, or whose Kustomization does
-not list it, is scaled down with nothing suspended. A Kustomization that is
+does not list it, is scaled down with nothing suspended. A Kustomization that is
 already suspended is left out, because the run did not suspend it and must not
-resume it. A failed read of a Kustomization is retried at the next pass.
+resume it. A failed read of a Kustomization is retried at the next pass, and a
+version Flux stops serving is never read as a deleted Kustomization: the run
+reports `the API server no longer serves Kustomization at kustomize.toolkit.fluxcd.io/v1 (...);
+the controller looks up the served version again and retries, and a restart of
+the controller also clears the versions it has cached`, relearns what the API
+server serves, and retries. The kind is resolved by group and kind, so a Flux
+upgrade that serves the Kustomization at another version changes nothing here,
+for a BackupRun and a RestoreRun alike.
 
 ### Quiesced snapshots
 
@@ -291,8 +341,11 @@ Succeeded for a snapshot left untagged.
 A source is owned by its claim and named after it. The mover is placed by the
 PersistentVolume's own node affinity, so it runs whether or not the app's pod
 does, and it carries no queue label, since the run's Workload already admitted
-it. The canary's source after the 22:45 scheduled run, trimmed to spec and the
-status fields that show it idle:
+it. A run writes the source's spec only when it finds the source idle: one that
+already carries the run's tag is left as it is, so a change to the retention or
+the affinities reaches the source on the next run that finds it idle, which can
+be a later run than the one that met it busy. The canary's source after the
+22:45 scheduled run, trimmed to spec and the status fields that show it idle:
 
 ```yaml
 metadata:
@@ -336,8 +389,19 @@ status:
 The tag stays on the source after the backup. VolSync syncs a source with no
 trigger at all in a tight loop, and one whose tag equals `lastManualSync` not at
 all, so a spent tag is how a source waits for the next run, as the status above
-shows. A run that finds a
-source still completing another run's tag waits for it (reason SourceBusy). A
+shows. Every tag the controller writes sets `spec.restic.unlock` to the same
+value, so VolSync runs `restic unlock` before that backup. restic removes only
+the locks it counts as stale, which is 30 minutes for a lock from another host,
+so a lock a killed mover left behind clears on the next run by itself.
+
+A run that finds a
+source still completing another run's tag waits for it, with reason SourceBusy
+and a message naming that run: `ReplicationSource
+canary-namespace-backup-data is still completing the backup of BackupRun
+scheduled-20260924-2245`. A source VolSync started syncing with no tag at all,
+which a run from an older version can leave behind, waits the same way with
+`ReplicationSource canary-namespace-backup-data is still syncing; VolSync has
+not recorded the end of its last sync`. A
 source of the same name the controller did not write is left alone, and the
 item fails naming it.
 
@@ -347,12 +411,38 @@ the tag stays. When the source still carries the run's tag, has not completed
 it, and reports a Failed mover in a sync VolSync started after the run's
 `startedAt`, the run fails the item with the mover's logs, so the run reports
 the failure at once instead of at its timeout. It leaves the ReplicationSource
-alone. VolSync keeps retrying, and a later run waits with reason SourceBusy
-until one of those retries completes the tag. While it waits, a quiesced
-namespace's later runs back up nothing, because a run checks every source
-before it stops the app. A retry that succeeds backs up the clone the failed
-run cut, and restic stamps the snapshot with the retry's time, so that
-snapshot can hold data older than its time. v0.9.0 changes this.
+alone. A mover that failed on a lock is reported with the explanation first:
+`The restic repository is locked (repository is already locked): a lock that
+another restic process holds or left behind, such as one of a mover that was
+killed, keeps restic from taking the lock it needs. ... The next backup does so
+by itself once the lock is older than 30 minutes. Mover logs: ...`
+
+A later run waits only for a tag some run still needs. When the tag's run
+failed, timed out or was deleted, or the tag was written by v0.7.x or v0.8.x, no
+run waits for it any more, and VolSync would complete the new trigger with that
+older backup. The run then fails that item at once and goes on with the rest of
+the namespace, naming the run or the trigger the tag belongs to, what VolSync is
+doing with it, and how to give that backup up: `To give that backup up, delete
+the ReplicationSource canary-namespace-backup-data while no pod of Job
+volsync-src-canary-namespace-backup-data is running; the next backup unlocks the
+repository first.` The source is left as it is, and the item goes on failing
+that way until the source is deleted. While a run waits for a live run's tag, a
+quiesced namespace's later runs back up nothing, because a run checks every
+source before it stops the app.
+
+An item the run fails while VolSync keeps retrying names the data a snapshot of
+that sync holds. VolSync retries the sync with the clone it cut when the sync
+started, and restic stamps a retry's snapshot with the retry's time, so that
+snapshot can hold data older than its time. The message ends `VolSync keeps
+retrying the sync it started at 2026-09-26T09:41:00Z with the clone it cut then,
+so a snapshot this sync saves later holds the data of 2026-09-26T09:41:00Z,
+whatever time restic stamps on it.` When VolSync has not cut the clone yet, it
+reads `VolSync goes on with the sync it started at 2026-09-26T09:41:00Z and has
+not cut its clone yet, so a snapshot this sync saves later holds the data of the
+moment it cuts the clone, whatever time restic stamps on it.` Such a snapshot
+carries no `quiesced` tag, so a `syncDatabaseToVolume` restore never chooses it;
+a plain `restoreAsOf` may, and the volume then holds the data VolSync captured
+for that claim, stamped later than the data is from.
 
 v0.8.0 and v0.8.1 deleted the ReplicationSource at this point. By the time
 VolSync reports the failure it has already started the next mover Job, so the
@@ -367,7 +457,12 @@ shows whether a repository holds one). Without it, each retry saves a snapshot,
 fails at `forget` with `repository is already locked`, and VolSync retries
 again, so the repository grows by several hundred snapshots a day that are
 never forgotten. A plain `restic unlock` removes only locks older than 30
-minutes, which a lock left under v0.8.1 is by the time you run it.
+minutes, which a lock left under v0.8.1 is by the time you run it. A source
+still carrying such a tag, whose retries fail on that lock, never finishes on
+its own: under v0.9.0 every later run fails that item at once with the message
+above, and the way out is the one the message names, delete the
+ReplicationSource while no pod of its Job runs, after which the next backup
+unlocks the repository.
 
 ## Back up now
 
@@ -382,17 +477,69 @@ has to carry `backup.wlz.li/enabled: "true"`.
 
 A BackupRun ends with reason Invalid only for a spec no retry can fix: a named
 claim or Cluster that is missing or not marked, or nothing marked in the
-namespace. Once the run has its items, an item fails only for what the item
+namespace. A run whose installed CRD lacks a field the controller writes ends
+before it changes anything, with reason CRDOutdated; [architecture.md](architecture.md#objects-the-controller-writes)
+has the check. Once the run has its items, an item fails only for what the item
 itself holds: `the claim <name> no longer exists`, `claim <name> is bound to
 the PersistentVolume <pv>, which does not exist`, a claim's retain- annotations
-that don't parse, or a source or Backup the API server rejects as invalid. A
-timeout or a 5xx from the API server while the run plans, stops workloads or
-starts an item is returned, and the next reconcile tries again.
+that don't parse, a source holding a tag no run waits for
+([Sources the controller writes](#sources-the-controller-writes)), or a source
+or Backup the API server rejects as invalid.
+
+A start that fails with an error a retry may fix, such as a CloudNativePG
+webhook that cannot be reached, no longer ends the pass. The item stays Pending
+with `not started yet: <error>`, the Ready condition takes reason Retrying with
+a message that names every such item and every wait, `retrying the start of
+notes-pg: <error>; ReplicationSource notes-data is still completing the backup
+of BackupRun scheduled-20260926-0900`, and the run keeps working: the quiesced
+workloads still come back once the clones are cut, and the item is tried again
+on every pass until the run's timeout. Without a retry, a run waiting on another
+run shows reason SourceBusy and names every wait in its message. A timeout or a
+5xx from the API server while the run plans, stops workloads or starts an item
+is returned, and the next reconcile tries again.
 
 A cluster without the CloudNativePG CRDs holds no Clusters. The scheduler and
 every run with `all: true` find none there, and a BackupRun with
 `database: <name>` ends Invalid with `no Cluster <name> in this namespace; the
 cluster has no CloudNativePG CRDs`.
+
+## One mover at a time
+
+A backup and a restore of the same claim or repository never run at once. Each
+run takes a `coordination.k8s.io` Lease for the claim and one for the
+repository right before it creates its mover object, the claim's named
+`backup-controller-claim-<claim uid>` and the repository's
+`backup-controller-repo-<secret uid>`. Creating a Lease is atomic, so of two
+runs that reach that moment in the same instant the API server admits one, and
+the other waits. The Lease is written in the run's namespace, names its holder
+in `backup.wlz.li/lease-holder-kind` (BackupRun or RestoreRun),
+`backup.wlz.li/lease-holder-uid` and `backup.wlz.li/lease-holder-name`, and
+lists the holder's items in `backup.wlz.li/lease-items`. A run releases its
+Leases once an item finishes, and takes over a Lease whose holder has finished
+or no longer exists. A Lease counts as held while the holder's item of the kind
+that takes it is Pending or Running, so a Cluster item that happens to share a
+claim's name does not keep that claim's Lease.
+
+A run that finds another run holding either Lease waits with reason SourceBusy:
+
+```text
+BackupRun scheduled-20260926-0900 holds Lease backup-controller-claim-3f2a1c7e-9d2b for notes-data; this run starts once that run has finished with it
+```
+
+A RestoreRun that started before the Leases existed is found through its mover
+object instead, and a BackupRun reports that hold as well: `RestoreRun
+notes-back-to-friday is restoring claim notes-data from repository
+notes-restic-data with ReplicationDestination restore-3f2a1c7e; this run starts
+once that restore has finished`. A namespace run checks every claim this way
+before it stops anything, so an app is never stopped for a backup that then
+waits.
+
+A claim's repository Secret that does not exist leaves the item Pending and
+retried: the run reports the missing Secret on the Ready condition, and tries
+again on the next pass. The Lease of an item that has finished is released on
+the run's next pass, and that release is best effort: a failure is logged and
+the run goes on, so it never holds the app past the quiesce limit, and the run
+releases every Lease it still holds when it finishes.
 
 ## Restore
 
@@ -432,6 +579,22 @@ Cluster canary-namespace-backup-pg: no base backup finished by 2026-09-24T22:12:
 Without the first check, VolSync's mover prints `No eligible snapshots found`,
 exits 0, and the restore reports success having written nothing.
 
+The run then checks that the snapshot it selected is one the mover will restore
+when it is pinned to that snapshot's second, and refuses the run with reason
+NoBackupInReach, before anything is created, when it is not:
+
+```text
+snapshot 6e473100 (2026-09-26T09:03:53Z) shares its second with snapshot 2edf5bab, and VolSync's mover picks by the whole second, so it would restore 2edf5bab. Choose 2edf5bab or a snapshot in another second
+```
+
+[restores.md](restores.md#which-snapshot-a-run-restores) has every case,
+including the one a `syncDatabaseToVolume` run adds. Right before the run
+creates a destination, it lists the repository once more: a snapshot a backup's
+retention removed after the checks, a snapshot that backup rewrote at another
+time, or one the mover would now pick instead, fails the item with the cause
+and `. Nothing was written to claim <claim>. Create a new RestoreRun to select
+again`.
+
 A missing repository Secret fails the check with `no repository Secret <name>
 in this namespace`. A check that fails with an error a retry may fix, such as a
 timeout from the API server or a repository the controller can't open, leaves
@@ -440,7 +603,11 @@ message, and the controller tries again. A run still retrying once its
 `timeout` has passed since it was created ends Failed with reason TimedOut, so
 a wrong repository password shows up in `kubectl get rrun` and ends the run.
 The same kind of error while a volume item waits to start is retried with the
-item left as it was.
+item left as it was. While a backup of a claim or its repository is in
+progress, the checks leave the run unplanned and Ready False with reason
+SourceBusy and the other run's message; a run that has still not passed its
+checks by its creation plus `timeout` ends Failed with reason TimedOut and
+`the run had not passed its checks by <time>: <message>`.
 
 ### A database restore
 
@@ -497,6 +664,31 @@ The rows from 22:20:25 to 22:22:33 are gone, the table ends at 22:18:25, the
 last tick before the target, and new writes continue. A Cluster that declares
 its own bootstrap method, such as `recovery` or `pg_basebackup`, while a run
 waits for it is refused, so the two sources cannot race.
+
+A Cluster that comes back without this run's recovery is left alone. Only the
+Cluster carrying the UID the run recorded is skipped or deleted again; any
+other Cluster of the item's name fails the item:
+
+```text
+Cluster canary-namespace-backup-pg came back carrying backup.wlz.li/bootstrap: initdb after this run deleted it, so it started empty and nothing was restored. Remove the annotation from its manifest and create a new RestoreRun to recover it. The run leaves the Cluster alone
+```
+
+```text
+Cluster canary-namespace-backup-pg (UID 3f2a1c7e-9d2b-4e6f-8a01-2c3d4e5f6071) came back without this run's recovery: it archives nowhere. The run does not delete a Cluster it did not recover
+```
+
+The reason after the colon names what the Cluster is doing instead: it archives
+nowhere, it carries the opt-out annotation, it declares its own bootstrap
+method such as `pg_basebackup`, `RestoreRun <name> recovered it`, or the
+bootstrap webhook did not mark it. A Cluster that came back carrying the
+opt-out annotation or declaring its own bootstrap says that it started empty or
+from that bootstrap and that nothing was restored. An item with no recorded
+`clusterUID`, from a run that started under v0.7.2 or found no Cluster when it
+started, says that it cannot tell the old Cluster from a new one, and leaves
+this one alone too. While the run waits for the Cluster to be created again, a
+Cluster that is deleted or replaced fails the item with `the recovered Cluster
+was deleted` or `the recovered Cluster was replaced by one this run did not
+recover`.
 
 ### Restore a whole namespace
 

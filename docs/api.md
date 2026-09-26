@@ -157,7 +157,7 @@ spec:
 | --- | --- | --- |
 | `source` | one of the three | the claim to back up, which has to carry `backup.wlz.li/enabled: "true"`; its ReplicationSource has the same name |
 | `database` | one of the three | the CloudNativePG Cluster to take a base backup of |
-| `all` | one of the three | every enabled claim and Cluster in the namespace, with the workloads marked `backup.wlz.li/quiesce` stopped until the clones are cut |
+| `all` | one of the three | every enabled claim and Cluster in the namespace, with the workloads marked `backup.wlz.li/quiesce` stopped until the clones are cut, and for at most the namespace's `backup.wlz.li/max-quiesce`, ten minutes by default |
 | `timeout` | no | how long the run may work once admitted, e.g. `10h`. Omitted, the namespace's `backup.wlz.li/timeout`, and 6h without one |
 | `ttlSecondsAfterFinished` | no | delete the run that long after it finishes. Omitted, it stays as the record |
 
@@ -171,7 +171,7 @@ scheduled run is an ordinary BackupRun named `scheduled-<yyyymmdd-hhmm>` with
 | `workload` | the Kueue Workload admitting the run, while it exists |
 | `startedAt`, `completedAt` | when Kueue admitted the run, and when it finished |
 | `quiescedAt`, `restartedAt` | when the run stopped and restarted the quiesced workloads, in whole seconds |
-| `restartPending` | true from the moment the run records `restartedAt` until it has given every workload its replicas back and resumed every Kustomization; a pass that finds it set repeats the restart and keeps the recorded `restartedAt` |
+| `restartPending` | true from the moment the run records `restartedAt` until it has given every workload its replicas back and resumed every Kustomization; a pass that finds it set repeats the restart and keeps the recorded `restartedAt`, and the pass that records the moment restarts the workloads whatever the field then holds, so a run an older version quiesced under a CRD without the field still gives the app back |
 | `quiesced[]` | the workloads the run stops, each with the replica count it had before the run touched it, which the run gives back |
 | `suspendedKustomizations[]` | the Flux Kustomizations the run suspends, as namespace/name; it resumes exactly these |
 | `items[]` | one per volume and database: kind, name, phase, message, the manual `trigger`, the restic `snapshot` and its `snapshotTime`, `empty` for a volume with no files, and the CloudNativePG `backup` |
@@ -192,13 +192,29 @@ ID and `snapshotTime` equals `restartedAt`. Without stopped workloads,
 [namespace-backups.md](namespace-backups.md#quiesced-snapshots) shows a run
 doing it.
 
+### Ready reasons
+
+| Ready reason | When |
+| --- | --- |
+| Queued | the run waits for Kueue to admit it |
+| Running | work is under way; the message is `backing up` |
+| SourceBusy | another run holds the run's claim or repository; the message names that run and what it holds, and every item that has to wait |
+| Retrying | an item could not start with an error a retry may fix, such as a Backup a CloudNativePG webhook refuses; the message names every such item and its error |
+| RestartFailed | the run could not give a stopped workload its replicas back or resume a Kustomization it suspended, so the app is still down; when the Lease release or the Workload delete failed as well, the reason stays RestartFailed and the message names both |
+| ReleaseFailed | the app is back, and the run cannot finish because it could not release its Leases or delete its Kueue Workload |
+| CRDOutdated | the run ended before it changed anything, because the installed CRD of its kind lacks a field the controller writes |
+| Invalid | the spec names something no retry can fix, such as a claim that is not marked `backup.wlz.li/enabled` |
+| Succeeded | the run finished with every item done |
+| Failed | the run finished with a failed item, or past its timeout |
+
 Whenever a run's Ready condition moves to a new reason, the controller records
 an event on the run with that reason, and the condition's message as its note.
-A run that finishes with any reason but Succeeded, such as Invalid or Failed,
-records a Warning; Queued, Running, SourceBusy and Succeeded record Normal
-events. `kubectl describe brun <name>` lists them under Events. Because
-events.k8s.io/v1 rejects a note over 1024 bytes, the controller cuts a longer
-message at that length, and the full text stays on the condition.
+A run that has finished with any reason but Succeeded, such as Invalid or
+Failed, records a Warning, and so do RestartFailed and ReleaseFailed, which the
+run reports while it is unfinished; Queued, Running, SourceBusy, Retrying and
+Succeeded record Normal events. `kubectl describe brun <name>` lists them under
+Events. Because events.k8s.io/v1 rejects a note over 1024 bytes, the controller
+cuts a longer message at that length, and the full text stays on the condition.
 
 ## RestoreRun
 
@@ -217,7 +233,7 @@ spec:
 | --- | --- | --- |
 | `claim` | one of `claim`/`repository`, `database` and `all` | the claim whose repository to restore from, and the claim to write into unless `into` names another |
 | `repository` | the same | the restic Secret in this namespace, for a repository no claim here owns; needs `into` and `intoSize` |
-| `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository`. With `claim`, a VolumeRestore fills it on the source claim's node; with `repository`, a mover writes into it directly, and the scheduler places it with the mover pod |
+| `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository`. The run creates it empty and writes the selected snapshot into it through its own ReplicationDestination with `copyMethod: Direct`, so the mover's log confirms what the claim holds. With `claim` the claim takes the source claim's size and the node its volume is on, and the scheduler places the mover pod with that volume; with `repository` there is no source node, and the mover pod is the claim's first consumer |
 | `intoSize` | with `repository` and `into` | the size of that claim; omitted with `claim`, the source claim's request |
 | `database` | one of the three | the Cluster to restore; the run deletes it and it recovers when it is created again. A Cluster carrying `backup.wlz.li/bootstrap: initdb`, or declaring its own bootstrap method such as `pg_basebackup`, ends the run Invalid |
 | `all` | one of the three | every enabled claim in place, then every enabled Cluster; a Cluster carrying `backup.wlz.li/bootstrap: initdb`, or declaring its own bootstrap method, gets a Skipped item |
@@ -237,11 +253,13 @@ spec:
 | `syncedTo` | the moment a `syncDatabaseToVolume` run restores the volumes and recovers the databases to |
 | `quiescedAt`, `restartedAt`, `quiesced[]`, `suspendedKustomizations[]` | when the run stopped and gave back the workloads `quiesce` lists, the replicas it gave each back, and the Flux Kustomizations it suspended and resumed |
 | `items[]` | one per volume and per database: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message, the `destination` while it exists, the `snapshot` and `snapshotTime` a volume restores, the `baseBackup` a recovery starts from, and the `clusterUID` of the Cluster a database item deletes |
-| `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, ClaimInUse, Retrying, or `recreate <cluster> to finish the restore` |
+| `conditions[type=Ready]` | the reason and message, e.g. NoBackupInReach, SourceBusy, ClaimInUse, Retrying, or `recreate <cluster> to finish the restore` |
 
 `items[].snapshotTime` is the time of the snapshot the run's checks selected,
 and the mover gets it as `restoreAsOf`;
-[restores.md](restores.md#which-snapshot-a-run-restores) says why.
+[restores.md](restores.md#which-snapshot-a-run-restores) says why the run
+refuses a snapshot VolSync's mover would not restore when pinned to that
+second, and how a run that lost its selection before it created anything ends.
 `items[].clusterUID` is the UID of the Cluster a database item deletes, written
 with the Deleted mark; [architecture.md](architecture.md#a-database-restore)
 shows how the run tells the old Cluster from the recovered one by it. Ready
@@ -249,6 +267,17 @@ reason Retrying marks a run whose checks keep failing with an error a retry may
 fix, such as a repository with the wrong password, with the phase still empty;
 [namespace-backups.md](namespace-backups.md#checks-before-anything-is-touched)
 has how long it retries.
+
+A volume item succeeds only when the destination's `status.latestMoverStatus`
+names the recorded snapshot in its log. A mover that restored another snapshot,
+that found none, or whose log names none, fails the item and the message says
+what the claim holds;
+[restores.md](restores.md#what-the-mover-restored) lists the messages. A run
+writes only into a claim it created itself: a claim or ReplicationDestination
+of the name `spec.into` that the run does not control fails the run, and the
+message says what to do instead. An `into` restore that a v0.8.1 or older
+controller started through the VolumeRestore populator ends Failed, because
+nothing can tell which snapshot the populator restored.
 
 A RestoreRun records an event at each new Ready reason, the same way a
 [BackupRun](#backuprun) does.
