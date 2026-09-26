@@ -80,11 +80,13 @@ func servedKind(mapper meta.RESTMapper, gk schema.GroupKind) (schema.GroupVersio
 // with a plain-text "404 page not found" from its not-found handler.
 // client-go turns the text answer into a NotFound whose details carry an
 // UnexpectedServerResponse cause, which apierrors.IsUnexpectedServerError
-// reports (checked against Kubernetes 1.36.4). For that error versionGone
-// makes mapper look the kind's versions up again (see rediscover) and returns
-// a *versionGoneError, for which apierrors.IsNotFound is false, so the caller
-// retries with nothing skipped. It returns any other error, and nil, as it
-// is.
+// reports. This was checked against Kubernetes 1.36.4, and
+// TestEnvtestAVersionNoLongerServedIsNotAMissingObject checks it against the
+// kube-apiserver versions.json pins on every envtest run. For that error
+// versionGone makes mapper look the kind's versions up again (see
+// rediscover) and returns a *versionGoneError, for which apierrors.IsNotFound
+// is false, so the caller retries with nothing skipped. It returns any other
+// error, and nil, as it is.
 func versionGone(mapper meta.RESTMapper, gvk schema.GroupVersionKind, err error) error {
 	if !apierrors.IsNotFound(err) || !apierrors.IsUnexpectedServerError(err) {
 		return err
