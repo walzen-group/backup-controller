@@ -227,7 +227,7 @@ required even when steps 3 and 4 pass.
 ### Step 6: Fix and release
 
 Change the controller where a behaviour moved, add a test that fails on the
-old code, and release. A release requires `make e2e` passing locally.
+old code, and release. A release follows [releasing.md](releasing.md): every check there, `make e2e` and `make demo` included, passes locally first.
 
 ## Which tests catch which behaviour
 
