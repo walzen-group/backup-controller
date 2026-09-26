@@ -1,0 +1,518 @@
+package runs
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// messageRuleScope is the code TestNoDecisionReadsAMessage reads: the
+// non-test Go files of each directory, or only the named files when a scope
+// lists them. It covers what restic-jobs step 3 left free of message reads;
+// steps 4, 7b and 10 widen it until it holds every non-test file of
+// internal/runs and internal/populator.
+var messageRuleScope = []messageRuleDir{
+	{dir: ".", files: []string{"backuprun.go"}},
+	{dir: "../populator"},
+}
+
+// messageRuleDir is one directory the rule reads.
+type messageRuleDir struct {
+	// dir is the directory, relative to this package.
+	dir string
+	// files names the files to read in it. Empty means every non-test Go
+	// file.
+	files []string
+}
+
+// messageRuleEntry names one top-level declaration the rule lets through,
+// and why.
+type messageRuleEntry struct {
+	// pkg is the directory's base name, such as runs or populator.
+	pkg string
+	// decl is the declaration: a function, a method as Type.name, or a
+	// package-level var.
+	decl string
+	// what says what the declaration matches or compares, which is never
+	// text a component wrote for a person.
+	what string
+}
+
+// textMatcherAllowlist lets a declaration use a text matcher (part 1 of
+// the rule). A new entry needs a reviewer's eye like any rule exception.
+// Nothing in the scope needs one yet: walkFields, applyStop, appliedPart,
+// restartWorkloads, inPlaceClaimLost, retention, resticSpan and lastLines
+// join it with the files that hold them.
+var textMatcherAllowlist = []messageRuleEntry{}
+
+// textMatcherPending holds the text matchers a later step removes. Each
+// entry is a known message read, kept only until that step lands, and the
+// step empties it.
+var textMatcherPending = []messageRuleEntry{
+	{pkg: "runs", decl: "BackupRunReconciler.collectItem",
+		what: "strings.Contains(logs, alreadyLocked) reads the mover's log for restic's lock line; restic-jobs step 10 (J3) removes it"},
+}
+
+// messageComparisonAllowlist lets a declaration compare a message, a log or
+// an error string (part 2 of the rule). readyChanged joins it with
+// restorerun.go: it compares a condition message only to skip an unchanged
+// status write.
+var messageComparisonAllowlist = []messageRuleEntry{}
+
+// No decision in the scope reads text a component wrote for a person: the
+// controller's own messages, VolSync's mover logs, or an error's string.
+// Part 1 fails on any text matcher outside the allowlist, since a message
+// read through a local looks like any other string. Part 2 fails on a
+// comparison (==, !=, a switch) of a .Message or .Logs field, an Error()
+// string, or a local assigned from one of those. An entry on a list that
+// matches nothing fails too, so the lists stay exact.
+func TestNoDecisionReadsAMessage(t *testing.T) {
+	var findings []messageFinding
+	for _, scope := range messageRuleScope {
+		findings = append(findings, scanMessageRule(t, scope)...)
+	}
+	lists := messageRuleLists{
+		matchers:    slices.Concat(textMatcherAllowlist, textMatcherPending),
+		comparisons: messageComparisonAllowlist,
+	}
+	left, unused := lists.apply(findings)
+	for _, f := range left {
+		t.Errorf("%s", f)
+	}
+	for _, e := range unused {
+		t.Errorf("the list entry %s.%s (%s) matches nothing; delete it", e.pkg, e.decl, e.what)
+	}
+}
+
+// The rule catches each shape of a message read in its fixture: a matcher
+// on a field, on a local and in a package-level var, a regexp method, a
+// comparison of a field, of an Error() string and of locals assigned from
+// them, and a switch on a message. A declaration on the allowlist is let
+// through, and an entry that matches nothing is reported.
+func TestTheMessageRuleCatchesEveryShape(t *testing.T) {
+	findings := scanMessageRule(t, messageRuleDir{dir: "testdata/nomessage"})
+	lists := messageRuleLists{
+		matchers: []messageRuleEntry{
+			{pkg: "nomessage", decl: "allowed", what: "a key the fixture built"},
+			{pkg: "nomessage", decl: "stale", what: "nothing"},
+		},
+	}
+	left, unused := lists.apply(findings)
+	got := map[int]string{}
+	for _, f := range left {
+		got[f.line] = f.rule
+	}
+	want := fixtureWants(t, "testdata/nomessage/fixture.go")
+	for line, rule := range want {
+		if got[line] != rule {
+			t.Errorf("fixture line %d: rule found %q, want %q", line, got[line], rule)
+		}
+	}
+	for line, rule := range got {
+		if _, ok := want[line]; !ok {
+			t.Errorf("fixture line %d: rule %q found where none is wanted", line, rule)
+		}
+	}
+	if len(unused) != 1 || unused[0].decl != "stale" {
+		t.Errorf("unused entries = %+v, want only stale", unused)
+	}
+}
+
+// fixtureWants reads the fixture's "// want <rule>" comments and returns
+// the rule each marked line must break, by line number.
+func fixtureWants(t *testing.T, path string) map[int]string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int]string{}
+	for i, line := range strings.Split(string(raw), "\n") {
+		if _, rule, ok := strings.Cut(line, "// want "); ok {
+			want[i+1] = strings.TrimSpace(rule)
+		}
+	}
+	if len(want) == 0 {
+		t.Fatalf("%s marks no line", path)
+	}
+	return want
+}
+
+// messageFinding is one message read the rule found.
+type messageFinding struct {
+	pkg, decl string
+	file      string
+	line      int
+	// rule is ruleMatcher or ruleComparison.
+	rule string
+	// text says what was found.
+	text string
+}
+
+// The two parts of the rule, as a finding names them.
+const (
+	ruleMatcher    = "matcher"
+	ruleComparison = "comparison"
+)
+
+func (f messageFinding) String() string {
+	return fmt.Sprintf("%s:%d in %s: %s (%s)", f.file, f.line, f.decl, f.text, f.rule)
+}
+
+// messageRuleLists holds the entries each part of the rule lets through.
+type messageRuleLists struct {
+	matchers, comparisons []messageRuleEntry
+}
+
+// apply drops the findings a list lets through. It returns the findings
+// left and the entries that let nothing through.
+func (l messageRuleLists) apply(findings []messageFinding) (left []messageFinding, unused []messageRuleEntry) {
+	used := map[messageRuleEntry]bool{}
+	for _, f := range findings {
+		list := l.matchers
+		if f.rule == ruleComparison {
+			list = l.comparisons
+		}
+		i := slices.IndexFunc(list, func(e messageRuleEntry) bool { return e.pkg == f.pkg && e.decl == f.decl })
+		if i < 0 {
+			left = append(left, f)
+			continue
+		}
+		used[list[i]] = true
+	}
+	for _, e := range slices.Concat(l.matchers, l.comparisons) {
+		if !used[e] {
+			unused = append(unused, e)
+		}
+	}
+	return left, unused
+}
+
+// scanMessageRule parses the files of one scope and returns every message
+// read in them, before any list applies.
+func scanMessageRule(t *testing.T, scope messageRuleDir) []messageFinding {
+	t.Helper()
+	paths := make([]string, 0, len(scope.files))
+	for _, name := range scope.files {
+		paths = append(paths, filepath.Join(scope.dir, name))
+	}
+	if len(paths) == 0 {
+		all, err := filepath.Glob(filepath.Join(scope.dir, "*.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range all {
+			if !strings.HasSuffix(path, "_test.go") {
+				paths = append(paths, path)
+			}
+		}
+	}
+	if len(paths) == 0 {
+		t.Fatalf("the scope %s holds no Go file", scope.dir)
+	}
+	abs, err := filepath.Abs(scope.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, path := range paths {
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, file)
+	}
+	pkg := messagePackage{fset: fset, name: filepath.Base(abs), regexps: regexpNames(files)}
+	var findings []messageFinding
+	for _, file := range files {
+		findings = append(findings, pkg.scanFile(file)...)
+	}
+	return findings
+}
+
+// messagePackage is what the rule knows of one package while it scans it.
+type messagePackage struct {
+	fset *token.FileSet
+	name string
+	// regexps are the names assigned a value built by package regexp
+	// anywhere in the package. A method called on one is a matcher. The
+	// rule goes by name alone, so a shadowed name counts as well.
+	regexps map[string]bool
+}
+
+// textMatchers are the functions of packages strings and bytes the rule
+// forbids: every one that matches, cuts or trims by content.
+var textMatchers = map[string]bool{
+	"HasPrefix": true, "HasSuffix": true, "Contains": true, "ContainsAny": true, "ContainsRune": true,
+	"ContainsFunc": true, "Cut": true, "CutPrefix": true, "CutSuffix": true, "Trim": true, "TrimPrefix": true,
+	"TrimSuffix": true, "TrimSpace": true, "TrimLeft": true, "TrimRight": true, "TrimFunc": true,
+	"TrimLeftFunc": true, "TrimRightFunc": true, "Index": true, "IndexAny": true, "IndexByte": true,
+	"IndexFunc": true, "IndexRune": true, "LastIndex": true, "LastIndexAny": true, "LastIndexByte": true,
+	"LastIndexFunc": true, "EqualFold": true, "Count": true,
+}
+
+// regexpNames returns every name assigned from an expression that uses
+// package regexp, in any file of the package.
+func regexpNames(files []*ast.File) map[string]bool {
+	names := map[string]bool{}
+	for _, file := range files {
+		local := importName(file, "regexp")
+		if local == "" {
+			continue
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			lhs, rhs := assignment(n)
+			for i, value := range rhs {
+				if i < len(lhs) && usesPackage(value, local) {
+					if id, ok := lhs[i].(*ast.Ident); ok {
+						names[id.Name] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	return names
+}
+
+// assignment returns the two sides of an assignment or a var spec, and
+// nothing for any other node.
+func assignment(n ast.Node) (lhs, rhs []ast.Expr) {
+	switch n := n.(type) {
+	case *ast.AssignStmt:
+		return n.Lhs, n.Rhs
+	case *ast.ValueSpec:
+		for _, name := range n.Names {
+			lhs = append(lhs, name)
+		}
+		return lhs, n.Values
+	}
+	return nil, nil
+}
+
+// usesPackage reports whether an expression refers to the package imported
+// as local.
+func usesPackage(e ast.Expr, local string) bool {
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			if id, ok := sel.X.(*ast.Ident); ok && id.Name == local {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// importName returns the name a file refers to an import path by, or ""
+// when the file does not import it.
+func importName(file *ast.File, path string) string {
+	for _, spec := range file.Imports {
+		if p, err := strconv.Unquote(spec.Path.Value); err != nil || p != path {
+			continue
+		}
+		if spec.Name != nil {
+			return spec.Name.Name
+		}
+		return path
+	}
+	return ""
+}
+
+// scanFile returns the message reads of one file, each named after its
+// top-level declaration. A dot import of strings, bytes or regexp is a
+// finding of its own, since the rule could not see its calls.
+func (p messagePackage) scanFile(file *ast.File) []messageFinding {
+	var findings []messageFinding
+	matchers := map[string]string{}
+	for _, path := range []string{"strings", "bytes", "regexp"} {
+		switch name := importName(file, path); name {
+		case "", "_":
+		case ".":
+			findings = append(findings, p.finding(file, "import", ruleMatcher, "a dot import of "+path))
+		default:
+			matchers[name] = path
+		}
+	}
+	for _, decl := range file.Decls {
+		for _, named := range declNames(decl) {
+			findings = append(findings, p.scanDecl(named, matchers)...)
+		}
+	}
+	return findings
+}
+
+// namedNode is a top-level declaration, or one spec of it, with the key the
+// lists use.
+type namedNode struct {
+	name string
+	node ast.Node
+}
+
+// declNames splits a top-level declaration into what the lists name: a
+// function, a method as Type.name, or each spec of a var, const or type
+// declaration by its first name.
+func declNames(decl ast.Decl) []namedNode {
+	switch d := decl.(type) {
+	case *ast.FuncDecl:
+		name := d.Name.Name
+		if d.Recv != nil && len(d.Recv.List) == 1 {
+			name = receiverType(d.Recv.List[0].Type) + "." + name
+		}
+		return []namedNode{{name, d}}
+	case *ast.GenDecl:
+		var nodes []namedNode
+		for _, spec := range d.Specs {
+			switch s := spec.(type) {
+			case *ast.ValueSpec:
+				nodes = append(nodes, namedNode{s.Names[0].Name, s})
+			case *ast.TypeSpec:
+				nodes = append(nodes, namedNode{s.Name.Name, s})
+			}
+		}
+		return nodes
+	}
+	return nil
+}
+
+// receiverType returns the name of a method's receiver type, without a
+// pointer or type parameters.
+func receiverType(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.StarExpr:
+		return receiverType(t.X)
+	case *ast.IndexExpr:
+		return receiverType(t.X)
+	case *ast.IndexListExpr:
+		return receiverType(t.X)
+	case *ast.Ident:
+		return t.Name
+	}
+	return "?"
+}
+
+// scanDecl returns the message reads in one top-level declaration.
+//
+// Parameters:
+//   - named is the declaration and its key.
+//   - matchers maps the file's names for strings, bytes and regexp to the
+//     import path.
+func (p messagePackage) scanDecl(named namedNode, matchers map[string]string) []messageFinding {
+	var findings []messageFinding
+	add := func(n ast.Node, rule, text string) {
+		findings = append(findings, p.finding(n, named.name, rule, text))
+	}
+	tainted := taintedLocals(named.node)
+	message := func(e ast.Expr) bool { return isMessage(e, tainted) }
+	ast.Inspect(named.node, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.SelectorExpr:
+			p.checkMatcher(n, matchers, add)
+		case *ast.BinaryExpr:
+			if (n.Op == token.EQL || n.Op == token.NEQ) && (message(n.X) || message(n.Y)) {
+				add(n, ruleComparison, "a comparison of a message, a log or an error string")
+			}
+		case *ast.SwitchStmt:
+			checkSwitch(n, message, add)
+		}
+		return true
+	})
+	return findings
+}
+
+// checkMatcher reports a selector that names a text matcher: a matching
+// function of strings or bytes, any function of regexp, or a method of a
+// name assigned from regexp.
+func (p messagePackage) checkMatcher(sel *ast.SelectorExpr, matchers map[string]string, add func(ast.Node, string, string)) {
+	id, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return
+	}
+	switch path := matchers[id.Name]; {
+	case path == "regexp":
+		add(sel, ruleMatcher, "regexp."+sel.Sel.Name)
+	case path != "" && textMatchers[sel.Sel.Name]:
+		add(sel, ruleMatcher, path+"."+sel.Sel.Name)
+	case path == "" && p.regexps[id.Name]:
+		add(sel, ruleMatcher, "the regexp method "+id.Name+"."+sel.Sel.Name)
+	}
+}
+
+// checkSwitch reports a switch whose tag, or one of whose case values, is a
+// message.
+func checkSwitch(s *ast.SwitchStmt, message func(ast.Expr) bool, add func(ast.Node, string, string)) {
+	if s.Tag == nil {
+		return
+	}
+	values := []ast.Expr{s.Tag}
+	for _, stmt := range s.Body.List {
+		if clause, ok := stmt.(*ast.CaseClause); ok {
+			values = append(values, clause.List...)
+		}
+	}
+	for _, v := range values {
+		if message(v) {
+			add(s, ruleComparison, "a switch on a message, a log or an error string")
+			return
+		}
+	}
+}
+
+// taintedLocals returns the names in a declaration that are assigned a
+// message, through :=, =, += or var, directly or from another such name,
+// repeated until no name is added.
+func taintedLocals(node ast.Node) map[string]bool {
+	tainted := map[string]bool{}
+	for changed := true; changed; {
+		changed = false
+		ast.Inspect(node, func(n ast.Node) bool {
+			lhs, rhs := assignment(n)
+			if len(lhs) != len(rhs) {
+				return true
+			}
+			for i, value := range rhs {
+				id, ok := lhs[i].(*ast.Ident)
+				if ok && !tainted[id.Name] && isMessage(value, tainted) {
+					tainted[id.Name], changed = true, true
+				}
+			}
+			return true
+		})
+	}
+	return tainted
+}
+
+// isMessage reports whether an expression is text a component wrote for a
+// person: a field .Message or .Logs, an Error() call, a string conversion
+// of one, or a tainted local.
+func isMessage(e ast.Expr, tainted map[string]bool) bool {
+	switch e := ast.Unparen(e).(type) {
+	case *ast.SelectorExpr:
+		return e.Sel.Name == "Message" || e.Sel.Name == "Logs"
+	case *ast.CallExpr:
+		if sel, ok := e.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Error" && len(e.Args) == 0 {
+			return true
+		}
+		if id, ok := e.Fun.(*ast.Ident); ok && id.Name == "string" && len(e.Args) == 1 {
+			return isMessage(e.Args[0], tainted)
+		}
+	case *ast.Ident:
+		return tainted[e.Name]
+	}
+	return false
+}
+
+// finding builds a finding at a node's position.
+func (p messagePackage) finding(n ast.Node, decl, rule, text string) messageFinding {
+	pos := p.fset.Position(n.Pos())
+	return messageFinding{pkg: p.name, decl: decl, file: pos.Filename, line: pos.Line, rule: rule, text: text}
+}
