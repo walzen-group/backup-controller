@@ -114,12 +114,15 @@ func newClient(t *testing.T, objects ...client.Object) client.Client {
 // newClientWithCRDs builds a strict fake client as newClient does, pruning
 // against the CRD files in crdFiles. The client also holds this project's
 // CustomResourceDefinitions from those files as objects, so a run's schema
-// check reads the same CRDs the client prunes against.
+// check reads the same CRDs the client prunes against. Its RESTMapper is a
+// *servedKinds that serves the scheme's built-in kinds and the versions the
+// CRD files serve, as the API server's discovery would.
 func newClientWithCRDs(t *testing.T, crdFiles []string, objects ...client.Object) client.Client {
 	t.Helper()
 	now := frozen
 	objects = append(objects, ownCRDObjects(t, crdFiles)...)
-	c := strictclient.Build(fake.NewClientBuilder().WithObjects(objects...), scheme(t), strictclient.Options{
+	s := scheme(t)
+	c := strictclient.Build(fake.NewClientBuilder().WithObjects(objects...).WithRESTMapper(newServedKinds(t, s, crdFiles)), s, strictclient.Options{
 		Clock: func() time.Time { return now },
 		CRDs:  crdFiles,
 	})

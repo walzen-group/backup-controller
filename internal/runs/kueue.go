@@ -153,11 +153,24 @@ func markPodsReady(ctx context.Context, c client.Client, workload *unstructured.
 }
 
 // deleteWorkload deletes the Workload of the run whose UID is given, which
-// gives the run's quota back to the queue. A Workload that is already gone
-// counts as deleted.
+// gives the run's quota back to the queue. It deletes at the version of
+// Workload the API server serves (see servedKind). A Workload that is
+// already gone counts as deleted, and so does every Workload on a cluster
+// that serves no version of the kind, which has no Kueue installed.
+//
+// It returns an error when the lookup of the served version fails for
+// another reason, such as a failed discovery call, or when the delete fails
+// with an error other than NotFound.
 func deleteWorkload(ctx context.Context, c client.Client, namespace string, uid types.UID) error {
+	gvk, err := servedKind(c.RESTMapper(), WorkloadGVK.GroupKind())
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("delete Workload %s: %w", workloadName(uid), err)
+	}
 	workload := &unstructured.Unstructured{}
-	workload.SetGroupVersionKind(WorkloadGVK)
+	workload.SetGroupVersionKind(gvk)
 	workload.SetNamespace(namespace)
 	workload.SetName(workloadName(uid))
 	if err := c.Delete(ctx, workload); err != nil && !apierrors.IsNotFound(err) {

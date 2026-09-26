@@ -101,6 +101,20 @@ const (
 	// the CRDs of the controller's release fixes it; Helm does not upgrade
 	// CRDs on its own.
 	ReasonCRDOutdated = "CRDOutdated"
+
+	// ReasonRestartFailed reports a BackupRun that is ending, or being
+	// deleted, and could not put back what it changed in the cluster: give a
+	// stopped workload its replicas back, resume a Kustomization it
+	// suspended, release its Leases or delete its Kueue Workload. The run
+	// stays unfinished and tries again on every reconcile until it can,
+	// because finishing would leave the app down with no record of the
+	// replicas it is owed. While a namespace run is unfinished, the
+	// namespace's schedule starts no new one. The message names the object
+	// and the error. Fixing the cause lets the run finish by itself; a person
+	// can also scale the workloads and resume the Kustomizations by hand,
+	// then delete the run and remove its backup.wlz.li/run-cleanup finalizer.
+	// The run records a Warning event when it first reports this.
+	ReasonRestartFailed = "RestartFailed"
 )
 
 // SetReady sets or replaces the Ready condition in a status's condition list.

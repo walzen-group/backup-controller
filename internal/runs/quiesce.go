@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"sort"
 	"strings"
@@ -12,17 +13,79 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
 // KustomizationGVK is the kind of a Flux Kustomization, the object that
 // applies a workload. A run suspends the Kustomization while the workload is
-// stopped, so that Flux doesn't scale the workload back up.
+// stopped, so that Flux doesn't scale the workload back up. The run reads
+// and writes Kustomizations at the version the API server serves, which
+// servedKind looks up; v1 is the version this code was written against.
 var KustomizationGVK = schema.GroupVersionKind{Group: "kustomize.toolkit.fluxcd.io", Version: "v1", Kind: "Kustomization"}
+
+// servedKind returns the group, version and kind at which the API server
+// serves the kind gk, as the client's RESTMapper looks it up by group and
+// kind with no version. A Flux or Kueue release that moves its kinds to a
+// new version therefore keeps working.
+//
+// Parameters:
+//   - mapper is the client's RESTMapper, from client.Client.RESTMapper. The
+//     manager's mapper asks the API server's discovery when it has not seen
+//     the group yet.
+//   - gk is the kind to look up.
+//
+// It returns an error for which apierrors.IsNotFound is true when the API
+// server serves no version of the kind. That means the kind's CRD is not
+// installed, and deleting a CRD deletes its objects, so no object of the
+// kind exists: callers treat it like an object that is gone. A discovery
+// call that failed, even one that failed for only some versions, returns
+// any other error, which the caller retries with nothing skipped.
+func servedKind(mapper meta.RESTMapper, gk schema.GroupKind) (schema.GroupVersionKind, error) {
+	mapping, err := mapper.RESTMapping(gk)
+	if err == nil {
+		return mapping.GroupVersionKind, nil
+	}
+	var partial *apiutil.ErrResourceDiscoveryFailed
+	if meta.IsNoMatchError(err) && !errors.As(err, &partial) {
+		return schema.GroupVersionKind{}, &apierrors.StatusError{ErrStatus: metav1.Status{
+			Status:  metav1.StatusFailure,
+			Code:    http.StatusNotFound,
+			Reason:  metav1.StatusReasonNotFound,
+			Message: fmt.Sprintf("the API server serves no version of %s", gk),
+		}}
+	}
+	return schema.GroupVersionKind{}, fmt.Errorf("look up the served version of %s: %w", gk, err)
+}
+
+// getKustomization reads one Kustomization at the version the API server
+// serves (see servedKind).
+//
+// Parameters:
+//   - reader reads the Kustomization.
+//   - mapper looks up the served version.
+//   - namespace and name name the Kustomization.
+//
+// It returns an error for which apierrors.IsNotFound is true when the
+// Kustomization doesn't exist or no version of the kind is served. Any other
+// failed lookup or read is returned as it is.
+func getKustomization(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, namespace, name string) (*unstructured.Unstructured, error) {
+	gvk, err := servedKind(mapper, KustomizationGVK.GroupKind())
+	if err != nil {
+		return nil, err
+	}
+	kustomization := &unstructured.Unstructured{}
+	kustomization.SetGroupVersionKind(gvk)
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, kustomization); err != nil {
+		return nil, err
+	}
+	return kustomization, nil
+}
 
 // fluxNameLabel and fluxNamespaceLabel are the labels kustomize-controller
 // writes on every object it applies. Together they name the Kustomization
@@ -169,12 +232,15 @@ func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 //
 // Parameters:
 //   - reader reads each Kustomization's spec.suspend and inventory.
+//   - mapper looks up the version at which the API server serves
+//     Kustomizations (see servedKind).
 //   - targets are the workloads to stop, from quiesceTargets or namedTargets.
 //
 // It returns each workload with the replica count it has now, which is the
 // count restartWorkloads gives back, and the Kustomizations to suspend as
 // "namespace/name" keys. It returns an error when a Kustomization can't be
-// read.
+// read. On a cluster that serves no version of Kustomization, every
+// Kustomization counts as gone.
 //
 // The kustomize-controller labels on a target name its Kustomization, and
 // that Kustomization is suspended only when its status.inventory lists the
@@ -185,7 +251,7 @@ func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 // doesn't list it is stopped with nothing suspended. A Kustomization that is
 // already suspended is left out, because the run didn't suspend it and must
 // not resume it. A Kustomization that applies several targets is listed once.
-func planStop(ctx context.Context, reader client.Reader, targets []workload) ([]backupv1alpha1.QuiescedWorkload, []string, error) {
+func planStop(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, targets []workload) ([]backupv1alpha1.QuiescedWorkload, []string, error) {
 	var suspend []string
 	read := map[string]*unstructured.Unstructured{}
 	for _, t := range targets {
@@ -197,9 +263,9 @@ func planStop(ctx context.Context, reader client.Reader, targets []workload) ([]
 		key := namespace + "/" + name
 		kustomization, done := read[key]
 		if !done {
-			kustomization = &unstructured.Unstructured{}
-			kustomization.SetGroupVersionKind(KustomizationGVK)
-			if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, kustomization); err != nil {
+			var err error
+			kustomization, err = getKustomization(ctx, reader, mapper, namespace, name)
+			if err != nil {
 				if !apierrors.IsNotFound(err) {
 					return nil, nil, fmt.Errorf("get Kustomization %s: %w", key, err)
 				}
@@ -276,15 +342,18 @@ func applyStop(ctx context.Context, c client.Client, namespace string, stop []ba
 //
 // Parameters:
 //   - reader reads each workload and Kustomization as it stands.
+//   - mapper looks up the version at which the API server serves
+//     Kustomizations (see servedKind).
 //   - namespace is the run's namespace, which holds the workloads.
 //   - stop and suspend are the plan, from the run's status.quiesced and
 //     status.suspendedKustomizations.
 //
 // It keeps a workload that stands at zero replicas and a Kustomization that
 // is suspended, since an earlier pass that lost its status write may have
-// stopped them. It drops what still runs and what is gone. An entry that
-// can't be read is kept, so the restart tries to put it back.
-func appliedPart(ctx context.Context, reader client.Reader, namespace string, stop []backupv1alpha1.QuiescedWorkload, suspend []string) ([]backupv1alpha1.QuiescedWorkload, []string) {
+// stopped them. It drops what still runs and what is gone, and a
+// Kustomization of a kind the API server no longer serves counts as gone.
+// An entry that can't be read is kept, so the restart tries to put it back.
+func appliedPart(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, namespace string, stop []backupv1alpha1.QuiescedWorkload, suspend []string) ([]backupv1alpha1.QuiescedWorkload, []string) {
 	var stopped []backupv1alpha1.QuiescedWorkload
 	for _, w := range stop {
 		object := workloadObject(namespace, w)
@@ -305,9 +374,7 @@ func appliedPart(ctx context.Context, reader client.Reader, namespace string, st
 	var suspended []string
 	for _, key := range suspend {
 		ns, name, _ := strings.Cut(key, "/")
-		kustomization := &unstructured.Unstructured{}
-		kustomization.SetGroupVersionKind(KustomizationGVK)
-		err := reader.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, kustomization)
+		kustomization, err := getKustomization(ctx, reader, mapper, ns, name)
 		switch {
 		case apierrors.IsNotFound(err):
 		case err != nil:
@@ -389,8 +456,10 @@ func podsGone(ctx context.Context, c client.Reader, namespace string, targets []
 //     "namespace/name" keys.
 //
 // A workload or Kustomization that has been deleted since is skipped, so a
-// second call after a partial failure is safe. It returns the first other
-// error it meets.
+// second call after a partial failure is safe. So is every Kustomization
+// when the API server serves no version of the kind, because Flux's CRDs
+// have been removed (see servedKind). It returns the first other error it
+// meets as a *restartError, which names the object it could not put back.
 func restartWorkloads(ctx context.Context, c client.Client, namespace string, stopped []backupv1alpha1.QuiescedWorkload, suspended []string) error {
 	for _, w := range stopped {
 		object := workloadObject(namespace, w)
@@ -398,17 +467,35 @@ func restartWorkloads(ctx context.Context, c client.Client, namespace string, st
 			continue
 		}
 		if err := scale(ctx, c, object, w.Replicas); err != nil && !apierrors.IsNotFound(err) {
-			return err
+			return &restartError{action: fmt.Sprintf("give %s %s its %d replicas back", w.Kind, w.Name, w.Replicas), err: err}
 		}
 	}
 	for _, key := range suspended {
 		ns, name, _ := strings.Cut(key, "/")
 		if err := setSuspend(ctx, c, ns, name, false); err != nil && !apierrors.IsNotFound(err) {
-			return err
+			return &restartError{action: "resume Kustomization " + key, err: err}
 		}
 	}
 	return nil
 }
+
+// restartError is a failure of restartWorkloads. It says which workload or
+// Kustomization the run could not put back, so the run can name it on its
+// Ready condition.
+type restartError struct {
+	// action is what the run could not do, such as "give Deployment notes
+	// its 2 replicas back".
+	action string
+
+	// err is the error from the API server or the RESTMapper.
+	err error
+}
+
+// Error returns "could not ", the action, and the error.
+func (e *restartError) Error() string { return "could not " + e.action + ": " + e.err.Error() }
+
+// Unwrap returns the error from the API server or the RESTMapper.
+func (e *restartError) Unwrap() error { return e.err }
 
 // scale sets a workload's spec.replicas. It sends a merge patch that names
 // only that field, so every other field of the object stays as it is.
@@ -420,10 +507,19 @@ func scale(ctx context.Context, c client.Client, object client.Object, replicas 
 	return nil
 }
 
-// setSuspend sets spec.suspend on one Kustomization with a merge patch.
+// setSuspend sets spec.suspend on one Kustomization with a merge patch, at
+// the version the API server serves (see servedKind).
+//
+// It returns an error for which apierrors.IsNotFound is true when the
+// Kustomization doesn't exist or no version of the kind is served, and any
+// other failed lookup or patch as it is.
 func setSuspend(ctx context.Context, c client.Client, namespace, name string, suspend bool) error {
+	gvk, err := servedKind(c.RESTMapper(), KustomizationGVK.GroupKind())
+	if err != nil {
+		return fmt.Errorf("set suspend %t on Kustomization %s/%s: %w", suspend, namespace, name, err)
+	}
 	kustomization := &unstructured.Unstructured{}
-	kustomization.SetGroupVersionKind(KustomizationGVK)
+	kustomization.SetGroupVersionKind(gvk)
 	kustomization.SetNamespace(namespace)
 	kustomization.SetName(name)
 	body := fmt.Sprintf(`{"spec":{"suspend":%t}}`, suspend)

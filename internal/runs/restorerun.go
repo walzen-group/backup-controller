@@ -1275,7 +1275,7 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 			}
 			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 		}
-		stop, suspend, err := planStop(ctx, r.Reader, targets)
+		stop, suspend, err := planStop(ctx, r.Reader, r.RESTMapper(), targets)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1286,7 +1286,7 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 	}
 	stopErr := applyStop(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	if stopErr != nil {
-		run.Status.Quiesced, run.Status.SuspendedKustomizations = appliedPart(ctx, r.Reader, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+		run.Status.Quiesced, run.Status.SuspendedKustomizations = appliedPart(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.QuiescedAt = &now

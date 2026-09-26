@@ -521,7 +521,7 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			run.Status.QuiescedAt, run.Status.RestartedAt = newTime(now), newTime(now)
 			return after(time.Second, r.writeStatus(ctx, run))
 		}
-		stop, suspend, err := planStop(ctx, r.Reader, targets)
+		stop, suspend, err := planStop(ctx, r.Reader, r.RESTMapper(), targets)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -533,7 +533,7 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 
 	stopErr := applyStop(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	if stopErr != nil {
-		run.Status.Quiesced, run.Status.SuspendedKustomizations = appliedPart(ctx, r.Reader, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+		run.Status.Quiesced, run.Status.SuspendedKustomizations = appliedPart(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	}
 	run.Status.QuiescedAt = newTime(now)
 	if err := r.writeStatus(ctx, run); err != nil {
@@ -906,9 +906,14 @@ func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Bac
 // reason is ReasonSucceeded and Failed for any other reason. It sets the
 // Ready condition to reason and message, records status.completedAt, and
 // removes the finalizer.
+//
+// When release fails, finish records nothing of the ending: releaseFailed
+// reports the failure on the run with reason RestartFailed, and the error it
+// returns makes the reconcile run again. The run stays unfinished until
+// release succeeds.
 func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
 	if err := r.release(ctx, run); err != nil {
-		return err
+		return r.releaseFailed(ctx, run, err)
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
@@ -966,15 +971,53 @@ func backupItemDone(run *backupv1alpha1.BackupRun, name string) bool {
 }
 
 // finalize puts back what a run changed when the run is deleted before it
-// finished, then removes the finalizer so the deletion can complete.
+// finished, then removes the finalizer so the deletion can complete. When
+// release fails, it reports the failure through releaseFailed and keeps the
+// finalizer, so the deletion waits until the run has put everything back.
 func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.BackupRun) error {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return nil
 	}
 	if err := r.release(ctx, run); err != nil {
-		return err
+		return r.releaseFailed(ctx, run, err)
 	}
 	return dropFinalizer(ctx, r.Client, run)
+}
+
+// releaseFailed reports on the run that release failed, and returns err so
+// the reconcile runs again with controller-runtime's backoff.
+//
+// It sets the Ready condition to False with reason RestartFailed and writes
+// the status. The message names what the run could not put back and the
+// error, says that the run keeps trying, and says what a person can do
+// instead. Announce turns the new reason into a Warning event. The status
+// write is best effort: a write that fails is made again by the next pass
+// that fails.
+//
+// The run never gives up. A run that finished while it still owed a restart
+// would lose the only record of the replicas the app had, and the next
+// namespace run would record the stopped workload's 0 as the count to give
+// back.
+func (r *BackupRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.BackupRun, err error) error {
+	message := "could not put back what the run changed: " + err.Error()
+	var restart *restartError
+	if errors.As(err, &restart) {
+		message = restart.Error()
+	}
+	message += ". The run retries until it can"
+	if run.Spec.All {
+		message += ", and this namespace's schedule waits for it"
+	}
+	if restart != nil {
+		message += ". Fix the cause, or scale the workloads in status.quiesced to their replicas and resume the" +
+			" Kustomizations in status.suspendedKustomizations yourself, then delete this BackupRun and remove its finalizer " +
+			Finalizer + "."
+	} else {
+		message += ". Fixing the cause lets the run finish by itself."
+	}
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestartFailed, message)
+	_ = r.writeStatus(ctx, run)
+	return err
 }
 
 // overdue returns the run's deadline and reports whether the run has worked
