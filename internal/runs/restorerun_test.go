@@ -257,7 +257,7 @@ func TestADatabaseRestoreDeletesAndFollowsTheCluster(t *testing.T) {
 	}
 
 	_ = unstructured.SetNestedField(recovered.Object, healthyPhase, "status", "phase")
-	if err := c.Update(context.Background(), recovered); err != nil {
+	if err := c.Status().Update(context.Background(), recovered); err != nil {
 		t.Fatal(err)
 	}
 	restoreStep(t, r)

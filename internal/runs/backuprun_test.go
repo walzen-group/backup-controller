@@ -323,7 +323,7 @@ func TestADatabaseRunTakesABaseBackup(t *testing.T) {
 	}
 
 	_ = unstructured.SetNestedField(backup.Object, "completed", "status", "phase")
-	if err := c.Update(context.Background(), backup); err != nil {
+	if err := c.Status().Update(context.Background(), backup); err != nil {
 		t.Fatal(err)
 	}
 	step(t, r)
@@ -427,7 +427,7 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 	complete(t, c, "snapshot 6e473100 saved")
 	backup, _ := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
 	_ = unstructured.SetNestedField(backup.Object, "completed", "status", "phase")
-	if err := c.Update(context.Background(), backup); err != nil {
+	if err := c.Status().Update(context.Background(), backup); err != nil {
 		t.Fatal(err)
 	}
 	step(t, r)
@@ -461,7 +461,7 @@ func quiescedRunToUpload(t *testing.T) (*BackupRunReconciler, client.Client) {
 	complete(t, c, "snapshot 6e473100 saved")
 	backup, _ := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
 	_ = unstructured.SetNestedField(backup.Object, "completed", "status", "phase")
-	if err := c.Update(context.Background(), backup); err != nil {
+	if err := c.Status().Update(context.Background(), backup); err != nil {
 		t.Fatal(err)
 	}
 	return r, c
@@ -563,11 +563,13 @@ func cutClone(t *testing.T, c client.Client) {
 }
 
 // cloneAt creates the Bound claim volsync-<claim>-src with the given creation
-// time, and returns it.
+// time, and returns it. The API server sets the creation time, so cloneAt
+// sets the server clock to created for the create.
 func cloneAt(t *testing.T, c client.Client, created time.Time) *corev1.PersistentVolumeClaim {
 	t.Helper()
+	defer atServerTime(t, c, created)()
 	clone := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "volsync-" + claimN + "-src", Namespace: ns, CreationTimestamp: metav1.NewTime(created),
+		ObjectMeta: metav1.ObjectMeta{Name: "volsync-" + claimN + "-src", Namespace: ns,
 			Finalizers: []string{"kubernetes.io/pvc-protection"}},
 		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 	}

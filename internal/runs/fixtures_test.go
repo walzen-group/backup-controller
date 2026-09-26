@@ -10,6 +10,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -67,19 +68,82 @@ func scheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-// newClient builds a fake client that holds the given objects. Every kind the
-// package writes status to has the status subresource, as it does on a real
-// API server.
+// crdDir is the folder of pinned CustomResourceDefinitions the strict client
+// prunes against.
+const crdDir = "../testinfra/crds/"
+
+// crds are the pinned CRDs of the kinds the package reads or writes: this
+// repository's own at v0.8.1, VolSync's ReplicationSource and
+// ReplicationDestination, CloudNativePG's Cluster and Backup, Kueue's Workload
+// and LocalQueue, Flux's Kustomization and the barman cloud plugin's
+// ObjectStore.
+var crds = []string{
+	crdDir + "backup-controller/v0.8.1/backup.wlz.li_backupruns.yaml",
+	crdDir + "backup-controller/v0.8.1/backup.wlz.li_restoreruns.yaml",
+	crdDir + "backup-controller/v0.8.1/backup.wlz.li_volumerestores.yaml",
+	crdDir + "volsync/volsync.backube_replicationsources.yaml",
+	crdDir + "volsync/volsync.backube_replicationdestinations.yaml",
+	crdDir + "cloudnative-pg/postgresql.cnpg.io_clusters.yaml",
+	crdDir + "cloudnative-pg/postgresql.cnpg.io_backups.yaml",
+	crdDir + "kueue/kueue.x-k8s.io_workloads.yaml",
+	crdDir + "kueue/kueue.x-k8s.io_localqueues.yaml",
+	crdDir + "flux/kustomize-controller.crds.yaml",
+	crdDir + "plugin-barman-cloud/barmancloud.cnpg.io_objectstores.yaml",
+}
+
+// newClient builds a strict fake client that holds the given objects. It sets
+// the server-owned metadata as kube-apiserver does, prunes custom resources
+// against the pinned CRDs in crds, and gives every kind the package uses the
+// status subresource its CRD declares. The server clock stands at frozen.
+//
+// It registers the status subresources itself and wraps the fake with
+// strictclient.New: strictclient.Build panics on this package's scheme,
+// because scheme.New returns an Unstructured without a kind for the kinds
+// registered as unstructured, and the fake builder cannot find the kind of
+// that object.
 func newClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
-	workload := &unstructured.Unstructured{}
-	workload.SetGroupVersionKind(WorkloadGVK)
-	return fake.NewClientBuilder().
+	status := []client.Object{
+		&backupv1alpha1.BackupRun{}, &backupv1alpha1.RestoreRun{}, &backupv1alpha1.VolumeRestore{},
+		&volsyncv1alpha1.ReplicationSource{}, &volsyncv1alpha1.ReplicationDestination{},
+	}
+	for _, gvk := range unstructuredKinds {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvk)
+		status = append(status, u)
+	}
+	inner := fake.NewClientBuilder().
 		WithScheme(scheme(t)).
 		WithObjects(objects...).
-		WithStatusSubresource(&backupv1alpha1.BackupRun{}, &backupv1alpha1.RestoreRun{},
-			&volsyncv1alpha1.ReplicationSource{}, &volsyncv1alpha1.ReplicationDestination{}, workload).
+		WithStatusSubresource(status...).
 		Build()
+	now := frozen
+	c := strictclient.New(inner, strictclient.Options{
+		Clock: func() time.Time { return now },
+		CRDs:  crds,
+	})
+	serverClocks[c] = &now
+	t.Cleanup(func() { delete(serverClocks, c) })
+	return c
+}
+
+// serverClocks holds the API server clock of each client newClient built
+// that a test has not finished with. The clock starts at frozen.
+var serverClocks = map[client.Client]*time.Time{}
+
+// atServerTime sets the API server clock of c, a client newClient built, to
+// at, so the objects created until the returned function runs get at as their
+// creationTimestamp. The returned function sets the clock back to what it
+// was.
+func atServerTime(t *testing.T, c client.Client, at time.Time) func() {
+	t.Helper()
+	now, ok := serverClocks[c]
+	if !ok {
+		t.Fatal("the client was not built by newClient")
+	}
+	was := *now
+	*now = at
+	return func() { *now = was }
 }
 
 // snapshots is a restic.Lister that returns a fixed list of snapshots.
