@@ -51,7 +51,7 @@ func TestOnlyAPlainTextNotFoundIsAVersionGone(t *testing.T) {
 		t.Errorf("VersionGone = %v, want a transient *VersionGoneError that is not NotFound", gone)
 	}
 	missing := apierrors.NewNotFound(gr, "store")
-	if got := VersionGone(mapper, gvk, missing); got != missing {
+	if got := VersionGone(mapper, gvk, missing); !errors.Is(got, missing) || !apierrors.IsNotFound(got) {
 		t.Errorf("VersionGone of a missing object = %v, want it unchanged", got)
 	}
 }

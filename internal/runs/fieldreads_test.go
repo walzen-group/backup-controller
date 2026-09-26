@@ -1,0 +1,199 @@
+package runs
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/yaml"
+)
+
+// The tests in this file stand in for a release of another project that
+// moves or renames a field the controller reads, and check that the run
+// fails loudly, naming the field, where reading the field as unset would
+// make it act on a wrong answer.
+
+// quiesceRun steps a spec.all BackupRun through plan, admission and
+// the quiesce pass, ignoring the errors of each pass, and returns it.
+func quiesceRun(t *testing.T, r *BackupRunReconciler) {
+	t.Helper()
+	for range 3 {
+		_ = tryStep(r)
+	}
+}
+
+// A Kustomization that applies the app, going by the app's
+// kustomize-controller labels, but carries no status.inventory.entries is
+// refused before anything stops: kustomize-controller records every object
+// it applies there, so a missing list means a Flux release moved it, and
+// reading it as "not listed" would stop the app with Flux still free to
+// scale it back up mid-backup.
+func TestAKustomizationWithoutItsInventoryIsRefused(t *testing.T) {
+	k := kustomization(false)
+	unstructured.RemoveNestedField(k.Object, "status")
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), k)
+	quiesceRun(t, r)
+
+	run := readBackupRun(t, c)
+	if replicas := replicasOf(t, c); replicas != 2 {
+		t.Errorf("replicas = %d, want the app left running", replicas)
+	}
+	if message := readyMessage(run.Status.Conditions); !strings.Contains(message, "status.inventory.entries") {
+		t.Errorf("Ready = %s: %q, want it to name status.inventory.entries", readyReason(run.Status.Conditions), message)
+	}
+}
+
+// An inventory entry whose id is not "<namespace>_<name>_<group>_<kind>" is
+// refused the same way.
+func TestAnInventoryEntryThatDoesNotParseIsRefused(t *testing.T) {
+	k := kustomization(false)
+	_ = unstructured.SetNestedSlice(k.Object, []any{map[string]any{"id": "notes/notes/apps/Deployment", "v": "v1"}}, "status", "inventory", "entries")
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), k)
+	quiesceRun(t, r)
+
+	run := readBackupRun(t, c)
+	if replicas := replicasOf(t, c); replicas != 2 {
+		t.Errorf("replicas = %d, want the app left running", replicas)
+	}
+	if message := readyMessage(run.Status.Conditions); !strings.Contains(message, "status.inventory.entries") || !strings.Contains(message, "notes/notes/apps/Deployment") {
+		t.Errorf("Ready = %s: %q, want it to name the field and the entry", readyReason(run.Status.Conditions), message)
+	}
+}
+
+// kustomizationCRDWithoutSuspend writes the pinned Kustomization CRD without
+// spec.suspend, as after a Flux release that renames the field, and returns
+// newClient's CRD files with it in place of the pinned one.
+func kustomizationCRDWithoutSuspend(t *testing.T) []string {
+	t.Helper()
+	pinned := crdDir + "flux/kustomize-controller.crds.yaml"
+	crd := readCRD(t, pinned)
+	versions, _, _ := unstructured.NestedSlice(crd.Object, "spec", "versions")
+	for _, v := range versions {
+		unstructured.RemoveNestedField(v.(map[string]any), "schema", "openAPIV3Schema", "properties", "spec", "properties", "suspend")
+	}
+	if err := unstructured.SetNestedSlice(crd.Object, versions, "spec", "versions"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := yaml.Marshal(crd.Object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "kustomizations.yaml")
+	if err := os.WriteFile(out, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := make([]string, 0, len(crds))
+	for _, path := range crds {
+		if path == pinned {
+			path = out
+		}
+		files = append(files, path)
+	}
+	return files
+}
+
+// A suspend the API server drops, because its schema no longer has
+// spec.suspend, is an error that names the field: the run reads the
+// Kustomization back from the patch and never stops the app behind a
+// Kustomization that is still reconciling.
+func TestASuspendTheAPIServerDropsIsAnError(t *testing.T) {
+	c := newClientWithCRDs(t, kustomizationCRDWithoutSuspend(t), backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	r := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	err := tryStep(r)
+	run := readBackupRun(t, c)
+	if err == nil && !strings.Contains(readyMessage(run.Status.Conditions), "spec.suspend") {
+		t.Errorf("the quiesce pass = %v, Ready = %s: %q; want an error naming spec.suspend", err, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
+	}
+	if err != nil && !strings.Contains(err.Error(), "spec.suspend") {
+		t.Errorf("the quiesce pass = %v, want an error naming spec.suspend", err)
+	}
+	if replicas := replicasOf(t, c); replicas != 2 {
+		t.Errorf("replicas = %d, want the app left running", replicas)
+	}
+}
+
+// A run that Kueue never admits, as when a Kueue release renames the
+// Admitted condition or the queueName field, does not wait forever holding
+// the namespace's schedule: once its timeout has passed since its creation
+// it fails, naming Kueue and its Workload, and gives the quota back.
+func TestAQueuedRunThatKueueNeverAdmitsFails(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore(), repository(), localQueueObject())
+	step(t, r) // plan
+	step(t, r) // admit: the Workload waits
+	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseQueued {
+		t.Fatalf("phase = %q, want Queued", run.Status.Phase)
+	}
+	step(t, r) // still waiting within the timeout
+	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseQueued {
+		t.Fatalf("phase = %q within the timeout, want Queued", run.Status.Phase)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(2 * time.Hour) } // the run's timeout is an hour
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	message := readyMessage(run.Status.Conditions)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(message, "Kueue") || !strings.Contains(message, workloadName(runUID)) {
+		t.Fatalf("phase = %q, Ready = %q; want Failed naming Kueue and the Workload %s", run.Status.Phase, message, workloadName(runUID))
+	}
+	if _, ok := getUnstructured(t, c, WorkloadGVK, ns, workloadName(runUID)); ok {
+		t.Error("the Workload outlived the failed run")
+	}
+}
+
+// A Backup whose status.phase is none of the phases CloudNativePG 1.30 sets,
+// as after a release that renames them, fails its item with a message that
+// names the field and the value. Read as "not done yet", it would hold the
+// run until its timeout and end it with a message that says nothing of why.
+func TestABackupInAPhaseTheControllerDoesNotKnowFailsNamingIt(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
+	step(t, r)
+	step(t, r)
+	step(t, r)
+	backup, ok := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
+	if !ok {
+		t.Fatal("no Backup was created")
+	}
+	_ = unstructured.SetNestedField(backup.Object, "Completed", "status", "phase")
+	if err := c.Status().Update(context.Background(), backup); err != nil {
+		t.Fatal(err)
+	}
+	step(t, r)
+
+	item := readBackupRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "status.phase") || !strings.Contains(item.Message, `"Completed"`) {
+		t.Errorf("item = %+v, want it Failed naming status.phase and \"Completed\"", item)
+	}
+}
+
+// A Backup CloudNativePG marks "invalid backup definition" never goes on, so
+// its item fails at once with CloudNativePG's error.
+func TestAnInvalidBackupDefinitionFailsTheItem(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
+	step(t, r)
+	step(t, r)
+	step(t, r)
+	backup, _ := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
+	_ = unstructured.SetNestedField(backup.Object, "invalid backup definition", "status", "phase")
+	_ = unstructured.SetNestedField(backup.Object, "no plugin configured", "status", "error")
+	if err := c.Status().Update(context.Background(), backup); err != nil {
+		t.Fatal(err)
+	}
+	step(t, r)
+
+	item := readBackupRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "no plugin configured") {
+		t.Errorf("item = %+v, want it Failed with CloudNativePG's error", item)
+	}
+}

@@ -239,6 +239,11 @@ func storeLocation(store *unstructured.Unstructured, serverName string) (Locatio
 		return Location{}, &destinationError{err}
 	}
 
+	// No endpointURL is a legitimate state: barman then talks to AWS S3's
+	// own endpoint. A destinationPath is always required, above; a
+	// barman-cloud release that moved it makes every Cluster's own store
+	// fail to resolve, and the webhook refuses the create, before the
+	// collision check could skip another Cluster's store for it.
 	endpoint, _, _ := unstructured.NestedString(store.Object, "spec", "configuration", "endpointURL")
 
 	return Location{

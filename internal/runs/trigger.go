@@ -67,6 +67,10 @@ func manualTag(source *volsyncv1alpha1.ReplicationSource) string {
 // lastManual returns the source's status.lastManualSync, the last manual tag
 // VolSync completed on it. It returns an empty string when the source has no
 // status yet.
+// That is a legitimate state, since VolSync writes the field only when a
+// manual sync completes, and it fails closed: a run waits for its own tag in
+// lastManualSync, up to its timeout, and busy counts a tag that is not there
+// as one VolSync has not completed.
 func lastManual(source *volsyncv1alpha1.ReplicationSource) string {
 	if source.Status == nil {
 		return ""

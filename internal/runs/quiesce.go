@@ -402,8 +402,9 @@ func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 // count restartWorkloads gives back, and the Kustomizations to suspend as
 // "namespace/name" keys. It returns a refusal (see isRefusal) when a
 // Kustomization that applies a target also applies a Deployment or a
-// StatefulSet in another namespace (see otherNamespaces), and an error when
-// a Kustomization can't be read. On a cluster that serves no version of
+// StatefulSet in another namespace (see otherNamespaces), or whose
+// status.inventory.entries is missing or does not parse (see inventoryIDs),
+// and an error when a Kustomization can't be read. On a cluster that serves no version of
 // Kustomization, every Kustomization counts as gone.
 //
 // The kustomize-controller labels on a target name its Kustomization, and
@@ -439,7 +440,13 @@ func planStop(ctx context.Context, reader client.Reader, mapper meta.RESTMapper,
 			}
 			read[key] = kustomization
 		}
-		if kustomization == nil || !inventoryLists(kustomization, t) || slices.Contains(suspend, key) {
+		if kustomization == nil || slices.Contains(suspend, key) {
+			continue
+		}
+		if _, err := inventoryIDs(kustomization); err != nil {
+			return nil, nil, refuse("%s", err.Error())
+		}
+		if !inventoryLists(kustomization, t) {
 			continue
 		}
 		if namespaces := otherNamespaces(kustomization, runNamespace); len(namespaces) > 1 {
@@ -512,6 +519,41 @@ func joinAnd(names []string) string {
 		return strings.Join(names, "")
 	}
 	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+}
+
+// inventoryIDs returns the ids of a Kustomization's status.inventory.entries.
+// kustomize-controller records each object it applied as an entry whose id
+// is "<namespace>_<name>_<group>_<kind>", such as
+// notes_notes_apps_Deployment; the namespace of a cluster-scoped object and
+// the group of a core object are empty.
+//
+// The caller reads the inventory of a Kustomization whose
+// kustomize-controller labels name it on a workload the run stops, so
+// kustomize-controller applied that workload and recorded it. It returns an
+// error that names the field when status.inventory.entries is missing or is
+// not a list, and one that names the entry when an entry has no string id of
+// four parts. A Flux release that moves or reshapes the field then fails the
+// run loudly: read as an empty list, it would make the run stop the workload
+// with its Kustomization still reconciling, and Flux would scale it back up
+// in the middle of the backup.
+func inventoryIDs(kustomization *unstructured.Unstructured) ([]string, error) {
+	key := kustomization.GetNamespace() + "/" + kustomization.GetName()
+	entries, found, err := unstructured.NestedSlice(kustomization.Object, "status", "inventory", "entries")
+	if err != nil || !found {
+		return nil, fmt.Errorf("the Kustomization %s has no list at status.inventory.entries, where kustomize-controller records every object it "+
+			"applies; either it has not applied yet or a Flux release moved the field (see docs/compatibility.md)", key)
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		fields, _ := entry.(map[string]any)
+		id, _ := fields["id"].(string)
+		if strings.Count(id, "_") != 3 {
+			return nil, fmt.Errorf("the Kustomization %s has an entry %v in status.inventory.entries whose id is not "+
+				"\"<namespace>_<name>_<group>_<kind>\"; a Flux release may have changed the format (see docs/compatibility.md)", key, entry)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // inventoryLists reports whether a Kustomization's status.inventory.entries
@@ -942,7 +984,9 @@ func scale(ctx context.Context, c client.Client, object client.Object, replicas 
 // Kustomization doesn't exist or no version of the kind is served. A patch
 // at a version the API server has stopped serving since the client's mapper
 // cached it returns a *served.VersionGoneError (see served.VersionGone). Any other failed
-// lookup or patch is returned as it is.
+// lookup or patch is returned as it is. A patch the API server answers with
+// a Kustomization whose spec.suspend is not the value set is an error that
+// names the field.
 func setSuspend(ctx context.Context, c client.Client, namespace, name string, suspend bool) error {
 	gvk, err := served.Kind(c.RESTMapper(), KustomizationGVK.GroupKind())
 	if err != nil {
@@ -955,6 +999,13 @@ func setSuspend(ctx context.Context, c client.Client, namespace, name string, su
 	body := fmt.Sprintf(`{"spec":{"suspend":%t}}`, suspend)
 	if err := c.Patch(ctx, kustomization, client.RawPatch(types.MergePatchType, []byte(body)), FieldOwner); err != nil {
 		return fmt.Errorf("set suspend %t on Kustomization %s/%s: %w", suspend, namespace, name, served.VersionGone(c.RESTMapper(), gvk, err))
+	}
+	// The patch's answer is the Kustomization as stored. A schema without
+	// spec.suspend drops the field without an error when the write is not
+	// strict, and Flux would then go on reconciling behind a stopped app.
+	if stored, _, _ := unstructured.NestedBool(kustomization.Object, "spec", "suspend"); stored != suspend {
+		return fmt.Errorf("set suspend %t on Kustomization %s/%s: the Kustomization reads spec.suspend %t after the patch; "+
+			"a Flux release may have moved the field (see docs/compatibility.md)", suspend, namespace, name, stored)
 	}
 	return nil
 }

@@ -151,6 +151,9 @@ func ensureWorkload(ctx context.Context, c client.Client, owner client.Object, o
 
 // admitted reports whether Kueue has admitted the Workload, which it shows
 // with an Admitted condition set to True.
+// No such condition is a legitimate state, a Workload still waiting in its
+// queue, and it fails closed: the run waits, and awaitAdmission fails it
+// once its timeout has passed since its creation, naming the Workload.
 func admitted(workload *unstructured.Unstructured) bool {
 	return conditionTrue(workload, "Admitted")
 }

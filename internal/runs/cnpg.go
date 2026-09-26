@@ -153,6 +153,10 @@ func hibernated(cluster *unstructured.Unstructured) bool {
 
 // clusterPhase returns the Cluster's status.phase as CloudNativePG reports
 // it, or an empty string when it has none.
+// An empty or unknown phase is a legitimate state, since CloudNativePG
+// reports many phases while a Cluster comes up, and it fails closed: a
+// RestoreRun waits for healthyPhase up to its timeout and never takes
+// another phase for a healthy Cluster.
 func clusterPhase(cluster *unstructured.Unstructured) string {
 	phase, _, _ := unstructured.NestedString(cluster.Object, "status", "phase")
 	return phase
@@ -210,12 +214,29 @@ func ensureBackup(ctx context.Context, c client.Client, namespace, cluster strin
 
 // backupResult reads the status.phase of the Backup with the given name.
 //
-// The result done is true once the phase is completed or failed, and ok is
-// true when it completed. For a failed Backup, message holds CloudNativePG's
-// error from status.error. It reads the Backup at the version the API server
-// serves (see served.Get), with the version mapper looks up. It returns an
-// error when the Backup can't be read, a read at a version the API server
-// has stopped serving included.
+// Parameters:
+//   - c reads the Backup, and mapper looks up the version at which the API
+//     server serves it (see served.Get).
+//   - namespace and name name the Backup.
+//
+// The result done is true once the Backup can go no further, and ok is true
+// when it completed. The phases are those of CloudNativePG 1.30
+// (api/v1/backup_types.go:32-58):
+//   - "completed" is done and ok.
+//   - "failed" and "invalid backup definition" are done and not ok, and
+//     message holds CloudNativePG's error from status.error. CloudNativePG
+//     never goes on with an invalid definition.
+//   - No phase yet, "pending", "started", "running", "finalizing" and
+//     "walArchivingFailing" are not done: CloudNativePG has not reconciled
+//     the Backup yet, is taking it, or retries it, and the run waits up to
+//     its timeout.
+//   - Any other value is done and not ok, with a message that names
+//     status.phase and the value. A CloudNativePG release that renamed its
+//     phases would otherwise hold the run until its timeout and end it with
+//     a message that says nothing of why.
+//
+// It returns an error when the Backup can't be read, a read at a version the
+// API server has stopped serving included.
 func backupResult(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace, name string) (done, ok bool, message string, err error) {
 	backup, err := served.Get(ctx, c, mapper, BackupGVK.GroupKind(), types.NamespacedName{Namespace: namespace, Name: name})
 	if err != nil {
@@ -225,11 +246,18 @@ func backupResult(ctx context.Context, c client.Reader, mapper meta.RESTMapper, 
 	switch phase {
 	case "completed":
 		return true, true, "", nil
-	case "failed":
+	case "failed", "invalid backup definition":
 		message, _, _ := unstructured.NestedString(backup.Object, "status", "error")
+		if message == "" {
+			message = fmt.Sprintf("the Backup %s/%s reports status.phase %q", namespace, name, phase)
+		}
 		return true, false, message, nil
+	case "", "pending", "started", "running", "finalizing", "walArchivingFailing":
+		return false, false, "", nil
 	}
-	return false, false, "", nil
+	return true, false, fmt.Sprintf("the Backup %s/%s reports status.phase %q, which is not a phase of CloudNativePG 1.30; "+
+		"a CloudNativePG release may have changed its phases, so the run can't tell whether the backup completed (see docs/compatibility.md)",
+		namespace, name, phase), nil
 }
 
 // newTime returns a pointer to a copy of t, so a caller can set a *metav1.Time
