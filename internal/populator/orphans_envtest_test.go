@@ -236,7 +236,7 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 	rdKey := types.NamespacedName{Namespace: orphanControllerNS, Name: destination}
 	primeKey := types.NamespacedName{Namespace: orphanControllerNS, Name: PrimeClaimName(claim.UID)}
 	secretKey := types.NamespacedName{Namespace: orphanControllerNS, Name: internalvolsync.SecretCopyName(claim.UID)}
-	podKey := types.NamespacedName{Namespace: orphanControllerNS, Name: moverJobName(destination) + "-abcde"}
+	podKey := types.NamespacedName{Namespace: orphanControllerNS, Name: internalvolsync.MoverJobName(destination) + "-abcde"}
 
 	prime := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: primeKey.Name, Namespace: primeKey.Namespace},
@@ -255,7 +255,7 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podKey.Name,
 			Namespace: podKey.Namespace,
-			Labels:    map[string]string{"job-name": moverJobName(destination)},
+			Labels:    map[string]string{"job-name": internalvolsync.MoverJobName(destination)},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,

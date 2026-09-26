@@ -325,6 +325,44 @@ func TestADeletedRestoreWaitsForItsStoppedMoversPod(t *testing.T) {
 	}
 }
 
+// A wait for a stopped mover's pod whose status write is lost is reported
+// again on the next pass. The run holds what it must meanwhile: the pod, its
+// finalizer and the Leases.
+func TestALostStatusWriteInTheMoverWaitConverges(t *testing.T) {
+	run, destination := quiescedMidRestore()
+	pod := moverPod(destination.Name, corev1.PodRunning)
+	lease := heldClaimLease(run, claimN)
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination, pod, lease)
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	r.Client = loseNextStatusWrite(c)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+		t.Fatal("the wait pass succeeded, want its lost status write returned")
+	}
+	if names := destinations(t, c); len(names) != 0 {
+		t.Errorf("destinations = %v, want the mover's deleted", names)
+	}
+	if got := replicasOf(t, c); got != 0 {
+		t.Errorf("replicas = %d, want the app still down while the mover pod is there", got)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, &coordinationv1.Lease{}); err != nil {
+		t.Errorf("get the claim Lease = %v, want it held while the mover pod is there", err)
+	}
+
+	restoreStep(t, r)
+
+	waiting := readRestoreRun(t, c)
+	if len(waiting.Finalizers) == 0 {
+		t.Error("the run dropped its finalizer while the mover pod was still there")
+	}
+	if readyReason(waiting.Status.Conditions) != backupv1alpha1.ReasonShutdown ||
+		!strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
+		t.Errorf("reason = %q, message = %q; want the wait reported again, naming pod %s",
+			readyReason(waiting.Status.Conditions), readyMessage(waiting.Status.Conditions), pod.Name)
+	}
+}
+
 // An into restore whose claim is deleted while its mover writes stops the
 // mover, and keeps its Leases until that mover's pod is gone. The run ends
 // Failed only once the pod has left.
