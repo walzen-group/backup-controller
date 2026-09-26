@@ -230,48 +230,28 @@ func TestARestoreWhoseSnapshotIsStillThereGoesAhead(t *testing.T) {
 }
 
 // A pass that created the item's destination and lost the status write
-// leaves the item Pending. When the next pass finds the snapshot gone, it
-// fails the item, says the destination from the lost pass may have written
-// part of the claim, and deletes that destination: an item that named no
-// destination would leave its mover running with nothing tracking it.
-func TestARecheckAfterALostWriteDeletesTheDestinationItCreated(t *testing.T) {
-	repo := copyRecorded(t, "timed")
-	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }), claim(), volumeRestore(), repository())
-	r.Snapshots = repo
-	restoreStep(t, r) // plan
-
-	r.Client = loseNextStatusWrite(c)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
-	}
-	if names := destinations(t, c); len(names) != 1 {
-		t.Fatalf("destinations = %v, want the one the lost pass created", names)
-	}
-	repo.forget(t, newestTimed)
-	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
-
-	expectItemFailed(t, c, "is no longer in the repository", "ReplicationDestination "+destinationName(restoreUID, 0))
-	expectNothingCreated(t, c, "")
-}
-
-// A pass that created the item's destination and lost the status write
-// leaves the item Pending. When the repository Secret, or the claim's
-// VolumeRestore that names it, is gone on the next pass, the run fails the
-// item, says the destination from the lost pass may have written part of the
-// claim, and deletes that destination. Before, the item named no destination
-// and said nothing was written, or nothing about the claim, so the mover ran
-// on with nothing tracking it (UF1).
-func TestARefusalAfterALostWriteDeletesTheDestinationItCreated(t *testing.T) {
+// leaves the item Pending. The next pass takes that destination over: the
+// item goes Running and names it, even when the snapshot is gone from the
+// repository or the repository Secret or the claim's VolumeRestore is gone by
+// then. The lost pass ran every check before the create, as a pass whose
+// write went through does, and the destination's mover may already write.
+// From then on the item is followed like any other Running item, and the run
+// stops that mover when it ends (UFR1). Before, the next pass failed the item
+// and deleted the destination (UF1), and a pod of its mover on the claim kept
+// the item waiting with nothing naming the destination.
+func TestAPassAfterALostWriteTakesTheDestinationOver(t *testing.T) {
 	for name, tc := range map[string]struct {
-		gone client.Object
-		want string
+		forget bool
+		gone   client.Object
 	}{
-		"repository Secret": {gone: repository(), want: "repository Secret " + repoN},
-		"VolumeRestore":     {gone: volumeRestore(), want: "VolumeRestore"},
+		"snapshot forgotten": {forget: true},
+		"repository Secret":  {gone: repository()},
+		"VolumeRestore":      {gone: volumeRestore()},
 	} {
 		t.Run(name, func(t *testing.T) {
+			repo := copyRecorded(t, "timed")
 			r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }), claim(), volumeRestore(), repository())
+			r.Snapshots = repo
 			restoreStep(t, r) // plan
 
 			r.Client = loseNextStatusWrite(c)
@@ -282,14 +262,23 @@ func TestARefusalAfterALostWriteDeletesTheDestinationItCreated(t *testing.T) {
 			if names := destinations(t, c); len(names) != 1 {
 				t.Fatalf("destinations = %v, want the one the lost pass created", names)
 			}
-			if err := c.Delete(context.Background(), tc.gone); err != nil {
-				t.Fatal(err)
+			if tc.forget {
+				repo.forget(t, newestTimed)
+			}
+			if tc.gone != nil {
+				if err := c.Delete(context.Background(), tc.gone); err != nil {
+					t.Fatal(err)
+				}
 			}
 			restoreStep(t, r)
-			restoreStep(t, r) // the pass after the destination's delete finds its mover gone
 
-			expectItemFailed(t, c, tc.want, "ReplicationDestination "+destinationName(restoreUID, 0), "may have written part of claim "+claimN)
-			expectNothingCreated(t, c, "")
+			run := readRestoreRun(t, c)
+			if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Destination != destinationName(restoreUID, 0) {
+				t.Errorf("item = %+v (%s), want Running naming %s", item, readyMessage(run.Status.Conditions), destinationName(restoreUID, 0))
+			}
+			if names := destinations(t, c); len(names) != 1 {
+				t.Errorf("destinations = %v, want the lost pass's left to its mover", names)
+			}
 		})
 	}
 }

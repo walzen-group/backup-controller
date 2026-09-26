@@ -961,6 +961,10 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // ReplicationDestination and moves the item to Running. A snapshot the mover
 // would no longer restore, because it was forgotten, retimed or shadowed in
 // its second since the checks, fails the item before the destination exists.
+// A Pending item whose destination the run already owns (see
+// lostDestination) goes to Running with it before any of that: an earlier
+// pass ran the checks, created it, and lost the status write that recorded
+// it, and a pod of its mover may be the one that mounts the claim.
 //
 // A Running item fails with the mover's logs when the mover failed. Once the
 // destination has completed the run's trigger, the item succeeds only when
@@ -990,6 +994,19 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (string, string, error) {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
+		// A destination the run owns under the item's name means an earlier
+		// pass ran every check below, created it, and lost the status write
+		// that recorded it. Its mover may already mount the claim, and
+		// claimHolder would then keep the item waiting on it, unnamed and so
+		// never stopped at the run's end.
+		lost, err := r.lostDestination(ctx, run, index)
+		if err != nil {
+			return "", "", err
+		}
+		if lost != "" {
+			item.Phase, item.Destination = backupv1alpha1.ItemRunning, lost
+			return "", "", nil
+		}
 		holder, err := claimHolder(ctx, r.Reader, run.Namespace, item.Name)
 		if err != nil {
 			return "", "", fmt.Errorf("look for a pod holding claim %s: %w", item.Name, err)
@@ -2053,21 +2070,34 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 // whose precondition fails, or a failed look at the mover's Job and pods.
 // The caller keeps waiting on an error, and the next pass tries again.
 //
-// The destination is read first and deleted only when the run owns it (see
-// ownsDestination); one with another trigger is left alone. The delete
-// carries the UID it read as a precondition, so a destination created under
-// the name since the read is never deleted. A destination that is already
-// gone is not an error. A mover the run deleted the destination of in this
-// pass counts as not gone, whatever the run can see of it: VolSync may be in
-// the middle of a reconcile of that destination and create the Job after
-// the look, so only the next pass looks (see moverRemains). An item keeps
-// the destination's name until its mover is gone, so every pass can look the
-// mover up again.
+// A chosen volume item that names no destination gets the one the run owns
+// under the item's name, if there is one (see lostDestination): a pass that
+// created it and lost the status write left it unnamed, and the run may end
+// before a later pass names it. The destination is read first and deleted
+// only when the run owns it (see ownsDestination); one with another trigger
+// is left alone. The delete carries the UID it read as a precondition, so a
+// destination created under the name since the read is never deleted. A
+// destination that is already gone is not an error. A mover the run deleted
+// the destination of in this pass counts as not gone, whatever the run can
+// see of it: VolSync may be in the middle of a reconcile of that destination
+// and create the Job after the look, so only the next pass looks (see
+// moverRemains). An item keeps the destination's name until its mover is
+// gone, so every pass can look the mover up again.
 func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) (moverList, error) {
 	var left moverList
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
-		if item.Destination == "" || !which(*item) {
+		if !which(*item) {
+			continue
+		}
+		if item.Destination == "" && item.Kind == "PersistentVolumeClaim" {
+			lost, err := r.lostDestination(ctx, run, i)
+			if err != nil {
+				return nil, destinationReleaseError(destinationName(run.UID, i), err)
+			}
+			item.Destination = lost
+		}
+		if item.Destination == "" {
 			continue
 		}
 		destination := &volsyncv1alpha1.ReplicationDestination{}
@@ -2349,6 +2379,41 @@ func claimHolder(ctx context.Context, c client.Reader, namespace, claim string) 
 		}
 	}
 	return "", nil
+}
+
+// lostDestination returns the name of the item's ReplicationDestination
+// when the run owns one that the item does not name, and "" when there is
+// none or it belongs to something else.
+//
+// Parameters:
+//   - run is the RestoreRun. A destination is its own when it carries the
+//     run's trigger (see ownsDestination).
+//   - index is the item's position in status.items, which destinationName
+//     turns into the name to look up.
+//
+// A failed read that is not NotFound comes back as an error, and the caller
+// changes nothing.
+//
+// A pass that creates the destination and then loses the status write that
+// records it leaves the item without the destination's name while the
+// destination's mover runs. restoreVolume takes such a destination over for
+// a Pending item, since the lost pass ran every check before the create, and
+// removeDestinations stops it for an item that ends before a pass took it
+// over. Without that, the mover would keep writing with nothing tracking it
+// once the run gives the app back and releases its Leases.
+func (r *RestoreRunReconciler) lostDestination(ctx context.Context, run *backupv1alpha1.RestoreRun, index int) (string, error) {
+	name := destinationName(run.UID, index)
+	destination := &volsyncv1alpha1.ReplicationDestination{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, destination); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get ReplicationDestination %s: %w", name, err)
+	}
+	if !ownsDestination(run, destination) {
+		return "", nil
+	}
+	return name, nil
 }
 
 // destinationName returns the name of the ReplicationDestination that
