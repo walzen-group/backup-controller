@@ -380,7 +380,7 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			}
 			source := &volsyncv1alpha1.ReplicationSource{}
 			err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
-			if err == nil && busy(source) && manualTag(source) != TriggerFor(run.UID) {
+			if err == nil && inUse(source) && manualTag(source) != TriggerFor(run.UID) {
 				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy,
 					fmt.Sprintf("ReplicationSource %s is still completing another run's backup", item.Name)))
 			}

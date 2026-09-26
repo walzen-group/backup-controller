@@ -22,10 +22,11 @@ import (
 )
 
 // errSourceBusy is the error ensureSource returns when the claim's
-// ReplicationSource carries another run's manual tag and VolSync hasn't
-// finished that backup yet. The run waits and tries again later. If it wrote
-// its own tag at that point, the tag would replace the first run's, and the
-// first run would wait for a backup that is never taken.
+// ReplicationSource is in use (see inUse) with a tag other than the run's.
+// The run waits and tries again later. If it wrote its own tag at that point,
+// VolSync's running sync would complete the new tag with a clone cut for the
+// older one, and a change to the mover's spec would make VolSync replace the
+// running mover Job, which kills restic and leaves its lock in the repository.
 var errSourceBusy = errors.New("the ReplicationSource is still completing another run's backup")
 
 // refusal is an error that no retry can fix: something a run names is
@@ -231,34 +232,57 @@ func positiveCount(value string) (int32, error) {
 	return int32(n), nil
 }
 
+// inUse reports whether VolSync may still be working on a source: it holds a
+// manual tag VolSync hasn't completed (see busy), or VolSync has recorded the
+// start of a sync in status.lastSyncStartTime and not yet cleared it. The
+// controller writes nothing onto such a source unless the tag is its own, and
+// then it doesn't write either.
+func inUse(source *volsyncv1alpha1.ReplicationSource) bool {
+	return busy(source) || (source.Status != nil && source.Status.LastSyncStartTime != nil)
+}
+
 // ensureSource creates or updates the ReplicationSource that backs up a claim,
 // with the run's tag as its manual trigger. Setting the tag is what starts
 // VolSync's backup.
 //
 // Parameters:
-//   - c writes the ReplicationSource.
-//   - reader reads the claim's VolumeRestore and PersistentVolume, the
-//     Namespace, and any ReplicationSource that already exists.
+//   - c reads any ReplicationSource that already exists and writes it.
+//   - reader reads the claim's VolumeRestore and PersistentVolume and the
+//     Namespace.
 //   - claim is the claim to back up. The ReplicationSource takes its name.
 //   - tag is the run's manual trigger, from TriggerFor. VolSync starts a
 //     backup when spec.trigger.manual holds a value it hasn't completed yet.
 //
-// It returns the ReplicationSource as written. While an existing source is
-// still busy with another run's tag, it returns that source and
-// errSourceBusy, and changes nothing. It returns a refusal, and writes
-// nothing, when a ReplicationSource of the same name exists without the label
-// app.kubernetes.io/managed-by: backup-controller, or when one of the
-// settings below is missing or doesn't parse. It also returns a refusal when
-// the API server rejects the source as invalid. Any other failed read or
-// write comes back as a plain error, which the caller retries.
+// It returns the ReplicationSource as it stands after the call. It writes
+// nothing and returns the source as read in these cases:
+//   - The source already carries tag, whether VolSync is still syncing it or
+//     has completed it. A lost status write after the first write gets here.
+//   - The source is in use (see inUse) with another tag, or with none. It
+//     then also returns errSourceBusy.
 //
-// The controller writes every field of the spec. The repository, the cache
-// class and the mover's security context come from the claim's VolumeRestore.
-// The retention comes from the claim's annotations, the prune interval from
-// the namespace's annotation, and the mover's node affinity from the claim's
-// volume. The source carries a controller reference to the claim, so a claim
-// deleted for a restore takes its source with it, and the next run writes a
-// new one.
+// It returns a refusal, and writes nothing, when a ReplicationSource of the
+// same name exists without the label app.kubernetes.io/managed-by:
+// backup-controller, or when one of the settings below is missing or doesn't
+// parse. It also returns a refusal when the API server rejects the source as
+// invalid. Any other failed read or write comes back as a plain error, which
+// the caller retries. That includes a Conflict or AlreadyExists when another
+// writer changed or created the source after the read the write is based on.
+//
+// The checks run inside the mutate function of controllerutil.CreateOrUpdate,
+// on the object whose resourceVersion the update carries. When another run
+// writes its tag after that read, the API server refuses the update with a
+// Conflict, and the next pass decides again from the stored source. A check
+// on an earlier read would let two runs pass it and the second overwrite the
+// first run's tag; VolSync's running sync would then complete the second tag
+// with a clone cut for the first run.
+//
+// On an idle source, or a new one, the controller writes every field of the
+// spec. The repository, the cache class and the mover's security context
+// come from the claim's VolumeRestore. The retention comes from the claim's
+// annotations, the prune interval from the namespace's annotation, and the
+// mover's node affinity from the claim's volume. The source carries a
+// controller reference to the claim, so a claim deleted for a restore takes
+// its source with it, and the next run writes a new one.
 //
 // A source of the same name that this controller didn't write is left alone.
 // Something else declares it, and writing over it would start a fight that the
@@ -284,18 +308,21 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 	source := &volsyncv1alpha1.ReplicationSource{
 		ObjectMeta: metav1.ObjectMeta{Name: claim.Name, Namespace: claim.Namespace},
 	}
-	existing := &volsyncv1alpha1.ReplicationSource{}
-	err = reader.Get(ctx, client.ObjectKeyFromObject(source), existing)
-	switch {
-	case err == nil && existing.Labels[backupv1alpha1.LabelManagedBy] != backupv1alpha1.ManagedByValue:
-		return nil, refuse("the ReplicationSource %s exists and was not written by backup-controller; remove it so the controller can write its own", claim.Name)
-	case err == nil && busy(existing) && manualTag(existing) != tag:
-		return existing, errSourceBusy
-	case err != nil && !apierrors.IsNotFound(err):
-		return nil, fmt.Errorf("get ReplicationSource %s/%s: %w", claim.Namespace, claim.Name, err)
-	}
-
 	_, err = controllerutil.CreateOrUpdate(ctx, c, source, func() error {
+		// CreateOrUpdate hands a source it didn't find over empty, with no
+		// resourceVersion. Anything else is the stored source the update
+		// will be based on.
+		if source.ResourceVersion != "" {
+			switch {
+			case source.Labels[backupv1alpha1.LabelManagedBy] != backupv1alpha1.ManagedByValue:
+				return refuse("the ReplicationSource %s exists and was not written by backup-controller; remove it so the controller can write its own", claim.Name)
+			case manualTag(source) == tag:
+				// Unchanged, so CreateOrUpdate writes nothing.
+				return nil
+			case inUse(source):
+				return errSourceBusy
+			}
+		}
 		if source.Labels == nil {
 			source.Labels = map[string]string{}
 		}
@@ -330,10 +357,14 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 		}
 		return nil
 	})
-	if err != nil {
-		if apierrors.IsInvalid(err) {
-			return nil, refuse("the API server refused ReplicationSource %s/%s: %v", claim.Namespace, claim.Name, err)
-		}
+	switch {
+	case errors.Is(err, errSourceBusy):
+		return source, errSourceBusy
+	case isRefusal(err):
+		return nil, err
+	case apierrors.IsInvalid(err):
+		return nil, refuse("the API server refused ReplicationSource %s/%s: %v", claim.Namespace, claim.Name, err)
+	case err != nil:
 		return nil, fmt.Errorf("write ReplicationSource %s/%s: %w", claim.Namespace, claim.Name, err)
 	}
 	return source, nil

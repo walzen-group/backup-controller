@@ -305,6 +305,234 @@ func TestASourceSomethingElseWroteIsLeftAlone(t *testing.T) {
 	}
 }
 
+// otherRunUID is the UID of the BackupRun otherRun, whose tag races this
+// package's run for the claim's source.
+const otherRunUID = types.UID("3f2a1c7e-0000-4000-8000-000000000002")
+
+// otherRun returns a second BackupRun of the claim, Running, with its item
+// for the claim Running under its own tag. It is the run a busy source waits
+// for.
+func otherRun() *backupv1alpha1.BackupRun {
+	return &backupv1alpha1.BackupRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "manual-notes", Namespace: ns, UID: otherRunUID, Generation: 1},
+		Spec:       backupv1alpha1.BackupRunSpec{Source: claimN, Timeout: &metav1.Duration{Duration: time.Hour}},
+		Status: backupv1alpha1.BackupRunStatus{
+			Phase: backupv1alpha1.RunPhaseRunning,
+			Items: []backupv1alpha1.BackupItem{{Kind: "ReplicationSource", Name: claimN,
+				Phase: backupv1alpha1.ItemRunning, Trigger: TriggerFor(otherRunUID)}},
+		},
+	}
+}
+
+// idleSource returns the claim's ReplicationSource as the controller wrote
+// it for an earlier run whose tag VolSync has completed.
+func idleSource() *volsyncv1alpha1.ReplicationSource {
+	return &volsyncv1alpha1.ReplicationSource{
+		ObjectMeta: metav1.ObjectMeta{Name: claimN, Namespace: ns,
+			Labels: map[string]string{backupv1alpha1.LabelManagedBy: backupv1alpha1.ManagedByValue}},
+		Spec:   volsyncv1alpha1.ReplicationSourceSpec{SourcePVC: claimN, Trigger: &volsyncv1alpha1.ReplicationSourceTriggerSpec{Manual: "backuprun-older"}},
+		Status: &volsyncv1alpha1.ReplicationSourceStatus{LastManualSync: "backuprun-older"},
+	}
+}
+
+// writeOtherTag stands in for the run otherRun writing its trigger onto the
+// claim's source, and VolSync starting that sync.
+func writeOtherTag(ctx context.Context, cl client.Client) error {
+	source := &volsyncv1alpha1.ReplicationSource{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: claimN}, source); err != nil {
+		return err
+	}
+	source.Spec.Trigger = &volsyncv1alpha1.ReplicationSourceTriggerSpec{Manual: TriggerFor(otherRunUID)}
+	if err := cl.Update(ctx, source); err != nil {
+		return err
+	}
+	at := metav1.NewTime(frozen)
+	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{LastManualSync: "backuprun-older", LastSyncStartTime: &at}
+	return cl.Status().Update(ctx, source)
+}
+
+// Two runs of the same claim never overwrite each other's trigger. The other
+// run writes its tag onto the idle source in the middle of this run's
+// ensureSource: after a read that found the source idle, or after the read
+// the write is based on. Either way this run leaves the other run's tag in
+// place and waits with reason SourceBusy. An overwritten tag would be
+// completed by the other run's sync, with a clone cut before this run's
+// quiesce.
+func TestTwoRunsDoNotOverwriteEachOthersTrigger(t *testing.T) {
+	for name, race := range map[string]interceptor.Funcs{
+		// The other run writes just before this run's client reads the
+		// source for its write, after any check through the Reader.
+		"before the read the write is based on": {
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); ok && key.Name == claimN {
+					if err := writeOtherTag(ctx, cl); err != nil {
+						return err
+					}
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
+		},
+		// The other run writes after this run's client read the source and
+		// just before its write reaches the API server.
+		"between the read and the write": {
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); ok && obj.GetName() == claimN {
+					if err := writeOtherTag(ctx, cl); err != nil {
+						return err
+					}
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+				claim(), volume(), volumeRestore(), repository(), idleSource(), otherRun())
+			step(t, r) // plan
+			step(t, r) // admit, no queue
+			raced := false
+			once := interceptor.Funcs{
+				Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if race.Get != nil && !raced {
+						if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); ok {
+							raced = true
+							return race.Get(ctx, cl, key, obj, opts...)
+						}
+					}
+					return cl.Get(ctx, key, obj, opts...)
+				},
+				Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+					if race.Update != nil && !raced {
+						if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); ok {
+							raced = true
+							return race.Update(ctx, cl, obj, opts...)
+						}
+					}
+					return cl.Update(ctx, obj, opts...)
+				},
+			}
+			r.Client = interceptor.NewClient(c.(client.WithWatch), once)
+
+			// The pass that loses the race may return the conflict for a
+			// retry; the next pass decides again from the stored source.
+			_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}})
+			if !raced {
+				t.Fatal("the race never ran; the run did not write the source")
+			}
+			step(t, r)
+
+			source := &volsyncv1alpha1.ReplicationSource{}
+			get(t, c, ns, claimN, source)
+			if got := manualTag(source); got != TriggerFor(otherRunUID) {
+				t.Fatalf("source trigger = %q, want the other run's %q left in place", got, TriggerFor(otherRunUID))
+			}
+			run := readBackupRun(t, c)
+			if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
+				t.Errorf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
+			}
+			if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemPending {
+				t.Errorf("item = %+v, want it Pending", item)
+			}
+		})
+	}
+}
+
+// neverWriteSyncing returns a client over c that fails the test on any
+// update, patch or delete of a ReplicationSource whose stored
+// status.lastSyncStartTime is set. VolSync is syncing such a source: a new
+// tag would be completed by the running sync, and any change to the mover's
+// spec makes VolSync replace the running mover Job, which kills restic and
+// leaves its lock in the repository.
+func neverWriteSyncing(t *testing.T, c client.Client) client.Client {
+	check := func(ctx context.Context, cl client.Client, verb string, obj client.Object) {
+		if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); !ok {
+			return
+		}
+		stored := &volsyncv1alpha1.ReplicationSource{}
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), stored); err != nil {
+			return
+		}
+		if stored.Status != nil && stored.Status.LastSyncStartTime != nil {
+			t.Errorf("%s of ReplicationSource %s while VolSync syncs tag %q", verb, obj.GetName(), manualTag(stored))
+		}
+	}
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			check(ctx, cl, "update", obj)
+			return cl.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			check(ctx, cl, "patch", obj)
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			check(ctx, cl, "delete", obj)
+			return cl.Delete(ctx, obj, opts...)
+		},
+	})
+}
+
+// The controller never writes a ReplicationSource that VolSync is syncing,
+// whoever's tag it syncs. With this run's own tag on it (a pass whose status
+// write was lost after the source write), the item goes Running and the
+// source keeps its spec, even when the claim's retention changed since. With
+// another live run's tag, the run waits with SourceBusy.
+func TestTheControllerNeverWritesASourceVolSyncIsSyncing(t *testing.T) {
+	syncing := func(tag string) *volsyncv1alpha1.ReplicationSource {
+		source := idleSource()
+		source.Spec.Trigger.Manual = tag
+		// The claim says retain-last 10; the source still has the 5 the
+		// claim said when the source was written.
+		five := "5"
+		source.Spec.Restic = &volsyncv1alpha1.ReplicationSourceResticSpec{Repository: repoN,
+			Retain: &volsyncv1alpha1.ResticRetainPolicy{Last: &five}}
+		at := metav1.NewTime(frozen)
+		source.Status.LastSyncStartTime = &at
+		return source
+	}
+	cases := map[string]struct {
+		source *volsyncv1alpha1.ReplicationSource
+		check  func(t *testing.T, run *backupv1alpha1.BackupRun)
+	}{
+		"this run's tag": {
+			source: syncing(TriggerFor(runUID)),
+			check: func(t *testing.T, run *backupv1alpha1.BackupRun) {
+				if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Trigger != TriggerFor(runUID) {
+					t.Errorf("item = %+v, want it Running under the run's tag", item)
+				}
+			},
+		},
+		"another live run's tag": {
+			source: syncing(TriggerFor(otherRunUID)),
+			check: func(t *testing.T, run *backupv1alpha1.BackupRun) {
+				if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
+					t.Errorf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
+				}
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+				claim(), volume(), volumeRestore(), repository(), tc.source, otherRun())
+			r.Client = neverWriteSyncing(t, c)
+			step(t, r) // plan
+			step(t, r) // admit, no queue
+			step(t, r) // start
+
+			tc.check(t, readBackupRun(t, c))
+			source := &volsyncv1alpha1.ReplicationSource{}
+			get(t, c, ns, claimN, source)
+			if got := manualTag(source); got != manualTag(tc.source) {
+				t.Errorf("source trigger = %q, want %q", got, manualTag(tc.source))
+			}
+			if last := source.Spec.Restic.Retain.Last; last == nil || *last != "5" {
+				t.Error("retain-last changed from 5; the syncing source's spec was rewritten")
+			}
+		})
+	}
+}
+
 // A database run creates a CloudNativePG Backup with method plugin, and
 // succeeds once the Backup completes.
 func TestADatabaseRunTakesABaseBackup(t *testing.T) {
