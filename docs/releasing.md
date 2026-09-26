@@ -161,7 +161,7 @@ git push origin vX.Y.Z
 The push starts .github/workflows/release.yaml. Its check job repeats the Go
 gate, and its release job builds and pushes the image, renders deploy/ pinned
 by digest, packages and pushes the chart, and creates the GitHub Release;
-[packaging.md](packaging.md#the-release-workflow-step-by-step) describes each
+[packaging.md](packaging.md#release-workflow-steps) describes each
 step.
 
 Expected result: both jobs pass, and the job summary shows the image digest.

@@ -7,7 +7,7 @@ Cluster recovers from its barman archive. This page covers both of those; the
 scheduled and on-demand runs the backups come from are in
 [namespace-backups.md](namespace-backups.md).
 
-## The mechanism it replaces
+## What VolSync's populator does
 
 A claim that names a ReplicationDestination in `dataSourceRef` is filled by
 VolSync's volume populator:
@@ -62,8 +62,9 @@ Three consequences follow, and all three last for the life of the claim:
 | the destination's dataset cannot be destroyed | its snapshot is in use |
 | every block the app overwrites is kept twice | the current version in the clone, the previous one in the snapshot |
 
-The third grows with writes rather than with time. A volume that appends barely
-notices. A volume that rewrites itself reaches a full second copy and stays
+The third grows with the data the app overwrites, and a volume nobody writes
+to does not grow at all. A volume that only appends holds almost nothing
+twice. A volume that rewrites itself reaches a full second copy and stays
 there.
 
 ## What this controller does instead
@@ -101,8 +102,9 @@ Two objects exist while that runs, the empty volume and the destination, and
 both are gone when it ends. What stays on the pool is the one dataset the app
 asked for.
 
-The app's dataset is then a plain dataset with no origin. Nothing is pinned,
-nothing drifts, and the destination keeps no permanent copy.
+The app's dataset is then a plain dataset with no origin. No snapshot is held
+open for it, it never grows toward a second copy, and the destination keeps no
+permanent copy.
 
 ## What an app keeps
 
@@ -123,7 +125,8 @@ A CloudNativePG Cluster reads `spec.bootstrap` once, when it is created. A
 Cluster whose manifest says `initdb`, which is every Cluster an app ships, comes
 up as an empty database whenever it is created again: after a cluster rebuild,
 after its namespace was destroyed, after someone deleted it. It reports healthy,
-and its full archive sits untouched in the bucket beside it. Nobody is told.
+and its full archive sits untouched in the bucket beside it. No condition,
+event or log line reports the lost data.
 
 Neither kustomize nor OpenTofu can choose `recovery` in its place, because both
 render the manifest before anything has read the object store. An admission

@@ -63,7 +63,7 @@ on its own. [packaging.md](packaging.md#rbac-the-controller-needs) lists the
 rule this needs.
 
 A backup and a restore of one claim or repository never run at once. Each run
-takes a `coordination.k8s.io` Lease for the claim and one for the repository
+acquires a `coordination.k8s.io` Lease for the claim and one for the repository
 before it creates its mover object, so the API server admits exactly one of two
 runs that reach that moment together, and a run that finds a Lease held waits
 with reason SourceBusy.
@@ -71,7 +71,7 @@ with reason SourceBusy.
 messages and the takeover rule.
 
 Two runs never stop one namespace's workloads at once, either. A run that is
-about to record a stop plan takes the namespace's Lease
+about to record a stop plan acquires the namespace's Lease
 `backup-controller-quiesce` in the same way and holds it until its stored
 status shows every workload back and every Kustomization resumed. A second run
 waits with the app running, and records its plan only once the first has given
@@ -318,9 +318,9 @@ func RunController(masterURL, kubeconfig, imageName, httpEndpoint, metricsPath,
 func RunControllerWithConfig(vpcfg VolumePopulatorConfig)
 ```
 
-Use the second. `VolumePopulatorConfig` takes either a `PodConfig` or a
-`ProviderFunctionConfig`, and this controller takes the second of those, which
-is what keeps a pod of our own out of the design entirely:
+Use the second. `VolumePopulatorConfig` accepts either a `PodConfig` or a
+`ProviderFunctionConfig`. This controller passes a `ProviderFunctionConfig`, so
+the library runs no pod of ours, and the three callbacks below do the work:
 
 | Callback | This controller's implementation |
 | --- | --- |
@@ -345,10 +345,10 @@ and an event recorder. go.mod pins the library at
 | cleans up | deletes the prime claim and calls `PopulateCleanupFn` |
 
 A mutator hook can alter the prime claim before it is created. This controller
-does not need one today; [decisions.md](decisions.md) records why the storage
-class is copied rather than chosen.
+does not need one today; [decisions.md](decisions.md#keep-the-prime-claims-storage-class-and-node)
+records why the prime claim keeps the app claim's storage class.
 
-## The node the volume lands on
+## Which node the volume lands on
 
 The copied `selected-node` annotation is the reason this design also settles a
 placement problem the snapshot path has.
@@ -356,18 +356,20 @@ placement problem the snapshot path has.
 With VolSync's populator, two independent decisions pick a worker. The scheduler
 picks one for the app's pod and writes it onto the claim; the restore mover is
 placed by its own affinity and the clone is made wherever it ran. They can
-disagree, and the volume wins, so the pod follows the volume rather than the
-schedule. The walzen test cluster showed exactly that on 2026-09-13: a claim
-annotated `selected-node: talos-unraid-w-2` whose PersistentVolume sat on
+disagree, and the volume wins: the pod has to run on the worker that holds the
+volume, whatever node the scheduler first chose. The walzen test cluster
+showed exactly that on 2026-09-13: a claim annotated
+`selected-node: talos-unraid-w-2` whose PersistentVolume sat on
 talos-unraid-w-1.
 
 Here the annotation is carried onto the prime claim, so the volume is created on
 the worker the scheduler chose for the pod, and the mover follows the volume it
-has to mount. One decision, made once.
+has to mount. The scheduler picks the worker once, and the volume and the
+mover both go to it.
 
 ## Object flow for one restore
 
-This is the path a claim takes when it is created and its `dataSourceRef` names
+This is the path a claim follows when it is created and its `dataSourceRef` names
 a VolumeRestore. A RestoreRun writes into a claim the same way, through a
 ReplicationDestination with `copyMethod: Direct`, but in the app's namespace
 and without the populator library;
@@ -432,7 +434,7 @@ a repository Secret that lives in the controller's namespace from the start.
 | the VolumeRestore is deleted mid-restore | its finalizer `backup.wlz.li/volume-populator` keeps it Terminating until every claim it fills has finished or been deleted, and each claim's cleanup deletes that claim's destination and Secret copy first |
 | the VolumeRestore is deleted before a claim's prime claim binds | the VolumeRestore carries no finalizer yet and goes at once. The claim stays Pending; once it is deleted, the orphan reconciler cleans up after it ([A claim whose VolumeRestore is gone](#a-claim-whose-volumerestore-is-gone)) |
 | the controller is down | claims stay Pending. Nothing is half-written and no app starts on an empty volume. A process whose run manager stopped exits, so the kubelet restarts it |
-| the controller restarts mid-restore | every object is named from the app claim's UID, so the next reconcile finds the existing destination rather than creating a second one |
+| the controller restarts mid-restore | every object is named from the app claim's UID, so the next reconcile finds the existing destination and creates no second one |
 | two apps restore at once | each destination carries the backup queue label, so Kueue admits them the way it admits every other mover |
 | the app's claim is deleted while the app runs | the pod loses its volume and stays down until the refill completes, which is what deleting a claim already does |
 | the app's claim is deleted mid-restore | the library's own garbage collection removes the prime claim; `PopulateCleanupFn` removes the destination and the Secret copy |

@@ -194,22 +194,27 @@ restartedAt: "2026-09-24T22:15:45Z"
    workload, it writes the snapshot again at `restartedAt`, as the next section
    describes. Then it deletes the Workload.
 
+On the canary, the writer was down 34 seconds, most of it the pod's 30-second
+termination grace, because its shell loop does not handle SIGTERM.
+
 A finalizer performs step 4 and deletes the Workload on failure, on timeout and
-when the run is deleted. A failure there is reported with reason RestartFailed
-while the app is still down, and with reason ReleaseFailed when the app is back
-and only a Lease or the Workload is left: `could not release the Leases it holds
-on its claims and repositories: ... Fix the cause, or delete the Leases labelled
-backup.wlz.li/lease-holder-uid=<uid> yourself; either way the run then finishes
-by itself.` The Leases go before the Workload, so the run keeps its place in the
-queue while it still owes the app its replicas. A Workload that resists
-deletion is reported the same way: `could not delete its Kueue Workload
-backuprun-<uid>, which holds the run's place in the queue: ...`, with the same
-offer to delete it by hand. A run being deleted says that
-the deletion completes by itself, and that a person can remove the finalizer
-`backup.wlz.li/run-cleanup` if it does not once the app runs again. The canary's
-writer was down 34 seconds, most of it
-the pod's 30-second termination grace, because its shell loop does not handle
-SIGTERM.
+when the run is deleted. When a step there fails, the run stays unfinished and
+retries. It reports reason RestartFailed while the app is still down, and
+reason ReleaseFailed when the app is back and only a Lease or the Workload is
+left:
+
+```text
+could not release the Leases it holds on its claims and repositories: <error>. The run retries until it can, and this namespace's schedule waits for it. Fix the cause, or delete the Leases labelled backup.wlz.li/lease-holder-uid=<uid> yourself; either way the run then finishes by itself.
+```
+
+The run deletes the Workload only after it has given the app back, so it keeps
+its place in the queue while it still owes the app its replicas. A failed
+Workload delete is reported the same way, starting `could not delete its Kueue
+Workload backuprun-<uid>, which holds the run's place in the queue`, with the
+advice to delete the Workload by hand. After a failed restart, a run being
+deleted says that the deletion completes by itself, and that a person can
+remove the finalizer `backup.wlz.li/run-cleanup` if it does not once the app
+runs again.
 
 The run writes each plan before it acts on it, so a pass that stops the
 workloads and then loses its status write is retried from the recorded plan.
@@ -430,8 +435,8 @@ A mover Job that fails leaves the tag open. VolSync writes the Job's logs into
 `status.latestMoverStatus`, deletes the Job and starts another, for as long as
 the tag stays. When the source still carries the run's tag, has not completed
 it, and reports a Failed mover in a sync VolSync started after the run's
-`startedAt`, the run fails the item with the mover's logs, so the run reports
-the failure at once instead of at its timeout. It leaves the ReplicationSource
+`startedAt`, the run fails the item with the mover's logs at once, and the
+failure shows on the run before its timeout. It leaves the ReplicationSource
 alone. A mover that failed on a lock is reported with the explanation first:
 `The restic repository is locked (repository is already locked): a lock that
 another restic process holds or left behind, such as one of a mover that was
@@ -509,7 +514,7 @@ or Backup the API server rejects as invalid.
 
 A start that fails with an error a retry may fix, such as a CloudNativePG
 webhook that cannot be reached, no longer ends the pass. The item stays Pending
-with `not started yet: <error>`, the Ready condition takes reason Retrying with
+with `not started yet: <error>`, the Ready condition gets reason Retrying with
 a message that names every such item and every wait, `retrying the start of
 notes-pg: <error>; ReplicationSource notes-data is still completing the backup
 of BackupRun scheduled-20260926-0900`, and the run keeps working: the quiesced
@@ -527,7 +532,7 @@ cluster has no CloudNativePG CRDs`.
 ## One mover at a time
 
 A backup and a restore of the same claim or repository never run at once. Each
-run takes a `coordination.k8s.io` Lease for the claim and one for the
+run acquires a `coordination.k8s.io` Lease for the claim and one for the
 repository right before it creates its mover object, the claim's named
 `backup-controller-claim-<claim uid>` and the repository's
 `backup-controller-repo-<secret uid>`. Creating a Lease is atomic, so of two
@@ -538,7 +543,7 @@ in `backup.wlz.li/lease-holder-kind` (BackupRun or RestoreRun),
 lists the holder's items in `backup.wlz.li/lease-items`. A run releases its
 Leases once an item finishes, and takes over a Lease whose holder has finished
 or no longer exists. A Lease counts as held while the holder's item of the kind
-that takes it is Pending or Running, so a Cluster item that happens to share a
+that acquires it is Pending or Running, so a Cluster item that happens to share a
 claim's name does not keep that claim's Lease.
 
 A run that finds another run holding either Lease waits with reason SourceBusy:
@@ -587,7 +592,7 @@ repository Lease it still holds when it finishes. The quiesce Leases go as
 ## One quiesce at a time
 
 Two runs never stop one namespace's workloads at once. A run that is about to
-write a stop plan first takes the `coordination.k8s.io` Lease
+write a stop plan first acquires the `coordination.k8s.io` Lease
 `backup-controller-quiesce` in its own namespace. Only a BackupRun with
 `all: true` that has at least one target acquires it, and only a RestoreRun whose
 `spec.quiesce` lists a workload; a run with `source:` or `database:` acquires

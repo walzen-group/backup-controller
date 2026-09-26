@@ -93,9 +93,10 @@ that is, without knowing how the claim was provisioned.
 
 ## Why an in-place restore needs the workload stopped
 
-The mover mounts the claim and writes into it. ReadWriteOnce restricts a claim to
-one node rather than to one pod, and the mover and the app both land on the node
-holding the volume, so Kubernetes permits both to mount it at once. Two writers
+The mover mounts the claim and writes into it. ReadWriteOnce lets every pod on
+the node that has the claim attached mount it, and only ReadWriteOncePod limits
+a claim to one pod. The mover and the app both land on the node holding the
+volume, so Kubernetes lets both mount it at once. Two writers
 on one filesystem is how the volume being restored is corrupted.
 
 Stopping the workload is what prevents it. A RestoreRun with `quiesce` stops the
@@ -126,7 +127,7 @@ run has deleted its destination, it keeps the claim's Lease until its mover's
 Job and pods are gone, and the second run waits with reason SourceBusy and a
 message naming the first run. The second run then starts on its own.
 
-A run takes the app down only when it can go on. On the pass that records its
+A run stops the app only when it can go on. On the pass that records its
 plan, before it stops anything, it checks every volume item it has not started:
 a backup of the claim or of its repository that is uploading, or a Lease
 another run holds on either, makes it wait in phase Waiting with reason
@@ -203,7 +204,7 @@ spec:
 ```
 
 The run creates `canary-backup-friday` empty, with the source claim's size and
-storage class, and takes the node the source claim's volume is on. A
+storage class, and copies the node the source claim's volume is on. A
 ReplicationDestination of the run's own, with `copyMethod: Direct`, writes the
 selected snapshot into that claim through a mover pod the scheduler places on
 that node, so the mover's log says which snapshot it restored and the run
@@ -301,8 +302,8 @@ as `restoreAsOf`, with no `previous`. Were the mover handed the run's own
 scheduled backup that finished in between would change which snapshot is the
 newest, or the one before it.
 
-Pinning the mover to a second is not the same as pinning it to a snapshot: it
-lists the snapshots itself and takes the newest one in that second. So the
+The mover gets a second, and no snapshot ID: it lists the snapshots itself and
+restores the newest one in that second. So the
 checks refuse a selection the mover would not restore, and the run ends Failed
 with reason NoBackupInReach before anything is created. Each message says what
 the mover would restore instead, or why nothing can be told:
@@ -391,7 +392,7 @@ deciding at creation time.
 `spec.bootstrap` is read once, when CloudNativePG creates a Cluster, and never
 again. So a Cluster created after a cluster rebuild bootstraps with `initdb`,
 comes up empty, and reports healthy while its archive sits untouched in the
-object store. Nobody is told.
+object store. No condition, event or log line reports the lost data.
 
 The bootstrap webhook watches Clusters being created and looks in the object
 store the Cluster archives through:
@@ -556,10 +557,10 @@ one service; if other/app-pg really archives to a different S3 service, give
 one of the two its own prefix in destinationPath.
 ```
 
-This is the one failure nothing else on the cluster can see. Each Cluster is
-valid on its own; the pair is the problem. The damage is silent and permanent:
-WAL filenames are timeline plus position and nothing else, so the second
-database overwrites the first's segments, and a base backup whose WAL range is
+No other component on the cluster reports this case. Each Cluster is valid on
+its own, and only the pair is wrong. Nothing reports the damage, and it cannot
+be undone: a WAL file's name holds only the timeline and the position, so the
+second database overwrites the first's segments, and a base backup whose WAL range is
 gone can never reach consistency again.
 
 A Cluster that declares its own recovery is checked like any other, and so is
@@ -635,8 +636,8 @@ and this controller both pick it up. A store that needs none declares none.
 The creation entry is registered with `failurePolicy: Fail`. When it cannot
 run, or cannot read the object store, the Cluster is refused.
 
-The alternative is worse than it sounds. Allowing the Cluster through would
-create it exactly as written, which is `initdb`, which is an empty database
+Admitting the Cluster when the webhook cannot decide would create it exactly as
+written, which is `initdb`, which is an empty database
 beside a full archive, reported as success. That failure arrives during a
 cluster rebuild, when this controller is most likely to be starting up and an
 admin is least likely to be reading Cluster events.

@@ -2,7 +2,7 @@
 
 A release is what the infrastructure repository installs. This repository's
 release pipeline is modelled on kuport's, which the walzen-group infrastructure
-already consumes, so copy that shape rather than inventing one.
+already consumes, so copy that shape.
 [walzen-group/kuport](https://github.com/walzen-group/kuport), file
 `.github/workflows/release.yaml`, is the reference implementation.
 [releasing.md](releasing.md) gives the checks a maintainer runs on the local
@@ -10,9 +10,9 @@ e2e cluster before pushing a tag, and the tag and push commands.
 
 ## What a release has to attach
 
-A tag `vX.Y.Z` produces four things, and the infrastructure repository reads the
-first of them. The release page lists the first three; the fourth is a registry
-push rather than an attached file:
+A tag `vX.Y.Z` produces three release files and one chart in the registry, and
+the infrastructure repository reads the first of them. The release page lists
+the three files, and the workflow pushes the chart to the registry:
 
 | Asset | Contents | Consumed by |
 | --- | --- | --- |
@@ -61,7 +61,7 @@ backup-controller/
 └── .github/workflows/          ci.yaml and release.yaml
 ```
 
-## The release workflow, step by step
+## Release workflow steps
 
 Copy kuport's and change the names. What each step is for:
 
@@ -139,7 +139,7 @@ caller in the controller:
 | `customresourcedefinitions` (apiextensions.k8s.io), named `backupruns.backup.wlz.li`, `restoreruns.backup.wlz.li` and `volumerestores.backup.wlz.li` | get | a run reads the installed CRD of its kind before it changes anything, and ends with reason CRDOutdated when the schema lacks a field the controller writes, which the API server would drop |
 | `replicationsources.volsync.backube` | get, list, watch, create, update, patch | writing each enabled claim's source and its manual trigger; v0.8.2 dropped delete, which v0.8.0 and v0.8.1 used after a failed mover |
 | `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill and one per volume restore, in place or with `into:`; the orphan reconciler deletes the destination of a claim whose VolumeRestore is gone |
-| `leases` (coordination.k8s.io) | get, list, create, update, delete | the Lease a BackupRun or RestoreRun takes on a claim and on its repository Secret right before it starts a mover, so a backup and a restore of either never run at once, and the Lease `backup-controller-quiesce` a run acquires in its namespace before it stops that namespace's workloads (internal/runs/lease.go). Runs live in every namespace, so the rule is cluster-wide, and `update` takes over the Lease of a run that has finished |
+| `leases` (coordination.k8s.io) | get, list, create, update, delete | the Lease a BackupRun or RestoreRun acquires on a claim and on its repository Secret right before it starts a mover, so a backup and a restore of either never run at once, and the Lease `backup-controller-quiesce` a run acquires in its namespace before it stops that namespace's workloads (internal/runs/lease.go). Runs live in every namespace, so the rule is cluster-wide, and `update` takes over the Lease of a run that has finished |
 | `jobs` (batch) | get | a RestoreRun and the orphan reconciler reading the Job of a mover they stopped by name, and waiting while it is there, since a Job with no pod can still start one |
 | `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
 | `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |
