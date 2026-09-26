@@ -29,8 +29,9 @@ import (
 // (C4, R3).
 
 // restoreShapes are the three shapes of a volume restore: in place, into a
-// new claim from a repository, and into a new claim from a claim's backups
-// through the populator. into is the claim an into restore creates.
+// new claim from a repository, and into a new claim from a claim's backups.
+// into is the claim an into restore creates. Each writes through a
+// ReplicationDestination the run creates.
 var restoreShapes = []struct {
 	name   string
 	mutate func(*backupv1alpha1.RestoreRun)
@@ -198,7 +199,8 @@ func TestARestoreWhoseSnapshotWasShadowedFailsBeforeWriting(t *testing.T) {
 }
 
 // A restore whose repository did not change since the checks creates its
-// objects pinned to the selected snapshot, from the recorded repository.
+// destination pinned to the selected snapshot, from the recorded repository.
+// An into restore creates no VolumeRestore.
 func TestARestoreWhoseSnapshotIsStillThereGoesAhead(t *testing.T) {
 	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
@@ -212,13 +214,11 @@ func TestARestoreWhoseSnapshotIsStillThereGoesAhead(t *testing.T) {
 				t.Fatalf("phase = %q, item = %+v; want Running", run.Status.Phase, run.Status.Items[0])
 			}
 			want := "2026-09-25T21:21:02Z"
-			if shape.name == "into from a claim" {
-				vr := &backupv1alpha1.VolumeRestore{}
-				get(t, c, ns, "scratch", vr)
-				if vr.Spec.RestoreAsOf == nil || *vr.Spec.RestoreAsOf != want {
-					t.Errorf("VolumeRestore restoreAsOf = %v, want %s", vr.Spec.RestoreAsOf, want)
+			if shape.into != "" {
+				key := types.NamespacedName{Namespace: ns, Name: shape.into}
+				if err := c.Get(context.Background(), key, &backupv1alpha1.VolumeRestore{}); !apierrors.IsNotFound(err) {
+					t.Errorf("VolumeRestore %s: %v, want none created", shape.into, err)
 				}
-				return
 			}
 			rd := &volsyncv1alpha1.ReplicationDestination{}
 			get(t, c, ns, run.Status.Items[0].Destination, rd)

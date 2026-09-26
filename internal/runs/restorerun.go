@@ -33,10 +33,11 @@ import (
 // writes the selected snapshot into it. A database restores by being created
 // again. The run deletes the Cluster, and when Flux or tofu creates it again,
 // the bootstrap webhook makes the new Cluster recover to the run's moment.
-// With spec.into set, a volume restores into a new claim through the ordinary
-// VolumeRestore populator path, and the app's own claims and databases are
-// left alone. A restore from spec.repository alone has no source claim to
-// take a node from, so its mover writes into the new claim directly.
+// With spec.into set, a volume restores into a new claim the run creates, and
+// the app's own claims and databases are left alone. A ReplicationDestination
+// in Direct mode writes the selected snapshot into that claim, from the
+// backups of spec.claim or from spec.repository, so its mover's log confirms
+// the snapshot the same way as in place.
 type RestoreRunReconciler struct {
 	client.Client
 
@@ -85,10 +86,12 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // error either returns for a retry goes through planFailed, which reports it
 // on the Ready condition and ends the run once spec.timeout has passed since
 // its creation. A run past its checks continues in work, or in
-// reconcileIntoNewClaim for an into restore. Before any of these, Reconcile
-// adds the run's finalizer. A run being deleted gets its changes put back by
-// finalize, and a finished run is deleted once spec.ttlSecondsAfterFinished
-// has passed.
+// restoreIntoEmptyClaim for an into restore. An into restore that a v0.8.1
+// or older controller started through the VolumeRestore populator continues
+// in followPopulator instead (see onPopulatorPath). Before any of these,
+// Reconcile adds the run's finalizer. A run being deleted gets its changes
+// put back by finalize, and a finished run is deleted once
+// spec.ttlSecondsAfterFinished has passed.
 //
 // A new run is first checked against the installed RestoreRun CRD (see
 // schemaCache.crdOutdated), and a run whose CRD lacks a field the controller
@@ -137,7 +140,10 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return result, nil
 	}
 	if run.Spec.Into != "" {
-		return r.reconcileIntoNewClaim(ctx, run)
+		if onPopulatorPath(run) {
+			return r.followPopulator(ctx, run)
+		}
+		return r.restoreIntoEmptyClaim(ctx, run)
 	}
 	return r.work(ctx, run)
 }
@@ -1131,17 +1137,19 @@ func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster client
 // planIntoNewClaim checks an into restore before it creates anything. It
 // selects the snapshot the restore would use, records it on the run's single
 // item, and moves the run to Running with status.startedAt set. The check has
-// to come first, because the populator would otherwise bind an empty claim and
-// report success. For a restore from spec.repository alone, the item also
-// names the ReplicationDestination that restoreIntoEmptyClaim creates.
+// to come first, because VolSync's mover restores nothing and still reports
+// success when no snapshot matches. The item also names the
+// ReplicationDestination that restoreIntoEmptyClaim creates, for a restore
+// from spec.claim and from spec.repository alike.
 //
 // A spec that can't work ends the run as Failed with reason Invalid: a claim
-// named spec.into that exists and that the run did not create (for a restore
-// through the populator, a VolumeRestore of that name as well; see
-// notCreatedByRun), a source claim or VolumeRestore that is missing, a
-// restoreAsOf that doesn't parse, or a restore from spec.repository alone
-// without spec.intoSize. The run writes only into a claim it creates itself,
-// so it never overwrites or takes over one it finds. A run with no
+// named spec.into that exists and that the run did not create (see
+// notCreatedByRun), for a restore from spec.claim a VolumeRestore of that
+// name, which describes the backups of a claim of that name, a source claim
+// or VolumeRestore that is missing, a restoreAsOf that doesn't parse, or a
+// restore from spec.repository alone without spec.intoSize. The run writes
+// only into a claim it creates itself, so it never overwrites or takes over
+// one it finds. A run with no
 // snapshot in reach, or whose snapshot VolSync's mover would not restore when
 // pinned to its second, ends with reason NoBackupInReach. Any other failed read,
 // and a failed listing of the repository, is returned for a retry.
@@ -1195,9 +1203,7 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 	item := backupv1alpha1.RestoreItem{
 		Kind: "PersistentVolumeClaim", Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning,
 		Snapshot: snapshot.ShortID(), SnapshotTime: &metav1.Time{Time: snapshot.Time},
-	}
-	if run.Spec.Claim == "" {
-		item.Destination = destinationName(run.UID, 0)
+		Destination: destinationName(run.UID, 0),
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
@@ -1208,110 +1214,136 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 	return after(time.Second, r.writeStatus(ctx, run))
 }
 
-// reconcileIntoNewClaim restores a volume into the new claim that spec.into
-// names, and leaves the app's claim alone. planIntoNewClaim has checked the
-// run before this runs. A restore from spec.repository alone goes to
-// restoreIntoEmptyClaim.
-//
-// With a source claim, it creates a VolumeRestore carrying the time of the
-// snapshot the checks selected (see pointInTimeRestore) and a claim whose data
-// source names it, so the ordinary populator path does the work. The claim
-// takes the source claim's node (see scratchClaim). The run succeeds once the
-// new claim is Bound, and is aborted with reason TimedOut when the claim has
-// not bound by spec.timeout. The deadline is checked before anything is
-// created, so a create the API server keeps refusing can't hold the run past
-// it. A source claim deleted before the new claim was created ends the run as
-// Failed. While a backup of the source claim or its repository is in progress
-// (see otherMover), the run waits with reason SourceBusy before it creates
-// anything. Right before the VolumeRestore is created, the repository is
-// listed again (see recheckSnapshot), and a snapshot the mover would no
-// longer restore aborts the run with reason Failed.
-//
-// The run writes only through a VolumeRestore and into a claim it created:
-// a Bound claim counts as restored only when the run controls it. A claim
-// or VolumeRestore named spec.into that the run did not create (see
-// notCreatedByRun), found at the create or on any later pass, aborts the run
-// with reason Failed. Such an object was created after the checks, which
-// refuse one that already existed.
-func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	if run.Spec.Claim == "" {
-		return r.restoreIntoEmptyClaim(ctx, run)
-	}
-	bound := &corev1.PersistentVolumeClaim{}
-	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
-	readErr := r.Reader.Get(ctx, key, bound)
-	if readErr == nil {
-		if refusal := notCreatedByRun(run, "claim", bound); refusal != "" {
-			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
-		}
-	}
-	if readErr == nil && bound.Status.Phase == corev1.ClaimBound {
-		for i := range run.Status.Items {
-			run.Status.Items[i].Phase = backupv1alpha1.ItemSucceeded
-		}
-		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonSucceeded,
-			fmt.Sprintf("claim %s is bound and holds the restored data", run.Spec.Into))
-	}
-	if deadline, over := r.overdue(run); over {
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, fmt.Sprintf("claim %s had not bound by %s", run.Spec.Into, deadline.Format(time.RFC3339)))
-	}
-	switch {
-	case readErr == nil:
-		return ctrl.Result{RequeueAfter: pollInterval}, nil
-	case !apierrors.IsNotFound(readErr):
-		return ctrl.Result{}, fmt.Errorf("get PersistentVolumeClaim %s: %w", key, readErr)
-	}
-
-	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
-	if err != nil {
-		if !isRefusal(err) {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error())
-	}
-	if waiting, err := r.waitForBackup(ctx, run, run.Spec.Claim, settings.Secret); waiting || err != nil {
-		return after(pollInterval, err)
-	}
-	why, err := r.recheckSnapshot(ctx, run, &run.Status.Items[0], settings.Secret)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if why != "" {
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, why+nothingWritten(run.Spec.Into))
-	}
-	vr := pointInTimeRestore(run, run.Status.Items[0], settings)
-	refusal, err := r.createOwned(ctx, run, vr, &backupv1alpha1.VolumeRestore{}, "VolumeRestore")
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if refusal != "" {
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
-	}
-	refusal, err = r.createOwned(ctx, run, scratchClaim(run, settings, vr.Name), &corev1.PersistentVolumeClaim{}, "claim")
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if refusal != "" {
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
-	}
-	return after(pollInterval, r.resume(ctx, run))
+// onPopulatorPath reports whether the run is an into restore from a claim
+// that a v0.8.1 or older controller planned for the VolumeRestore populator,
+// and whose item has not finished. Such an item names no
+// ReplicationDestination: planIntoNewClaim names one on every item it plans,
+// and only finish clears it, in the same status write that records the run's
+// end.
+func onPopulatorPath(run *backupv1alpha1.RestoreRun) bool {
+	return run.Spec.Claim != "" && len(run.Status.Items) == 1 &&
+		run.Status.Items[0].Destination == "" && !finished(run.Status.Items[0])
 }
 
-// restoreIntoEmptyClaim restores a repository that no claim in the namespace
-// backs up to, which spec.repository names, into the new claim spec.into
-// names.
+// followPopulator carries an into restore from a claim that a v0.8.1 or
+// older controller started through the VolumeRestore populator (see
+// onPopulatorPath) to its end, and returns the result the reconcile hands
+// back.
 //
-// The populator path can't do this on a WaitForFirstConsumer class, which is
-// every class on the walzen cluster. The populator library fills a claim only
-// once volume.kubernetes.io/selected-node is set on it, and only the scheduler
-// sets that, when it places a pod that uses the claim. With no source claim
-// there is no node to copy, and picking one here would have to repeat the
-// scheduler's checks of topology, capacity and taints. So the run creates a
-// plain claim of spec.intoSize, with no data source, and a
-// ReplicationDestination whose mover writes the selected snapshot into it
-// (see directDestination). The mover pod is the claim's first consumer, so
-// the scheduler places the claim where the mover runs, the way VolSync places
-// a destination claim it creates itself.
+// The populator's mover runs in the controller's namespace, and the
+// populator deletes its ReplicationDestination, and with it the mover's log,
+// before the claim binds. So nothing tells which snapshot the populator
+// restored, and such a run never ends Succeeded. followPopulator reads the
+// claim and the VolumeRestore named spec.into through the uncached Reader,
+// and goes by what it finds:
+//
+//   - A claim of that name the run does not control (see notCreatedByRun):
+//     the run ends Failed with the refusal and leaves the claim alone.
+//   - The run's claim, Bound: the run ends Failed and says that it cannot
+//     confirm the snapshot and what to do (see populatorUnconfirmed).
+//   - The run's claim, neither Bound nor being deleted: the populator is
+//     still at work. The run waits for it and creates nothing, until
+//     spec.timeout ends it TimedOut. The run's VolumeRestore keeps a backup
+//     of the source claim waiting meanwhile (see otherMover).
+//   - The run's claim being deleted, or no claim beside the run's
+//     VolumeRestore: the claim holds nothing the run restored, and the run
+//     ends Failed. It creates no claim, because the populator would fill it.
+//   - A VolumeRestore of that name the run does not control and no claim:
+//     the run ends Failed with the refusal from notCreatedByRun.
+//   - Neither exists: the old controller created nothing. The item gets the
+//     name of its ReplicationDestination, the status is written, and the
+//     next pass goes on in restoreIntoEmptyClaim, which lists the repository
+//     again before it creates anything.
+//
+// The run deletes nothing it finds. The claim and the VolumeRestore it
+// created go with it through the garbage collector, and finish takes the
+// populator's finalizer off a VolumeRestore the populator never took on (see
+// releaseVolumeRestore). A failed read or status write comes back as an
+// error, and the next pass tries again.
+func (r *RestoreRunReconciler) followPopulator(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
+	item := &run.Status.Items[0]
+	into := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
+	claim := &corev1.PersistentVolumeClaim{}
+	claimErr := r.Reader.Get(ctx, into, claim)
+	if claimErr != nil && !apierrors.IsNotFound(claimErr) {
+		return ctrl.Result{}, fmt.Errorf("get PersistentVolumeClaim %s: %w", into, claimErr)
+	}
+	if claimErr == nil {
+		switch {
+		case !metav1.IsControlledBy(claim, run):
+			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, notCreatedByRun(run, "claim", claim))
+		case claim.DeletionTimestamp != nil:
+			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, populatorClaimGone(run.Spec.Into))
+		case claim.Status.Phase == corev1.ClaimBound:
+			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, populatorUnconfirmed(*item))
+		}
+		if deadline, over := r.overdue(run); over {
+			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonTimedOut,
+				fmt.Sprintf("claim %s had not bound by %s", run.Spec.Into, deadline.Format(time.RFC3339)))
+		}
+		return ctrl.Result{RequeueAfter: pollInterval}, nil
+	}
+
+	vr := &backupv1alpha1.VolumeRestore{}
+	if err := r.Reader.Get(ctx, into, vr); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("get VolumeRestore %s: %w", into, err)
+		}
+		// Nothing was created: the run restores like one this version
+		// planned. The name goes into the status before anything is created,
+		// so no pass can create a destination the item does not name.
+		item.Destination = destinationName(run.UID, 0)
+		return after(time.Second, r.writeStatus(ctx, run))
+	}
+	if refusal := notCreatedByRun(run, "VolumeRestore", vr); refusal != "" {
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
+	}
+	return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, populatorClaimGone(run.Spec.Into))
+}
+
+// populatorUnconfirmed returns the message of an item that a v0.8.1 or older
+// controller restored through the VolumeRestore populator, once its claim is
+// Bound (see followPopulator). item is the run's single item, which names the
+// claim and records the snapshot the checks selected.
+func populatorUnconfirmed(item backupv1alpha1.RestoreItem) string {
+	selected := ""
+	if item.Snapshot != "" {
+		selected = fmt.Sprintf(" The checks selected snapshot %s.", item.Snapshot)
+	}
+	return fmt.Sprintf("this restore was started by v0.8.1 or older through the VolumeRestore populator, "+
+		"and this version cannot confirm which snapshot the populator restored: its mover's log went with the populator's ReplicationDestination.%[2]s "+
+		"Claim %[1]s is Bound, and the run leaves it and VolumeRestore %[1]s in place. "+
+		"Compare the claim with the data you expect, or restore again with a new RestoreRun, whose mover's log the run checks: "+
+		"give it another spec.into, or delete this RestoreRun first, which deletes claim %[1]s and VolumeRestore %[1]s",
+		item.Name, selected)
+}
+
+// populatorClaimGone returns the message of an item that a v0.8.1 or older
+// controller started through the VolumeRestore populator whose claim, named
+// into, does not exist or is being deleted (see followPopulator).
+func populatorClaimGone(into string) string {
+	return fmt.Sprintf("this restore was started by v0.8.1 or older through the VolumeRestore populator, "+
+		"and claim %s, which the populator fills, does not exist or is being deleted, so it holds nothing this run restored. "+
+		"This version creates no claim for the populator to fill. Create a new RestoreRun to restore the claim", into)
+}
+
+// restoreIntoEmptyClaim restores into the new claim spec.into names, from
+// the backups of the claim spec.claim names or from the repository
+// spec.repository names.
+//
+// The run creates a plain claim, with no data source, and a
+// ReplicationDestination in the run's namespace whose mover writes the
+// selected snapshot into it (see directDestination), so the mover's log
+// confirms the snapshot as it does in place. The claim takes the source
+// claim's size and class, or spec.intoSize, and the node the source claim's
+// volume is on (see scratchClaim). On a WaitForFirstConsumer class, which is
+// every class on the walzen cluster, that node lets the provisioner create
+// the volume at once, and the scheduler places the mover pod with it. A
+// restore from spec.repository alone has no source claim and no node to
+// copy, and picking one here would have to repeat the scheduler's checks of
+// topology, capacity and taints. Its mover pod is the claim's first
+// consumer, so the scheduler places the claim where the mover runs, the way
+// VolSync places a destination claim it creates itself.
 //
 // The run fails with the mover's logs when the mover fails. Once the
 // destination has completed the run's trigger, the run succeeds only when the
@@ -1320,12 +1352,14 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 // finish deletes the destination, for the reason work gives, and a pass that
 // finds the item's end recorded only finishes the run. It is aborted with
 // reason TimedOut when the restore has not finished by spec.timeout, and the
-// deadline is checked before anything is created.
-// While a backup of the repository is in progress (see otherMover), the run
-// waits with reason SourceBusy before it creates anything. Right before the
-// claim is created, the repository is listed again (see recheckSnapshot),
-// and a snapshot the mover would no longer restore aborts the run with
-// reason Failed.
+// deadline is checked before anything is created. A source claim that is
+// gone before anything was created, or whose VolumeRestore is, aborts the run
+// with reason Failed.
+// While a backup of the source claim or the repository is in progress (see
+// otherMover), the run waits with reason SourceBusy before it creates
+// anything. Right before the claim is created, the repository is listed
+// again (see recheckSnapshot), and a snapshot the mover would no longer
+// restore aborts the run with reason Failed.
 //
 // The run writes only into a claim it created and only through a
 // destination it created. A claim named spec.into that the run did not
@@ -1398,9 +1432,12 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 		return ctrl.Result{}, fmt.Errorf("get ReplicationDestination %s: %w", item.Destination, readErr)
 	}
 
-	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, "", run.Spec.Repository, run.Spec.MoverSecurityContext)
+	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
-		return ctrl.Result{}, err
+		if !isRefusal(err) {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error())
 	}
 	// A claim that appeared since the checks ends the run before it waits
 	// for anything: it is not the run's to write into.
@@ -1411,7 +1448,13 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	if refusal != "" {
 		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
 	}
-	if waiting, err := r.waitForBackup(ctx, run, run.Spec.Into, settings.Secret); waiting || err != nil {
+	// The Leases and the wait cover the source claim when there is one, as
+	// the checks did, and the new claim otherwise.
+	leased := run.Spec.Claim
+	if leased == "" {
+		leased = run.Spec.Into
+	}
+	if waiting, err := r.waitForBackup(ctx, run, leased, settings.Secret); waiting || err != nil {
 		return after(pollInterval, err)
 	}
 	why, err := r.recheckSnapshot(ctx, run, item, settings.Secret)
@@ -1423,7 +1466,7 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	}
 	// The destination is created only once the claim is known to be the
 	// run's: its mover deletes every file the snapshot lacks.
-	refusal, err = r.createOwned(ctx, run, scratchClaim(run, settings, ""), &corev1.PersistentVolumeClaim{}, "claim")
+	refusal, err = r.createOwned(ctx, run, scratchClaim(run, settings), &corev1.PersistentVolumeClaim{}, "claim")
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1529,10 +1572,10 @@ func replacedDestination(name string) string {
 
 // claimLost returns a message when the claim spec.into names is gone, is
 // being deleted, or is not the one the run created (see notCreatedByRun),
-// and "" while the run's own claim is there. An into restore from a
-// repository checks it on every pass after its destination exists, so a
-// mover that finished never counts as a restore into a claim that is no
-// longer the run's. A failed read comes back as an error.
+// and "" while the run's own claim is there. An into restore checks it on
+// every pass after its destination exists, so a mover that finished never
+// counts as a restore into a claim that is no longer the run's. A failed
+// read comes back as an error.
 func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha1.RestoreRun) (string, error) {
 	lost := fmt.Sprintf("claim %s was deleted (or replaced) while the mover wrote into it", run.Spec.Into)
 	claim := &corev1.PersistentVolumeClaim{}
@@ -1653,9 +1696,9 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // workload it still holds stopped, and records the
 // terminal phase: Succeeded when reason is ReasonSucceeded and Failed for any
 // other reason. It sets the Ready condition to reason and message, records
-// status.completedAt, and removes the finalizer. For an into restore that
-// did not succeed, it first releases the VolumeRestore with
-// releaseVolumeRestore.
+// status.completedAt, and removes the finalizer. For a run that did not
+// succeed, it first releases the VolumeRestore that a v0.8.1 or older
+// controller created for an into restore, with releaseVolumeRestore.
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
 	if reason != backupv1alpha1.ReasonSucceeded {
 		if err := r.releaseVolumeRestore(ctx, run); err != nil {
@@ -1688,8 +1731,8 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 
 // finalize runs when the run is deleted before it finished. It deletes the
 // run's ReplicationDestinations, releases the run's Leases (see
-// releaseLeases), starts any workload the run still holds
-// stopped, releases an into restore's VolumeRestore with
+// releaseLeases), starts any workload the run still holds stopped, releases
+// the VolumeRestore an older controller created for an into restore with
 // releaseVolumeRestore, and removes the finalizer so the deletion can
 // complete. Without it, a run deleted while its mover writes would leave a
 // restore running against a claim with nothing tracking it.
@@ -1960,12 +2003,14 @@ func finishedWithDestination(items []backupv1alpha1.RestoreItem) bool {
 // populator's prefix, which the binary sets.
 const populatorClaimFinalizer = "/populate-target-protection"
 
-// releaseVolumeRestore takes populator.Finalizer off the VolumeRestore an into
-// restore created, when the populator never took that VolumeRestore on. finish
-// calls it for an into restore that did not succeed, and finalize for one
-// deleted before it finished.
+// releaseVolumeRestore takes populator.Finalizer off the VolumeRestore named
+// spec.into that a v0.8.1 or older controller created for an into restore
+// from a claim (see followPopulator), when the populator never took that
+// VolumeRestore on. finish calls it for a run that did not succeed, and
+// finalize for one deleted before it finished. A run this version planned
+// creates no VolumeRestore, so for it there is nothing to release.
 //
-// pointInTimeRestore creates the VolumeRestore with the finalizer, and the
+// The older controller created the VolumeRestore with the finalizer, and the
 // populator's Cleanup removes it once the claim is filled or deleted. The
 // library calls Cleanup only for a claim it has started on, so a claim it
 // never reached, such as one still waiting for a node, would leave the

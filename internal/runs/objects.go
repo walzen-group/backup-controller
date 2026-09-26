@@ -7,7 +7,6 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	"github.com/walzen-group/backup-controller/internal/populator"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -144,10 +143,11 @@ func selectedMoment(item backupv1alpha1.RestoreItem) *string {
 	return &moment
 }
 
-// directDestination builds the ReplicationDestination for a restore that
-// writes straight into a claim: an in-place restore, whose claim is the one
-// the app uses, and a restore from spec.repository alone into a new claim.
-// Its mover mounts the claim and writes the chosen snapshot into it.
+// directDestination builds the ReplicationDestination through which every
+// volume restore writes straight into a claim: an in-place restore, whose
+// claim is the one the app uses, and an into restore, whose claim the run
+// created (see scratchClaim). Its mover mounts the claim and writes the
+// chosen snapshot into it.
 //
 // Parameters:
 //   - run is the RestoreRun. Its UID becomes the manual trigger.
@@ -216,14 +216,17 @@ func ownsDestination(run *backupv1alpha1.RestoreRun, destination *volsyncv1alpha
 //
 // Parameters:
 //   - run is the RestoreRun. It controls an object whose controller
-//     reference carries its UID, as scratchClaim and pointInTimeRestore set
-//     it; a run created again under the same name does not.
+//     reference carries its UID, as scratchClaim sets it, and as a v0.8.1
+//     or older controller set it on the VolumeRestore of an into restore
+//     from a claim; a run created again under the same name does not.
 //   - kind is "claim" or "VolumeRestore", for the message.
 //   - object is the object as read from the API server.
 //
 // When another RestoreRun controls the object, the message names that run:
 // the garbage collector deletes the object when that run is deleted, so a
-// run that took the object over would lose it under its own success.
+// run that took the object over would lose it under its own success. A
+// VolumeRestore describes the backups of the claim of its name, so its name
+// is taken by a claim too, even while that claim does not exist.
 func notCreatedByRun(run *backupv1alpha1.RestoreRun, kind string, object metav1.Object) string {
 	if metav1.IsControlledBy(object, run) {
 		return ""
@@ -239,95 +242,38 @@ func notCreatedByRun(run *backupv1alpha1.RestoreRun, kind string, object metav1.
 			"Choose a name no claim in this namespace has. To overwrite an existing claim, restore it in place with spec.claim.",
 			object.GetName(), owner)
 	}
-	return fmt.Sprintf("%s %s already exists and this run did not create it%s. "+
-		"spec.into names a new claim, and the %s that fills it, for the run to create, and a restore never uses a %s it did not create. "+
-		"Choose a name no claim or %s in this namespace has.",
-		kind, object.GetName(), owner, kind, kind, kind)
+	return fmt.Sprintf("%[1]s %[2]s already exists and this run did not create it%[3]s. "+
+		"A %[1]s describes the backups of the claim of its name, so that name belongs to another claim, and "+
+		"spec.into names a new claim for the run to create. Choose a name no claim or %[1]s in this namespace has.",
+		kind, object.GetName(), owner)
 }
 
-// pointInTimeRestore builds the VolumeRestore that an Into restore fills its
-// scratch claim from. Because it is an ordinary VolumeRestore, the volume
-// populator does the restore, and none of that work is repeated here. The run
-// is its controller owner.
-//
-// Parameters:
-//   - run is the RestoreRun. The VolumeRestore is named after its spec.into.
-//   - item is the run's single item, which records the snapshot the run's
-//     checks selected.
-//   - settings are the repository and mover settings from repositoryFor.
-//
-// The VolumeRestore carries the selected snapshot's time as restoreAsOf (see
-// selectedMoment). A VolumeRestore has no previous, so a run with
-// spec.previous gets the snapshot it recorded only this way. An item with no
-// recorded time, from a run an older controller planned, falls back to the
-// run's spec.restoreAsOf.
-//
-// It also carries populator.Finalizer from the start. The populator adds that
-// finalizer only when it first fills a claim, and a VolumeRestore deleted
-// before then would leave the library's finalizer on the claim with nothing
-// to remove it. The populator's Cleanup removes it once no claim is being
-// filled.
-func pointInTimeRestore(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem, settings restoreSettings) *backupv1alpha1.VolumeRestore {
-	labels := map[string]backupv1alpha1.MoverPodLabelValue{}
-	for key, value := range settings.MoverPodLabels {
-		labels[key] = backupv1alpha1.MoverPodLabelValue(value)
-	}
-	if len(labels) == 0 {
-		labels = nil
-	}
-	restoreAsOf := selectedMoment(item)
-	if restoreAsOf == nil {
-		restoreAsOf = run.Spec.RestoreAsOf
-	}
-
-	return &backupv1alpha1.VolumeRestore{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:       run.Spec.Into,
-			Namespace:  run.Namespace,
-			Finalizers: []string{populator.Finalizer},
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(run, backupv1alpha1.GroupVersion.WithKind("RestoreRun")),
-			},
-		},
-		Spec: backupv1alpha1.VolumeRestoreSpec{
-			Repository:            settings.Secret,
-			RestoreAsOf:           restoreAsOf,
-			CacheStorageClassName: settings.CacheStorageClassName,
-			MoverPodLabels:        labels,
-			MoverSecurityContext:  settings.MoverSecurityContext,
-		},
-	}
-}
-
-// scratchClaim builds the claim that an Into restore fills.
+// scratchClaim builds the plain claim that an into restore creates and its
+// mover fills.
 //
 // Parameters:
 //   - run is the RestoreRun. The claim takes its name from spec.into, and
 //     spec.intoSize, when set, replaces the source claim's size.
-//   - settings are the source claim's settings from repositoryFor.
-//   - restore is the name of the VolumeRestore that the claim's
-//     dataSourceRef names, which is the one pointInTimeRestore builds. An
-//     empty name leaves the claim with no data source, for a restore from
-//     spec.repository alone, whose mover writes into the claim directly.
+//   - settings are the source claim's settings from repositoryFor. A
+//     restore from spec.repository alone has none.
 //
-// The claim takes the source claim's size and class, so the copy is
-// provisioned the way the original was. It is an ordinary dynamic claim.
-// Deleting it deletes its dataset too, which makes a scratch copy cheap to
-// throw away. The run is its controller owner.
+// The claim has no data source: the run's ReplicationDestination writes the
+// selected snapshot into it (see directDestination). It takes the source
+// claim's size and class, so the copy is provisioned the way the original
+// was. It is an ordinary dynamic claim. Deleting it deletes its dataset too,
+// which makes a scratch copy cheap to throw away. The run is its controller
+// owner.
 //
-// It also takes the source claim's selected node, and without that it is
-// never filled at all. On a WaitForFirstConsumer class the populator library
-// waits for volume.kubernetes.io/selected-node before it creates anything,
-// and the scheduler writes that annotation when it schedules a pod that uses
-// the claim. A scratch claim has no pod, so nothing would ever write it, and
-// the claim would stay Pending for as long as it existed. Every class on the
-// walzen cluster binds WaitForFirstConsumer.
-//
-// The source's node is also where the copy belongs. The copy is made to be
-// compared against the original, and both datasets belong on the pool that
-// already holds one of them. A restore from spec.repository alone has no
-// source node, and restoreIntoEmptyClaim lets the mover pod place the claim.
-func scratchClaim(run *backupv1alpha1.RestoreRun, settings restoreSettings, restore string) *corev1.PersistentVolumeClaim {
+// It also takes the source claim's selected node,
+// volume.kubernetes.io/selected-node. On a WaitForFirstConsumer class, which
+// is every class on the walzen cluster, the provisioner creates the volume
+// on that node at once, and the scheduler places the mover pod, which has no
+// other pod to follow, on the node that holds the volume. The copy is made to
+// be compared against the original, and both datasets belong on the pool
+// that already holds one of them. A restore from spec.repository alone has
+// no source node, and the scheduler places the claim with the mover pod,
+// which is its first consumer.
+func scratchClaim(run *backupv1alpha1.RestoreRun, settings restoreSettings) *corev1.PersistentVolumeClaim {
 	size := settings.Capacity
 	if run.Spec.IntoSize != nil {
 		size = run.Spec.IntoSize
@@ -351,13 +297,6 @@ func scratchClaim(run *backupv1alpha1.RestoreRun, settings restoreSettings, rest
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			StorageClassName: settings.StorageClassName,
 		},
-	}
-	if restore != "" {
-		claim.Spec.DataSourceRef = &corev1.TypedObjectReference{
-			APIGroup: &backupv1alpha1.GroupVersion.Group,
-			Kind:     "VolumeRestore",
-			Name:     restore,
-		}
 	}
 	if size != nil {
 		claim.Spec.Resources = corev1.VolumeResourceRequirements{

@@ -68,10 +68,6 @@ func restoredStatus(short string) *volsyncv1alpha1.ReplicationDestinationStatus 
 	}
 }
 
-// directShapes are the restore shapes whose mover the run creates itself, so
-// it reads the mover's log: in place, and into a new claim from a repository.
-var directShapes = restoreShapes[:2]
-
 // finishMover marks the ReplicationDestination of the run's first item as
 // VolSync marks one whose mover succeeded: the run's trigger completed, and
 // latestMoverStatus Successful with the given logs, in one status write.
@@ -131,7 +127,7 @@ func TestTheRecordedMoverLogsSayWhatTheMoverRestored(t *testing.T) {
 // A restore whose mover's log names the snapshot the checks recorded
 // succeeds.
 func TestARestoreConfirmsTheSnapshotFromTheMoversLog(t *testing.T) {
-	for _, shape := range directShapes {
+	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			r, c := startedRestore(t, shape.mutate)
 			finishMover(t, c, restoreLogFor(monday.ShortID()))
@@ -150,7 +146,7 @@ func TestARestoreConfirmsTheSnapshotFromTheMoversLog(t *testing.T) {
 // snapshots found", restores nothing and exits 0, and VolSync completes the
 // trigger. The item fails and says what the claim holds.
 func TestARestoreThatRestoredNothingFails(t *testing.T) {
-	for _, shape := range directShapes {
+	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			r, c := startedRestore(t, shape.mutate)
 			finishMover(t, c, recordedNoEligibleLog)
@@ -172,7 +168,7 @@ func TestARestoreThatRestoredNothingFails(t *testing.T) {
 // A mover that restored another snapshot than the one the checks recorded
 // fails the item, naming both.
 func TestARestoreThatRestoredAnotherSnapshotFails(t *testing.T) {
-	for _, shape := range directShapes {
+	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			r, c := startedRestore(t, shape.mutate)
 			finishMover(t, c, restoreLogFor(sunday.ShortID()))
@@ -194,7 +190,7 @@ func TestARestoreWithoutLogsFails(t *testing.T) {
 		"empty":     "",
 		"truncated": truncatedLog(restoreLogFor(monday.ShortID()), 64),
 	}
-	for _, shape := range directShapes {
+	for _, shape := range restoreShapes {
 		for name, log := range logs {
 			t.Run(shape.name+"/"+name, func(t *testing.T) {
 				r, c := startedRestore(t, shape.mutate)
@@ -213,7 +209,7 @@ func TestARestoreWithoutLogsFails(t *testing.T) {
 // leaves the item Running and the destination in place. The next pass reads
 // the same log, fails the item again, and only then deletes the destination.
 func TestAMoverLogFailureSurvivesALostStatusWrite(t *testing.T) {
-	for _, shape := range directShapes {
+	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			r, c := startedRestore(t, shape.mutate)
 			finishMover(t, c, recordedNoEligibleLog)

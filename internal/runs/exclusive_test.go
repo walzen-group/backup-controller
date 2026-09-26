@@ -8,6 +8,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/populator"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -322,18 +323,43 @@ func TestANamespaceRunWaitsForARestoreBeforeItQuiesces(t *testing.T) {
 	}
 }
 
-// A restore of the claim's backups into a new claim goes through the
-// populator, whose mover runs in the controller's namespace. Its VolumeRestore
-// stands for that mover: a backup of the claim waits while it is there.
-func TestABackupWaitsWhileAPopulatorRestoreOfTheClaimRuns(t *testing.T) {
+// A restore of the claim's backups into a new claim writes through its own
+// ReplicationDestination, which names the claim's repository: a backup of the
+// claim waits while it is there.
+func TestABackupWaitsWhileAnIntoRestoreFromTheClaimRuns(t *testing.T) {
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" }, asOf("2026-09-21T04:00:00Z")),
 		claim(), volume(), volumeRestore(), repository())
 	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
 	rr := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
 	restoreStep(t, rr) // plan
-	restoreStep(t, rr) // creates the VolumeRestore and the claim
-	get(t, c, ns, "scratch", &backupv1alpha1.VolumeRestore{})
+	restoreStep(t, rr) // creates the claim and the destination
+	if names := destinations(t, c); len(names) != 1 {
+		t.Fatalf("destinations = %v, want the restore's", names)
+	}
+	step(t, br)
+	step(t, br)
+	step(t, br)
+
+	run := readBackupRun(t, c)
+	if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy || !strings.Contains(readyMessage(run.Status.Conditions), "RestoreRun back-to-monday") {
+		t.Fatalf("reason = %q, message = %q; want SourceBusy naming the RestoreRun", readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
+	}
+	if ownSourceTag(t, c) == TriggerFor(runUID) {
+		t.Error("the backup wrote its trigger while the restore ran")
+	}
+}
+
+// A restore a v0.8.1 controller started through the populator has its mover
+// in the controller's namespace. Its VolumeRestore stands for that mover: a
+// backup of the claim waits while the run is live and the VolumeRestore is
+// there.
+func TestABackupWaitsWhileAPopulatorRestoreOfTheClaimRuns(t *testing.T) {
+	restore := populatorRun()
+	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		restore, populatorRestore(restore, populator.Finalizer), populatorClaim(restore, corev1.ClaimPending, populator.ClaimFinalizer),
+		claim(), volume(), volumeRestore(), repository())
+	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
 	step(t, br)
 	step(t, br)
 	step(t, br)

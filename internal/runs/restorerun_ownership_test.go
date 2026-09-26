@@ -39,7 +39,7 @@ func intoApp(r *backupv1alpha1.RestoreRun) {
 }
 
 // intoMonday is a mutate function for restoreRun that restores the claim's
-// backups into a new claim named notes-data-monday, through the populator.
+// backups into a new claim named notes-data-monday.
 func intoMonday(r *backupv1alpha1.RestoreRun) {
 	r.Spec.Claim, r.Spec.Into = claimN, "notes-data-monday"
 }
@@ -126,12 +126,13 @@ func TestAnIntoRestoreRefusesAnExistingClaim(t *testing.T) {
 	}
 }
 
-// An into restore through the populator whose spec.into names an existing
-// Bound claim ends Invalid at its checks, and creates no VolumeRestore. The
-// same holds for a VolumeRestore of that name, which may be the app's own.
+// An into restore from a claim whose spec.into names an existing Bound claim
+// ends Invalid at its checks and creates nothing. So does one whose spec.into
+// names an existing VolumeRestore: a VolumeRestore describes the backups of
+// the claim of its name, so that name is taken by a claim of the app's.
 // Before, the run found the claim Bound and ended Succeeded with nothing
 // restored.
-func TestAnIntoRestoreThroughThePopulatorRefusesAnExistingClaim(t *testing.T) {
+func TestAnIntoRestoreFromAClaimRefusesAnExistingClaimOrVolumeRestore(t *testing.T) {
 	for name, existing := range map[string]client.Object{
 		"claim": boundClaim("notes-data-monday"),
 		"VolumeRestore": &backupv1alpha1.VolumeRestore{
@@ -148,11 +149,16 @@ func TestAnIntoRestoreThroughThePopulatorRefusesAnExistingClaim(t *testing.T) {
 				t.Fatalf("phase = %q, reason = %q, message = %q; want Invalid saying %q",
 					run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), want)
 			}
+			if names := destinations(t, c); len(names) != 0 {
+				t.Errorf("destinations = %v, want none", names)
+			}
+			key := types.NamespacedName{Namespace: ns, Name: "notes-data-monday"}
 			if name == "claim" {
-				vr := &backupv1alpha1.VolumeRestore{}
-				if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "notes-data-monday"}, vr); err == nil {
+				if err := c.Get(context.Background(), key, &backupv1alpha1.VolumeRestore{}); err == nil {
 					t.Error("a VolumeRestore was created for a claim the run did not create")
 				}
+			} else if err := c.Get(context.Background(), key, &corev1.PersistentVolumeClaim{}); err == nil {
+				t.Error("a claim was created under the name of an existing VolumeRestore")
 			}
 		})
 	}
