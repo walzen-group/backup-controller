@@ -51,7 +51,7 @@ populator-machinery/controller.go in lib-volume-populator v3.3.0.
 | With background cascading deletion, the owner goes first and the garbage collector deletes its dependents afterwards. | kubernetes.io/docs/concepts/architecture/garbage-collection, "Background cascading deletion" |
 | The API server drops status fields its CRD does not declare, and controller-runtime decodes the response into the object it sent. After Status().Update, an undeclared field reads back as its zero value. | envtest 1.36.3, internal/testinfra/strictclient |
 | Listing a kind whose CRD is absent returns a no-match error (meta.IsNoMatchError). localQueue treats that error like NotFound, so a cluster without Kueue runs without admission. | envtest 1.36.3; internal/runs/kueue.go:30-45 |
-| The admission call carries the API server's deadline in the timeout query parameter. The bootstrap webhook answers inside that budget. | k8s.io/apiserver pkg/admission/plugin/webhook/mutating/dispatcher.go:276-293 |
+| The admission call carries the API server's deadline in the timeout query parameter. The bootstrap webhook answers inside that budget. | k8s.io/apiserver v0.36.3 (the module of Kubernetes 1.36.3; go.mod does not pin it) pkg/admission/plugin/webhook/mutating/dispatcher.go:276-295 |
 
 ### Flux 2.9.5
 
@@ -67,21 +67,24 @@ the rows below cite those modules where the behaviour lives in them.
 
 ### VolSync 0.16.0
 
+The Go paths in both VolSync tables are relative to internal/controller in
+the VolSync module.
+
 | Behaviour | Source |
 | --- | --- |
-| A sync is in progress while status.lastSyncStartTime is set. | internal/controller/statemachine/machine.go:162-174 |
+| A sync is in progress while status.lastSyncStartTime is set. | statemachine/machine.go:162-174 |
 | When a sync completes, VolSync copies whatever spec.trigger.manual holds at that moment into status.lastManualSync. It writes lastManualSync only then, and starts a new sync only when the manual tag differs from it. | statemachine/machine.go:213-214, 225-242 |
 | VolSync writes latestMoverStatus and lastManualSync in the same status update. | mover/restic/mover.go:648-650; statemachine/machine.go:103-118, 185-215 |
-| The mover Job has backoffLimit 8. At 8 failed pods VolSync writes the logs into status.latestMoverStatus with result Failed, deletes the Job with background propagation, and creates a new Job on the next reconcile. A failing mover is retried forever. | mover/restic/mover.go:355-356, 609-618 |
-| VolSync creates the clone volsync-<source>-src once per sync, and every Job and pod of that sync reuses it. Only Cleanup after a completed sync deletes the clone. | mover/restic/mover.go:171-188, 270-294 |
+| The mover Job has backoffLimit 8. At 8 failed pods VolSync writes the logs into status.latestMoverStatus with result Failed, deletes the Job with background propagation, and creates a new Job on the next reconcile. A failing mover is retried forever. | mover/restic/mover.go:355-356, 609-618; utils/podlogs.go:166-169, 186-191 |
+| VolSync creates the clone volsync-<source>-src once per sync, and every Job and pod of that sync reuses it. Of VolSync's own steps, only Cleanup after a completed sync deletes the clone. The ReplicationSource is also the clone's controller owner, so deleting the source deletes the clone through garbage collection. | mover/restic/mover.go:171-188, 270-294; volumehandler/volumehandler.go:336-358; utils/cleanup.go:36-39, 50-58 |
 | The ReplicationSource is the controller owner of its Job, so deleting the source deletes the running mover pod. | mover/restic/mover.go:347 |
-| Each reconcile rebuilds the Job; a change to spec.restic.unlock, the retention or the affinity alters the pod template and kills a running mover. | mover/restic/mover.go:346, 362, 370-380, 404 |
+| Each reconcile rebuilds the Job; a change to spec.restic.unlock, the retention or the affinity alters the pod template and kills a running mover. VolSync sets the affinity only when the copy method is Direct. | mover/restic/mover.go:346, 362, 373-380, 404, 523-531 |
 | A prune falls due pruneIntervalDays after lastPruned, or after the source's creation when lastPruned is empty. | mover/restic/mover.go:378, 656-667 |
 | When spec.restic.unlock differs from status.restic.lastUnlocked, every mover pod runs restic unlock before backup. lastUnlocked is written only after a Job succeeds. | mover/restic/mover.go:373-376, 631-635, 669-674 |
-| The restore Job is named volsync-dst-<destination>, and VolSync puts no finalizer on a ReplicationDestination. | mover/restic/mover.go:333-341 |
+| The restore Job is named volsync-dst-<destination>. When that name is longer than 63 characters, VolSync replaces the destination's name in it with a hash. VolSync puts no finalizer on a ReplicationDestination: no code under internal/ in the module adds a finalizer. | mover/restic/mover.go:333-341; utils/utils.go:48, 371-373, 386-396 |
 | enableFileDeletion sets RESTORE_OPTIONS=--delete, so a restore removes every file the snapshot lacks. | mover/restic/mover.go:396-398, 409 |
-| VolSync pins a mover to the node of a Running (or else Pending) pod that uses the claim, skipping its own pods. | utils/affinity.go:57-92 |
-| The logs of a successful mover pass a filter that keeps lines such as "restoring", "No eligible", "ERROR" and "Restic completed in" and drops "Selected restic snapshot with id". The filtered log keeps its last 1024 bytes (MOVER_LOG_MAX_BYTES). | mover/restic/logfilter.go:26-43; utils/podlogs.go:40, 177-228 |
+| With the Direct copy method, VolSync pins a mover to the node of a Running (or else Pending) pod that uses the claim, skipping its own pods. A ReadWriteMany claim gets no pin. | mover/restic/mover.go:523-531; utils/affinity.go:50-92 |
+| The logs of a successful mover pass a filter that keeps lines such as "restoring", "No eligible", "ERROR" and "Restic completed in" and drops "Selected restic snapshot with id". By default the filtered log keeps its last 1024 bytes (MOVER_LOG_MAX_BYTES). | mover/restic/logfilter.go:26-43; utils/podlogs.go:39-40, 177-227 |
 
 The mover script, mover-restic/entry.sh in the same module:
 
@@ -90,8 +93,8 @@ The mover script, mover-restic/entry.sh in the same module:
 | entry.sh runs under set -e and is the pod's PID 1 with no trap, so a deleted pod kills restic by SIGKILL and restic leaves its lock. | entry.sh:7; mover/restic/mover.go:486 |
 | A backup mover runs restic forget with the source's retention after every backup, and prune on its interval. | entry.sh:154-167, 371-379 |
 | Its unlock step runs plain restic unlock (--remove-all is commented out), which removes only stale locks. | entry.sh:173-174 |
-| The restore mover keeps only snapshot lines containing /data, maps each whole-second epoch to the last snapshot listed with that epoch, and picks the newest epoch at or before RESTORE_AS_OF, then steps back SELECT_PREVIOUS. restic.AtOrBefore reproduces this selection. | entry.sh:265-320, 284-306 |
-| With no snapshot in reach, the mover prints "No eligible snapshots found" and "=== No data will be restored ===" and exits 0, so VolSync reports success for a restore that wrote nothing. | entry.sh:334-342 |
+| The restore mover keeps only snapshot lines containing /data and maps each whole-second epoch to the last snapshot listed with that epoch. It reverses the listed order (restic lists the oldest first), picks the first epoch at or before RESTORE_AS_OF, then steps back SELECT_PREVIOUS. restic.AtOrBefore reproduces this selection. | entry.sh:231-248, 265-320 (the listing loop at 284-292, the pick at 297-312) |
+| With no snapshot in reach, the mover prints "No eligible snapshots found" and "=== No data will be restored ===" and exits 0, so VolSync reports success for a restore that wrote nothing. | entry.sh:334-342, 380-391 |
 | Otherwise it prints "Selected restic snapshot with id: <id>" and runs restic restore. | entry.sh:346-350 |
 
 ### restic
@@ -116,8 +119,8 @@ cited code is identical in both.
 
 | Behaviour | Source |
 | --- | --- |
-| The chart's pod webhook mpod.kb.io has failurePolicy Fail when the pod integration is on (prod turns it on), and its namespaceSelector is managedJobsNamespaceSelector (kueue-managed: "true" in prod). While Kueue's webhook is down, the API server refuses every pod create in those namespaces, mover pods included. | chart templates/webhook/manifests.yaml:307-340 |
-| With manageJobsWithoutQueueName false, Kueue gates only objects that carry the kueue.x-k8s.io/queue-name label. | hack/e2e/kueue/values.yaml (prod's settings) |
+| The chart's pod webhook mpod.kb.io has failurePolicy Fail when the pod integration is on (prod turns it on), and its namespaceSelector is managedJobsNamespaceSelector (kueue-managed: "true" in prod). While Kueue's webhook is down, the API server refuses every pod create in those namespaces, mover pods included. | chart templates/webhook/manifests.yaml:19-20, 307-341 |
+| With manageJobsWithoutQueueName false, Kueue gates only objects that carry the kueue.x-k8s.io/queue-name label. A managed namespace that holds a LocalQueue named default is the exception: there Kueue's webhooks write queue-name: default onto an unlabelled Job or pod whose owner Kueue does not already manage, and Kueue then gates it. | Kueue v0.19.5 source pkg/controller/jobs/pod/pod_webhook.go:145-162; pkg/controller/jobframework/defaults.go:59-89; pkg/controller/jobframework/reconciler.go:368-379; pkg/controller/constants/constants.go:27; hack/e2e/kueue/values.yaml (prod's settings) |
 | A BackupRun's Workload in kueue.x-k8s.io/v1beta2 is admitted against its LocalQueue; Kueue reads the pod template to count quota and never runs its image. | internal/runs/kueue.go:21-28 |
 
 ### CloudNativePG 1.30.0
@@ -150,13 +153,14 @@ cited code is identical in both.
 | For a claim being deleted, the library skips population and runs cleanup. | controller.go:743, 976 |
 | Population creates the prime claim, adds the claim finalizer, and calls Populate only once the prime has spec.volumeName. | controller.go:779, 791, 804-809 |
 | Cleanup runs PopulateCleanupFn, deletes the prime, then removes the claim finalizer; each step returns on error and the claim is requeued. | controller.go:980-1008 |
-| The prime is named "prime-" + the claim's UID, and the claim finalizer is <Prefix>/populate-target-protection (backup.wlz.li/populate-target-protection here). | controller.go:67, 69, 720; cmd/backup-controller/main.go:42 |
+| The prime is named "prime-" + the claim's UID, and the claim finalizer is <Prefix>/populate-target-protection (backup.wlz.li/populate-target-protection here). | controller.go:67, 69, 318, 720; this repository's cmd/backup-controller/main.go:95 and internal/populator/names.go:9 |
 
 ### cert-manager 1.21.2
 
 | Behaviour | Source |
 | --- | --- |
-| A self-signed Issuer issues and renews the webhook's serving certificate, and the cainjector copies its CA into the MutatingWebhookConfiguration that carries cert-manager.io/inject-ca-from. The controller pod reads the renewed tls.crt and tls.key without a restart. | deploy/webhook.yaml:1-30, 71; chart/templates/deployment.yaml:57-59 |
+| A self-signed Issuer issues and renews the webhook's serving certificate and writes the certificate itself as ca.crt into its Secret. The cainjector reads ca.crt from the Secret of the Certificate that cert-manager.io/inject-ca-from names and writes it into the caBundle of every webhook in that MutatingWebhookConfiguration. | cert-manager pkg/controller/certificaterequests/selfsigned/selfsigned.go:217-221; pkg/controller/cainjector/sources.go:78-153; pkg/controller/cainjector/injectables.go:94-112; this repository's deploy/webhook.yaml:9-35, 71 |
+| The controller pod reads the renewed tls.crt and tls.key without a restart: controller-runtime's webhook server watches both files and reloads them. | controller-runtime v0.24.1 pkg/webhook/server.go:201-217; this repository's chart/templates/deployment.yaml:57-63 |
 
 ### RustFS 1.0.0
 
