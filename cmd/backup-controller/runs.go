@@ -147,6 +147,7 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 	skipNameValidation := true
 	options := ctrl.Options{
 		Scheme:                 scheme,
+		Client:                 clientOptions(scheme),
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: healthAddr,
 		LeaderElection:         false,

@@ -22,6 +22,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/served"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/klog/v2"
@@ -143,7 +144,7 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 		}
 	}
 
-	kubeClient, err := client.New(config, client.Options{Scheme: scheme})
+	kubeClient, err := client.New(config, clientOptions(scheme))
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
 	}
@@ -152,4 +153,25 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 	// longer serves an error the populator retries, never a missing
 	// ReplicationDestination.
 	return &clientOperations{client: served.Client(kubeClient)}, nil
+}
+
+// clientOptions returns the options of every client the controller writes
+// through: the manager's client and the populator's.
+//
+// The scheme argument is the client's scheme.
+//
+// Every create, update and patch asks for fieldValidation=Strict, so a field
+// the target's schema does not declare fails the write with an error that
+// names it, which the run reports. Without it kube-apiserver defaults to
+// Warn (k8s.io/apiserver v0.36.3 pkg/endpoints/handlers/rest.go:409-414):
+// it prunes a custom resource's unknown fields and answers with a warning
+// only, so a field a CloudNativePG, Flux, Kueue or VolSync release renamed or
+// removed would vanish from the controller's write without a trace.
+// controller-runtime v0.24.1 passes the option on every Create, Update and
+// Patch of the client and of its Status and SubResource writers
+// (pkg/client/client.go:124-126, pkg/client/fieldvalidation.go).
+// TestEnvtestTheControllersWritesRefuseUnknownFields checks both against the
+// pinned kube-apiserver.
+func clientOptions(scheme *runtime.Scheme) client.Options {
+	return client.Options{Scheme: scheme, FieldValidation: metav1.FieldValidationStrict}
 }
