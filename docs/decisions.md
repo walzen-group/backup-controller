@@ -207,8 +207,13 @@ database restore works only through the bootstrap, so the run leaves the
 Cluster alone. Under `all: true` the rest of the namespace still restores, and
 the Skipped item's message names the annotation. A run that names the Cluster
 has nothing it could do, so it ends Invalid before it touches anything. A
-Cluster that gains the annotation after the run marked it Deleted, or comes back
-with it, is Skipped and never deleted again. [restores.md](restores.md#starting-a-database-empty)
+Cluster that gains the annotation after the run marked it Deleted is Skipped and
+never deleted again, while one created again with the annotation after the run
+deleted it fails the item: it started empty, and the run says so and leaves it
+alone. From v0.9.0 the same holds for any Cluster that comes back without the
+run's recovery, whatever the reason, because the run deletes only the Cluster
+whose UID it recorded.
+[restores.md](restores.md#starting-a-database-empty)
 has the messages.
 
 From v0.8.1 the same holds for a Cluster whose owner declares its own bootstrap
