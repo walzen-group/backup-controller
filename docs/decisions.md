@@ -4,7 +4,7 @@ Each entry records what was chosen, what else was on the table, and what would
 have gone wrong. A reader who arrives at one of the rejected options should be
 able to tell from the entry alone why it was rejected.
 
-## Build a populator rather than patch VolSync
+## Build a populator of our own, and leave VolSync unpatched
 
 VolSync's populator requires `copyMethod: Snapshot` because it fills the prime
 claim from `status.latestImage`. Teaching it to restore directly into an empty
@@ -24,7 +24,7 @@ A controller can also be adopted one volume at a time, because a claim chooses
 its path by what `dataSourceRef` names. A fork changes behaviour for every app
 at once.
 
-## Use the library's provider callbacks rather than a populator pod
+## Fill the claim through the library's provider callbacks
 
 `lib-volume-populator` accepts either a `PodConfig`, where the library runs a
 pod of yours against the prime claim, or a `ProviderFunctionConfig` of three
@@ -33,22 +33,23 @@ callbacks.
 A pod would have to do the restore, which means restic in an image of ours, the
 repository credentials mounted into it, a second implementation of something
 VolSync already does, and a restore that runs outside the cluster's backup
-queue. Every one of those is a standing cost.
+queue. We would have to maintain each of those for as long as the controller
+exists.
 
 The callbacks let the fill step be "create a ReplicationDestination and wait",
 so VolSync's own mover does every byte with the credentials and the queue it
 already uses. The controller holds no repository credentials, mounts no volume
 and contains no restic code.
 
-## Define a kind of our own rather than reuse ReplicationDestination
+## Define a data source kind of our own
 
 A claim could keep naming `kind: ReplicationDestination` in `dataSourceRef`, and
 nothing in the app would change.
 
 VolSync registers its own populator for that kind. Two populators watching the
 same kind would both act on the same claims, and the result depends on which one
-gets there first. That is a conflict rather than a preference, so the data source
-is a kind of ours.
+gets there first. No setting on the claim can pick one of the two, so the data
+source is a kind of ours.
 
 The kind carries a second advantage: a claim that says `kind: VolumeRestore`
 says what fills it, and an app on the old path and an app on the new one are
@@ -152,7 +153,7 @@ replicas along with the Cluster.
 From v0.8.0 a RestoreRun with `repository:` and `into:` creates a plain claim
 of `intoSize` with no data source, and a ReplicationDestination with
 `copyMethod: Direct` whose mover writes the selected snapshot into that claim.
-From v0.9.0 every `into` restore takes that path, from `claim:` and from
+From v0.9.0 every `into` restore goes through that path, from `claim:` and from
 `repository:` alike. Until then a run with `claim:` and `into:` wrote a
 VolumeRestore and a claim naming it in `dataSourceRef`, and the populator filled
 that claim.
@@ -177,7 +178,7 @@ create or no pod can reach, and the claim does not say why.
 With a Direct destination, the mover pod is the claim's first consumer. The
 scheduler places the mover, and the claim is provisioned on the mover's node,
 the way VolSync places a destination claim it creates itself. An `into` restore
-from a `claim:` has a node to copy as well, and takes it, so the copy lands on
+from a `claim:` has a node to copy as well, and copies it, so the copy lands on
 the pool that holds the original and the scheduler places the mover pod with
 the volume. The claim is Bound while the mover still writes into it, so the
 run's Succeeded phase is what says the data is there, and from v0.9.0 that phase
@@ -268,7 +269,7 @@ store to answer, where v0.8.x admitted it without reading anything. An outage
 refuses the create, which Flux retries, and a Cluster that cannot archive is
 never created.
 
-## Compare bucket and prefix, and never the endpoint, for a shared archive
+## Compare only bucket and prefix for a shared archive
 
 From v0.9.0 the webhook's shared-archive check calls two Clusters' archives
 the same when the bucket matches, ignoring letter case, and the prefix matches
@@ -345,7 +346,7 @@ field of the same name in VolSync's retain block. Until v0.5.2 only `last`
 existed, which cut a volume kept as seven daily, four weekly and six monthly
 snapshots down to its seven newest, and six months of history to seven weeks.
 
-## Report status on the VolumeRestore rather than only in logs
+## Report status on the VolumeRestore itself
 
 A restore that is running, and a restore that has failed, both have to be
 visible without reading controller logs. The object carries kstatus-compatible
@@ -361,9 +362,12 @@ controller writes. The API server drops an undeclared field from every write,
 so a run under an old CRD could stop an app, record nothing to start it again,
 and report Succeeded.
 
-The check walks the fields the controller writes out of the Go types rather
-than comparing version numbers, so an install that applied the CRDs of the
-current release passes it whatever the previous release was. A failed read of
+The check walks the fields the controller writes out of the Go types, and looks
+each one up in the installed schema, so an install that applied the CRDs of the
+current release passes it whatever the previous release was. The CRDs carry
+no release number, and the API version `v1alpha1` stays the same from one
+release to the next, so neither says which fields the installed schema
+declares. A failed read of
 another kind is retried, but the run fails closed when it may not read the CRD
 at all, since it then cannot tell whether its writes survive. Helm upgrades no
 CRD on its own, which is why every release ships them in the same asset and the
@@ -402,7 +406,7 @@ or is gone is taken over by the next run that wants it.
 
 ## Take one quiesce Lease per namespace
 
-From v0.9.0 a run that is about to stop a namespace's workloads takes the
+From v0.9.0 a run that is about to stop a namespace's workloads acquires the
 `coordination.k8s.io` Lease `backup-controller-quiesce` in that namespace
 before it records the plan in its status. The run holds the Lease until its
 stored status shows every workload back and every Kustomization resumed, and a
@@ -429,11 +433,11 @@ another run stop the workloads while this run's status write that clears
 under the other run's stop.
 
 A run judges its own restart, and another run's, by the stored status alone.
-During v0.9.0's development the run also read its plan back and repeated a
-restart whose workloads stood below their recorded counts. That repeat scaled
-up an app a second run had stopped since, and the second run, which held the
-Lease by then, found its app running mid-backup. A workload someone scales to
-zero after a run's restart now stays at zero.
+A run could also read the workloads back and repeat a restart whose workloads
+stand below their recorded counts. That repeat would scale up an app a second
+run had stopped since, and the second run, which holds the Lease by then,
+would find its app running mid-backup. With the status as the only record, a
+workload someone scales to zero after a run's restart stays at zero.
 
 ## Refuse a Kustomization that applies two namespaces
 
@@ -448,10 +452,10 @@ namespace's workloads are left without drift correction for that time. A run
 in the second namespace would find the Kustomization already suspended and
 leave it out of its plan; the first run's resume then lets Flux scale the
 second namespace's app back up in the middle of that run's backup or restore.
-A Lease per Kustomization, taken in a fixed order across namespaces, kept the
-two runs apart, but a run whose set of targets changed between two passes could
-hold one Lease while waiting for another, and two runs could then wait on each
-other until both timed out. Every app on the walzen cluster has a Kustomization
+A Lease per Kustomization, acquired in a fixed order across namespaces, would
+keep the two runs apart. A run whose set of targets changed between two passes
+could then hold one Lease while it waited for another, and two runs could wait
+on each other until both timed out. Every app on the walzen cluster has a Kustomization
 of its own, so the refusal asks for the layout the cluster already uses.
 
 ## Upgrade only while no run is active
@@ -475,8 +479,9 @@ That still needed a field on every run recording the release that planned it,
 a wait in every new run for an older run being ended, and a release step for
 the VolumeRestore an older `into` restore had created.
 
-A run lasts minutes, so an operator can wait for the active runs to finish
-before moving the image, and the new controller then holds no code for
+A backup lasts minutes, and a restore that recovers a Cluster or writes a large
+volume can last hours, so an operator can wait for the active runs to
+finish before moving the image, and the new controller then holds no code for
 temporary objects an older version left. Objects that outlive a run carry
 across versions as before: VolumeRestores, schedules, repositories, snapshots,
 Clusters and the CRDs, which each run checks before it changes anything.
@@ -510,7 +515,7 @@ A run could instead wait until its `timeout`, six hours by default. That leaves
 an app and its database down for six hours because one mover is stuck, with
 nothing on the run saying the app is what is being held. The limit bounds that,
 and the volumes whose clones were cut go on uploading after the app is running,
-so a slow mover costs the run nothing but its own item.
+so a slow mover fails only its own item.
 
 ## Fail an item whose source tag no run waits for
 
@@ -522,8 +527,8 @@ started. From v0.9.0 a run that finds such an open tag fails that item at once,
 names the run or trigger the tag belongs to, what VolSync is doing with it, and
 how to give that backup up.
 
-Waiting was the earlier behaviour, and it cost the whole namespace: a namespace
-run checks every source before it stops the app, so one tag no run waited for
-kept every run of that namespace in SourceBusy until its timeout. Failing the
+Waiting was the earlier behaviour, and it held up the whole namespace: a
+namespace run checks every source before it stops the app, so one tag no run
+waited for kept every run of that namespace in SourceBusy until its timeout. Failing the
 item leaves the source alone, and VolSync still finishes on its own once the
 mover succeeds; the message says how to give the backup up when it never will.
