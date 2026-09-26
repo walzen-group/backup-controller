@@ -590,3 +590,57 @@ func TestThePassThatStopsAMoverDoesNotGiveTheAppBack(t *testing.T) {
 		t.Errorf("replicas = %d on the pass after, want the 2 the app had", got)
 	}
 }
+
+// quiescedRestoreDone returns the run from quiescedMidRestore with its volume
+// item Succeeded in an earlier pass, whose status write recorded the end
+// before the run deleted the ReplicationDestination, and that destination.
+func quiescedRestoreDone() (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.ReplicationDestination) {
+	run, destination := quiescedMidRestore()
+	run.Status.Items[0].Phase = backupv1alpha1.ItemSucceeded
+	return run, destination
+}
+
+// A finished item whose stopped mover is still there keeps its Lease. work
+// releases the Leases of finished items at the start of each pass, so a
+// backup of the claim need not wait for the rest of the run, but a mover that
+// may still write keeps the claim and the repository to its run (rule X2).
+func TestAFinishedItemKeepsItsLeaseWhileItsStoppedMoverIsThere(t *testing.T) {
+	run, destination := quiescedRestoreDone()
+	pod := moverPod(destination.Name, corev1.PodRunning)
+	lease := heldClaimLease(run, claimN)
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination, pod, lease)
+
+	restoreStep(t, r)
+	restoreStep(t, r)
+
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, &coordinationv1.Lease{}); err != nil {
+		t.Errorf("get the claim Lease = %v, want it held while mover pod %s is there", err, pod.Name)
+	}
+}
+
+// A run whose finished item's stopped mover is still there does not give the
+// app back, however far the rest of the run has come: that mover may still
+// write into the claim the app would mount (rule X2).
+func TestARestoreDoesNotGiveTheAppBackWhileAFinishedItemsMoverIsThere(t *testing.T) {
+	run, destination := quiescedRestoreDone()
+	pod := moverPod(destination.Name, corev1.PodRunning)
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination, pod)
+
+	restoreStep(t, r)
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 0 {
+		t.Errorf("replicas = %d while mover pod %s is there, want the app still down", got, pod.Name)
+	}
+	if !suspended(t, c) {
+		t.Error("the Kustomization was resumed while the mover pod was there")
+	}
+	waiting := readRestoreRun(t, c)
+	if readyReason(waiting.Status.Conditions) != backupv1alpha1.ReasonShutdown ||
+		!strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
+		t.Errorf("reason = %q, message = %q; want %s naming pod %s", readyReason(waiting.Status.Conditions),
+			readyMessage(waiting.Status.Conditions), backupv1alpha1.ReasonShutdown, pod.Name)
+	}
+}
