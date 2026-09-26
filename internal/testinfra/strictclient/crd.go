@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 
 	apiextensionsinternal "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -27,6 +30,55 @@ import (
 type crdSet struct {
 	schemas map[schema.GroupVersionKind]*structuralschema.Structural
 	status  map[schema.GroupVersionKind]bool
+}
+
+// crdCache holds the CRD sets loaded so far in this process, keyed by
+// crdCacheKey of the file list. Every client built from the same list shares
+// one crdSet, so the files are read and parsed once per test binary. A
+// crdSet is never changed after loadCRDs returns it: Build and coerce only
+// read its maps, and the pruning functions only read the schemas
+// (structuralpruning.PruneWithOptions copies the root before it sets
+// XEmbeddedResource and descends through copies of the properties).
+var crdCache sync.Map // string -> *crdCacheEntry
+
+// crdCacheEntry is one crdCache slot. once makes concurrent first callers
+// wait for a single load, whose result every caller then shares.
+type crdCacheEntry struct {
+	once sync.Once
+	set  *crdSet
+	err  error
+}
+
+// cachedCRDs returns the crdSet for paths, loading it with loadCRDs on first
+// use and handing the same set to every later caller with the same list.
+//
+// The key is the ordered list of absolute paths, so a relative path names
+// the same file for every test of a package. The order is part of the key
+// because a later file's definition of a kind replaces an earlier one's. A
+// load error is cached with the set, since the files are pinned test data.
+// It is safe for concurrent use.
+func cachedCRDs(paths []string) (*crdSet, error) {
+	e, _ := crdCache.LoadOrStore(crdCacheKey(paths), &crdCacheEntry{})
+	entry := e.(*crdCacheEntry)
+	entry.once.Do(func() {
+		entry.set, entry.err = loadCRDs(paths)
+	})
+	return entry.set, entry.err
+}
+
+// crdCacheKey joins the absolute form of each path with NUL bytes, which
+// cannot appear in a path. A path that cannot be made absolute is used as
+// given.
+func crdCacheKey(paths []string) string {
+	abs := make([]string, len(paths))
+	for i, p := range paths {
+		if a, err := filepath.Abs(p); err == nil {
+			abs[i] = a
+		} else {
+			abs[i] = p
+		}
+	}
+	return strings.Join(abs, "\x00")
 }
 
 // loadCRDs reads CustomResourceDefinition manifests (YAML or JSON, one or
@@ -123,7 +175,7 @@ func (s *crdSet) add(crd *apiextensionsv1.CustomResourceDefinition) error {
 // create for these kinds, as customResourceStrategy.PrepareForCreate does
 // (pkg/registry/customresource/strategy.go:144-151).
 func Build(b *fake.ClientBuilder, scheme *runtime.Scheme, opts Options) *Client {
-	set, err := loadCRDs(opts.CRDs)
+	set, err := cachedCRDs(opts.CRDs)
 	if err != nil {
 		panic(err)
 	}
@@ -147,7 +199,7 @@ func Build(b *fake.ClientBuilder, scheme *runtime.Scheme, opts Options) *Client 
 		}
 		b = b.WithStatusSubresource(obj)
 	}
-	return New(b.WithScheme(scheme).Build(), opts)
+	return newClient(b.WithScheme(scheme).Build(), opts, set)
 }
 
 // coerce prunes obj the way kube-apiserver 1.36.3 prunes a custom resource

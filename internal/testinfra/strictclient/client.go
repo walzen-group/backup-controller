@@ -134,6 +134,22 @@ type Client struct {
 // CRD file cannot be loaded. It does not register status subresources with
 // the fake; Build does.
 func New(inner client.WithWatch, opts Options) *Client {
+	var set *crdSet
+	if len(opts.CRDs) > 0 {
+		var err error
+		set, err = cachedCRDs(opts.CRDs)
+		if err != nil {
+			panic(err)
+		}
+	}
+	return newClient(inner, opts, set)
+}
+
+// newClient is New with the CRD set already loaded, so that Build, which
+// loads the set to register the status subresources, does not look it up a
+// second time. set is shared with other clients and only read; it is ignored
+// when opts.CRDs is empty. newClient panics when opts.Clock is nil.
+func newClient(inner client.WithWatch, opts Options, set *crdSet) *Client {
 	if opts.Clock == nil {
 		panic("strictclient: Options.Clock is required")
 	}
@@ -142,10 +158,6 @@ func New(inner client.WithWatch, opts Options) *Client {
 	}
 	c := &Client{WithWatch: inner, opts: opts}
 	if len(opts.CRDs) > 0 {
-		set, err := loadCRDs(opts.CRDs)
-		if err != nil {
-			panic(err)
-		}
 		c.crds = set
 	}
 	return c
