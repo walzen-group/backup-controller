@@ -212,6 +212,7 @@ roundtrip_script() {
   local side=$1 b key
   echo "set -e"
   echo "body='rustfs e2e check from the $side'"
+  # shellcheck disable=SC2016 # $body expands in the printed script
   echo 'printf "%s" "$body" > /tmp/rustfs-check-put'
   for b in "${buckets[@]}"; do
     key="e2e-check/$side-object.txt"
