@@ -98,20 +98,39 @@ something is happening now and where to look.
 
 | Ready reason | When |
 | --- | --- |
-| Restoring | a claim is being filled; the message names the ReplicationDestination and the controller's namespace |
-| RestoreFailed | the mover failed; the message holds its logs, and the reason stays while VolSync retries the mover, until a sync succeeds |
-| NoBackupInReach | the moment the claim's `backup.wlz.li/restore-as-of` or `spec.restoreAsOf` asks for is older than every snapshot; the message names which of the two it came from, the claim stays Pending, and the controller creates no destination |
+| Restoring | claims are being filled and none of them has failed; the message lists the ReplicationDestination of every claim in `status.claims`, in that order, and the controller's namespace, for example `waiting for ReplicationDestinations restore-3f2a1c7e, restore-9b04d2aa in backup-system` |
+| RestoreFailed | a claim's mover failed; the message is `claim <name>: ` followed by the mover's logs |
+| NoBackupInReach | the moment the claim's `backup.wlz.li/restore-as-of` or `spec.restoreAsOf` asks for is older than every snapshot; the message is `claim <name>: ` followed by the reason, which names where the moment came from. The claim stays Pending, and the controller creates no destination |
 | Restored | no claim is being filled |
 
+The populator sets Ready from every entry in `status.claims`, so all the claims
+that fill from one VolumeRestore report the same condition. While any entry is
+Failed, a pass for another claim leaves Ready as it is. A RestoreFailed or
+NoBackupInReach therefore stays on the VolumeRestore while its other claims
+restore or finish. RestoreFailed also stays while VolSync retries the failed
+claim's mover, until a sync succeeds and the claim's entry goes back to
+Restoring.
+
 While any claim is listed in `status.claims`, the VolumeRestore carries the
-finalizer `backup.wlz.li/volume-populator`. The populator adds it before it
-creates anything for a claim, and removes it once `status.claims` is empty.
-A VolumeRestore deleted mid-restore therefore stays Terminating until its
-claims finish or are deleted. Each claim's cleanup deletes that claim's
-ReplicationDestination and Secret copy, and the cleanup that empties
-`status.claims` removes the finalizer, which lets the deletion finish. A
-VolumeRestore that is already being deleted without the
+finalizer `backup.wlz.li/volume-populator`. The library calls the populator for
+a claim only once the claim's prime claim, `prime-<uid>` in the controller's
+namespace, is bound. On that first call the populator adds the finalizer,
+before it copies the Secret or creates the destination, and it removes the
+finalizer once `status.claims` is empty. A VolumeRestore deleted mid-restore
+therefore stays Terminating until its claims finish or are deleted. Each
+claim's cleanup deletes that claim's ReplicationDestination and Secret copy, and
+the cleanup that empties `status.claims` removes the finalizer, which lets the
+deletion finish. A VolumeRestore that is already being deleted without the
 finalizer starts no new restore.
+
+Until the prime claim binds, the VolumeRestore carries no finalizer, and a
+delete removes it at once. The library looks a claim's VolumeRestore up before
+it cleans up after the claim, and it stops when the VolumeRestore is gone. A
+claim deleted after its VolumeRestore would then keep the library's finalizer
+`backup.wlz.li/populate-target-protection` and stay Terminating. The
+controller's orphan reconciler releases such a claim;
+[architecture.md](architecture.md#a-claim-whose-volumerestore-is-gone) lists its
+steps and the events it records on the claim.
 
 ### Validation the CRD carries
 

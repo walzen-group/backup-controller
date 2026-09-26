@@ -118,19 +118,19 @@ caller in the controller:
 
 | Resources | Verbs | For |
 | --- | --- | --- |
-| `persistentvolumeclaims` | get, list, watch, create, patch, delete | the app's claim, the prime claim, and an `into:` scratch claim |
+| `persistentvolumeclaims` | get, list, watch, create, patch, delete | the app's claim, the prime claim, and an `into:` scratch claim; the orphan reconciler watches claims being deleted, deletes a claim's prime claim, and patches the library's finalizer off a claim whose VolumeRestore is gone |
 | `persistentvolumeclaims/finalizers` | update | each ReplicationSource names its claim as owner with `blockOwnerDeletion`, which the OwnerReferencesPermissionEnforcement admission plugin allows only to a writer that may update the owner's finalizers |
 | `persistentvolumes` | get, list, watch, patch | rebinding the volume to the app's claim, and reading a volume's node for its mover |
 | `storageclasses` | get, list, watch | reading the binding mode |
-| `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used, and a RestoreRun finding the pod that holds a claim |
-| `volumerestores` (our group) | get, list, watch, create, update | reading the data source, a RestoreRun writing the point-in-time one its scratch claim fills from, and adding and removing the `backup.wlz.li/volume-populator` finalizer |
+| `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used, a RestoreRun finding the pod that holds a claim, and the orphan reconciler listing the mover pod it waits for |
+| `volumerestores` (our group) | get, list, watch, create, update | reading the data source, a RestoreRun writing the point-in-time one its scratch claim fills from, adding and removing the `backup.wlz.li/volume-populator` finalizer, and the orphan reconciler's check that a claim's VolumeRestore is gone and its watch for deleted ones |
 | `volumerestores/status` | patch, update | reporting conditions |
 | `backupruns` | get, list, watch, create, update, delete | the runs and their finalizer; create is the scheduler, delete the 30-day TTL |
 | `restoreruns` | get, list, watch, update, delete | the runs and their finalizer |
 | `backupruns/status`, `restoreruns/status` | patch, update | reporting phase, items and conditions |
 | `backupruns/finalizers`, `restoreruns/finalizers` | update | the Workload, scratch claim and VolumeRestore a run creates name the run as their controller with `blockOwnerDeletion`, which OwnerReferencesPermissionEnforcement allows only with this verb |
 | `replicationsources.volsync.backube` | get, list, watch, create, update, patch | writing each enabled claim's source and its manual trigger; v0.8.2 dropped delete, which v0.8.0 and v0.8.1 used after a failed mover |
-| `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill, per in-place restore, and per restore from `repository:` into a new claim |
+| `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill, per in-place restore, and per restore from `repository:` into a new claim; the orphan reconciler deletes the destination of a claim whose VolumeRestore is gone |
 | `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
 | `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |
 | `clusters.postgresql.cnpg.io` | get, list, delete | the webhook's shared-archive check, a database run, and a database restore deleting its Cluster |
@@ -140,9 +140,9 @@ caller in the controller:
 | `workloads.kueue.x-k8s.io` | get, create, delete | admitting a run as one Workload |
 | `workloads/status` | update | the PodsReady condition the run sets itself |
 | `localqueues.kueue.x-k8s.io` | list | finding the namespace's queue |
-| `secrets` | get, create, delete | copying the repository Secret for a fill, and the restic and object store reads |
+| `secrets` | get, create, delete | copying the repository Secret for a fill and deleting the copy afterwards, the orphan reconciler deleting the copy of a claim whose VolumeRestore is gone, and the restic and object store reads |
 | `events` | create, patch | the recorder the library uses |
-| `events.events.k8s.io` | create, patch | an event on a BackupRun or RestoreRun at each new Ready reason |
+| `events.events.k8s.io` | create, patch | an event on a BackupRun or RestoreRun at each new Ready reason, and the orphan reconciler's WaitingForMover and DataSourceGone events on a claim |
 
 Narrow `secrets` if it can be narrowed. A ClusterRole that can read every Secret
 in the cluster is the one line in this install worth arguing about, and

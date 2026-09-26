@@ -5,7 +5,7 @@
 | Part | Package | Acts on |
 | --- | --- | --- |
 | the populator | internal/populator, on lib-volume-populator | a claim whose `dataSourceRef` names a VolumeRestore, while it is Pending |
-| the run manager | internal/runs, on controller-runtime | BackupRun and RestoreRun objects, and the scheduler that creates a BackupRun at each tick of a Namespace's `backup.wlz.li/schedule` |
+| the run manager | internal/runs, on controller-runtime | BackupRun and RestoreRun objects, the scheduler that creates a BackupRun at each tick of a Namespace's `backup.wlz.li/schedule`; it also runs the populator's orphan reconciler from internal/populator, which releases a deleted claim whose VolumeRestore is gone |
 | the bootstrap webhook | internal/bootstrap | a CloudNativePG Cluster on CREATE, and a recovered one on UPDATE |
 
 internal/volsync builds the ReplicationDestinations both the populator and a
@@ -31,7 +31,9 @@ In the app's namespace:
 
 In the controller's namespace, for each claim the populator fills: a copy of the
 repository Secret and a ReplicationDestination, both deleted when the fill ends,
-and the prime claim the library creates and hands over.
+and the prime claim the library creates and hands over. When the claim is
+deleted after its VolumeRestore, the orphan reconciler deletes all three
+([A claim whose VolumeRestore is gone](#a-claim-whose-volumerestore-is-gone)).
 
 On objects the controller does not own:
 
@@ -45,7 +47,8 @@ On objects the controller does not own:
 | a recovered Cluster | the `initdb` a GitOps tool applies again, dropped | on UPDATE, in the webhook |
 | a Cluster in a database RestoreRun | deleted, so it is created again and recovered | when the restore starts |
 | a claim being filled | the library's `backup.wlz.li` annotations and finalizer | while the fill runs |
-| the VolumeRestore a claim fills from | the finalizer `backup.wlz.li/volume-populator` | while any claim is listed in its `status.claims` |
+| a claim being deleted whose VolumeRestore is gone | the library's finalizer `backup.wlz.li/populate-target-protection` removed by the orphan reconciler, and its WaitingForMover and DataSourceGone events | once the claim's destination, mover pod, Secret copy and prime claim are gone |
+| the VolumeRestore a claim fills from | the finalizer `backup.wlz.li/volume-populator` | while any claim is listed in its `status.claims`; the populator adds it on its first call for a claim, which the library makes once the claim's prime claim is bound |
 
 Its own BackupRuns and RestoreRuns carry a finalizer, which releases whatever a
 run changed when the run fails, times out or is deleted. The sources it writes
@@ -185,8 +188,8 @@ which CloudNativePG would otherwise refuse as a second bootstrap method.
 ## Process, probes and rollout
 
 One pod runs all three parts. The populator library runs in the main goroutine,
-and a controller-runtime manager runs the run reconcilers, the scheduler and
-the webhook server beside it. The container listens on four ports:
+and a controller-runtime manager runs the run reconcilers, the scheduler, the
+populator's orphan reconciler and the webhook server beside it. The container listens on four ports:
 
 | Port | Flag | Serves |
 | --- | --- | --- |
@@ -344,15 +347,110 @@ a repository Secret that lives in the controller's namespace from the start.
 
 | Case | What happens |
 | --- | --- |
-| the repository has no snapshot yet, a first deploy | VolSync completes with nothing to write; the prime claim binds empty, the app starts on an empty volume, which matches what the snapshot path does today |
-| the restore fails | `PopulateCompleteFn` keeps returning false, the prime claim never binds, the app's claim stays Pending and its pod does not start. The VolumeRestore reports RestoreFailed with the mover's logs for as long as VolSync keeps retrying the mover, and the ReplicationDestination's status and events hold the rest |
+| the repository has no snapshot yet, a first deploy | VolSync completes with nothing to write; the library hands the empty volume to the app's claim, and the app starts on an empty volume, which matches what the snapshot path does today |
+| the restore fails | `PopulateCompleteFn` keeps returning false, the library never hands the volume over, the app's claim stays Pending and its pod does not start. The VolumeRestore reports RestoreFailed with `claim <name>: ` and the mover's logs for as long as VolSync keeps retrying the mover, also while other claims of the same VolumeRestore restore or finish, and the ReplicationDestination's status and events hold the rest |
 | the claim's `restoreAsOf` is older than every snapshot | the VolumeRestore reports NoBackupInReach, the controller creates no ReplicationDestination, and the claim stays Pending until the moment is changed or the claim is recreated without it |
 | the VolumeRestore is deleted mid-restore | its finalizer `backup.wlz.li/volume-populator` keeps it Terminating until every claim it fills has finished or been deleted, and each claim's cleanup deletes that claim's destination and Secret copy first |
+| the VolumeRestore is deleted before a claim's prime claim binds | the VolumeRestore carries no finalizer yet and goes at once. The claim stays Pending; once it is deleted, the orphan reconciler cleans up after it ([A claim whose VolumeRestore is gone](#a-claim-whose-volumerestore-is-gone)) |
 | the controller is down | claims stay Pending. Nothing is half-written and no app starts on an empty volume. A process whose run manager stopped exits, so the kubelet restarts it |
 | the controller restarts mid-restore | every object is named from the app claim's UID, so the next reconcile finds the existing destination rather than creating a second one |
 | two apps restore at once | each destination carries the backup queue label, so Kueue admits them the way it admits every other mover |
 | the app's claim is deleted while the app runs | the pod loses its volume and stays down until the refill completes, which is what deleting a claim already does |
 | the app's claim is deleted mid-restore | the library's own garbage collection removes the prime claim; `PopulateCleanupFn` removes the destination and the Secret copy |
+| the app's claim is deleted after its VolumeRestore | the library can no longer clean up, and the orphan reconciler does it in its place ([A claim whose VolumeRestore is gone](#a-claim-whose-volumerestore-is-gone)) |
+
+## A claim whose VolumeRestore is gone
+
+The library looks a claim's VolumeRestore up before anything else. When the
+VolumeRestore is gone, it records an event and returns, and it never reaches
+the branch that cleans up after a deleted claim (lib-volume-populator v3.3.0
+populator-machinery/controller.go:661-671). A claim deleted after its
+VolumeRestore would keep the library's finalizer
+`backup.wlz.li/populate-target-protection` and stay Terminating, and its prime
+claim, Secret copy and ReplicationDestination would stay in the controller's
+namespace.
+
+A VolumeRestore can be deleted before its claim in two ways. It carries no
+`backup.wlz.li/volume-populator` finalizer until the claim's prime claim is
+bound, so a delete before then removes it at once. Later, the cleanup that
+empties `status.claims` removes that finalizer, and the library deletes the
+prime claim and its own finalizer only after it. A VolumeRestore already being
+deleted is removed between the two, and when the library's delete of the prime
+claim fails there, its next pass finds no VolumeRestore.
+
+The orphan reconciler finishes the cleanup. It runs in the run manager and logs
+as populator-orphans. It acts on a claim that is being deleted, still carries
+`backup.wlz.li/populate-target-protection`, names a VolumeRestore in its own
+namespace in `dataSourceRef`, and lives outside the controller's namespace. The
+run manager queues such a claim whenever it changes, and queues the claims
+that name a VolumeRestore when that VolumeRestore is deleted. After a start,
+the manager's first list sends every claim through the reconciler, so a claim
+that was stuck before the controller started is released on that start.
+
+For such a claim, the reconciler reads the claim and its VolumeRestore with
+uncached reads from the API server, and goes on only when the API server answers
+NotFound for the VolumeRestore. A VolumeRestore that exists in any state leaves
+the claim to the library. Then, in the controller's namespace, it:
+
+1. deletes the ReplicationDestination `restore-<uid>`;
+2. lists the pods of the mover Job `volsync-dst-restore-<uid>`, and while any is
+   left records WaitingForMover on the claim and looks again 30 seconds later;
+3. deletes the Secret copy and the prime claim `prime-<uid>`;
+4. removes `backup.wlz.li/populate-target-protection` from the claim, and
+   records DataSourceGone.
+
+The reconciler deletes the Secret copy and the prime claim only once the mover
+pod is gone; a restic restore killed half way leaves its lock in the
+repository. Every delete accepts an object that is already gone, and the
+finalizer goes last, so a pass that fails part way starts again from step 1 and
+finishes on a later pass.
+
+| Event | Type | Message |
+| --- | --- | --- |
+| WaitingForMover | Normal | `VolumeRestore <name> is gone; waiting for mover pod <namespace>/<pod> (phase <phase>) of ReplicationDestination restore-<uid> to go before the cleanup finishes` |
+| DataSourceGone | Warning | `VolumeRestore <name> was deleted before the populator finished with this claim; deleted ReplicationDestination restore-<uid>, Secret copy <secret> and prime claim prime-<uid> in <namespace>, and removed finalizer backup.wlz.li/populate-target-protection` |
+
+To follow one claim's cleanup, read the claim's events:
+
+```
+kubectl -n <app namespace> events --for pvc/<claim>
+```
+
+### Known limitation: a prime claim left behind
+
+The library reads claims from its own informer caches, which the orphan
+reconciler does not use. When those caches still show the deleted claim but no
+longer show its prime claim, the library can create `prime-<uid>` again after
+the reconciler deleted it. No component deletes that prime claim afterwards.
+It stays in the controller's namespace, unbound, with no claim left to hand a
+volume to. This is rare. Every prime claim is named after its own claim's UID,
+so a left-behind one blocks no other restore.
+
+A left-behind prime claim is a `prime-<uid>` whose `<uid>` matches no claim in
+the cluster.
+
+#### Step 1: List the prime claims whose claim is gone
+
+```
+primes=$(kubectl -n backup-system get pvc -o name | sed -n 's#^persistentvolumeclaim/prime-##p')
+uids=$(kubectl get pvc -A -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}')
+for uid in $primes; do echo "$uids" | grep -qx "$uid" || echo "prime-$uid"; done
+```
+
+Replace backup-system with the controller's namespace. The prime claims are
+listed before the claims, so a claim created between the two commands still
+has its UID in the second list.
+
+Expected result: no output. Each name printed is a prime claim left behind.
+
+#### Step 2: Delete each prime claim listed
+
+```
+kubectl -n backup-system delete pvc prime-<uid>
+```
+
+A prime claim of a restore still running has a claim with its UID, so step 1
+never lists it.
 
 ## What runs where for one fill
 
