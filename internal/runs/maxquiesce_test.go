@@ -246,7 +246,10 @@ func TestAPodThatNeverStopsReleasesTheAppAtTheLimit(t *testing.T) {
 // A pass at the limit whose status write is lost leaves the app down, since
 // it records status.restartedAt before it starts anything. The next pass is
 // past the limit too, restarts the app, and records its own moment, so
-// restartedAt is never later than the restart.
+// restartedAt is never later than the restart. The clock of that pass moves
+// on by a second each time the run reads it, and the test notes the latest
+// time the run had read when the Deployment's scale-up reached the API
+// server, so a moment taken after the restart would show.
 func TestALostWriteAtTheLimitKeepsTheRestartAfterTheMoment(t *testing.T) {
 	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
 	healthy := r.Client
@@ -263,14 +266,29 @@ func TestALostWriteAtTheLimitKeepsTheRestartAfterTheMoment(t *testing.T) {
 		t.Fatalf("restartedAt = %v after the lost write, want it unset", run.Status.RestartedAt)
 	}
 
-	r.Client = healthy
-	restart := frozen.Add(10*time.Minute + 30*time.Second)
-	if replicas := replicasAt(t, r, c, restart.Sub(frozen)); replicas != 2 {
+	clock := frozen.Add(10*time.Minute + 30*time.Second)
+	r.Now = func() time.Time {
+		now := clock
+		clock = clock.Add(time.Second)
+		return now
+	}
+	var scaledUp time.Time
+	r.Client = interceptor.NewClient(healthy.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if data, _ := patch.Data(obj); scaledUp.IsZero() && strings.Contains(string(data), `"replicas":2`) {
+				// The latest time the run has read.
+				scaledUp = clock.Add(-time.Second)
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	step(t, r)
+	if replicas := replicasOf(t, c); replicas != 2 || scaledUp.IsZero() {
 		t.Fatalf("replicas = %d on the pass after the lost write, want 2 back", replicas)
 	}
 	run := readBackupRun(t, c)
-	if run.Status.RestartedAt == nil || run.Status.RestartedAt.Time.After(restart) {
-		t.Errorf("restartedAt = %v, want a moment no later than the restart at %s", run.Status.RestartedAt, restart)
+	if run.Status.RestartedAt == nil || run.Status.RestartedAt.Time.After(scaledUp) {
+		t.Errorf("restartedAt = %v, want a moment no later than the scale-up at %s", run.Status.RestartedAt, scaledUp)
 	}
 	if run.Status.RestartPending {
 		t.Error("restartPending is still set after the restart")
