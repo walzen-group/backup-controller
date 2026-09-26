@@ -68,19 +68,25 @@ func scheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-// crdDir is the folder of pinned CustomResourceDefinitions the strict client
-// prunes against.
+// crdDir is the folder of pinned third-party CustomResourceDefinitions the
+// strict client prunes against.
 const crdDir = "../testinfra/crds/"
 
-// crds are the pinned CRDs of the kinds the package reads or writes: this
-// repository's own at v0.8.1, VolSync's ReplicationSource and
-// ReplicationDestination, CloudNativePG's Cluster and Backup, Kueue's Workload
-// and LocalQueue, Flux's Kustomization and the barman cloud plugin's
-// ObjectStore.
+// ownCRDDir holds this repository's own CRDs as the current code generates
+// them. The tests prune against these, so a field added to the API is kept in
+// the tests the moment make manifests writes it. The copies of older releases
+// under crdDir/backup-controller serve the upgrade tests only.
+const ownCRDDir = "../../config/crd/"
+
+// crds are the CRDs of the kinds the package reads or writes: this
+// repository's own from config/crd, and the pinned VolSync
+// ReplicationSource and ReplicationDestination, CloudNativePG Cluster and
+// Backup, Kueue Workload and LocalQueue, Flux Kustomization and the barman
+// cloud plugin's ObjectStore.
 var crds = []string{
-	crdDir + "backup-controller/v0.8.1/backup.wlz.li_backupruns.yaml",
-	crdDir + "backup-controller/v0.8.1/backup.wlz.li_restoreruns.yaml",
-	crdDir + "backup-controller/v0.8.1/backup.wlz.li_volumerestores.yaml",
+	ownCRDDir + "backup.wlz.li_backupruns.yaml",
+	ownCRDDir + "backup.wlz.li_restoreruns.yaml",
+	ownCRDDir + "backup.wlz.li_volumerestores.yaml",
 	crdDir + "volsync/volsync.backube_replicationsources.yaml",
 	crdDir + "volsync/volsync.backube_replicationdestinations.yaml",
 	crdDir + "cloudnative-pg/postgresql.cnpg.io_clusters.yaml",
