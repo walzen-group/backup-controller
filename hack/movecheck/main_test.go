@@ -10,7 +10,8 @@ import (
 
 // before is the fixture package every single-directory case starts from:
 // a function with an imported package behind an alias, a plain function, a
-// const group without iota, an iota group, a type and its method.
+// const group without iota, a var group whose spec spans lines, an iota
+// group, a type and its method.
 var before = map[string]string{
 	"a.go": `package fixture
 
@@ -26,6 +27,13 @@ const (
 	// X is one.
 	X = 1
 	Y = 2 // Y is two.
+)
+
+var (
+	// V spans lines.
+	V = []int{
+		1,
+	}
 )
 
 const (
@@ -102,7 +110,9 @@ func edited(t *testing.T, pairs ...string) string {
 func TestAMoveBetweenFilesKeepsEveryHash(t *testing.T) {
 	a := edited(t,
 		"// G is moved or changed by the cases.\nfunc G() int { return 2 }\n", "",
+		"\t// X is one.\n\tX = 1\n", "",
 		"\tY = 2 // Y is two.\n", "",
+		"\t// V spans lines.\n\tV = []int{\n\t\t1,\n\t}\n", "",
 		"// T is a type with a method.\ntype T struct{ n int }\n\n// M returns n.\nfunc (t *T) M() int { return t.n }\n", "")
 	b := `package fixture
 
@@ -112,7 +122,15 @@ func (t *T) M() int { return t.n }
 // G is moved or changed by the cases.
 func G() int { return 2 }
 
+// X is one.
+const X = 1
+
 const Y = 2 // Y is two.
+
+// V spans lines.
+var V = []int{
+	1,
+}
 
 // T is a type with a method.
 type T struct{ n int }
@@ -132,10 +150,12 @@ func TestAChangedBodyChangesTheHash(t *testing.T) {
 }
 
 func TestAChangedCommentChangesTheHash(t *testing.T) {
-	after := edited(t, "// X is one.", "// X is uno.")
-	got := changed(fingerprints(t, writePkg(t, before)), fingerprints(t, writePkg(t, map[string]string{"a.go": after})))
-	if len(got) != 1 || got[0] != "const X" {
-		t.Errorf("changed = %v, want [const X]", got)
+	for comment, key := range map[string]string{"// X is one.": "const X", "// Y is two.": "const Y"} {
+		after := edited(t, comment, comment+" Changed.")
+		got := changed(fingerprints(t, writePkg(t, before)), fingerprints(t, writePkg(t, map[string]string{"a.go": after})))
+		if len(got) != 1 || got[0] != key {
+			t.Errorf("changed = %v after editing %q, want [%s]", got, comment, key)
+		}
 	}
 }
 

@@ -25,8 +25,9 @@
 //     name is replaced by the path it stands for, so a declaration whose
 //     text is unchanged but whose file imports another path under the same
 //     name hashes differently;
-//   - for a const, var or type group, each spec on its own with its doc and
-//     line comment, so a group split across files changes no hash. A const
+//   - for a const, var or type declaration, each spec on its own with its
+//     doc and line comment and without indentation, so a group split across
+//     files, or a spec taken out of its group, changes no hash. A const
 //     spec whose value depends on its place in the group (it uses iota, or
 //     omits its expression) is hashed with the text of the whole group,
 //     since splitting the group changes its value.
@@ -480,7 +481,7 @@ func (h hasher) funcDecl(d *ast.FuncDecl) ([]decl, error) {
 	if d.Doc != nil {
 		start = d.Doc.Pos()
 	}
-	sum, err := h.hash(d, start, d.End())
+	text, err := h.text(d, start, d.End())
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +489,7 @@ func (h hasher) funcDecl(d *ast.FuncDecl) ([]decl, error) {
 	if d.Recv != nil && len(d.Recv.List) > 0 {
 		name = h.spell(receiverName(d.Recv.List[0].Type)) + "." + d.Name.Name
 	}
-	return []decl{{key: "func " + name, hash: sum}}, nil
+	return []decl{{key: "func " + name, hash: digest(text)}}, nil
 }
 
 // spell returns the name a declaration of the old side is keyed under: the
@@ -529,15 +530,13 @@ func (h hasher) genDecl(d *ast.GenDecl) ([]decl, error) {
 	}
 	decls := make([]decl, 0, len(d.Specs))
 	for _, spec := range d.Specs {
-		node := ast.Node(spec)
-		start, end := specRange(d, spec)
+		var text string
+		var err error
 		if d.Tok == token.CONST && h.placeDependent(spec) {
-			node, start, end = d, d.Pos(), d.End()
-			if d.Doc != nil {
-				start = d.Doc.Pos()
-			}
+			text, err = h.groupText(d)
+		} else {
+			text, err = h.specText(d, spec)
 		}
-		sum, err := h.hash(node, start, end)
 		if err != nil {
 			return nil, err
 		}
@@ -545,16 +544,26 @@ func (h hasher) genDecl(d *ast.GenDecl) ([]decl, error) {
 		for _, id := range specNames(spec) {
 			names = append(names, h.spell(id.Name))
 		}
-		decls = append(decls, decl{key: d.Tok.String() + " " + strings.Join(names, ","), hash: sum})
+		decls = append(decls, decl{key: d.Tok.String() + " " + strings.Join(names, ","), hash: digest(text)})
 	}
 	return decls, nil
 }
 
-// specRange returns the source range of one spec with its doc and line
-// comment. The doc of a declaration without parentheses is the declaration's
-// own doc, so "const X = 1" and the same spec inside a group hash alike.
-func specRange(d *ast.GenDecl, spec ast.Spec) (token.Pos, token.Pos) {
-	start, end := spec.Pos(), spec.End()
+// groupText returns the text of a whole declaration with its doc comment.
+func (h hasher) groupText(d *ast.GenDecl) (string, error) {
+	start := d.Pos()
+	if d.Doc != nil {
+		start = d.Doc.Pos()
+	}
+	return h.text(d, start, d.End())
+}
+
+// specText returns the text of one spec on its own: its doc comment, the
+// spec with each line's indentation removed, and its line comment. The doc
+// of a declaration without parentheses is the declaration's own, so
+// "const X = 1" and the same spec inside a group hash alike wherever the
+// group's indentation put it.
+func (h hasher) specText(d *ast.GenDecl, spec ast.Spec) (string, error) {
 	var doc, comment *ast.CommentGroup
 	switch s := spec.(type) {
 	case *ast.TypeSpec:
@@ -565,13 +574,25 @@ func specRange(d *ast.GenDecl, spec ast.Spec) (token.Pos, token.Pos) {
 	if doc == nil && !d.Lparen.IsValid() {
 		doc = d.Doc
 	}
+	body, err := h.text(spec, spec.Pos(), spec.End())
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
 	if doc != nil {
-		start = doc.Pos()
+		for _, c := range doc.List {
+			b.WriteString(c.Text + "\n")
+		}
+	}
+	for line := range strings.SplitSeq(body, "\n") {
+		b.WriteString(strings.TrimLeft(line, " \t") + "\n")
 	}
 	if comment != nil {
-		end = comment.End()
+		for _, c := range comment.List {
+			b.WriteString(c.Text + "\n")
+		}
 	}
-	return start, end
+	return b.String(), nil
 }
 
 // placeDependent reports whether a const spec's value depends on its place
@@ -597,10 +618,16 @@ func (h hasher) placeDependent(spec ast.Spec) bool {
 	return uses
 }
 
-// hash returns the sha256 of the source range [start, end) after replacing
-// each imported package name in node with its import path and respelling
-// each renamed identifier.
-func (h hasher) hash(node ast.Node, start, end token.Pos) (string, error) {
+// digest returns the hex sha256 of text.
+func digest(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
+// text returns the source range [start, end) after replacing each imported
+// package name in node with its import path and respelling each renamed
+// identifier.
+func (h hasher) text(node ast.Node, start, end token.Pos) (string, error) {
 	edits, err := h.edits(node)
 	if err != nil {
 		return "", err
@@ -616,8 +643,7 @@ func (h hasher) hash(node ast.Node, start, end token.Pos) (string, error) {
 		at = e.end
 	}
 	b.Write(h.file.src[at:hi])
-	sum := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(sum[:]), nil
+	return b.String(), nil
 }
 
 // edits collects the replacements for node: each package name of a
