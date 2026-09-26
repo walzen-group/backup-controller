@@ -784,3 +784,40 @@ func TestATimedOutRunKeepsTheWaitItTimedOutOn(t *testing.T) {
 			readyMessage(done.Status.Conditions), backupv1alpha1.ReasonTimedOut, want)
 	}
 }
+
+// A restore whose items have all finished only waits for its stopped
+// movers to go before it gives the app back, and a deadline that passes
+// during that wait does not end it TimedOut: it ends as its items say. Here
+// the item Succeeded before the deadline, and the run still waits for the
+// mover's pod when the deadline passes. Before, the pass after the deadline
+// timed the run out, and it ended Failed although it restored everything.
+func TestAFinishedRestoreEndsAsItsItemsSayWhenTheDeadlinePassesInItsMoverWait(t *testing.T) {
+	run, destination := quiescedRestoreDone()
+	pod := moverPod(destination.Name, corev1.PodRunning)
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination, pod)
+	deadline := frozen.Add(4 * time.Hour)
+	r.Now = func() time.Time { return deadline.Add(-30 * time.Second) }
+
+	restoreStep(t, r) // deletes the destination
+	restoreStep(t, r) // finds the mover's pod still there
+	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonShutdown {
+		t.Fatalf("reason = %q before the deadline, want %s", reason, backupv1alpha1.ReasonShutdown)
+	}
+	r.Now = func() time.Time { return deadline.Add(time.Minute) }
+	restoreStep(t, r)
+	if err := c.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+	restoreStep(t, r)
+
+	done := readRestoreRun(t, c)
+	if done.Status.Phase != backupv1alpha1.RunPhaseSucceeded || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonSucceeded {
+		t.Errorf("phase = %q, reason = %q, message = %q; want Succeeded, %s", done.Status.Phase, readyReason(done.Status.Conditions),
+			readyMessage(done.Status.Conditions), backupv1alpha1.ReasonSucceeded)
+	}
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d once the mover was gone, want the 2 the app had", got)
+	}
+}

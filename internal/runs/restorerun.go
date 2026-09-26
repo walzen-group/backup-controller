@@ -858,8 +858,12 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // empty result once the run has ended (see finish). A failed read, write or
 // delete comes back as an error, and controller-runtime retries the pass.
 //
-// A run past spec.timeout ends with reason TimedOut (see timeOut), and a
-// message that names the SourceBusy wait it was in. With spec.quiesce set,
+// A run past spec.timeout with an item still unfinished ends with reason
+// TimedOut (see timeOut), and a message that names the SourceBusy wait it
+// was in. A run whose items have all finished only waits for its stopped
+// movers to go before it gives the app back, so a deadline that passes
+// during that wait leaves it waiting, and it ends as its items say. With
+// spec.quiesce set,
 // the first passes call quiesce to stop the listed workloads, and later
 // passes restore nothing until every pod of those workloads is gone. work
 // then moves each volume item a step further (see restoreVolume), and
@@ -888,7 +892,10 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // failedReason), and a run that waits for a deleted Cluster waits with that
 // reason and the message from recreateMessage.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	if deadline, over := r.overdue(run); over {
+	// A run whose items have all finished only waits to give back what it
+	// holds, and that wait is bounded by its movers (rule X2), so it ends as
+	// its items say.
+	if deadline, over := r.overdue(run); over && !restoreDone(run.Status.Items) {
 		return r.timeOut(ctx, run, timedOutMessage(deadline, run.Status.Conditions))
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
