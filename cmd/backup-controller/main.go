@@ -149,10 +149,19 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 		return nil, fmt.Errorf("create client: %w", err)
 	}
 	klog.Infof("starting backup-controller: watching %s VolumeRestore", backupv1alpha1.GroupVersion.String())
-	// served.Client makes a 404 for a VolSync version the API server no
-	// longer serves an error the populator retries, never a missing
-	// ReplicationDestination.
-	return &clientOperations{client: served.Client(kubeClient)}, nil
+	return operationsFor(kubeClient), nil
+}
+
+// operationsFor returns the populator's operations over kubeClient.
+//
+// Parameters:
+//   - kubeClient is the populator's client, built with clientOptions.
+//
+// served.Client wraps it, so a 404 for a VolSync version the API server no
+// longer serves is an error the populator retries, never a missing
+// ReplicationDestination.
+func operationsFor(kubeClient client.Client) *clientOperations {
+	return &clientOperations{client: served.Client(kubeClient)}
 }
 
 // clientOptions returns the options of every client the controller writes

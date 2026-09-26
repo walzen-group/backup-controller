@@ -20,8 +20,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	ctrlmanager "sigs.k8s.io/controller-runtime/pkg/manager"
@@ -145,26 +147,7 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 		return err
 	}
 
-	skipNameValidation := true
-	options := ctrl.Options{
-		Scheme:                 scheme,
-		Client:                 clientOptions(scheme),
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
-		HealthProbeBindAddress: healthAddr,
-		LeaderElection:         false,
-		// controller-runtime refuses a controller name it has seen before in
-		// the process. The binary builds one manager, so its names are unique
-		// already, and the tests build several managers in one process.
-		Controller: ctrlconfig.Controller{SkipNameValidation: &skipNameValidation},
-	}
-	if hook.CertDir != "" {
-		options.WebhookServer = webhook.NewServer(webhook.Options{
-			CertDir: hook.CertDir,
-			Port:    hook.Port,
-		})
-	}
-
-	manager, err := ctrl.NewManager(config, options)
+	manager, err := ctrl.NewManager(config, managerOptions(scheme, metricsAddr, healthAddr, hook))
 	if err != nil {
 		return fmt.Errorf("create the manager: %w", err)
 	}
@@ -230,11 +213,7 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 		return fmt.Errorf("register the scheduler: %w", err)
 	}
 
-	// The orphan reconciler reads ReplicationDestinations and takes a
-	// NotFound for one that is gone; served.Client makes a 404 for a VolSync
-	// version no longer served an error it retries instead.
-	orphanClient := served.Client(manager.GetClient())
-	orphans := &populator.OrphanReconciler{Client: orphanClient, Reader: served.Reader(reader, orphanClient), Recorder: recorder, Namespace: namespace}
+	orphans := orphanReconciler(manager.GetClient(), reader, recorder, namespace)
 	if err := orphans.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the populator orphan controller: %w", err)
 	}
@@ -257,6 +236,41 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 
 	klog.Infof("starting backup-controller: reconciling %s BackupRun and RestoreRun, scheduling namespaces", backupv1alpha1.GroupVersion.String())
 	return nil
+}
+
+// managerOptions returns the options of the controller-runtime manager
+// startRunControllers builds.
+//
+// Parameters:
+//   - scheme is the run scheme (see runScheme).
+//   - metricsAddr and healthAddr are the addresses of the metrics and probe
+//     servers, as startRunControllers takes them.
+//   - hook says where the bootstrap webhook listens; an empty hook.CertDir
+//     adds no webhook server.
+//
+// The manager's client is built with clientOptions, so every write the
+// reconcilers send asks for strict field validation. The manager runs no
+// leader election: the Deployment runs one replica.
+func managerOptions(scheme *runtime.Scheme, metricsAddr, healthAddr string, hook BootstrapWebhook) ctrl.Options {
+	skipNameValidation := true
+	options := ctrl.Options{
+		Scheme:                 scheme,
+		Client:                 clientOptions(scheme),
+		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		HealthProbeBindAddress: healthAddr,
+		LeaderElection:         false,
+		// controller-runtime refuses a controller name it has seen before in
+		// the process. The binary builds one manager, so its names are unique
+		// already, and the tests build several managers in one process.
+		Controller: ctrlconfig.Controller{SkipNameValidation: &skipNameValidation},
+	}
+	if hook.CertDir != "" {
+		options.WebhookServer = webhook.NewServer(webhook.Options{
+			CertDir: hook.CertDir,
+			Port:    hook.Port,
+		})
+	}
+	return options
 }
 
 // checkServedVersions logs, once at startup, each served version the
@@ -282,4 +296,22 @@ func checkServedVersions(mapper meta.RESTMapper) {
 	if err := bootstrap.Warm(mapper); err != nil {
 		klog.Errorf("could not look up the served versions the bootstrap webhook reads; its first request looks them up again: %v", err)
 	}
+}
+
+// orphanReconciler returns the populator's orphan reconciler over the
+// manager's client and uncached reader.
+//
+// Parameters:
+//   - c is the manager's client, which the reconciler writes through.
+//   - reader is the manager's uncached API reader.
+//   - recorder writes the reconciler's events.
+//   - namespace is the controller namespace, where the reconciler cleans up.
+//
+// The reconciler reads ReplicationDestinations and takes a NotFound for one
+// that is gone. served.Client and served.Reader wrap both, so a 404 for a
+// VolSync version the API server no longer serves is an error it retries,
+// never a destination that is gone.
+func orphanReconciler(c client.Client, reader client.Reader, recorder events.EventRecorder, namespace string) *populator.OrphanReconciler {
+	wrapped := served.Client(c)
+	return &populator.OrphanReconciler{Client: wrapped, Reader: served.Reader(reader, wrapped), Recorder: recorder, Namespace: namespace}
 }

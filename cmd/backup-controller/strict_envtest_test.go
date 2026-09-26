@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
@@ -56,6 +57,7 @@ func backupWith(name, field string) *unstructured.Unstructured {
 // client built with clientOptions asks for Strict, so the same create, and a
 // merge patch like setSuspend's with a misspelt field, fail with an error
 // that names the field, while setSuspend's own patch still goes through.
+// The manager built from managerOptions writes through the same options.
 func TestEnvtestTheControllersWritesRefuseUnknownFields(t *testing.T) {
 	ctx := context.Background()
 	env := &envtest.Environment{
@@ -130,5 +132,15 @@ func TestEnvtestTheControllersWritesRefuseUnknownFields(t *testing.T) {
 	}
 	if err := patch(controller, `{"spec":{"suspend":true}}`); err != nil {
 		t.Errorf("setSuspend's patch through clientOptions = %v, want it applied", err)
+	}
+
+	// The manager the reconcilers write through asks for Strict as well.
+	manager, err := ctrl.NewManager(cfg, managerOptions(s, "0", "0", BootstrapWebhook{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = manager.GetClient().Create(ctx, backupWith("manager", "renamedField"))
+	if err == nil || !strings.Contains(err.Error(), `unknown field "spec.renamedField"`) {
+		t.Errorf("create through the manager's client = %v, want an error naming spec.renamedField", err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -161,5 +162,20 @@ func TestEnabledClustersRetriesAListAtAVersionNoLongerServed(t *testing.T) {
 	c := newClient(t, cluster())
 	if _, err := enabledClusters(context.Background(), clusterListGone(c), c.RESTMapper(), ns); err == nil || !retryable(err) {
 		t.Errorf("enabledClusters error = %v, want one the caller retries", err)
+	}
+}
+
+// A database backup in a cluster without the CloudNativePG CRDs is refused
+// with a message that says so. The API server's discovery serves no version
+// of Cluster there, which getCluster reports as an error for which
+// meta.IsNoMatchError is true, and never as a Cluster that is missing.
+func TestADatabaseBackupWithoutCloudNativePGSaysTheCRDsAreMissing(t *testing.T) {
+	r, c, _ := servedBackupReconciler(t, []string{ClusterGVK.Group}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }))
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(readyMessage(run.Status.Conditions), "no CloudNativePG CRDs") {
+		t.Errorf("phase = %q, message = %q; want Failed saying the cluster has no CloudNativePG CRDs",
+			run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
 }
