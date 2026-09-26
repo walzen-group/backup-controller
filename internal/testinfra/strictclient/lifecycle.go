@@ -33,6 +33,10 @@ import (
 // stored uid differs from the precondition. The storage key in the message
 // is namespace/name, where the real server shows its etcd key. Other errors
 // and the deletion itself are the fake client's.
+//
+// Every delete that is not a dry run is recorded with the dependents of the
+// object (see Cascades), and with Options.GarbageCollect those dependents are
+// handled the way the garbage collector would; see deleteCascading.
 func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
 	o := &client.DeleteOptions{}
 	o.ApplyOptions(opts)
@@ -45,7 +49,14 @@ func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.D
 			return c.uidConflict(obj, *p.UID, old.GetUID())
 		}
 	}
-	return c.WithWatch.Delete(ctx, obj, opts...)
+	if len(o.DryRun) > 0 {
+		return c.WithWatch.Delete(ctx, obj, opts...)
+	}
+	owner, err := c.stored(ctx, obj)
+	if err != nil {
+		return c.WithWatch.Delete(ctx, obj, opts...)
+	}
+	return c.deleteCascading(ctx, owner, o, opts)
 }
 
 // checkNoNewFinalizers refuses a write that would add a finalizer to an

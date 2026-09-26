@@ -35,13 +35,22 @@
 //     that CRD's schema on every write, with the apiextensions pruning code.
 //     See Client.coerce. Build registers the status subresources those CRDs
 //     declare, and Create drops the status of such a kind.
+//   - apps Deployment and StatefulSet get generation 1 on create and one more
+//     on every write that changes their spec (and, for a Deployment, its
+//     annotations). See Client.generationRule.
+//   - Every delete records the deleted object's dependents (Client.Cascades),
+//     and with Options.GarbageCollect they are orphaned, deleted in the
+//     background or deleted in the foreground as the garbage collector of
+//     kube-controller-manager 1.36.3 would, blockOwnerDeletion included. See
+//     Client.deleteCascading.
 //
-// It leaves out: generation for built-in kinds (each built-in strategy has
-// its own rule; the wrapper keeps the stored value and never bumps it), the
-// finalizer check for server-side apply patches, CRD defaulting and
-// metadata coercion, garbage collection and blockOwnerDeletion. Those are separate behaviours; each one is added as a
-// method or an Options field of Client, the way Create, Update and Patch are
-// here.
+// It leaves out: generation for other built-in kinds (Job and
+// PersistentVolumeClaim among them; the wrapper keeps the stored value), the
+// finalizer check for server-side apply patches, CRD defaulting and metadata
+// coercion, per-kind default propagation policies, and a collector that runs
+// again later (see Client.deleteCascading). Those are separate behaviours;
+// each one is added as a method or an Options field of Client, the way
+// Create, Update and Patch are here.
 //
 // A write that changes the generation after a patch or update is stored in two
 // steps (the fake's write, then one update that sets the generation), so the
@@ -56,6 +65,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -84,6 +94,12 @@ type Options struct {
 	// pruned against that version's schema on every write (see
 	// Client.coerce). Build also registers their status subresources.
 	CRDs []string
+
+	// GarbageCollect makes Delete also do what the garbage collector of
+	// kube-controller-manager 1.36.3 would do to the deleted object's
+	// dependents (see Client.Delete). Without it Delete only records them
+	// (see Client.Cascades).
+	GarbageCollect bool
 }
 
 // Client is a client.WithWatch that sets the server-owned metadata the way
@@ -93,6 +109,9 @@ type Client struct {
 
 	opts Options
 	crds *crdSet
+
+	mu       sync.Mutex
+	cascades []Cascade
 }
 
 // New wraps a fake client.
@@ -148,7 +167,7 @@ func DefaultIsCustomResource(gvk schema.GroupVersionKind) bool {
 // are discarded. On success obj holds the stored object. Errors are the fake
 // client's.
 func (c *Client) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
-	isCR, err := c.isCustomResource(obj)
+	rule, err := c.generationRule(obj)
 	if err != nil {
 		return err
 	}
@@ -156,7 +175,7 @@ func (c *Client) Create(ctx context.Context, obj client.Object, opts ...client.C
 	// RFC 3339, and the object a real create returns is the stored one.
 	obj.SetCreationTimestamp(metav1.NewTime(c.opts.Clock().Truncate(time.Second)))
 	obj.SetUID(uuid.NewUUID())
-	if isCR {
+	if rule != generationKept {
 		obj.SetGeneration(1)
 	}
 	if err := c.coerce(obj, true); err != nil {
@@ -264,13 +283,13 @@ func (c *Client) settleGeneration(ctx context.Context, obj, old client.Object, d
 			return err
 		}
 	}
-	isCR, err := c.isCustomResource(cur)
+	rule, err := c.generationRule(cur)
 	if err != nil {
 		return err
 	}
 	want := old.GetGeneration()
-	if isCR {
-		changed, err := contentChanged(old, cur)
+	if rule != generationKept {
+		changed, err := rule.changed(old, cur)
 		if err != nil {
 			return err
 		}
@@ -337,12 +356,75 @@ func nonMetadata(obj client.Object) (map[string]any, error) {
 	return out, nil
 }
 
-func (c *Client) isCustomResource(obj client.Object) (bool, error) {
+// generationRule is how a kind's registry strategy sets metadata.generation.
+type generationRule int
+
+const (
+	// generationKept: the strategy leaves generation alone, so it stays at
+	// whatever is stored (0 for a new object).
+	generationKept generationRule = iota
+	// generationContent: 1 on create, +1 when anything outside metadata
+	// changes (the custom resource strategy).
+	generationContent
+	// generationSpec: 1 on create, +1 when spec changes (StatefulSet).
+	generationSpec
+	// generationSpecOrAnnotations: 1 on create, +1 when spec or the
+	// annotations change (Deployment).
+	generationSpecOrAnnotations
+)
+
+// generationRule returns the rule for obj's kind.
+//
+// Custom resources follow customResourceStrategy (see the package comment).
+// apps Deployment and StatefulSet follow their strategies in
+// k8s.io/kubernetes 1.36.3 (pkg/registry/apps/deployment/strategy.go and
+// pkg/registry/apps/statefulset/strategy.go): PrepareForCreate sets
+// generation to 1 and PrepareForUpdate raises it by one when
+// apiequality.Semantic.DeepEqual finds the spec changed; the Deployment
+// strategy also raises it when the annotations change, since the deployment
+// controller copies them to its ReplicaSets. That source is not in the
+// module cache, so these rules were not checked against it line by line.
+// Job and PersistentVolumeClaim are left out: the wrapper keeps their stored
+// generation.
+func (c *Client) generationRule(obj client.Object) (generationRule, error) {
 	gvk, err := apiutil.GVKForObject(obj, c.Scheme())
 	if err != nil {
-		return false, err
+		return generationKept, err
 	}
-	return c.opts.IsCustomResource(gvk), nil
+	if c.opts.IsCustomResource(gvk) {
+		return generationContent, nil
+	}
+	switch gvk.GroupKind() {
+	case schema.GroupKind{Group: "apps", Kind: "Deployment"}:
+		return generationSpecOrAnnotations, nil
+	case schema.GroupKind{Group: "apps", Kind: "StatefulSet"}:
+		return generationSpec, nil
+	}
+	return generationKept, nil
+}
+
+// changed reports whether the write from old to cur raises the generation
+// under the rule.
+func (r generationRule) changed(old, cur client.Object) (bool, error) {
+	switch r {
+	case generationContent:
+		return contentChanged(old, cur)
+	case generationSpec, generationSpecOrAnnotations:
+		a, err := nonMetadata(old)
+		if err != nil {
+			return false, err
+		}
+		b, err := nonMetadata(cur)
+		if err != nil {
+			return false, err
+		}
+		if !equality.Semantic.DeepEqual(a["spec"], b["spec"]) {
+			return true, nil
+		}
+		return r == generationSpecOrAnnotations &&
+			!equality.Semantic.DeepEqual(old.GetAnnotations(), cur.GetAnnotations()), nil
+	}
+	return false, nil
 }
 
 func isDryRunUpdate(opts []client.UpdateOption) bool {
