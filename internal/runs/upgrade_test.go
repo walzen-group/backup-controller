@@ -245,7 +245,6 @@ func TestAnUpgradedRestoreNamesTheClusterItDeleted(t *testing.T) {
 // releaseVolumeRestore). Before, the run followed the populator.
 func TestAnUpgradedPopulatorRestoreDeletesNothing(t *testing.T) {
 	run := populatorRun()
-	run.Status.PlannedBy = ""
 	r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(),
 		populatorRestore(run, populator.Finalizer), populatorClaim(run, corev1.ClaimPending, populator.ClaimFinalizer))
 	left := snapshotVersions(t, c, &backupv1alpha1.VolumeRestore{ObjectMeta: metav1.ObjectMeta{Name: "notes-data-monday"}},

@@ -6,9 +6,6 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -65,11 +62,6 @@ const (
 // deleted holds the claim, unless the run's item that names the destination
 // has finished. A destination of a run that finished or no longer exists
 // does not; the finished run deletes it.
-//
-// A live RestoreRun that restores a claim's backups into a new claim through
-// the populator holds that claim and the repository its VolumeRestore names
-// once the VolumeRestore, which the run controls, exists: the populator's
-// mover runs in the controller's namespace, which this list does not reach.
 //
 // A failed list comes back as an error, and the caller retries; nothing is
 // decided on it.
@@ -177,28 +169,6 @@ func restoreInProgress(ctx context.Context, reader client.Reader, namespace, cla
 			return fmt.Sprintf("RestoreRun %s is restoring claim %s from repository %s with ReplicationDestination %s; this run starts once that restore has finished",
 				run.Name, target, destination.Spec.Restic.Repository, destination.Name), nil
 		}
-	}
-
-	// A run that restores a claim's backups into a new claim through the
-	// populator has its mover in the controller's namespace, where this
-	// list does not reach. Its VolumeRestore, which the run owns, stands for
-	// it here.
-	for _, run := range live {
-		if run.Spec.Claim == "" || run.Spec.Into == "" {
-			continue
-		}
-		vr := &backupv1alpha1.VolumeRestore{}
-		if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: run.Spec.Into}, vr); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return "", fmt.Errorf("get VolumeRestore %s/%s: %w", namespace, run.Spec.Into, err)
-		}
-		if !metav1.IsControlledBy(vr, run) || (!matches(run.Spec.Claim, claim) && !matches(vr.Spec.Repository, secret)) {
-			continue
-		}
-		return fmt.Sprintf("RestoreRun %s is restoring the backups of claim %s from repository %s into claim %s through VolumeRestore %s; this run starts once that restore has finished",
-			run.Name, run.Spec.Claim, vr.Spec.Repository, run.Spec.Into, vr.Name), nil
 	}
 	return "", nil
 }

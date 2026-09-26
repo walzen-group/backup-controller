@@ -24,18 +24,6 @@ func atFrozen(after time.Duration) *metav1.Time {
 	return &t
 }
 
-// withCRDVersion returns crds with this project's CRD file named file
-// replaced by the copy in dir, such as the v0.8.1 folder.
-func withCRDVersion(file, dir string) []string {
-	files := append([]string(nil), crds...)
-	for i, f := range files {
-		if f == ownCRDDir+file {
-			files[i] = dir + file
-		}
-	}
-	return files
-}
-
 // quiesceLeaseIn returns the namespace's quiesce Lease as stored, or nil when
 // the namespace holds none.
 func quiesceLeaseIn(t *testing.T, c client.Client, namespace string) *coordinationv1.Lease {
@@ -79,7 +67,7 @@ func checkedRestore(mutate ...func(*backupv1alpha1.RestoreRun)) *backupv1alpha1.
 			r.Status.Phase = backupv1alpha1.RunPhaseRunning
 			r.Status.StartedAt = atFrozen(0)
 			r.Status.Items = []backupv1alpha1.RestoreItem{
-				{Kind: "PersistentVolumeClaim", Name: claimN, Phase: backupv1alpha1.ItemPending, Snapshot: "6e473100"},
+				{Kind: "PersistentVolumeClaim", Name: claimN, Phase: backupv1alpha1.ItemPending, Snapshot: monday.ShortID(), SnapshotTime: &metav1.Time{Time: monday.Time}},
 			}
 		},
 	}, mutate...)...)
@@ -367,49 +355,11 @@ func TestALostWriteAfterTheRestartKeepsTheQuiesceLease(t *testing.T) {
 	}
 }
 
-// A BackupRun left by v0.8.x has a plan and no Lease. A new run waits for it
-// instead of planning over it.
-func TestARunFromBeforeLeasesIsWaitedFor(t *testing.T) {
-	files := withCRDVersion("backup.wlz.li_backupruns.yaml", crdDir+"backup-controller/v0.8.1/")
-	c := newClientWithCRDs(t, files, quiescedBackup(), quiescedRestoreOf(),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
-	rr := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
-	if quiesceLeaseIn(t, c, ns) != nil {
-		t.Fatal("the seeded run holds a Lease; v0.8.x took none")
-	}
-
-	restoreStep(t, rr) // quiesce: waits for the run from before the Leases
-	restore := readRestoreRun(t, c)
-	if len(restore.Status.Quiesced) != 0 {
-		t.Fatalf("the restore recorded %+v; want no plan while the old run owes a restart", restore.Status.Quiesced)
-	}
-	if readyReason(restore.Status.Conditions) != backupv1alpha1.ReasonSourceBusy ||
-		!strings.Contains(readyMessage(restore.Status.Conditions), "BackupRun before-upgrade") {
-		t.Fatalf("reason = %q, message = %q; want SourceBusy naming the old run",
-			readyReason(restore.Status.Conditions), readyMessage(restore.Status.Conditions))
-	}
-	if got := replicasOf(t, c); got != 2 {
-		t.Fatalf("replicas = %d while the restore waits, want 2", got)
-	}
-
-	// The old run's status shows the restart, so its plan is given back.
-	old := backupIn(t, c, ns, "before-upgrade")
-	old.Status.RestartedAt = atFrozen(0)
-	old.Status.RestartPending = false
-	if err := c.Status().Update(context.Background(), old); err != nil {
-		t.Fatal(err)
-	}
-	restoreStep(t, rr)
-	restore = readRestoreRun(t, c)
-	if len(restore.Status.Quiesced) != 1 || restore.Status.Quiesced[0].Replicas != 2 {
-		t.Fatalf("the restore recorded %+v, want Deployment %s at 2", restore.Status.Quiesced, appN)
-	}
-}
-
 // A quiesce Lease is taken over only when its holder has durably given the
-// workloads back: a holder that is gone, finished, or shows a restart whose
-// plan reads back is stale; a holder that still owes a restart, has no plan
-// yet, or is being deleted is live.
+// workloads back: a holder that is gone, finished, or whose stored status
+// shows the restart done is stale, whatever the workloads stand at now; a
+// holder that still owes a restart, has no plan yet, or is being deleted is
+// live.
 func TestAQuiesceLeaseIsTakenOverOnlyWhenItsHolderRestarted(t *testing.T) {
 	restarted := func(b *backupv1alpha1.BackupRun) {
 		b.Status.RestartedAt = atFrozen(0)
@@ -431,7 +381,7 @@ func TestAQuiesceLeaseIsTakenOverOnlyWhenItsHolderRestarted(t *testing.T) {
 			return quiescedBackup(func(b *backupv1alpha1.BackupRun) { b.Status.Phase = backupv1alpha1.RunPhaseSucceeded })
 		}, store: true, stopped: 0},
 		"restarted, plan back":    {holder: func() *backupv1alpha1.BackupRun { return quiescedBackup(restarted) }, store: true, stopped: 2},
-		"restarted, plan stopped": {holder: func() *backupv1alpha1.BackupRun { return quiescedBackup(restarted) }, store: true, stopped: 0, live: true},
+		"restarted, app stopped since": {holder: func() *backupv1alpha1.BackupRun { return quiescedBackup(restarted) }, store: true, stopped: 0},
 		"restart pending": {
 			holder: func() *backupv1alpha1.BackupRun {
 				return quiescedBackup(func(b *backupv1alpha1.BackupRun) {
@@ -463,7 +413,7 @@ func TestAQuiesceLeaseIsTakenOverOnlyWhenItsHolderRestarted(t *testing.T) {
 			}
 			lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: quiesceLeaseName, Namespace: ns}}
 			stamp(lease, leaseHolder{kind: "BackupRun", run: holder, scope: scopeQuiesce}, nil)
-			live, err := holderLive(context.Background(), c, c.RESTMapper(), lease)
+			live, err := holderLive(context.Background(), c, lease)
 			if err != nil || live != tc.live {
 				t.Errorf("holderLive = %t, %v; want %t", live, err, tc.live)
 			}
@@ -637,4 +587,94 @@ func TestAWaitThatOutlastsTheTimeoutNamesTheWait(t *testing.T) {
 			t.Errorf("replicas = %d after the timed-out backup, want the restore's 0", got)
 		}
 	})
+}
+
+// A run whose stored status shows its restart done never gives the app back
+// again, even when the app stands at 0 once more, as it does when another run
+// has stopped it since. Before, a restart whose plan did not read back was
+// repeated, which scaled the app up under the other run's stop (BRF1F1).
+func TestARunNeverRepeatsARestartItsStatusShowsDone(t *testing.T) {
+	source := idleSource()
+	source.Spec.Trigger.Manual = TriggerFor(runUID)
+	r, c := backupReconciler(t, quiescedBackup(func(b *backupv1alpha1.BackupRun) {
+		b.Status.StartedAt = atFrozen(-time.Minute)
+		b.Status.RestartedAt = atFrozen(0)
+		b.Status.SuspendedKustomizations = []string{"flux-system/" + appN}
+		b.Status.Items[0].Phase, b.Status.Items[0].Trigger = backupv1alpha1.ItemRunning, TriggerFor(runUID)
+	}), claim(), volume(), volumeRestore(), repository(), source, stoppedDeployment(), kustomization(true))
+
+	step(t, r) // the upload goes on
+	if got := replicasOf(t, c); got != 0 || !suspended(t, c) {
+		t.Fatalf("replicas = %d, suspended = %t; want the other stop left alone", got, suspended(t, c))
+	}
+	complete(t, c, "snapshot 6e473100 saved")
+	step(t, r) // collect and finish
+	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+		t.Fatalf("phase = %q (%s), want Succeeded", run.Status.Phase, readyMessage(run.Status.Conditions))
+	}
+	if got := replicasOf(t, c); got != 0 || !suspended(t, c) {
+		t.Errorf("replicas = %d, suspended = %t after the run finished; want the other stop left alone", got, suspended(t, c))
+	}
+}
+
+// A RestoreRun whose stored status shows its restart done never gives the
+// app back again while it waits for its Cluster to be created, even when the
+// app stands at 0 once more.
+func TestARestoreNeverRepeatsARestartItsStatusShowsDone(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) {
+		r.Spec.Database = pgN
+		r.Spec.Quiesce = []backupv1alpha1.WorkloadRef{{Kind: "Deployment", Name: appN}}
+		r.Status.Phase = backupv1alpha1.RunPhaseWaiting
+		r.Status.StartedAt = atFrozen(-time.Minute)
+		r.Status.QuiescedAt, r.Status.RestartedAt = atFrozen(-time.Minute), atFrozen(0)
+		r.Status.Quiesced = []backupv1alpha1.QuiescedWorkload{{Kind: "Deployment", Name: appN, Replicas: 2}}
+		r.Status.SuspendedKustomizations = []string{"flux-system/" + appN}
+		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "Cluster", Name: pgN, Phase: backupv1alpha1.ItemDeleted, ClusterUID: "old-cluster-uid"}}
+	}), stoppedDeployment(), kustomization(true))
+
+	restoreStep(t, r)
+
+	if got := readRestoreRun(t, c); readyReason(got.Status.Conditions) != backupv1alpha1.ReasonRecreate {
+		t.Fatalf("reason = %q (%s), want %s", readyReason(got.Status.Conditions), readyMessage(got.Status.Conditions), backupv1alpha1.ReasonRecreate)
+	}
+	if got := replicasOf(t, c); got != 0 || !suspended(t, c) {
+		t.Errorf("replicas = %d, suspended = %t; want the other stop left alone", got, suspended(t, c))
+	}
+}
+
+// A run an older release planned took no quiesce Lease and holds the app
+// stopped until this release has ended it. A new run in the namespace waits
+// for it, with no Lease taken and nothing recorded, and plans the count the
+// ended run gave back. Before, a new run waited for such a run only while
+// its plan did not read back.
+func TestANewRunWaitsForARunAnOlderReleasePlanned(t *testing.T) {
+	c := newClient(t, quiescedBackup(func(b *backupv1alpha1.BackupRun) {
+		b.Finalizers = []string{Finalizer}
+		b.Status.PlannedBy = ""
+	}), quiescedRestoreOf(), claim(), volume(), volumeRestore(), repository(), stoppedDeployment(), kustomization(false))
+	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
+	rr := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
+
+	restoreStep(t, rr) // quiesce: waits for the older run
+	restore := readRestoreRun(t, c)
+	if len(restore.Status.Quiesced) != 0 || quiesceLeaseIn(t, c, ns) != nil {
+		t.Fatalf("the restore recorded %+v and the Lease is %v; want no plan and no Lease while the older run is unfinished",
+			restore.Status.Quiesced, quiesceLeaseIn(t, c, ns))
+	}
+	if readyReason(restore.Status.Conditions) != backupv1alpha1.ReasonSourceBusy ||
+		!strings.Contains(readyMessage(restore.Status.Conditions), "BackupRun before-upgrade was started by an older version") {
+		t.Fatalf("reason = %q, message = %q; want SourceBusy naming the older run",
+			readyReason(restore.Status.Conditions), readyMessage(restore.Status.Conditions))
+	}
+
+	step(t, br) // the older run ends with reason Upgraded and gives the app back
+	if backup := readBackupRun(t, c); readyReason(backup.Status.Conditions) != backupv1alpha1.ReasonUpgraded || replicasOf(t, c) != 2 {
+		t.Fatalf("reason = %q, replicas = %d; want the older run ended with reason Upgraded and the app at 2",
+			readyReason(backup.Status.Conditions), replicasOf(t, c))
+	}
+	restoreStep(t, rr)
+	restore = readRestoreRun(t, c)
+	if len(restore.Status.Quiesced) != 1 || restore.Status.Quiesced[0].Replicas != 2 {
+		t.Fatalf("the restore recorded %+v, want Deployment %s at 2", restore.Status.Quiesced, appN)
+	}
 }

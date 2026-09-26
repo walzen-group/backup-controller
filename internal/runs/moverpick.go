@@ -110,8 +110,7 @@ func unpinnable(all []restic.Snapshot, s restic.Snapshot, quiescedOnly bool) str
 // Parameters:
 //   - all is every snapshot in the repository now, unfiltered.
 //   - item is the volume item. item.Snapshot is the recorded short ID, and
-//     item.SnapshotTime the time the run pins the mover to. An item planned
-//     by v0.7.2 has no time, and the listed snapshot's own time stands in.
+//     item.SnapshotTime the time the run pins the mover to.
 //   - quiescedOnly is passed on to unpinnable for its advice.
 //
 // It returns the listed snapshot with the recorded short ID, and "" when the
@@ -126,12 +125,16 @@ func unpinnable(all []restic.Snapshot, s restic.Snapshot, quiescedOnly bool) str
 //   - the snapshot is there, and the mover would pick another one in its
 //     second, or can't be predicted (see unpinnable).
 //
-// An item with no recorded snapshot gets a reason too, since the run can't
-// pin the mover to anything. It does not change all.
+// An item with no recorded snapshot, or no recorded snapshot time, gets a
+// reason too, since the run can't pin the mover to anything. Only an older
+// release planned such an item. It does not change all.
 func changedSince(all []restic.Snapshot, item backupv1alpha1.RestoreItem, quiescedOnly bool) (restic.Snapshot, string) {
 	id := item.Snapshot
 	if id == "" {
 		return restic.Snapshot{}, "the item records no snapshot, so the run can't pin the mover to one"
+	}
+	if item.SnapshotTime == nil {
+		return restic.Snapshot{}, fmt.Sprintf("the item records no snapshot time for snapshot %s, so the run can't pin the mover to it", id)
 	}
 	recorded, ok := restic.ByShortID(all, id)
 	if !ok {
@@ -141,17 +144,10 @@ func changedSince(all []restic.Snapshot, item backupv1alpha1.RestoreItem, quiesc
 					id, s.ShortID(), s.Time.UTC().Format(time.RFC3339))
 			}
 		}
-		when := ""
-		if item.SnapshotTime != nil {
-			when = fmt.Sprintf(" (%s)", item.SnapshotTime.UTC().Format(time.RFC3339))
-		}
-		return restic.Snapshot{}, fmt.Sprintf("snapshot %s%s, which the checks selected, is no longer in the repository; "+
-			"a backup's retention (restic forget) removed it after the checks", id, when)
+		return restic.Snapshot{}, fmt.Sprintf("snapshot %s (%s), which the checks selected, is no longer in the repository; "+
+			"a backup's retention (restic forget) removed it after the checks", id, item.SnapshotTime.UTC().Format(time.RFC3339))
 	}
-	pin := recorded.Time
-	if item.SnapshotTime != nil {
-		pin = item.SnapshotTime.Time
-	}
+	pin := item.SnapshotTime.Time
 	if picked, ok := restic.MoverPick(all, pin); ok && picked.ID == recorded.ID {
 		return recorded, ""
 	}

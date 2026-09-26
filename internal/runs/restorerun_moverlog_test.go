@@ -272,11 +272,11 @@ func TestAnIntoRestoreFailedOnItsLogIsNotStartedAgain(t *testing.T) {
 	}
 }
 
-// legacyRunningRun returns the RestoreRun back-to-monday as a v0.7.2
-// controller left it: a Running volume item recording the snapshot given in
-// snapshot and no snapshotTime, whose destination was pinned from
-// spec.restoreAsOf and previous. It also returns that destination.
-func legacyRunningRun(snapshot string) (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.ReplicationDestination) {
+// runningRun returns the RestoreRun back-to-monday with a Running volume item
+// recording the snapshot given in snapshot and no snapshotTime, and the
+// item's destination. The checks never record an item like it; it stands for
+// a status the run can't confirm anything from.
+func runningRun(snapshot string) (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.ReplicationDestination) {
 	started := metav1.NewTime(frozen)
 	name := destinationName(restoreUID, 0)
 	run := restoreRun(asOf("2026-09-21T06:00:00Z"), func(r *backupv1alpha1.RestoreRun) {
@@ -291,24 +291,10 @@ func legacyRunningRun(snapshot string) (*backupv1alpha1.RestoreRun, *volsyncv1al
 	return run, destination
 }
 
-// A v0.7.2 item already Running when the controller is upgraded is checked
-// against its mover's log like any other. Its destination was pinned from
-// spec.restoreAsOf and previous, so its mover may have restored another
-// snapshot; the item fails then and names both.
-func TestALegacyRunningItemIsCheckedAgainstItsMoversLog(t *testing.T) {
-	run, destination := legacyRunningRun(sunday.ShortID())
-	r, c := restoreReconciler(t, nil, run, destination, claim(), volumeRestore(), repository())
-	finishMover(t, c, restoreLogFor(monday.ShortID()))
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	expectItemFailed(t, c, "the mover restored snapshot 6e473100 where the checks selected 2edf5bab; claim "+claimN+" now holds 6e473100")
-}
-
 // A Running item that records no snapshot can't be confirmed from any log,
 // so it fails whatever the mover restored.
 func TestARunningItemWithoutASnapshotFails(t *testing.T) {
-	run, destination := legacyRunningRun("")
+	run, destination := runningRun("")
 	r, c := restoreReconciler(t, nil, run, destination, claim(), volumeRestore(), repository())
 	finishMover(t, c, restoreLogFor(monday.ShortID()))
 	restoreStep(t, r)

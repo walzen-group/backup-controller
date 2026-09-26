@@ -200,9 +200,10 @@ func TestAClusterCreatedAgainWithoutArchivingIsNotDeleted(t *testing.T) {
 	}
 }
 
-// An item marked Deleted without a clusterUID, as a run started under v0.7.2
-// left it, can't tell the old Cluster from a new one. A live Cluster that is
-// not the run's recovery fails the item and stays, whichever it is.
+// An item marked Deleted without a clusterUID can't tell the old Cluster from
+// a new one. A run that found no Cluster at its start leaves such an item,
+// and a test stands in for the rest by clearing the field. A live Cluster
+// that is not the run's recovery fails the item and stays, whichever it is.
 func TestARunWithoutAClusterUIDDeletesNothing(t *testing.T) {
 	forget := func(t *testing.T, c client.Client) {
 		t.Helper()

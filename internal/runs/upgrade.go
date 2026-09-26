@@ -3,6 +3,10 @@ package runs
 import (
 	"fmt"
 	"strings"
+
+	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // runFormat names the format of a run's status that this release writes and
@@ -12,22 +16,36 @@ import (
 // olderPlan).
 const runFormat = "v0.9"
 
-// olderPlan reports whether a run was planned by a release whose status
-// format differs from runFormat, so this release must end it rather than
-// continue it.
+// olderPlan reports whether an unfinished run was planned by a release whose
+// status format differs from runFormat, so this release must end it rather
+// than continue it.
 //
 // Parameters:
-//   - plannedBy is the run's status.plannedBy, which an older release left
-//     empty.
-//   - planned is true once anything has planned the run: its status has a
-//     phase, items or quiescedAt. A run nothing has planned is new under this
-//     release and plans as usual.
+//   - run is a *BackupRun or a *RestoreRun. Any other kind is never older.
 //
-// The caller checks this after the deletion and the finished run are dealt
-// with, so a run being deleted is put back by its finalizer as before, and a
-// finished run is left to its time to live.
-func olderPlan(plannedBy string, planned bool) bool {
-	return planned && plannedBy != runFormat
+// A run counts as planned once its status has a phase, items or quiescedAt.
+// An older release left status.plannedBy empty. A run nothing has planned
+// is new under this release and plans as usual, and a finished run is never
+// older: it is left to its time to live. The reconcilers check this after a
+// run's deletion is dealt with, so a run being deleted is put back by its
+// finalizer as before.
+func olderPlan(run client.Object) bool {
+	var (
+		phase      backupv1alpha1.RunPhase
+		plannedBy  string
+		items      int
+		quiescedAt *metav1.Time
+	)
+	switch r := run.(type) {
+	case *backupv1alpha1.BackupRun:
+		phase, plannedBy, items, quiescedAt = r.Status.Phase, r.Status.PlannedBy, len(r.Status.Items), r.Status.QuiescedAt
+	case *backupv1alpha1.RestoreRun:
+		phase, plannedBy, items, quiescedAt = r.Status.Phase, r.Status.PlannedBy, len(r.Status.Items), r.Status.QuiescedAt
+	default:
+		return false
+	}
+	planned := phase != "" || items > 0 || quiescedAt != nil
+	return planned && !phase.Finished() && plannedBy != runFormat
 }
 
 // stoppedState says what an older run's status records of the workloads it

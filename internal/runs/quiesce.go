@@ -174,101 +174,6 @@ const (
 	fluxNamespaceLabel = "kustomize.toolkit.fluxcd.io/namespace"
 )
 
-// owesRestart reports whether a run that stopped workloads must still give
-// them back, so that another run must not stop the same workloads and a
-// quiesce Lease it holds is live.
-//
-// Parameters:
-//   - reader reads the workloads and Kustomizations the plan names. Callers
-//     pass the uncached Reader, so the answer never rests on a stale cache.
-//   - mapper looks up the version at which the API server serves
-//     Kustomizations (see servedKind).
-//   - run is a *BackupRun or a *RestoreRun.
-//
-// A run with no plan (quiescedAt unset and status.quiesced empty) owes
-// nothing. A plan with no recorded restart, or one whose BackupRun still has
-// status.restartPending set, owes. Otherwise the plan counts as given back
-// only when every workload in status.quiesced reads back with spec.replicas
-// at or above the count the run recorded, and every Kustomization in
-// status.suspendedKustomizations reads back unsuspended. A workload or
-// Kustomization that reads NotFound counts as given back, since there is
-// nothing left to put back. Every other read error counts as owing: a run
-// never treats a failed read as evidence that the app is up.
-//
-// It returns an error only for a run of another kind, which is a programming
-// error; the readers' errors are folded into the answer, as above.
-func owesRestart(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, run client.Object) (bool, error) {
-	var (
-		namespace      string
-		quiescedAt     *metav1.Time
-		restartedAt    *metav1.Time
-		restartPending bool
-		stop           []backupv1alpha1.QuiescedWorkload
-		suspend        []string
-	)
-	switch r := run.(type) {
-	case *backupv1alpha1.BackupRun:
-		namespace, quiescedAt, restartedAt, restartPending = r.Namespace, r.Status.QuiescedAt, r.Status.RestartedAt, r.Status.RestartPending
-		stop, suspend = r.Status.Quiesced, r.Status.SuspendedKustomizations
-	case *backupv1alpha1.RestoreRun:
-		namespace, quiescedAt, restartedAt = r.Namespace, r.Status.QuiescedAt, r.Status.RestartedAt
-		stop, suspend = r.Status.Quiesced, r.Status.SuspendedKustomizations
-	default:
-		return false, fmt.Errorf("owesRestart is not defined for %T", run)
-	}
-	if quiescedAt == nil && len(stop) == 0 {
-		return false, nil
-	}
-	if restartedAt == nil || restartPending {
-		return true, nil
-	}
-	for _, w := range stop {
-		givenBack, err := atLeastReplicas(ctx, reader, namespace, w)
-		if err != nil || !givenBack {
-			return true, nil
-		}
-	}
-	for _, key := range suspend {
-		ns, name, _ := strings.Cut(key, "/")
-		kustomization, err := getKustomization(ctx, reader, mapper, ns, name)
-		switch {
-		case err == nil:
-			if on, _, _ := unstructured.NestedBool(kustomization.Object, "spec", "suspend"); on {
-				return true, nil
-			}
-		case !apierrors.IsNotFound(err):
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// atLeastReplicas reports whether a counted workload stands at or above the
-// replica count the run recorded for it. That count is what the run gives
-// back, so a lower one means the app is not back yet.
-//
-// A workload that reads NotFound counts as given back, since there is nothing
-// left to scale, and a workload that records no spec.replicas counts as one,
-// the Kubernetes default. Any other failed read comes back as an error.
-func atLeastReplicas(ctx context.Context, reader client.Reader, namespace string, w backupv1alpha1.QuiescedWorkload) (bool, error) {
-	object := &unstructured.Unstructured{}
-	object.SetGroupVersionKind(appsv1.SchemeGroupVersion.WithKind(w.Kind))
-	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: w.Name}, object); err != nil {
-		if apierrors.IsNotFound(err) {
-			return true, nil
-		}
-		return false, err
-	}
-	replicas, found, err := unstructured.NestedInt64(object.Object, "spec", "replicas")
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return 1 >= w.Replicas, nil
-	}
-	return replicas >= int64(w.Replicas), nil
-}
-
 // durablyRestarted reports whether the run's stored status shows that it gave
 // the workloads back: status.restartedAt is set and, on a BackupRun,
 // status.restartPending is cleared. A RestoreRun writes restartedAt only
@@ -283,40 +188,41 @@ func durablyRestarted(run client.Object) bool {
 	return false
 }
 
-// stoppedElsewhere returns a message naming another run in the run's
-// namespace that has stopped workloads and not given them back, or "" when
-// there is none. A run that is about to stop a namespace's workloads calls it
-// before it records its plan, so it never counts a workload another live run
-// stopped as standing at zero replicas. That covers a run left by v0.8.x,
-// which holds no Lease, as well as a run that has not taken one yet.
+// waitingOn returns a message naming another run in the run's namespace that
+// this run must wait for before it stops the namespace's workloads, or ""
+// when there is none. A run calls it before it takes the namespace's quiesce
+// Lease, with nothing stopped.
 //
 // Parameters:
-//   - reader lists and reads the namespace's runs, uncached. A failed list
-//     comes back as an error, and nothing is decided on it.
-//   - mapper looks up the served Kustomization version, for the holders'
-//     suspended Kustomizations (see owesRestart).
-//   - run is the asking run; runs with its UID are skipped. A run that is
-//     being deleted counts: its finalizer may still restart the workloads.
+//   - reader lists the namespace's runs, uncached. A failed list comes back
+//     as an error, and nothing is decided on it.
+//   - run is the asking run; runs with its UID are skipped.
 //
-// An unfinished RestoreRun with a Cluster item in phase Deleted is named as
-// well: it waits for its Cluster to be created again, and a Kustomization
-// this run suspends is the one Flux needs to create it.
-func stoppedElsewhere(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, run metav1.Object) (string, error) {
+// It names two kinds of run. The first is an unfinished run that an older
+// release planned (see olderPlan). Such a run took no quiesce Lease, and it
+// may hold the workloads stopped until this release has ended it and given
+// them back, which can take more than one pass while a mover it stopped
+// shuts down; a run that planned meanwhile would record the stopped count as
+// the one to give back. The second is an unfinished RestoreRun with a
+// Cluster item in phase Deleted. It waits for its Cluster to be created
+// again, and a Kustomization this run suspends may be the one Flux needs to
+// create it.
+func waitingOn(ctx context.Context, reader client.Reader, run metav1.Object) (string, error) {
+	older := func(kind, name string) string {
+		return fmt.Sprintf("%s %s was started by an older version of backup-controller and is being ended; this run stops the workloads once that run has given them back",
+			kind, name)
+	}
 	backups := &backupv1alpha1.BackupRunList{}
 	if err := reader.List(ctx, backups, client.InNamespace(run.GetNamespace())); err != nil {
 		return "", fmt.Errorf("list BackupRuns in %s: %w", run.GetNamespace(), err)
 	}
 	for i := range backups.Items {
 		other := &backups.Items[i]
-		if string(other.UID) == string(run.GetUID()) || other.Status.Phase.Finished() {
+		if other.UID == run.GetUID() || other.Status.Phase.Finished() {
 			continue
 		}
-		owes, err := owesRestart(ctx, reader, mapper, other)
-		if err != nil {
-			return "", err
-		}
-		if owes {
-			return stoppedMessage("BackupRun", other.Name, other.Status.Quiesced), nil
+		if olderPlan(other) {
+			return older("BackupRun", other.Name), nil
 		}
 	}
 	restores := &backupv1alpha1.RestoreRunList{}
@@ -325,15 +231,11 @@ func stoppedElsewhere(ctx context.Context, reader client.Reader, mapper meta.RES
 	}
 	for i := range restores.Items {
 		other := &restores.Items[i]
-		if string(other.UID) == string(run.GetUID()) || other.Status.Phase.Finished() {
+		if other.UID == run.GetUID() || other.Status.Phase.Finished() {
 			continue
 		}
-		owes, err := owesRestart(ctx, reader, mapper, other)
-		if err != nil {
-			return "", err
-		}
-		if owes {
-			return stoppedMessage("RestoreRun", other.Name, other.Status.Quiesced), nil
+		if olderPlan(other) {
+			return older("RestoreRun", other.Name), nil
 		}
 		if cluster := deletedCluster(other); cluster != "" {
 			return fmt.Sprintf("RestoreRun %s has deleted Cluster %s and waits for it to be created again; this run stops the workloads once that Cluster is back",
@@ -341,18 +243,6 @@ func stoppedElsewhere(ctx context.Context, reader client.Reader, mapper meta.RES
 		}
 	}
 	return "", nil
-}
-
-// stoppedMessage returns the Ready message of a run that waits for another
-// run whose plan is not given back, naming the workload that run mentions
-// first.
-func stoppedMessage(kind, name string, stop []backupv1alpha1.QuiescedWorkload) string {
-	if len(stop) == 0 {
-		return fmt.Sprintf("%s %s stopped this namespace's workloads and has not given them back yet; this run stops the workloads once that run has given them back",
-			kind, name)
-	}
-	return fmt.Sprintf("%s %s stopped %s %s and has not given it back yet; this run stops the workloads once that run has given them back",
-		kind, name, stop[0].Kind, stop[0].Name)
 }
 
 // deletedCluster returns the name of a Cluster the run deleted and waits for

@@ -112,8 +112,7 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// A run an older release planned is not continued: what it recorded may
 	// not mean what this release reads. It ends here, and finish gives back
 	// what it stopped.
-	planned := run.Status.Phase != "" || len(run.Status.Items) > 0 || run.Status.QuiescedAt != nil
-	if olderPlan(run.Status.PlannedBy, planned) {
+	if olderPlan(run) {
 		stopped := stoppedNothing
 		switch {
 		case len(run.Status.Quiesced) == 0 && len(run.Status.SuspendedKustomizations) == 0:
@@ -339,10 +338,9 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // how to give the app back by hand (see releaseFailed). It returns the error,
 // so the restart is retried. A pass that
 // finds status.restartPending set repeats the restart and keeps the recorded
-// moment. The pass that records the moment restarts even when the installed
-// CRD dropped status.restartPending from its write, as the v0.7.2 CRD does.
-// Times in the status are whole seconds. Last, it collects the result
-// of every Running item.
+// moment. Once the stored status shows the restart done, no pass repeats it.
+// Times in the status are whole seconds. Last, it collects the result of
+// every Running item.
 //
 // The workloads stay stopped for at most the namespace's
 // backup.wlz.li/max-quiesce limit, ten minutes by default, counted from
@@ -377,16 +375,14 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		log.FromContext(ctx).Error(err, "could not release the Leases of the run's finished items; the run goes on",
 			"namespace", run.Namespace, "name", run.Name)
 	}
-	// The quiesce Leases go once the stored status shows every workload back
-	// and this run will not touch them again (see owesRestart). Best effort
-	// as well: a Lease left behind is stale under holderLive's rule and the
-	// next run takes it over.
+	// The quiesce Leases go once the stored status shows every workload back,
+	// since the run then never touches them again. Best effort as well: a
+	// Lease left behind is stale under holderLive's rule and the next run
+	// takes it over.
 	if durablyRestarted(run) {
-		if owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run); err == nil && !owes {
-			if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
-				log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
-					"namespace", run.Namespace, "name", run.Name)
-			}
+		if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
+			log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
+				"namespace", run.Namespace, "name", run.Name)
 		}
 	}
 
@@ -460,11 +456,10 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		if err := r.writeStatus(ctx, run); err != nil {
 			return ctrl.Result{}, err
 		}
-		// An installed BackupRun CRD that lacks status.restartPending drops
-		// it from the write, and the write decodes the stored object back
-		// into run. The schema checks run only before the workloads stop,
-		// so a run an older controller stopped them for reaches this point
-		// unchecked, and this pass restarts on its own knowledge.
+		// The write decodes the stored object back into run, and a CRD that
+		// lacks status.restartPending would have dropped the flag from it.
+		// This pass restarts on what it just decided, so it never relies on
+		// a field the write may have dropped.
 		restart = true
 	}
 	if restart || run.Status.RestartPending {
@@ -474,16 +469,6 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 			return ctrl.Result{}, r.releaseFailed(ctx, run, err, true)
 		}
 		run.Status.RestartPending = false
-	} else if owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run); err != nil {
-		return ctrl.Result{}, err
-	} else if owes && durablyRestarted(run) {
-		// The stored status reads restarted, but the plan does not read back:
-		// the restart did not reach the workloads, as it cannot on a CRD that
-		// drops status.restartPending. The run repeats its restart, and
-		// restartWorkloads skips what already stands at its count.
-		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
-			return ctrl.Result{}, r.releaseFailed(ctx, run, err, true)
-		}
 	}
 
 	for i := range run.Status.Items {
@@ -540,16 +525,12 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 // back. When no workload is marked, quiesce sets status.restartedAt to
 // the same moment, because there is nothing to start again.
 //
-// Before it records a plan, quiesce checks the installed BackupRun CRD again
-// with schemaOutdated, so a run an older controller planned is refused before
-// it stops anything.
+// Before it records a plan, with nothing stopped, quiesce waits with reason
+// SourceBusy while a volume is busy with another run, while another run is in
+// the way (see waitingOn), and while another run holds the namespace's
+// quiesce Lease.
 func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (ctrl.Result, error) {
 	if len(run.Status.Quiesced) == 0 {
-		// A run an older controller planned before the upgrade was never
-		// checked, so the check runs again before anything is stopped.
-		if refused, err := r.schemaOutdated(ctx, run); refused || err != nil {
-			return ctrl.Result{}, err
-		}
 		// A volume still busy with another run's backup would keep the
 		// stopped workloads down for as long as that backup takes. The run
 		// waits with the workloads still running. A volume busy with a
@@ -605,6 +586,16 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			run.Status.QuiescedAt, run.Status.RestartedAt = newTime(now), newTime(now)
 			return after(time.Second, r.writeStatus(ctx, run))
 		}
+		// A run an older release planned, which holds no Lease, and a
+		// restore that waits for the Cluster it deleted keep this run
+		// waiting with nothing stopped and no Lease held.
+		waiting, err := waitingOn(ctx, r.Reader, run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if waiting != "" {
+			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, waiting))
+		}
 		// The namespace's quiesce Lease lets one run at a time stop its
 		// workloads. It is taken before the plan and held until the stored
 		// status shows the workloads back, so a second run waits here with
@@ -616,16 +607,6 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		}
 		if busy != "" {
 			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy))
-		}
-		// A run left by an older controller holds no Lease, and a run that
-		// has not finished may still give the app back. Wait for the first
-		// such run rather than plan over it.
-		stopped, err := stoppedElsewhere(ctx, r.Reader, r.RESTMapper(), run)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if stopped != "" {
-			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, stopped))
 		}
 		// A Kustomization that applies a target may also apply workloads of
 		// another namespace, whose run would resume it while this run's
@@ -706,7 +687,7 @@ func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1al
 	if restoring != "" {
 		return restoring, nil
 	}
-	return leaseHeldElsewhere(ctx, r.Reader, r.RESTMapper(), run, run.Namespace, claimName, vr.Spec.Repository)
+	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, vr.Spec.Repository)
 }
 
 // startItem starts the backup of one Pending item and sets the item's phase.
@@ -1177,7 +1158,8 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 //
 // A run with status.restartPending set has chosen its restart moment and may
 // not have started the workloads yet. release starts them and keeps that
-// moment.
+// moment. A run whose status shows the restart done starts nothing again, so
+// it never scales up a workload another run has stopped since.
 //
 // The Leases are released even when the restart fails: the run's items are
 // done, and otherMover still keeps another run's mover off a claim whose
@@ -1193,10 +1175,7 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 // Every step is safe to repeat.
 func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.BackupRun) error {
 	var restartErr error
-	holding, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run)
-	if err != nil {
-		return err
-	}
+	holding := (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil
 	if holding || run.Status.RestartPending {
 		restartErr = restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 		if restartErr == nil {

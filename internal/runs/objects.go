@@ -134,7 +134,8 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 // seconds, as RFC 3339. The mover takes the newest snapshot at or before
 // restoreAsOf, comparing whole seconds, and every newer snapshot is later than
 // that, so it takes the selected one. It returns nil for an item with no
-// recorded snapshot time, which a run planned by an older controller has.
+// recorded snapshot time, which recheckSnapshot refuses before any
+// destination is built.
 func selectedMoment(item backupv1alpha1.RestoreItem) *string {
 	if item.SnapshotTime == nil {
 		return nil
@@ -165,19 +166,10 @@ func selectedMoment(item backupv1alpha1.RestoreItem) *string {
 // previous (see selectedMoment). Handing it spec.restoreAsOf and
 // spec.previous would make it choose again when it starts, and a backup taken
 // since the checks would shift what the newest snapshot, or the one before
-// it, is. An item with no recorded time, from a run an older controller
-// planned, falls back to status.syncedTo for a synced run and to the run's
-// spec otherwise.
+// it, is. The callers run recheckSnapshot first, which refuses an item with
+// no recorded time.
 func directDestination(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem, settings restoreSettings, name string) *volsyncv1alpha1.ReplicationDestination {
 	claim := item.Name
-	restoreAsOf, previous := run.Spec.RestoreAsOf, run.Spec.Previous
-	switch {
-	case item.SnapshotTime != nil:
-		restoreAsOf, previous = selectedMoment(item), nil
-	case run.Status.SyncedTo != nil:
-		moment := run.Status.SyncedTo.UTC().Format(time.RFC3339)
-		restoreAsOf, previous = &moment, nil
-	}
 	return &volsyncv1alpha1.ReplicationDestination{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: run.Namespace},
 		Spec: volsyncv1alpha1.ReplicationDestinationSpec{
@@ -188,8 +180,7 @@ func directDestination(run *backupv1alpha1.RestoreRun, item backupv1alpha1.Resto
 					DestinationPVC: &claim,
 				},
 				Repository:            settings.Secret,
-				RestoreAsOf:           restoreAsOf,
-				Previous:              previous,
+				RestoreAsOf:           selectedMoment(item),
 				CacheStorageClassName: settings.CacheStorageClassName,
 				EnableFileDeletion:    true,
 				CleanupCachePVC:       true,

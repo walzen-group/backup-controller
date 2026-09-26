@@ -93,12 +93,10 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // error either returns for a retry goes through planFailed, which reports it
 // on the Ready condition and ends the run once spec.timeout has passed since
 // its creation. A run past its checks continues in work, or in
-// restoreIntoEmptyClaim for an into restore. An into restore that a v0.8.1
-// or older controller started through the VolumeRestore populator continues
-// in followPopulator instead (see onPopulatorPath). Before any of these,
-// Reconcile adds the run's finalizer. A run being deleted gets its changes
-// put back by finalize, and a finished run is deleted once
-// spec.ttlSecondsAfterFinished has passed.
+// restoreIntoEmptyClaim for an into restore. Before any of these, Reconcile
+// adds the run's finalizer. A run being deleted gets its changes put back by
+// finalize, and a finished run is deleted once spec.ttlSecondsAfterFinished
+// has passed.
 //
 // An unfinished run that an older release planned, whose status.plannedBy is
 // not this release's format, goes through none of these: abort ends it with
@@ -132,8 +130,7 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// A run an older release planned is not continued: what it recorded may
 	// not mean what this release reads. It ends here, and finish stops its
 	// movers and gives back what it stopped.
-	planned := run.Status.Phase != "" || len(run.Status.Items) > 0 || run.Status.QuiescedAt != nil
-	if olderPlan(run.Status.PlannedBy, planned) {
+	if olderPlan(run) {
 		// A RestoreRun records restartedAt only after its restart succeeded,
 		// so a run that recorded it has nothing left to give back.
 		stopped := stoppedNothing
@@ -171,9 +168,6 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return result, nil
 	}
 	if run.Spec.Into != "" {
-		if onPopulatorPath(run) {
-			return r.followPopulator(ctx, run)
-		}
 		return r.restoreIntoEmptyClaim(ctx, run)
 	}
 	return r.work(ctx, run)
@@ -619,9 +613,8 @@ func (r *RestoreRunReconciler) listRepository(ctx context.Context, run *backupv1
 // Parameters:
 //   - item is the volume item. item.Snapshot is the short ID the checks
 //     recorded, and item.SnapshotTime the time the object pins the mover to.
-//     An item with no snapshotTime, which a v0.7.2 controller planned, gets
-//     the time of the listed snapshot with that short ID here, so its object
-//     is pinned to that snapshot's second like any other.
+//     An item without either gets a reason (see changedSince), so no mover
+//     is ever left to choose a snapshot by itself.
 //   - secretName names the repository Secret in the run's namespace.
 //
 // Time passes between the checks and the create: a pod may hold the claim,
@@ -642,14 +635,8 @@ func (r *RestoreRunReconciler) recheckSnapshot(ctx context.Context, run *backupv
 	// Only an in-place synced run picks among quiesced snapshots; the advice
 	// in the reason keeps to them then.
 	quiescedOnly := run.Spec.SyncDatabaseToVolume && run.Spec.Into == ""
-	recorded, why := changedSince(snapshots, *item, quiescedOnly)
-	if why != "" {
-		return why, nil
-	}
-	if item.SnapshotTime == nil {
-		item.SnapshotTime = &metav1.Time{Time: recorded.Time}
-	}
-	return "", nil
+	_, why := changedSince(snapshots, *item, quiescedOnly)
+	return why, nil
 }
 
 // nothingWritten returns the end of the message of an item that
@@ -742,16 +729,13 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
-	// The quiesce Leases go once the stored status shows every workload back
-	// and this run will not touch them again (see owesRestart). Best effort:
-	// a Lease left behind is stale under holderLive's rule and the next run
-	// takes it over.
+	// The quiesce Leases go once the stored status shows every workload back,
+	// since the run then never touches them again. Best effort: a Lease left
+	// behind is stale under holderLive's rule and the next run takes it over.
 	if durablyRestarted(run) {
-		if owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run); err == nil && !owes {
-			if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
-				log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
-					"namespace", run.Namespace, "name", run.Name)
-			}
+		if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
+			log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
+				"namespace", run.Namespace, "name", run.Name)
 		}
 	}
 
@@ -856,18 +840,12 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	// A database comes back only when its owner creates it again, and a
 	// Kustomization this run suspended creates nothing. So the app is given
 	// back once every volume is restored and every database is deleted, down
-	// to its last instance pod and PVC. owesRestart also repeats a restart
-	// whose plan does not read back, so a workload a person stopped, or one
-	// whose scale-up was refused, is put back.
-	if volumesDone && !anyRestorePending(run.Status.Items) && len(shuttingDown) == 0 {
-		owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run)
-		if err != nil {
+	// to its last instance pod and PVC. A run whose status shows the restart
+	// done starts nothing again, so it never scales up a workload another run
+	// has stopped since.
+	if volumesDone && !anyRestorePending(run.Status.Items) && len(shuttingDown) == 0 && stopped(run) {
+		if err := r.restart(ctx, run); err != nil {
 			return ctrl.Result{}, err
-		}
-		if owes {
-			if err := r.restart(ctx, run); err != nil {
-				return ctrl.Result{}, err
-			}
 		}
 	}
 
@@ -1065,9 +1043,9 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 //     notRecovered), and the run leaves the Cluster alone. It did not create
 //     that Cluster, and deleting it would only loop as Flux creates it again.
 //
-// An item marked Deleted without a UID, as a run started under v0.7.2 or one
-// that found no Cluster to delete leaves it, has no old Cluster, so a live
-// Cluster that is not the run's recovery fails the item.
+// An item marked Deleted without a UID, which a run that found no Cluster to
+// delete leaves, has no old Cluster, so a live Cluster that is not the run's
+// recovery fails the item.
 func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
@@ -1171,9 +1149,9 @@ func notRecovered(item *backupv1alpha1.RestoreItem, cluster *unstructured.Unstru
 	}
 
 	if item.ClusterUID == "" {
-		return fmt.Sprintf("Cluster %s (UID %s) is not this run's recovery: %s. The item holds no clusterUID "+
-			"(a run started under v0.7.2 records none, and neither does a run that found no Cluster at its start), "+
-			"so it can't tell the old Cluster from a new one, and it leaves this one alone. Create a new RestoreRun to restore it", name, uid, why)
+		return fmt.Sprintf("Cluster %s (UID %s) is not this run's recovery: %s. The item holds no clusterUID, "+
+			"because the run found no Cluster at its start, so it can't tell the old Cluster from a new one, "+
+			"and it leaves this one alone. Create a new RestoreRun to restore it", name, uid, why)
 	}
 	switch {
 	case optedOut:
@@ -1288,119 +1266,6 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning,
 		fmt.Sprintf("restoring into claim %s", run.Spec.Into))
 	return after(time.Second, r.writeStatus(ctx, run))
-}
-
-// onPopulatorPath reports whether the run is an into restore from a claim
-// that a v0.8.1 or older controller planned for the VolumeRestore populator,
-// and whose item has not finished. Such an item names no
-// ReplicationDestination: planIntoNewClaim names one on every item it plans,
-// and only finish clears it, in the same status write that records the run's
-// end.
-func onPopulatorPath(run *backupv1alpha1.RestoreRun) bool {
-	return run.Spec.Claim != "" && len(run.Status.Items) == 1 &&
-		run.Status.Items[0].Destination == "" && !finished(run.Status.Items[0])
-}
-
-// followPopulator carries an into restore from a claim that a v0.8.1 or
-// older controller started through the VolumeRestore populator (see
-// onPopulatorPath) to its end, and returns the result the reconcile hands
-// back.
-//
-// The populator's mover runs in the controller's namespace, and the
-// populator deletes its ReplicationDestination, and with it the mover's log,
-// before the claim binds. So nothing tells which snapshot the populator
-// restored, and such a run never ends Succeeded. followPopulator reads the
-// claim and the VolumeRestore named spec.into through the uncached Reader,
-// and goes by what it finds:
-//
-//   - A claim of that name the run does not control (see notCreatedByRun):
-//     the run ends Failed with the refusal and leaves the claim alone.
-//   - The run's claim, Bound: the run ends Failed and says that it cannot
-//     confirm the snapshot and what to do (see populatorUnconfirmed).
-//   - The run's claim, neither Bound nor being deleted: the populator is
-//     still at work. The run waits for it and creates nothing, until
-//     spec.timeout ends it TimedOut. The run's VolumeRestore keeps a backup
-//     of the source claim waiting meanwhile (see otherMover).
-//   - The run's claim being deleted, or no claim beside the run's
-//     VolumeRestore: the claim holds nothing the run restored, and the run
-//     ends Failed. It creates no claim, because the populator would fill it.
-//   - A VolumeRestore of that name the run does not control and no claim:
-//     the run ends Failed with the refusal from notCreatedByRun.
-//   - Neither exists: the old controller created nothing. The item gets the
-//     name of its ReplicationDestination, the status is written, and the
-//     next pass goes on in restoreIntoEmptyClaim, which lists the repository
-//     again before it creates anything.
-//
-// The run deletes nothing it finds. The claim and the VolumeRestore it
-// created go with it through the garbage collector, and finish takes the
-// populator's finalizer off a VolumeRestore the populator never took on (see
-// releaseVolumeRestore). A failed read or status write comes back as an
-// error, and the next pass tries again.
-func (r *RestoreRunReconciler) followPopulator(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	item := &run.Status.Items[0]
-	into := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
-	claim := &corev1.PersistentVolumeClaim{}
-	claimErr := r.Reader.Get(ctx, into, claim)
-	if claimErr != nil && !apierrors.IsNotFound(claimErr) {
-		return ctrl.Result{}, fmt.Errorf("get PersistentVolumeClaim %s: %w", into, claimErr)
-	}
-	if claimErr == nil {
-		switch {
-		case !metav1.IsControlledBy(claim, run):
-			return r.abort(ctx, run, backupv1alpha1.ReasonFailed, notCreatedByRun(run, "claim", claim))
-		case claim.DeletionTimestamp != nil:
-			return r.abort(ctx, run, backupv1alpha1.ReasonFailed, populatorClaimGone(run.Spec.Into))
-		case claim.Status.Phase == corev1.ClaimBound:
-			return r.abort(ctx, run, backupv1alpha1.ReasonFailed, populatorUnconfirmed(*item))
-		}
-		if deadline, over := r.overdue(run); over {
-			return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut,
-				fmt.Sprintf("claim %s had not bound by %s", run.Spec.Into, deadline.Format(time.RFC3339)))
-		}
-		return ctrl.Result{RequeueAfter: pollInterval}, nil
-	}
-
-	vr := &backupv1alpha1.VolumeRestore{}
-	if err := r.Reader.Get(ctx, into, vr); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("get VolumeRestore %s: %w", into, err)
-		}
-		// Nothing was created: the run restores like one this version
-		// planned. The name goes into the status before anything is created,
-		// so no pass can create a destination the item does not name.
-		item.Destination = destinationName(run.UID, 0)
-		return after(time.Second, r.writeStatus(ctx, run))
-	}
-	if refusal := notCreatedByRun(run, "VolumeRestore", vr); refusal != "" {
-		return r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
-	}
-	return r.abort(ctx, run, backupv1alpha1.ReasonFailed, populatorClaimGone(run.Spec.Into))
-}
-
-// populatorUnconfirmed returns the message of an item that a v0.8.1 or older
-// controller restored through the VolumeRestore populator, once its claim is
-// Bound (see followPopulator). item is the run's single item, which names the
-// claim and records the snapshot the checks selected.
-func populatorUnconfirmed(item backupv1alpha1.RestoreItem) string {
-	selected := ""
-	if item.Snapshot != "" {
-		selected = fmt.Sprintf(" The checks selected snapshot %s.", item.Snapshot)
-	}
-	return fmt.Sprintf("this restore was started by v0.8.1 or older through the VolumeRestore populator, "+
-		"and this version cannot confirm which snapshot the populator restored: its mover's log went with the populator's ReplicationDestination.%[2]s "+
-		"Claim %[1]s is Bound, and the run leaves it and VolumeRestore %[1]s in place. "+
-		"Compare the claim with the data you expect, or restore again with a new RestoreRun, whose mover's log the run checks: "+
-		"give it another spec.into, or delete this RestoreRun first, which deletes claim %[1]s and VolumeRestore %[1]s",
-		item.Name, selected)
-}
-
-// populatorClaimGone returns the message of an item that a v0.8.1 or older
-// controller started through the VolumeRestore populator whose claim, named
-// into, does not exist or is being deleted (see followPopulator).
-func populatorClaimGone(into string) string {
-	return fmt.Sprintf("this restore was started by v0.8.1 or older through the VolumeRestore populator, "+
-		"and claim %s, which the populator fills, does not exist or is being deleted, so it holds nothing this run restored. "+
-		"This version creates no claim for the populator to fill. Create a new RestoreRun to restore the claim", into)
 }
 
 // restoreIntoEmptyClaim restores into the new claim spec.into names, from
@@ -1716,6 +1581,11 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 // BackupRun. A spec.quiesce entry the namespace does not hold ends the run as
 // Failed with reason Invalid before anything is stopped, and a failed read of
 // an entry or a Kustomization is returned for a retry.
+//
+// Before it records a plan, with nothing stopped, quiesce waits with reason
+// SourceBusy while a backup holds one of the run's claims or repositories,
+// while another run is in the way (see waitingOn), and while another run
+// holds the namespace's quiesce Lease.
 func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if len(run.Status.Quiesced) == 0 {
 		targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
@@ -1745,6 +1615,16 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, held))
 			}
 		}
+		// A run an older release planned, which holds no Lease, and a
+		// restore that waits for the Cluster it deleted keep this run
+		// waiting with nothing stopped and no Lease held.
+		waiting, err := waitingOn(ctx, r.Reader, run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if waiting != "" {
+			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, waiting))
+		}
 		// The namespace's quiesce Lease lets one run at a time stop its
 		// workloads. It is taken before the plan and held until the stored
 		// status shows the workloads back, so a second run waits here with
@@ -1757,16 +1637,7 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		if busy != "" {
 			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy))
 		}
-		// A run left by an older controller holds no Lease, and a run that
-		// has not finished may still give the app back. Wait for the first
-		// such run rather than plan over it.
-		stopped, err := stoppedElsewhere(ctx, r.Reader, r.RESTMapper(), run)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if stopped != "" {
-			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, stopped))
-		}
+
 		// A Kustomization that applies a target may also apply workloads of
 		// another namespace, whose run would resume it while this run's
 		// workloads stand at zero. The run holds a Lease per such
@@ -1839,7 +1710,7 @@ func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *bac
 	if backing != "" {
 		return backing, nil
 	}
-	return leaseHeldElsewhere(ctx, r.Reader, r.RESTMapper(), run, run.Namespace, claimName, settings.Secret)
+	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, settings.Secret)
 }
 
 // restart gives the stopped workloads their replicas back, resumes the
@@ -1900,11 +1771,7 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 	// The app is given back before the Leases go: a run that could not start
 	// the workloads keeps the claim and the repository to itself until it
 	// can, so no other run's mover starts on them meanwhile.
-	owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run)
-	if err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
-	}
-	if owes {
+	if stopped(run) {
 		if err := r.restart(ctx, run); err != nil {
 			return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
 		}
@@ -1981,11 +1848,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 		return r.waitForStopped(ctx, run, waiting)
 	}
 	// The app is given back before the Leases go, as in finish.
-	owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run)
-	if err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
-	}
-	if owes {
+	if stopped(run) {
 		if err := r.restart(ctx, run); err != nil {
 			return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
 		}
@@ -2362,17 +2225,20 @@ func finishedWithDestination(items []backupv1alpha1.RestoreItem) bool {
 }
 
 // releaseVolumeRestore releases the VolumeRestore named spec.into that a
-// v0.8.1 or older controller created for an into restore from a claim (see
-// followPopulator), once the populator library can no longer start on the
-// claim it fills. finalize calls it for a run being deleted. A run this
-// version planned creates no VolumeRestore, so for it there is nothing to
-// release.
+// v0.8.1 or older controller created for an into restore from a claim, once
+// the populator library can no longer start on the claim it fills. Such a
+// run ends with reason Upgraded (see olderPlan), and finalize calls this
+// when it is deleted. A run this release planned (see status.plannedBy)
+// creates no VolumeRestore, so for it there is nothing to release and
+// nothing is read.
 //
 // The older controller created the VolumeRestore with populator.Finalizer,
 // and the populator's Cleanup removes that once the claim is filled or
-// deleted. The library calls Cleanup only for a claim it has started on, so a
-// claim it never reached, such as one still waiting for a node, would leave
-// the VolumeRestore hanging in deletion after the run is gone.
+// deleted. The library calls Cleanup only for a claim it has started on, and
+// the populator's OrphanReconciler acts only on a claim whose VolumeRestore
+// is gone, so a claim the library never reached, such as one still waiting
+// for a node, or no claim at all, would leave the VolumeRestore hanging in
+// deletion after the run is gone.
 //
 // The library starts on a claim that exists, and adding
 // populator.ClaimFinalizer to it is the first thing it does, so the finalizer
@@ -2399,7 +2265,7 @@ func finishedWithDestination(items []backupv1alpha1.RestoreItem) bool {
 // It returns a message while the run waits for the claim, and "" once
 // nothing holds the VolumeRestore, or there is none to release.
 func (r *RestoreRunReconciler) releaseVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun) (string, error) {
-	if run.Spec.Into == "" {
+	if run.Spec.Into == "" || run.Status.PlannedBy == runFormat {
 		return "", nil
 	}
 	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
@@ -2490,9 +2356,10 @@ func (r *RestoreRunReconciler) releaseFailed(ctx context.Context, run *backupv1a
 // spec.into whose populator.Finalizer releaseVolumeRestore has yet to
 // release. finish keeps the run's finalizer while it does, because that
 // release happens only once the claim the library fills is gone, and finalize
-// waits for the claim.
+// waits for the claim. A run this release planned creates no VolumeRestore,
+// so for it nothing is read.
 func (r *RestoreRunReconciler) holdsVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun) (bool, error) {
-	if run.Spec.Into == "" {
+	if run.Spec.Into == "" || run.Status.PlannedBy == runFormat {
 		return false, nil
 	}
 	vr := &backupv1alpha1.VolumeRestore{}

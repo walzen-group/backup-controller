@@ -229,49 +229,6 @@ func TestARestoreWhoseSnapshotIsStillThereGoesAhead(t *testing.T) {
 	}
 }
 
-// legacyRun returns the RestoreRun back-to-monday as a v0.7.2 controller
-// left it: past its checks, with a Pending volume item that records the
-// snapshot's short ID and no snapshotTime.
-func legacyRun(snapshot string) *backupv1alpha1.RestoreRun {
-	started := metav1.NewTime(frozen)
-	return restoreRun(func(r *backupv1alpha1.RestoreRun) {
-		r.Spec.Claim = claimN
-		r.Status.Phase = backupv1alpha1.RunPhaseRunning
-		r.Status.StartedAt = &started
-		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN,
-			Phase: backupv1alpha1.ItemPending, Snapshot: snapshot}}
-	})
-}
-
-// An item a v0.7.2 controller planned records no snapshotTime. Before its
-// destination is created it gets the time of the listed snapshot with its
-// short ID, so the mover is pinned to that snapshot's second like any other.
-func TestALegacyItemGetsItsSnapshotTimeBeforeItStarts(t *testing.T) {
-	r, c := restoreReconciler(t, nil, legacyRun(sunday.ShortID()), claim(), volumeRestore(), repository())
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	item := run.Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemRunning || item.SnapshotTime == nil || !item.SnapshotTime.Equal(&metav1.Time{Time: sunday.Time}) {
-		t.Fatalf("item = %+v; want Running with sunday's time", item)
-	}
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, item.Destination, rd)
-	if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-20T05:00:02Z" || rd.Spec.Restic.Previous != nil {
-		t.Errorf("destination restoreAsOf = %v, previous = %v; want 2026-09-20T05:00:02Z and none", rd.Spec.Restic.RestoreAsOf, rd.Spec.Restic.Previous)
-	}
-}
-
-// A legacy item whose snapshot is no longer in the repository fails before
-// anything is created.
-func TestALegacyItemWhoseSnapshotIsGoneFails(t *testing.T) {
-	r, c := restoreReconciler(t, nil, legacyRun("deadbeef"), claim(), volumeRestore(), repository())
-	restoreStep(t, r)
-
-	expectItemFailed(t, c, "snapshot deadbeef", "is no longer in the repository")
-	expectNothingCreated(t, c, "")
-}
-
 // A pass that created the item's destination and lost the status write
 // leaves the item Pending. When the next pass finds the snapshot gone, it
 // fails the item, says the destination from the lost pass may have written
@@ -390,4 +347,23 @@ func TestARestoreWaitingForABackupAtItsChecksTimesOut(t *testing.T) {
 			expectNothingCreated(t, c, shape.into)
 		})
 	}
+}
+
+// An item that records a snapshot and no snapshotTime fails before its
+// destination exists: the run has no second to pin the mover to, and a mover
+// left to choose by spec.restoreAsOf could restore another snapshot. Only an
+// older release planned such an item. Before, the item took the time of the
+// listed snapshot with its short ID.
+func TestAnItemWithoutASnapshotTimeFailsBeforeItStarts(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) {
+		r.Spec.Claim = claimN
+		r.Status.Phase = backupv1alpha1.RunPhaseRunning
+		r.Status.StartedAt = atFrozen(0)
+		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN,
+			Phase: backupv1alpha1.ItemPending, Snapshot: sunday.ShortID()}}
+	}), claim(), volumeRestore(), repository())
+	restoreStep(t, r)
+
+	expectItemFailed(t, c, "records no snapshot time")
+	expectNothingCreated(t, c, "")
 }

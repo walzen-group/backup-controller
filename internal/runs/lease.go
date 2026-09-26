@@ -10,7 +10,6 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -210,7 +209,7 @@ func acquireLease(ctx context.Context, c client.Client, reader client.Reader, ho
 		return updateLease(ctx, c, held)
 	}
 
-	live, err := holderLive(ctx, reader, c.RESTMapper(), held)
+	live, err := holderLive(ctx, reader, held)
 	if err != nil {
 		return "", err
 	}
@@ -306,22 +305,20 @@ const (
 // Lease names, has not finished, and has an item the Lease names that is
 // Pending or Running. Only an item of the kind that takes Leases counts (see
 // backupLeaseItemKind), so a Cluster item of the same name as the claim does
-// not keep the claim's Lease. A quiesce Lease is live while the holder has not
-// durably given the workloads back (see owesRestart): it exists with the UID
-// the Lease names, has not finished, and either owes a restart, has not
-// recorded one, or recorded one whose plan does not read back. A run being
-// deleted counts as live until its finalizer has released the Lease.
-// A Lease that names no run kind this controller knows is left alone, and
-// counts as live. A failed read comes back as an error.
+// not keep the claim's Lease. A quiesce Lease is live while the holder's
+// stored status does not show the workloads given back (see
+// durablyRestarted): it exists with the UID the Lease names, has not
+// finished, and has no plan yet or has not recorded its restart as done. A
+// run being deleted counts as live until its finalizer has released the
+// Lease. A Lease that names no run kind this controller knows is left alone,
+// and counts as live. A failed read comes back as an error.
 //
 // Parameters:
-//   - reader reads the holder run and the workloads of its plan, uncached.
-//   - mapper looks up the version at which the API server serves
-//     Kustomizations, for the plan's suspended ones (see owesRestart).
+//   - reader reads the holder run, uncached.
 //   - lease is the Lease as stored. The holder's namespace comes from the
 //     annotation stamp writes; a Lease from an older controller lives in the
 //     holder's namespace.
-func holderLive(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, lease *coordinationv1.Lease) (bool, error) {
+func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1.Lease) (bool, error) {
 	namespace := lease.Namespace
 	if holder := lease.Annotations[annotationLeaseHolderNamespace]; holder != "" {
 		namespace = holder
@@ -342,11 +339,7 @@ func holderLive(ctx context.Context, reader client.Reader, mapper meta.RESTMappe
 			return false, nil
 		}
 		if quiesce {
-			owes, err := owesRestart(ctx, reader, mapper, run)
-			if err != nil {
-				return false, err
-			}
-			return owes || run.Status.RestartedAt == nil || run.Status.RestartPending, nil
+			return !durablyRestarted(run), nil
 		}
 		for _, item := range run.Status.Items {
 			if item.Kind == backupLeaseItemKind && slices.Contains(items, item.Name) &&
@@ -367,11 +360,7 @@ func holderLive(ctx context.Context, reader client.Reader, mapper meta.RESTMappe
 			return false, nil
 		}
 		if quiesce {
-			owes, err := owesRestart(ctx, reader, mapper, run)
-			if err != nil {
-				return false, err
-			}
-			return owes || run.Status.RestartedAt == nil, nil
+			return !durablyRestarted(run), nil
 		}
 		for _, item := range run.Status.Items {
 			if item.Kind == restoreLeaseItemKind && slices.Contains(items, item.Name) && !finished(item) {
@@ -473,8 +462,6 @@ func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Re
 // Parameters:
 //   - reader reads the claim, the Secret and the Leases. Callers pass the
 //     uncached Reader: a Lease a run takes in this instant must be seen.
-//   - mapper looks up the served Kustomization version, for a quiesce Lease
-//     among the run's own (see holderLive).
 //   - run is the asking run; only its UID is read, so its own Lease is free.
 //   - namespace, claim and secret name the claim and the repository Secret,
 //     as acquireLeases takes them.
@@ -483,7 +470,7 @@ func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Re
 // resolves them with, so this check can never look at a Lease the run would
 // not take. A failed read comes back as an error, and the caller retries with
 // nothing stopped.
-func leaseHeldElsewhere(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, run metav1.Object, namespace, claim, secret string) (string, error) {
+func leaseHeldElsewhere(ctx context.Context, reader client.Reader, run metav1.Object, namespace, claim, secret string) (string, error) {
 	names, err := leaseNamesFor(ctx, reader, namespace, claim, secret)
 	if err != nil {
 		return "", err
@@ -500,7 +487,7 @@ func leaseHeldElsewhere(ctx context.Context, reader client.Reader, mapper meta.R
 		if holderUID(held) == string(run.GetUID()) {
 			continue
 		}
-		live, err := holderLive(ctx, reader, mapper, held)
+		live, err := holderLive(ctx, reader, held)
 		if err != nil {
 			return "", err
 		}

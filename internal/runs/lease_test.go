@@ -112,11 +112,11 @@ func TestTwoRunsWhoseChecksPassTogetherStartOneMover(t *testing.T) {
 
 // blindToQuiesce wraps c so that its lists of ReplicationSources,
 // ReplicationDestinations, BackupRuns and RestoreRuns come back empty. A
-// reconciler reading through it stands in for a pass whose pre-check and
-// stoppedElsewhere ran in the same instant as the other run's: neither sees
-// the other's runs or mover objects, and only the quiesce Lease, which goes
-// through c, keeps them apart. Gets are not hidden: holderLive reads the run
-// a Lease names, and hiding that Get would let a run take over a live
+// reconciler reading through it stands in for a pass whose pre-checks,
+// waitingOn among them, ran in the same instant as the other run's: neither
+// sees the other's runs or mover objects, and only the quiesce Lease, which
+// goes through c, keeps them apart. Gets are not hidden: holderLive reads the
+// run a Lease names, and hiding that Get would let a run take over a live
 // holder's Lease.
 func blindToQuiesce(c client.Client) client.Client {
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
@@ -382,7 +382,7 @@ func TestALeaseIsLiveOnlyForTheVolumeItemThatTookIt(t *testing.T) {
 			c := newClient(t, tc.holder.(client.Object))
 			lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: claimLeaseName("claim-uid"), Namespace: ns}}
 			stamp(lease, leaseHolder{kind: tc.kind, run: tc.holder, item: claimN}, []string{claimN})
-			live, err := holderLive(context.Background(), c, nil, lease)
+			live, err := holderLive(context.Background(), c, lease)
 			if err != nil || live != tc.live {
 				t.Errorf("holderLive = %t, %v; want %t", live, err, tc.live)
 			}
