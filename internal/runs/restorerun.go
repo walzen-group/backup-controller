@@ -766,12 +766,12 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 // has its Cluster deleted. A Deleted item waits until Flux or tofu creates the
 // Cluster again and the bootstrap webhook marks it as this run's recovery,
 // which moves the item to Recovering. A Recovering item succeeds once the
-// Cluster is healthy, and fails if the recovered Cluster is deleted.
+// Cluster is healthy and still carries the run's mark, and fails if the
+// recovered Cluster is deleted or replaced.
 //
-// A Cluster that opts out of the bootstrap webhook, or whose owner declares
-// its own bootstrap method (see leftAlone), moves the item to Skipped, and the
-// run never deletes it. That holds for the old Cluster before the delete
-// reaches it and for a Cluster created again.
+// A Pending item whose Cluster opts out of the bootstrap webhook, or whose
+// owner declares its own bootstrap method (see leftAlone), moves to Skipped,
+// and the run never deletes that Cluster.
 //
 // The item is marked Deleted, and the status written, before the Cluster is
 // deleted. The bootstrap webhook recovers a Cluster only for a run whose item
@@ -779,13 +779,24 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 // Cluster again. The same write records the old Cluster's UID in
 // status.items[].clusterUID.
 //
-// A Deleted item tells the old Cluster from a new one by that UID. The
-// webhook's backup.wlz.li/restore-run annotation stays on a recovered Cluster
-// for good, so a run created again under the same name finds it on the old
-// Cluster too. When the delete failed, or the controller stopped after the
-// mark was written, the Cluster still there carries the recorded UID, and the
-// run deletes it again. Only a Cluster with another UID and the annotation
-// naming this run counts as the recovery.
+// A Deleted item sorts the live Cluster of its name into one of three kinds:
+//
+//   - The old Cluster, whose UID is the recorded one: the delete failed, or
+//     the controller stopped after the mark was written. The run deletes it
+//     again, or Skips the item when the Cluster opted out or declared its own
+//     bootstrap since. The webhook's backup.wlz.li/restore-run annotation
+//     stays on a recovered Cluster for good, so it says nothing on the old
+//     Cluster.
+//   - This run's recovery: another UID and the annotation naming this run.
+//   - Any other Cluster: one created again empty by the owner's choice, with
+//     its own bootstrap, archiving nowhere, recovered for another run, or not
+//     seen by the webhook. The item fails with a message saying so (see
+//     notRecovered), and the run leaves the Cluster alone. It did not create
+//     that Cluster, and deleting it would only loop as Flux creates it again.
+//
+// An item marked Deleted without a UID, as a run started under v0.7.2 or one
+// that found no Cluster to delete leaves it, has no old Cluster, so a live
+// Cluster that is not the run's recovery fails the item.
 func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
@@ -818,22 +829,19 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 			return err
 		case !found || cluster.GetDeletionTimestamp() != nil:
 			return nil
-		case leftAlone(cluster) != "":
-			// Created again by the owner's choice, empty or with its own
-			// bootstrap, or marked that way before the delete reached it.
-			// Deleting it again would only loop.
-			item.Phase, item.Message = backupv1alpha1.ItemSkipped, leftAlone(cluster)
 		case item.ClusterUID != "" && cluster.GetUID() == item.ClusterUID:
 			// The old Cluster, which the earlier delete did not reach. Its
 			// annotations say nothing about this run.
+			if why := leftAlone(cluster); why != "" {
+				// Marked to be left alone before the delete reached it.
+				item.Phase, item.Message = backupv1alpha1.ItemSkipped, why
+				return nil
+			}
 			return r.deleteCluster(ctx, cluster)
 		case cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun] == run.Name:
 			item.Phase = backupv1alpha1.ItemRecovering
 		default:
-			// The webhook writes backup.wlz.li/restore-run on every Cluster it
-			// recovers for a run whose item says Deleted. A live Cluster
-			// without it was not created through this run.
-			return r.deleteCluster(ctx, cluster)
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, notRecovered(item, cluster)
 		}
 
 	case backupv1alpha1.ItemRecovering:
@@ -841,13 +849,81 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		switch {
 		case err != nil:
 			return err
-		case !found:
+		case !found || cluster.GetDeletionTimestamp() != nil:
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, "the recovered Cluster was deleted"
+		case cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun] != run.Name:
+			// The webhook recovers a Cluster only for a run whose item says
+			// Deleted, so one created again now carries no mark of this run.
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, "the recovered Cluster was replaced by one this run did not recover"
 		case clusterPhase(cluster) == healthyPhase:
 			item.Phase = backupv1alpha1.ItemSucceeded
 		}
 	}
 	return nil
+}
+
+// notRecovered explains why a live Cluster that a Deleted item finds is not
+// the run's recovery, for the item's message. The caller has already ruled
+// out the old Cluster (the recorded UID) and the run's own recovery (the
+// backup.wlz.li/restore-run annotation naming the run).
+//
+// Parameters:
+//   - item is the run's Deleted database item. An empty item.ClusterUID
+//     means the run can't tell the old Cluster from a new one.
+//   - cluster is the live Cluster of the item's name.
+//
+// With a recorded UID, a Cluster that opted out of the bootstrap webhook or
+// declares its own bootstrap came back without a recovery, and the message
+// says nothing was restored and how to recover it. Any other Cluster gets
+// "came back without this run's recovery" with the reason: it archives
+// nowhere, another RestoreRun recovered it, or the webhook did not mark it.
+// Without a recorded UID the message gives the same reason and says the run
+// can't tell whether this is the Cluster it meant to delete. Every message
+// says the run leaves the Cluster alone.
+func notRecovered(item *backupv1alpha1.RestoreItem, cluster *unstructured.Unstructured) string {
+	name, uid := cluster.GetName(), cluster.GetUID()
+	optedOut := cluster.GetAnnotations()[bootstrap.OptOutAnnotation] == bootstrap.OptOutValue
+	method := bootstrap.OwnerBootstrap(cluster)
+
+	var why string
+	switch other := cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun]; {
+	case optedOut:
+		why = fmt.Sprintf("it carries %s: %s", bootstrap.OptOutAnnotation, bootstrap.OptOutValue)
+	case method != "":
+		why = fmt.Sprintf("it declares its own spec.bootstrap.%s", method)
+	case !archives(cluster):
+		why = "it archives nowhere"
+	case other != "":
+		why = fmt.Sprintf("RestoreRun %s recovered it", other)
+	default:
+		why = "the bootstrap webhook did not mark it"
+	}
+
+	if item.ClusterUID == "" {
+		return fmt.Sprintf("Cluster %s (UID %s) is not this run's recovery: %s. The item holds no clusterUID "+
+			"(a run started under v0.7.2 records none, and neither does a run that found no Cluster at its start), "+
+			"so it can't tell the old Cluster from a new one, and it leaves this one alone. Create a new RestoreRun to restore it", name, uid, why)
+	}
+	switch {
+	case optedOut:
+		return fmt.Sprintf("Cluster %s came back carrying %s: %s after this run deleted it, so it started empty and nothing was restored. "+
+			"Remove the annotation from its manifest and create a new RestoreRun to recover it. The run leaves the Cluster alone",
+			name, bootstrap.OptOutAnnotation, bootstrap.OptOutValue)
+	case method != "":
+		return fmt.Sprintf("Cluster %s came back declaring spec.bootstrap.%s after this run deleted it, so it started from that bootstrap and nothing was restored. "+
+			"Remove spec.bootstrap.%s from its manifest and create a new RestoreRun to recover it. The run leaves the Cluster alone",
+			name, method, method)
+	}
+	return fmt.Sprintf("Cluster %s (UID %s) came back without this run's recovery: %s. The run does not delete a Cluster it did not recover",
+		name, uid, why)
+}
+
+// archives reports whether a Cluster archives its WAL through the
+// barman-cloud plugin (see bootstrap.Archiver). The webhook admits a Cluster
+// that archives nowhere unchanged, so such a Cluster is never a recovery.
+func archives(cluster *unstructured.Unstructured) bool {
+	_, _, found := bootstrap.Archiver(cluster)
+	return found
 }
 
 // deleteCluster deletes the Cluster the run read. The delete carries the
@@ -1586,7 +1662,11 @@ func failedMover(destination *volsyncv1alpha1.ReplicationDestination) (string, b
 //     so the database would stay down until the timeout and nothing would be
 //     restored.
 //
-// The returned text is the item's message.
+// The run asks this of a Cluster it has not deleted: at its checks, at a
+// Pending item, and of the old Cluster (the recorded UID) that a Deleted item
+// finds still there. A Cluster created again after the delete is never
+// Skipped, since it came back without the restore; restoreDatabase fails
+// that item (see notRecovered). The returned text is the item's message.
 func leftAlone(cluster *unstructured.Unstructured) string {
 	if cluster.GetAnnotations()[bootstrap.OptOutAnnotation] == bootstrap.OptOutValue {
 		return fmt.Sprintf("the Cluster carries %s: %s, which asks for an empty database, so the run leaves it alone",

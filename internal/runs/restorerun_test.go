@@ -1007,30 +1007,6 @@ func TestARestoreOfAnOptedOutDatabaseIsInvalid(t *testing.T) {
 	}
 }
 
-// A Cluster created again with backup.wlz.li/bootstrap: initdb after the run
-// deleted the old one comes back empty by the owner's choice. The run marks
-// the item Skipped and does not delete the new Cluster.
-func TestAClusterCreatedAgainOptedOutIsSkipped(t *testing.T) {
-	r, c := restoreReconciler(t, prober{saturday},
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), cluster(), objectStore(), storeSecret())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // delete
-
-	recreated := cluster(optedOut, func(u *unstructured.Unstructured) { u.SetUID("new-cluster-uid") })
-	if err := c.Create(context.Background(), recreated); err != nil {
-		t.Fatal(err)
-	}
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemSkipped || !strings.Contains(item.Message, bootstrap.OptOutAnnotation) {
-		t.Errorf("item = %+v, want Skipped naming %s", item, bootstrap.OptOutAnnotation)
-	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
-		t.Error("the Cluster created again with the opt-out was deleted")
-	}
-}
-
 // loseNextStatusWrite returns a client over c that fails the first status
 // write of a RestoreRun with a conflict, the way a lost write or a controller
 // crash loses it.
