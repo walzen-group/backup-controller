@@ -48,13 +48,18 @@ func (s stubProber) BaseBackups(context.Context, Location) ([]BaseBackup, error)
 	return nil, s.err
 }
 
-// Contents answers from the has field: a stub store with a completed base
+// Survey answers from the has field: a stub store with a completed base
 // backup holds one base backup directory, and one without is an empty prefix.
-func (s stubProber) Contents(context.Context, Location) (Contents, error) {
-	if s.has {
-		return Contents{Any: true, BaseDirs: 1}, s.err
+// Like BaseBackups, it lists no backup finished by any target.
+func (s stubProber) Survey(_ context.Context, _ Location, target *time.Time) (Archive, error) {
+	if !s.has {
+		return Archive{Empty: true}, s.err
 	}
-	return Contents{}, s.err
+	archive := Archive{Backups: 1, Read: 1}
+	if target == nil {
+		archive.Found = &BaseBackup{ID: "stub"}
+	}
+	return archive, s.err
 }
 
 // scheme registers the core and backup types, plus ObjectStore and Cluster as

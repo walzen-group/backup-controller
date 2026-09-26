@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -92,12 +93,15 @@ type Prober interface {
 // whether a new database may start empty there. S3Prober is the real one.
 type ArchiveProber interface {
 	Prober
-	// Contents reports whether anything exists under the location's
-	// server prefix, and how many directories it holds under base/.
-	Contents(ctx context.Context, at Location) (Contents, error)
+	// Survey reports whether anything exists under the location's server
+	// prefix, how many base backup directories it holds, and a DONE base
+	// backup, one finished at or before target when target is not nil.
+	// When its context ends first, it returns an *OutOfTimeError.
+	Survey(ctx context.Context, at Location, target *time.Time) (Archive, error)
 }
 
-// Contents is what ArchiveProber.Contents found under a database's prefix.
+// Contents is what S3Prober.Contents found under a database's prefix. The
+// webhook builds one from Survey's Archive to word its refusal.
 type Contents struct {
 	// Any is true when at least one object exists under the server prefix.
 	Any bool

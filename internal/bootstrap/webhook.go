@@ -3,11 +3,13 @@ package bootstrap
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"time"
 
+	"github.com/go-logr/logr"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -68,7 +70,15 @@ type Decider struct {
 	// which base backups exist. cmd/backup-controller passes S3Prober, and
 	// the tests pass a stub.
 	Prober ArchiveProber
+	// Budget is how long Handle may spend on one create. Zero means
+	// DefaultBudget. Tests lower it.
+	Budget time.Duration
 }
+
+// DefaultBudget is how long Handle spends on one create before it refuses
+// with what it read so far. deploy/webhook.yaml gives the API server's call
+// 15 s; the other 5 s cover TLS, the API server and the Kubernetes reads.
+const DefaultBudget = 10 * time.Second
 
 // Handle answers one admission request for a Cluster. For a new Cluster whose
 // object store already holds a completed base backup, it rewrites the Cluster
@@ -107,7 +117,10 @@ type Decider struct {
 //
 // Failures to read the store, list Clusters or RestoreRuns, or talk to the
 // object store return an HTTP 500 error response, which the API server treats
-// as a refusal. A body that isn't a valid Cluster returns an HTTP 400.
+// as a refusal. A body that isn't a valid Cluster returns an HTTP 400. A
+// create gets Budget (DefaultBudget when zero) to decide; when the object
+// store survey runs out of it, the create is refused with the counts read so
+// far and how to clear the failed backups (see surveyFailed).
 func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.Response {
 	logger := log.FromContext(ctx).WithValues(
 		"cluster", fmt.Sprintf("%s/%s", req.Namespace, req.Name),
@@ -135,6 +148,15 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	if req.DryRun != nil && *req.DryRun {
 		return admission.Allowed("dry run")
 	}
+
+	// The API server refuses the create after its own timeout with a bare
+	// deadline error. The handler stops first, so its refusal says why.
+	budget := d.Budget
+	if budget == 0 {
+		budget = DefaultBudget
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 
 	cluster := &unstructured.Unstructured{}
 	if err := json.Unmarshal(req.Object.Raw, cluster); err != nil {
@@ -182,12 +204,11 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	// prefix that holds WAL, and the skip annotation would let the new
 	// database overwrite the old one's segments.
 	if cluster.GetAnnotations()[OptOutAnnotation] == OptOutValue && method == "" {
-		contents, err := d.Prober.Contents(ctx, at)
+		archive, err := d.Prober.Survey(ctx, at, nil)
 		if err != nil {
-			logger.Error(err, "cannot list the object store")
-			return admission.Errored(http.StatusInternalServerError, err)
+			return surveyFailed(logger, at, err)
 		}
-		if contents.Any {
+		if !archive.Empty {
 			logger.Info("refusing the Cluster", "reason", "opted out over an old archive", "prefix", at.ServerPrefix())
 			return admission.Denied(fmt.Sprintf(
 				"The Cluster asks for an empty database (%s: %s), and s3://%s/%s still holds the archive of an earlier one. CloudNativePG will not archive a new database into a prefix that holds WAL, so this one would never be backed up. To discard the old archive, delete everything under s3://%s/%s and create the Cluster again. To keep it, give this Cluster a serverName that is not %q.",
@@ -225,12 +246,20 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Denied(err.Error())
 	}
 
-	has, err := d.Prober.HasBaseBackup(ctx, at)
+	archive, err := d.Prober.Survey(ctx, at, target)
 	if err != nil {
-		logger.Error(err, "cannot list the object store")
-		return admission.Errored(http.StatusInternalServerError, err)
+		return surveyFailed(logger, at, err)
 	}
-	if !has {
+	// A target before the oldest base backup's end is one Postgres can never
+	// reach. CloudNativePG would keep the Cluster in recovery reporting that
+	// no backup matched, so the webhook refuses it here with the reason.
+	if archive.Found == nil && archive.Oldest != nil && target != nil {
+		return admission.Denied(fmt.Sprintf(
+			"%s asks for %s, and no base backup in %s/%s finished by then%s.",
+			source, target.Format(time.RFC3339), at.Bucket, at.BasePrefix(), oldest([]BaseBackup{*archive.Oldest}),
+		))
+	}
+	if archive.Found == nil {
 		if run != nil || target != nil {
 			return admission.Denied(fmt.Sprintf(
 				"%s asks for a recovery, and %s/%s holds no completed base backup to recover from.",
@@ -241,34 +270,12 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		// holds WAL, so a database started empty over anything at all could
 		// never be backed up, and a recovery has no base backup to start
 		// from. An empty prefix is the only place initdb is safe.
-		contents, err := d.Prober.Contents(ctx, at)
-		if err != nil {
-			logger.Error(err, "cannot list the object store")
-			return admission.Errored(http.StatusInternalServerError, err)
-		}
-		if contents.Any {
+		if !archive.Empty {
 			logger.Info("refusing the Cluster", "reason", "an archive with no completed base backup", "prefix", at.ServerPrefix())
-			return admission.Denied(noDoneBackup(at, serverName, contents))
+			return admission.Denied(noDoneBackup(at, serverName, Contents{Any: true, BaseDirs: archive.Backups}))
 		}
 		logger.Info("leaving the Cluster to initdb", "reason", "no completed base backup in the store", "prefix", at.BasePrefix())
 		return admission.Allowed("no base backup")
-	}
-
-	// A target before the oldest base backup's end is one Postgres can never
-	// reach. CloudNativePG would keep the Cluster in recovery reporting that
-	// no backup matched, so the webhook refuses it here with the reason.
-	if target != nil {
-		backups, err := d.Prober.BaseBackups(ctx, at)
-		if err != nil {
-			logger.Error(err, "cannot list the base backups")
-			return admission.Errored(http.StatusInternalServerError, err)
-		}
-		if _, ok := AtOrBefore(backups, *target); !ok {
-			return admission.Denied(fmt.Sprintf(
-				"%s asks for %s, and no base backup in %s/%s finished by then%s.",
-				source, target.Format(time.RFC3339), at.Bucket, at.BasePrefix(), oldest(backups),
-			))
-		}
 	}
 
 	if err := setRecovery(cluster, store, serverName, target); err != nil {
@@ -637,6 +644,29 @@ func setRecovery(cluster *unstructured.Unstructured, store, serverName string, t
 	annotations[SkipCheckAnnotation] = "enabled"
 	cluster.SetAnnotations(annotations)
 	return nil
+}
+
+// surveyFailed answers a create whose Survey failed. An *OutOfTimeError is
+// refused with a message a person can act on: the counts read so far, and
+// how to clear the failed backups barman never deletes. Any other error is
+// an HTTP 500, which the API server treats as a refusal.
+func surveyFailed(logger logr.Logger, at Location, err error) admission.Response {
+	var late *OutOfTimeError
+	if !errors.As(err, &late) {
+		logger.Error(err, "cannot read the object store")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	logger.Info("refusing the Cluster", "reason", "the survey ran out of time", "backups", late.Backups, "read", late.Read)
+	base := fmt.Sprintf("s3://%s/%s", at.Bucket, at.BasePrefix())
+	if late.Backups == 0 {
+		return admission.Denied(fmt.Sprintf(
+			"Checking %s ran out of time before the object store listed its base backups. Check that the object store answers, then create the Cluster again.", base,
+		))
+	}
+	return admission.Denied(fmt.Sprintf(
+		"Checking %s ran out of time: %d base backups are there, and the newest %d read were none of them completed. barman never deletes failed or unfinished backups. Delete the base/<id>/ directories whose backup.info does not say status=DONE (barman-cloud-backup-delete --backup-id <id> deletes one), then create the Cluster again.",
+		base, late.Backups, late.Read,
+	))
 }
 
 // noDoneBackup words the refusal of a Cluster whose prefix holds objects but

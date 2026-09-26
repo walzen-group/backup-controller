@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"sort"
 	"strings"
 	"time"
 
@@ -25,47 +24,6 @@ type BaseBackup struct {
 	// consistent state only once the WAL written during the backup is
 	// replayed.
 	End time.Time
-}
-
-// BaseBackups lists the completed base backups of one database, oldest first.
-// The webhook uses it to check that a recovery target can be reached, and the
-// RestoreRun controller uses it to pick the backup a restore starts from.
-//
-// The at argument is the database's Location, as ResolveLocation returns it.
-//
-// barman keeps one directory per backup, and each holds a backup.info file of
-// key=value lines. The method lists every object under the location's base
-// prefix, downloads each backup.info and parses it with ParseBackupInfo. It
-// skips a backup whose status isn't DONE, because a recovery can't start from
-// a failed or running backup. It returns an error when the listing fails, when
-// a backup.info can't be downloaded or read, or when a DONE backup's end_time
-// doesn't parse. A location with no completed backup gives an empty list
-// and no error.
-func (p S3Prober) BaseBackups(ctx context.Context, at Location) ([]BaseBackup, error) {
-	client, err := p.client(at)
-	if err != nil {
-		return nil, err
-	}
-
-	var backups []BaseBackup
-	listing := client.ListObjects(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.BasePrefix(), Recursive: true})
-	for object := range listing {
-		if object.Err != nil {
-			return nil, fmt.Errorf("list %s/%s: %w", at.Bucket, at.BasePrefix(), object.Err)
-		}
-		if !strings.HasSuffix(object.Key, "/backup.info") {
-			continue
-		}
-		backup, done, err := readBaseBackup(ctx, client, at.Bucket, object.Key)
-		if err != nil {
-			return nil, err
-		}
-		if done {
-			backups = append(backups, backup)
-		}
-	}
-	sort.Slice(backups, func(i, j int) bool { return backups[i].End.Before(backups[j].End) })
-	return backups, nil
 }
 
 // readBaseBackup downloads one backup.info from the bucket and parses it with
