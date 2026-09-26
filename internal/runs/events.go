@@ -40,8 +40,9 @@ func readyReason(conditions []metav1.Condition) string {
 //
 // The event is a Warning when the Ready condition is True with a reason other
 // than Succeeded, which is how a run that finished any other way reports, and
-// when its reason is RestartFailed, which a run reports while it cannot give
-// back what it stopped. In every other case it is Normal.
+// when its reason is RestartFailed or ReleaseFailed, which a run reports while
+// it cannot give back what it stopped or release what it holds. In every
+// other case it is Normal.
 func announce(recorder events.EventRecorder, run client.Object, conditions []metav1.Condition, before, action string) {
 	if recorder == nil {
 		return
@@ -51,7 +52,8 @@ func announce(recorder events.EventRecorder, run client.Object, conditions []met
 			continue
 		}
 		eventtype := corev1.EventTypeNormal
-		if (ready.Status == metav1.ConditionTrue && ready.Reason != backupv1alpha1.ReasonSucceeded) || ready.Reason == backupv1alpha1.ReasonRestartFailed {
+		if (ready.Status == metav1.ConditionTrue && ready.Reason != backupv1alpha1.ReasonSucceeded) ||
+			ready.Reason == backupv1alpha1.ReasonRestartFailed || ready.Reason == backupv1alpha1.ReasonReleaseFailed {
 			eventtype = corev1.EventTypeWarning
 		}
 		recorder.Eventf(run, nil, eventtype, ready.Reason, action, "%s", fitNote(ready.Message))

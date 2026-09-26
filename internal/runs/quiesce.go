@@ -534,12 +534,24 @@ func podsGone(ctx context.Context, c client.Reader, namespace string, targets []
 // A workload or Kustomization that has been deleted since is skipped, so a
 // second call after a partial failure is safe. So is every Kustomization
 // when the API server serves no version of the kind, because Flux's CRDs
-// have been removed (see servedKind). It returns the first other error it
-// meets as a *restartError, which names the object it could not put back.
+// have been removed (see servedKind). A workload that already stands at its
+// recorded count, and a Kustomization that is no longer suspended, are
+// skipped as well, so a person who puts the app back by hand while the API
+// server refuses the run's own patches lets the run go on. A read that fails
+// leaves the patch to decide. It returns the first other error it meets as
+// a *restartError, which names the object it could not put back.
+//
+// The reads are of unstructured objects, which the manager's client sends
+// to the API server rather than to its cache (controller-runtime's
+// client.CacheOptions.Unstructured is false by default), so they need only
+// the get verb and start no informer.
 func restartWorkloads(ctx context.Context, c client.Client, namespace string, stopped []backupv1alpha1.QuiescedWorkload, suspended []string) error {
 	for _, w := range stopped {
 		object := workloadObject(namespace, w)
 		if object == nil {
+			continue
+		}
+		if atCount(ctx, c, namespace, w) {
 			continue
 		}
 		if err := scale(ctx, c, object, w.Replicas); err != nil && !apierrors.IsNotFound(err) {
@@ -548,11 +560,30 @@ func restartWorkloads(ctx context.Context, c client.Client, namespace string, st
 	}
 	for _, key := range suspended {
 		ns, name, _ := strings.Cut(key, "/")
+		if kustomization, err := getKustomization(ctx, c, c.RESTMapper(), ns, name); err == nil {
+			if on, _, _ := unstructured.NestedBool(kustomization.Object, "spec", "suspend"); !on {
+				continue
+			}
+		}
 		if err := setSuspend(ctx, c, ns, name, false); err != nil && !apierrors.IsNotFound(err) {
 			return &restartError{action: "resume Kustomization " + key, err: err}
 		}
 	}
 	return nil
+}
+
+// atCount reports whether the recorded workload w already stands at the
+// replica count the run recorded for it. It reads the workload as an
+// unstructured object (see restartWorkloads for why) and returns false when
+// the read fails or the workload has no spec.replicas.
+func atCount(ctx context.Context, c client.Reader, namespace string, w backupv1alpha1.QuiescedWorkload) bool {
+	object := &unstructured.Unstructured{}
+	object.SetGroupVersionKind(appsv1.SchemeGroupVersion.WithKind(w.Kind))
+	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: w.Name}, object); err != nil {
+		return false
+	}
+	replicas, found, err := unstructured.NestedInt64(object.Object, "spec", "replicas")
+	return err == nil && found && replicas == int64(w.Replicas)
 }
 
 // restartError is a failure of restartWorkloads. It says which workload or

@@ -198,10 +198,14 @@ func TestARestartThatKeepsFailingIsReportedAndRetried(t *testing.T) {
 			t.Fatalf("pass %d: reason = %q, want %s", pass, reason, backupv1alpha1.ReasonRestartFailed)
 		}
 		message := readyMessage(run.Status.Conditions)
-		for _, want := range []string{"Deployment " + appN, "2 replicas", "a policy refuses the change", Finalizer} {
+		for _, want := range []string{"Deployment " + appN, "2 replicas", "a policy refuses the change",
+			"scale Deployment " + appN + " to 2", "resume Kustomization flux-system/" + appN, Finalizer} {
 			if !strings.Contains(message, want) {
 				t.Errorf("pass %d: message %q does not name %q", pass, message, want)
 			}
+		}
+		if strings.Index(message, Finalizer) < strings.Index(message, "scale Deployment "+appN+" to 2") {
+			t.Errorf("pass %d: message %q gives the finalizer before the scaling step", pass, message)
 		}
 	}
 	got := recorded(recorder)
@@ -304,8 +308,10 @@ func TestOnlyAKindNoVersionOfWhichIsServedIsGone(t *testing.T) {
 
 // A run that has given back everything it stopped, and then cannot release
 // its Leases or delete its Kueue Workload, says which of the two failed and
-// gives advice for that. It never tells a person to scale workloads or
-// resume Kustomizations, which the run has already done.
+// gives advice for that. It reports this with reason ReleaseFailed and a
+// Warning event, since the app is back and RestartFailed would say it is
+// down. It never tells a person to scale workloads or resume Kustomizations,
+// which the run has already done.
 func TestAReleaseFailureNamesWhatFailed(t *testing.T) {
 	refused := errors.New("a policy refuses the delete")
 	for name, tc := range map[string]struct {
@@ -339,13 +345,18 @@ func TestAReleaseFailureNamesWhatFailed(t *testing.T) {
 			step(t, r) // admit, no queue
 			step(t, r) // start: the run takes the Leases
 			complete(t, c, "snapshot 6e473100 saved")
+			recorder := events.NewFakeRecorder(10)
+			r.Recorder = recorder
 			if err := tryStep(r); err == nil {
 				t.Fatal("the collect pass returned no error, want the refused delete retried")
 			}
 
 			run := readBackupRun(t, c)
-			if run.Status.Phase.Finished() || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonRestartFailed {
-				t.Fatalf("phase = %q, reason = %q, want the run unfinished with %s", run.Status.Phase, readyReason(run.Status.Conditions), backupv1alpha1.ReasonRestartFailed)
+			if run.Status.Phase.Finished() || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonReleaseFailed {
+				t.Fatalf("phase = %q, reason = %q, want the run unfinished with %s", run.Status.Phase, readyReason(run.Status.Conditions), backupv1alpha1.ReasonReleaseFailed)
+			}
+			if got := recorded(recorder); len(got) != 1 || !strings.HasPrefix(got[0], "Warning "+backupv1alpha1.ReasonReleaseFailed+" ") {
+				t.Errorf("events = %q, want one Warning %s", got, backupv1alpha1.ReasonReleaseFailed)
 			}
 			message := readyMessage(run.Status.Conditions)
 			for _, want := range append(tc.names, refused.Error()) {
@@ -364,8 +375,9 @@ func TestAReleaseFailureNamesWhatFailed(t *testing.T) {
 
 // A restart that fails in the pass that gives the app back after the clones
 // are cut, long before the run's timeout, is reported at once: Ready turns
-// False with reason RestartFailed and the message finish writes, with one
-// Warning event. Each later pass tries again, and the first one the API
+// False with reason RestartFailed and a message that says the run is still
+// backing up, must not be deleted, and how to give the app back by hand,
+// with one Warning event. Each later pass tries again, and the first one the API
 // server accepts gives the app back and goes on backing up.
 func TestARestartThatFailsBeforeTheTimeoutIsReported(t *testing.T) {
 	r, c, _ := servedBackupReconciler(t, nil, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -402,10 +414,14 @@ func TestARestartThatFailsBeforeTheTimeoutIsReported(t *testing.T) {
 			t.Fatalf("pass %d: reason = %q, want %s", pass, reason, backupv1alpha1.ReasonRestartFailed)
 		}
 		message := readyMessage(run.Status.Conditions)
-		for _, want := range []string{"Deployment " + appN, "2 replicas", "a policy refuses the change", Finalizer} {
+		for _, want := range []string{"Deployment " + appN, "2 replicas", "a policy refuses the change", "still backing up",
+			"do not delete it", "scale Deployment " + appN + " to 2", "resume Kustomization flux-system/" + appN} {
 			if !strings.Contains(message, want) {
 				t.Errorf("pass %d: message %q does not name %q", pass, message, want)
 			}
+		}
+		if strings.Contains(message, Finalizer) || strings.Contains(message, "delete this BackupRun") {
+			t.Errorf("pass %d: message %q tells a person to delete a run that is still backing up", pass, message)
 		}
 	}
 	got := recorded(recorder)
@@ -444,9 +460,9 @@ func staleFluxReconciler(t *testing.T, aggregated bool, objects ...client.Object
 // looked up and cached, while a run holds the app down, never leaves the
 // Kustomization suspended. The API server answers the resume at the cached
 // version with a 404 for the resource, which is not a deleted
-// Kustomization: the pass reports RestartFailed and the mapper looks the
-// version up again, and the next pass resumes the Kustomization at the new
-// version.
+// Kustomization. The restart reads the Kustomization before it resumes it;
+// that read at the cached version makes the mapper look the version up
+// again, and the same pass resumes the Kustomization at the new version.
 func TestAKustomizationVersionFluxStopsServingIsNotTakenForGone(t *testing.T) {
 	for name, aggregated := range map[string]bool{"aggregated discovery": true, "legacy discovery": false} {
 		t.Run(name, func(t *testing.T) {
@@ -462,20 +478,8 @@ func TestAKustomizationVersionFluxStopsServingIsNotTakenForGone(t *testing.T) {
 
 			d.serve("v2")
 			cutClone(t, c)
-			if err := tryStep(r); err == nil {
-				t.Fatal("the restart pass returned no error, want the resume at the unserved version retried")
-			}
-			run := readBackupRun(t, c)
-			if reason := readyReason(run.Status.Conditions); reason != backupv1alpha1.ReasonRestartFailed || !run.Status.RestartPending {
-				t.Fatalf("reason = %q, restartPending = %t after the failed resume, want %s and the restart still owed",
-					reason, run.Status.RestartPending, backupv1alpha1.ReasonRestartFailed)
-			}
-			if message := readyMessage(run.Status.Conditions); !strings.Contains(message, "Kustomization flux-system/"+appN) {
-				t.Errorf("message %q does not name the Kustomization", message)
-			}
-
 			if err := tryStep(r); err != nil {
-				t.Fatalf("pass after the mapper looked v2 up: %v", err)
+				t.Fatalf("the restart pass after Flux moved to v2: %v", err)
 			}
 			if suspended(t, c) {
 				t.Fatal("the Kustomization stayed suspended after Flux moved to v2")
@@ -573,6 +577,71 @@ func TestARefusedRestartStillReleasesTheLeases(t *testing.T) {
 			}
 			if holder := leaseHolderOf(t, c, claimLease) + leaseHolderOf(t, c, repoLease); holder != "" {
 				t.Errorf("a Lease is still held by %q after the refused restart, want both released", holder)
+			}
+		})
+	}
+}
+
+// A person who gives the app back by hand, as the RestartFailed message
+// says, lets the run go on while the API server still refuses the run's own
+// scale-up: the run skips a workload already at the count it recorded and a
+// Kustomization already resumed. That holds for the restart after the clones
+// are cut, and for the restart when the run ends at its timeout.
+func TestAnAppGivenBackByHandLetsTheRunGoOn(t *testing.T) {
+	for name, fail := range map[string]func(t *testing.T, r *BackupRunReconciler, c client.Client){
+		"after the clones are cut": func(t *testing.T, r *BackupRunReconciler, c client.Client) { cutClone(t, c) },
+		"at the timeout": func(t *testing.T, r *BackupRunReconciler, c client.Client) {
+			r.Now = func() time.Time { return frozen.Add(2 * time.Hour) }
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, c, _ := servedBackupReconciler(t, nil, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+				claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+			refuse := false
+			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+				Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if _, ok := obj.(*appsv1.Deployment); ok && refuse {
+						if data, _ := patch.Data(obj); !strings.Contains(string(data), `"replicas":0`) {
+							return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, obj.GetName(), errors.New("a policy refuses the change"))
+						}
+					}
+					return cl.Patch(ctx, obj, patch, opts...)
+				},
+			})
+			step(t, r) // plan
+			step(t, r) // admit, no queue
+			step(t, r) // quiesce
+			step(t, r) // start
+			refuse = true
+			fail(t, r, c)
+			if err := tryStep(r); err == nil {
+				t.Fatal("the reconcile returned no error, want the refused restart retried")
+			}
+			if reason := readyReason(readBackupRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonRestartFailed {
+				t.Fatalf("reason = %q after the refused restart, want %s", reason, backupv1alpha1.ReasonRestartFailed)
+			}
+
+			// A person scales the Deployment and resumes the Kustomization.
+			d := &appsv1.Deployment{}
+			get(t, c, ns, appN, d)
+			if err := c.Patch(context.Background(), d, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"replicas":2}}`))); err != nil {
+				t.Fatal(err)
+			}
+			k, _ := getUnstructured(t, c, KustomizationGVK, "flux-system", appN)
+			if err := c.Patch(context.Background(), k, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"suspend":false}}`))); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := tryStep(r); err != nil {
+				t.Fatalf("pass after the app was given back by hand: %v", err)
+			}
+			run := readBackupRun(t, c)
+			if run.Status.RestartPending || run.Status.RestartedAt == nil || readyReason(run.Status.Conditions) == backupv1alpha1.ReasonRestartFailed {
+				t.Errorf("restartPending = %t, restartedAt = %v, reason = %q; want the restart done and the run going on",
+					run.Status.RestartPending, run.Status.RestartedAt, readyReason(run.Status.Conditions))
+			}
+			if replicasOf(t, c) != 2 || suspended(t, c) {
+				t.Errorf("replicas = %d, suspended = %t; want the app as the person left it", replicasOf(t, c), suspended(t, c))
 			}
 		})
 	}

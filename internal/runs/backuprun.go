@@ -314,8 +314,10 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // status.restartedAt with status.restartPending set, and
 // writes the status. It then scales the workloads back up, resumes the
 // Kustomizations it suspended, and clears status.restartPending. When that
-// restart fails, the pass reports it at once with reason RestartFailed (see
-// releaseFailed) and returns the error, so the restart is retried. A pass that
+// restart fails, the pass reports it at once with reason RestartFailed and a
+// message that says the run is still backing up and must not be deleted, and
+// how to give the app back by hand (see releaseFailed). It returns the error,
+// so the restart is retried. A pass that
 // finds status.restartPending set repeats the restart and keeps the recorded
 // moment. The pass that records the moment restarts even when the installed
 // CRD dropped status.restartPending from its write, as the v0.7.2 CRD does.
@@ -437,7 +439,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 			// The run says why the app is still down at once, rather than
 			// only at its timeout, and the error makes the pass run again.
-			return ctrl.Result{}, r.releaseFailed(ctx, run, err)
+			return ctrl.Result{}, r.releaseFailed(ctx, run, err, true)
 		}
 		run.Status.RestartPending = false
 	}
@@ -1012,12 +1014,12 @@ func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Bac
 // removes the finalizer.
 //
 // When release fails, finish records nothing of the ending: releaseFailed
-// reports the failure on the run with reason RestartFailed, and the error it
-// returns makes the reconcile run again. The run stays unfinished until
-// release succeeds.
+// reports the failure on the run with reason RestartFailed or ReleaseFailed,
+// and the error it returns makes the reconcile run again. The run stays
+// unfinished until release succeeds.
 func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
 	if err := r.release(ctx, run); err != nil {
-		return r.releaseFailed(ctx, run, err)
+		return r.releaseFailed(ctx, run, err, false)
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
@@ -1134,41 +1136,67 @@ func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.
 		return nil
 	}
 	if err := r.release(ctx, run); err != nil {
-		return r.releaseFailed(ctx, run, err)
+		return r.releaseFailed(ctx, run, err, false)
 	}
 	return dropFinalizer(ctx, r.Client, run)
 }
 
 // releaseFailed reports on the run that it could not put back what it
 // changed, and returns err so the reconcile runs again with
-// controller-runtime's backoff. finish and finalize call it when release
-// fails, and work calls it when the restart after the clones are cut fails.
+// controller-runtime's backoff.
 //
-// It sets the Ready condition to False with reason RestartFailed and writes
-// the status. The message names what the run could not do and the error,
-// says that the run keeps trying, and gives advice that fits what failed:
-// for a workload or Kustomization it could not put back (a *restartError),
-// how to put it back by hand and let the run go; for a Lease or the Kueue
-// Workload it could not delete (a *releaseError), how to delete it by hand.
-// When err holds both, as release returns them, the message names both
-// failures and gives both pieces of advice. Announce turns the new reason into a Warning event. The status write is
-// best effort: a write that fails is made again by the next pass that fails.
+// Parameters:
+//   - err is the error from release, or the *restartError of the restart
+//     after the clones are cut.
+//   - working is true when work calls it for that restart, while the run is
+//     still backing up, and false when finish or finalize call it because
+//     release failed.
+//
+// It sets the Ready condition to False and writes the status. The reason is
+// RestartFailed when the run could not give a workload back or resume a
+// Kustomization (a *restartError), since the app is still down, and
+// ReleaseFailed when it could only not release its Leases or delete its Kueue
+// Workload (a *releaseError). The message names what the run could not do
+// and the error, says that the run keeps trying, and gives advice that fits
+// what failed. For a failed restart it lists each workload with its recorded
+// count and each Kustomization to resume (see byHand), which a person can
+// do while the run keeps trying: restartWorkloads skips what is already
+// back. A run that is still working says it must not be deleted. Only a run
+// that is ending or being deleted adds, after that step, that a person can
+// delete it and remove its finalizer. For a Lease or the Workload, the
+// advice says how to delete it by hand. When err holds both, as release
+// returns them, the message names both failures and gives both pieces of
+// advice. Announce turns either reason into a Warning event. The status
+// write is best effort: a write that fails is made again by the next pass
+// that fails.
 //
 // The run never gives up. A run that finished while it still owed a restart
 // would lose the only record of the replicas the app had, and the next
 // namespace run would record the stopped workload's 0 as the count to give
 // back.
-func (r *BackupRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.BackupRun, err error) error {
+func (r *BackupRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.BackupRun, err error, working bool) error {
+	reason := backupv1alpha1.ReasonRestartFailed
 	var failed, advice []string
 	var restart *restartError
 	var step *releaseError
 	if errors.As(err, &restart) {
 		failed = append(failed, restart.Error())
-		advice = append(advice, "Fix the cause, or scale the workloads in status.quiesced to their replicas and resume the"+
-			" Kustomizations in status.suspendedKustomizations yourself, then delete this BackupRun and remove its finalizer "+
-			Finalizer+".")
+		switch {
+		case working:
+			advice = append(advice, "The run is still backing up; do not delete it. To give the app back now, "+
+				byHand(run)+" yourself; the run then goes on by itself.")
+		case !run.DeletionTimestamp.IsZero():
+			advice = append(advice, "Fix the cause, or "+byHand(run)+" yourself; the deletion then completes by itself. "+
+				"If it still does not once the app runs again, remove the finalizer "+Finalizer+" from this BackupRun.")
+		default:
+			advice = append(advice, "Fix the cause, or "+byHand(run)+" yourself; the run then finishes by itself. "+
+				"If it still does not once the app runs again, delete this BackupRun and remove its finalizer "+Finalizer+".")
+		}
 	}
 	if errors.As(err, &step) {
+		if restart == nil {
+			reason = backupv1alpha1.ReasonReleaseFailed
+		}
 		failed = append(failed, step.Error())
 		advice = append(advice, step.advice)
 	}
@@ -1181,9 +1209,36 @@ func (r *BackupRunReconciler) releaseFailed(ctx context.Context, run *backupv1al
 		message += ", and this namespace's schedule waits for it"
 	}
 	message += ". " + strings.Join(advice, " ")
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestartFailed, message)
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
 	_ = r.writeStatus(ctx, run)
 	return err
+}
+
+// byHand returns what a person does to give the run's app back by hand, as
+// a phrase that starts with a verb: "scale Deployment notes to 2 and resume
+// Kustomization flux-system/notes". It names each workload in
+// status.quiesced with the replica count the run recorded for it, and each
+// Kustomization in status.suspendedKustomizations.
+func byHand(run *backupv1alpha1.BackupRun) string {
+	var steps []string
+	var counts []string
+	for _, w := range run.Status.Quiesced {
+		counts = append(counts, fmt.Sprintf("%s %s to %d", w.Kind, w.Name, w.Replicas))
+	}
+	if len(counts) > 0 {
+		steps = append(steps, "scale "+strings.Join(counts, ", "))
+	}
+	switch len(run.Status.SuspendedKustomizations) {
+	case 0:
+	case 1:
+		steps = append(steps, "resume Kustomization "+run.Status.SuspendedKustomizations[0])
+	default:
+		steps = append(steps, "resume the Kustomizations "+strings.Join(run.Status.SuspendedKustomizations, ", "))
+	}
+	if len(steps) == 0 {
+		return "put the workloads back"
+	}
+	return strings.Join(steps, " and ")
 }
 
 // overdue returns the run's deadline and reports whether the run has worked
