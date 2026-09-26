@@ -116,36 +116,43 @@ const (
 	ReasonUpgraded = "Upgraded"
 
 	// ReasonRestartFailed reports a BackupRun or RestoreRun whose app is
-	// still down, or whose state the run could not read, because the run
-	// could not give a stopped workload its replicas back, resume a
-	// Kustomization it suspended, delete its ReplicationDestinations or
-	// release its Leases. A BackupRun reports it while it is still backing
-	// up, as soon as the restart after the clones are cut fails, and a run
-	// reports it when it is ending or being deleted. The run stays unfinished
-	// and tries again on every reconcile until it can, because finishing
-	// would leave the app down with no record of the replicas it is owed.
-	// While a namespace run is unfinished, the namespace's schedule starts no
-	// new one. The message names what the run could not do and the error, and
-	// lists each workload with the replica count it is owed and each
-	// Kustomization to resume. Fixing the cause lets the run go on by
-	// itself, and so does scaling those workloads and resuming those
-	// Kustomizations by hand: the run skips what is already back. A run that
-	// is still working must not be deleted. Only for a run that is ending
-	// or being deleted does the message also say, after the scaling step,
+	// still down because a step the run takes before it gives the app back
+	// failed, or whose state the run could not read. That step is giving a
+	// stopped workload its replicas back or resuming a Kustomization the run
+	// suspended. For a RestoreRun it can also be the step that comes first,
+	// stopping its movers: deleting each ReplicationDestination and waiting
+	// until the mover's Job and pods are gone. A BackupRun reports it while it
+	// is still backing up, as soon as the restart after the clones are cut
+	// fails, and a run reports it when it is ending or being deleted. The run
+	// stays unfinished and tries again on every reconcile until it can,
+	// because finishing would leave the app down with no record of the
+	// replicas it is owed. While a namespace run is unfinished, the
+	// namespace's schedule starts no new one. The message names what the run
+	// could not do and the error, and lists each workload with the replica
+	// count it is owed and each Kustomization to resume. Fixing the cause
+	// lets the run go on by itself. After a failed restart step, so does
+	// scaling those workloads and resuming those Kustomizations by hand: the
+	// run skips what is already back. After a mover the run could not stop,
+	// the message also names the ReplicationDestination and the mover's Job,
+	// which a person can delete by hand. A run that is still working must not
+	// be deleted. Only for a run that is ending or being deleted after a
+	// failed restart step does the message also say, after the scaling step,
 	// that a person can delete the run and remove its
 	// backup.wlz.li/run-cleanup finalizer. The run records a Warning event
 	// when it first reports this.
 	ReasonRestartFailed = "RestartFailed"
 
-	// ReasonReleaseFailed reports a BackupRun or RestoreRun that has given
-	// the app back and is ending, or being deleted, but could not release
-	// its Leases on its claims and repositories, delete its Kueue Workload or
-	// ReplicationDestinations, or release the VolumeRestore of an into
-	// restore. The run stays unfinished and tries again on every reconcile
-	// until it can. The message names what the run could not release and the
-	// error, and says that a person can delete it by hand, after which the
-	// run finishes by itself. The run records a Warning event when it first
-	// reports this.
+	// ReasonReleaseFailed reports a BackupRun or RestoreRun that is ending,
+	// or being deleted, and holds no workload stopped, because it gave the
+	// app back or stopped none, but could not release what it still holds:
+	// its Leases on its claims and repositories, its Kueue Workload, a
+	// restore mover it has to stop (its ReplicationDestination, and the
+	// mover's Job and pods), or the VolumeRestore an older release created
+	// for an into restore, which the run reads and releases. The run stays
+	// unfinished and tries again on every reconcile until it can. The message
+	// names what the run could not do and the error, and says what a person
+	// can fix or delete by hand, after which the run finishes by itself. The
+	// run records a Warning event when it first reports this.
 	ReasonReleaseFailed = "ReleaseFailed"
 )
 

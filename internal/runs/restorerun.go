@@ -2352,7 +2352,14 @@ func (r *RestoreRunReconciler) releaseVolumeRestore(ctx context.Context, run *ba
 	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
 	vr := &backupv1alpha1.VolumeRestore{}
 	if err := r.Reader.Get(ctx, key, vr); err != nil {
-		return "", client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", &releaseError{
+			action: "read its VolumeRestore " + key.Name + ", which it must check before it finishes",
+			advice: "Fixing the cause lets the run finish by itself.",
+			err:    err,
+		}
 	}
 	if !metav1.IsControlledBy(vr, run) || !controllerutil.ContainsFinalizer(vr, populator.Finalizer) || len(vr.Status.Claims) > 0 {
 		return "", nil
@@ -2363,7 +2370,11 @@ func (r *RestoreRunReconciler) releaseVolumeRestore(ctx context.Context, run *ba
 	switch {
 	case apierrors.IsNotFound(err):
 	case err != nil:
-		return "", fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
+		return "", &releaseError{
+			action: fmt.Sprintf("read claim %s, which it must check before it releases VolumeRestore %s", key.Name, key.Name),
+			advice: "Fixing the cause lets the run finish by itself.",
+			err:    err,
+		}
 	case claim.DeletionTimestamp == nil && metav1.IsControlledBy(claim, run):
 		uid := claim.UID
 		if err := r.Delete(ctx, claim, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
@@ -2410,31 +2421,32 @@ func destinationReleaseError(name string, err error) error {
 }
 
 // releaseFailed reports on the run that it could not stop one of its movers,
-// release what it holds or give the app back, and returns err so the
-// reconcile runs again with controller-runtime's backoff.
+// give the app back or release what it holds, and hands the error back.
 //
 // Parameters:
-//   - err is the error from finish or finalize: the *releaseError of a
-//     ReplicationDestination the run could not delete or a Lease or
-//     VolumeRestore it could not release, the *restartError of a restart that
-//     failed, or another error, such as a failed read.
+//   - run is the RestoreRun that failed. Its Ready condition is set and its
+//     status written.
+//   - err is the error from finish or finalize: the *releaseError of a mover
+//     the run could not stop or of a Lease or VolumeRestore it could not
+//     read or release, or the *restartError of a restart that failed.
 //   - working is true while the run is still restoring. finish and finalize
-//     pass false.
+//     pass false, which lets the advice say the run can be deleted.
 //
-// It sets the Ready condition to the reason and message from releaseFailure,
-// and writes the status. The reason is RestartFailed while the app is still
-// down or the run could not tell whether it is, and ReleaseFailed when only a
-// release step failed. Announce turns either reason into a Warning event. The
-// status write is best effort: a write that fails is made again by the next
-// pass that fails.
+// It returns err, so the reconcile runs again with controller-runtime's
+// backoff.
 //
-// The run never gives up. A run that finished while it still held a claim, a
-// repository or the app would lose the only record of what it has to put
-// back.
+// The Ready condition takes the reason and message from releaseFailure. The
+// reason is RestartFailed while the run still holds workloads stopped (see
+// stopped), whatever step failed, and ReleaseFailed when a release step
+// failed once the app is back. Announce turns either reason into a Warning
+// event. The status write is best effort: a write that fails is made again
+// by the next pass that fails. The run never gives up. A run that finished
+// while it still held a claim, a repository or the app would lose the only
+// record of what it has to put back.
 func (r *RestoreRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.RestoreRun, err error, working bool) error {
 	reason, message := releaseFailure(err, releasePlan{
 		stopped: run.Status.Quiesced, suspended: run.Status.SuspendedKustomizations,
-		kind: "RestoreRun", working: working, deleting: !run.DeletionTimestamp.IsZero(),
+		kind: "RestoreRun", working: working, deleting: !run.DeletionTimestamp.IsZero(), appDown: stopped(run),
 	})
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
 	_ = r.writeStatus(ctx, run)
@@ -2457,7 +2469,11 @@ func (r *RestoreRunReconciler) holdsVolumeRestore(ctx context.Context, run *back
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
-		return false, fmt.Errorf("get VolumeRestore %s: %w", key, err)
+		return false, &releaseError{
+			action: "read its VolumeRestore " + key.Name + ", which it must check before it finishes",
+			advice: "Fixing the cause lets the run finish by itself.",
+			err:    err,
+		}
 	}
 	return metav1.IsControlledBy(vr, run) && controllerutil.ContainsFinalizer(vr, populator.Finalizer), nil
 }

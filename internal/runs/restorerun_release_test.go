@@ -8,6 +8,7 @@ import (
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/populator"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -128,8 +129,10 @@ func TestARestoreThatCannotGiveTheAppBackSaysWhatFailed(t *testing.T) {
 }
 
 // A run that cannot delete its ReplicationDestination says which object it
-// could not release and what a person can delete by hand, with reason
-// ReleaseFailed.
+// could not delete and what a person can delete by hand. The app is still
+// down at that point, since the mover must be gone before the app comes
+// back, so the reason is RestartFailed and the message names the workload
+// with the replicas a person can set and the Kustomization to resume.
 func TestARestoreThatCannotDeleteItsDestinationSaysWhatFailed(t *testing.T) {
 	run, destination := quiescedMidRestore()
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
@@ -152,18 +155,57 @@ func TestARestoreThatCannotDeleteItsDestinationSaysWhatFailed(t *testing.T) {
 	}
 
 	after := readRestoreRun(t, c)
-	if after.Status.Phase.Finished() || readyReason(after.Status.Conditions) != backupv1alpha1.ReasonReleaseFailed {
+	if after.Status.Phase.Finished() || readyReason(after.Status.Conditions) != backupv1alpha1.ReasonRestartFailed {
 		t.Fatalf("phase = %q, reason = %q; want the run unfinished with %s",
-			after.Status.Phase, readyReason(after.Status.Conditions), backupv1alpha1.ReasonReleaseFailed)
+			after.Status.Phase, readyReason(after.Status.Conditions), backupv1alpha1.ReasonRestartFailed)
 	}
-	if got := recorded(recorder); len(got) != 1 || !strings.HasPrefix(got[0], "Warning "+backupv1alpha1.ReasonReleaseFailed+" ") {
-		t.Errorf("events = %q, want one Warning %s", got, backupv1alpha1.ReasonReleaseFailed)
+	if got := recorded(recorder); len(got) != 1 || !strings.HasPrefix(got[0], "Warning "+backupv1alpha1.ReasonRestartFailed+" ") {
+		t.Errorf("events = %q, want one Warning %s", got, backupv1alpha1.ReasonRestartFailed)
 	}
 	if got := replicasOf(t, c); got != 0 {
 		t.Errorf("replicas = %d, want the app still down while the mover's destination is there", got)
 	}
 	message := readyMessage(after.Status.Conditions)
-	for _, want := range []string{"ReplicationDestination " + destination.Name, refused.Error()} {
+	for _, want := range []string{"ReplicationDestination " + destination.Name, refused.Error(), "scale Deployment " + appN + " to 2", "resume Kustomization flux-system/" + appN} {
+		if !strings.Contains(message, want) {
+			t.Errorf("message %q does not name %q", message, want)
+		}
+	}
+}
+
+// An upgraded run that stopped the app, and whose read of its VolumeRestore
+// fails once the app is back, reports ReleaseFailed. The app runs again by
+// then, so RestartFailed would say it is down.
+func TestARestoreThatCannotReadItsVolumeRestoreAfterTheRestartSaysReleaseFailed(t *testing.T) {
+	run := populatorRun()
+	run.Status.QuiescedAt = run.Status.StartedAt
+	run.Status.Quiesced = []backupv1alpha1.QuiescedWorkload{{Kind: "Deployment", Name: appN, Replicas: 2}}
+	r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(), stoppedDeployment(),
+		populatorRestore(run, populator.Finalizer))
+	refused := errors.New("the API server is overloaded")
+	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*backupv1alpha1.VolumeRestore); ok && key.Name == run.Spec.Into {
+				return apierrors.NewServiceUnavailable(refused.Error())
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+		t.Fatal("the pass succeeded, want the failed read returned")
+	}
+
+	if got := replicasOf(t, c); got != 2 {
+		t.Fatalf("replicas = %d, want the app back before the VolumeRestore is read", got)
+	}
+	after := readRestoreRun(t, c)
+	if after.Status.Phase.Finished() || readyReason(after.Status.Conditions) != backupv1alpha1.ReasonReleaseFailed {
+		t.Fatalf("phase = %q, reason = %q, message = %q; want the run unfinished with %s", after.Status.Phase,
+			readyReason(after.Status.Conditions), readyMessage(after.Status.Conditions), backupv1alpha1.ReasonReleaseFailed)
+	}
+	message := readyMessage(after.Status.Conditions)
+	for _, want := range []string{"VolumeRestore " + run.Spec.Into, refused.Error()} {
 		if !strings.Contains(message, want) {
 			t.Errorf("message %q does not name %q", message, want)
 		}

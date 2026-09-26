@@ -779,11 +779,14 @@ func (e *restartError) Error() string { return "could not " + e.action + ": " + 
 // Unwrap returns the error from the API server or the RESTMapper.
 func (e *restartError) Unwrap() error { return e.err }
 
-// releaseError is a failure of a run's release after the workloads are back:
-// the run could not release its Leases, delete a ReplicationDestination or
-// its Kueue Workload, or release a VolumeRestore. It says what the run could
-// not do and what a person can do about it, so the run can put both on its
-// Ready condition.
+// releaseError is a failure of a step that releases or deletes something a
+// run holds: its Leases, its Kueue Workload, a restore mover it stops (the
+// ReplicationDestination, and the wait for the mover's Job and pods), or the
+// VolumeRestore an older release created. The step can come before the
+// workloads are back, as a RestoreRun stops its movers first, or after them;
+// releasePlan.appDown tells releaseFailure which. The error says what the run
+// could not do and what a person can do about it, so the run can put both on
+// its Ready condition.
 type releaseError struct {
 	// action is what the run could not do, such as "release the Leases it
 	// holds on its claims and repositories".
@@ -822,28 +825,45 @@ type releasePlan struct {
 	// deleting is true when the run is being deleted.
 	deleting bool
 
+	// appDown is true when the run still holds workloads stopped or
+	// Kustomizations suspended. A step that fails before the restart, such as
+	// a RestoreRun stopping its movers, then reports RestartFailed with the
+	// steps that give the app back by hand, because the app is still down.
+	appDown bool
+
 	// scheduled is true when a namespace's schedule starts no new run until
 	// this one has finished, which is a BackupRun with spec.all set.
 	scheduled bool
 }
 
 // releaseFailure returns the Ready reason and message for a run that could
-// not put back what it changed: the *restartError from restartWorkloads, the
-// *releaseError from releasing a Lease or deleting an object the run
-// created, or another error from that work, such as a failed read.
+// not put back what it changed or release what it holds.
 //
-// The reason is RestartFailed while the app is still down or the run could
-// not tell whether it is, and ReleaseFailed when only a release step failed.
+// Parameters:
+//   - err is the *restartError from restartWorkloads, the *releaseError of a
+//     step that releases or deletes something the run holds, both joined
+//     with errors.Join, or another error from that work, such as a failed
+//     read.
+//   - plan is the part of the run's status the message is built from, and
+//     says whether the app is still down (see releasePlan).
+//
+// It returns the reason and the message. The reason is RestartFailed while
+// the app is still down, which is after a failed restart and after any
+// failure while plan.appDown is set, and also when the run could not tell
+// what failed. It is ReleaseFailed when only a release step failed and the
+// app is back.
+//
 // The message names every step that failed, says that the run keeps trying,
 // and gives advice that fits. A failed restart names each workload with the
 // count it is owed and each Kustomization to resume, which a person can do
 // while the run tries again, and restartWorkloads skips what is already
-// back. A release step carries its own advice. A run that is still working
-// says it must not be deleted; only a run that is ending or being deleted
-// says that a person can delete it, or remove its finalizer, once the app
-// runs again. When err holds both a restart and a release failure, as
-// BackupRun.release returns them, the message names both and gives both
-// pieces of advice.
+// back. A release step carries its own advice. While the app is down after a
+// release step failed, the message adds the same scaling steps, to be taken
+// once no mover of the run still writes. A run that is still working says it
+// must not be deleted; only a run that is ending or being deleted says that a
+// person can delete it, or remove its finalizer, once the app runs again.
+// When err holds both a restart and a release failure, as BackupRun.release
+// returns them, the message names both and gives both pieces of advice.
 func releaseFailure(err error, plan releasePlan) (string, string) {
 	reason := backupv1alpha1.ReasonRestartFailed
 	var failed, advice []string
@@ -866,7 +886,7 @@ func releaseFailure(err error, plan releasePlan) (string, string) {
 		}
 	}
 	if errors.As(err, &step) {
-		if restart == nil {
+		if restart == nil && !plan.appDown {
 			reason = backupv1alpha1.ReasonReleaseFailed
 		}
 		failed = append(failed, step.Error())
@@ -875,6 +895,10 @@ func releaseFailure(err error, plan releasePlan) (string, string) {
 	if len(failed) == 0 {
 		failed = []string{"could not put back what the run changed: " + err.Error()}
 		advice = []string{"Fixing the cause lets the run finish by itself."}
+	}
+	if restart == nil && plan.appDown {
+		advice = append(advice, fmt.Sprintf("The app stays stopped until the run gets past this. To give it back sooner, "+
+			"make sure no mover of the run still writes to its claims, then %s yourself.", byHand(plan.stopped, plan.suspended)))
 	}
 	message := strings.Join(failed, "; it also ") + ". The run retries until it can"
 	if plan.scheduled {
