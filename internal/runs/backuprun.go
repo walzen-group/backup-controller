@@ -301,7 +301,9 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 // every Pending item. An item that fails to start with an error other than a
 // refusal stays Pending with "not started yet: " and the error in its
 // message, the Ready condition takes reason Retrying and names each such
-// item, and the pass goes on; the next pass tries the item again. Once
+// item, and the pass goes on; the next pass tries the item again. When
+// another item waits for a source busy with another run, the Retrying
+// message names that wait as well. Once
 // every volume's clone is cut, it records the time of the pass in
 // status.restartedAt with status.restartPending set, and
 // writes the status. It then scales the workloads back up, resumes the
@@ -435,7 +437,12 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	reason, message := backupv1alpha1.ReasonRunning, "backing up"
 	switch {
 	case len(retrying) > 0:
+		// An item that waits for another run is named as well, so the retry
+		// does not hide it.
 		reason, message = backupv1alpha1.ReasonRetrying, "retrying the start of "+strings.Join(retrying, "; ")
+		if waiting != "" {
+			message += "; " + waiting
+		}
 	case waiting != "":
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, waiting))
 	}
@@ -890,13 +897,19 @@ func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claim
 // abort ends a run early as Failed. It marks every Pending or Running item as
 // Failed with the given message, then calls finish, which starts the stopped
 // workloads again and deletes the run's Workload so the queue gets its slot
-// back.
+// back. A Pending item whose last start attempt failed keeps that error: its
+// message becomes the given message, "; last error: " and the error.
 func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, message string) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
-		if item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+		if item.Phase != backupv1alpha1.ItemPending && item.Phase != backupv1alpha1.ItemRunning {
+			continue
 		}
+		failed := message
+		if last, ok := strings.CutPrefix(item.Message, notStartedYet); ok && item.Phase == backupv1alpha1.ItemPending {
+			failed += "; last error: " + last
+		}
+		item.Phase, item.Message = backupv1alpha1.ItemFailed, failed
 	}
 	return r.finish(ctx, run, backupv1alpha1.ReasonFailed, message)
 }

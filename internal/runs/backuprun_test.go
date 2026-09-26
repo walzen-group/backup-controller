@@ -1464,6 +1464,68 @@ func TestAFailedReadWhileStartingAnItemIsRetried(t *testing.T) {
 	}
 }
 
+// A run that times out while an item still fails to start ends with the
+// item's message naming the timeout and the error of its last start attempt,
+// so a person reading the failed run sees why the item never started.
+func TestATimedOutRunKeepsAnItemsLastStartError(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore(), repository())
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.PersistentVolume); ok {
+				return apierrors.NewServiceUnavailable("etcd leader changed")
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	step(t, r) // the start fails
+
+	r.Now = func() time.Time { return frozen.Add(2 * time.Hour) }
+	step(t, r) // past the one-hour timeout
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Fatalf("phase = %q, want Failed after the timeout", run.Status.Phase)
+	}
+	item := run.Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "had not finished by") ||
+		!strings.Contains(item.Message, "; last error: ") || !strings.Contains(item.Message, "etcd leader changed") {
+		t.Errorf("item = %+v, want it Failed naming the timeout and, after \"; last error: \", the start error", item)
+	}
+}
+
+// When one item fails to start and another waits for a source busy with
+// another run's backup, the Ready condition names both, so neither cause is
+// hidden behind the other.
+func TestReadyNamesARetryAndABusySourceTogether(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), cluster(), otherRun())
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce: nothing is marked, so nothing stops
+	if err := c.Create(context.Background(), busySource(TriggerFor(otherRunUID))); err != nil {
+		t.Fatal(err)
+	}
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == BackupGVK {
+				return apierrors.NewInternalError(errors.New(`failed calling webhook "vbackup.cnpg.io": connect: connection refused`))
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	message := readyMessage(run.Status.Conditions)
+	if !strings.Contains(message, pgN) || !strings.Contains(message, "connection refused") || !strings.Contains(message, "manual-notes") {
+		t.Errorf("Ready = %s: %s, want it to name the Cluster %s with its error and the BackupRun manual-notes the claim waits for",
+			readyReason(run.Status.Conditions), message, pgN)
+	}
+}
+
 // A namespace run in a cluster without the CloudNativePG CRDs backs up the
 // volumes. The API server answers a list of Clusters there with a no-match
 // error, which means there are no Clusters.
