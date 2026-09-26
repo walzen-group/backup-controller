@@ -159,6 +159,17 @@ const (
 	// stopped so nothing reads a half-restored claim. A person who deletes
 	// the ReplicationDestination lets the run end.
 	ReasonVolSyncUnsupported = "VolSyncUnsupported"
+
+	// ReasonClusterVersionUnsupported reports a RestoreRun that found the API
+	// server serving CloudNativePG's Cluster at another version and no longer
+	// at postgresql.cnpg.io/v1, the version the bootstrap webhook's rules
+	// name. The API server then creates a Cluster without calling the
+	// webhook, and the Cluster starts as an empty database. The run deletes
+	// no Cluster: a run that has not deleted one ends Failed with this
+	// reason, and a run that already deleted one waits with it, its message
+	// saying to hold the creation back until v1 is served again or a
+	// controller release registers the new version.
+	ReasonClusterVersionUnsupported = "ClusterVersionUnsupported"
 )
 
 // SetReady sets or replaces the Ready condition in a status's condition list.

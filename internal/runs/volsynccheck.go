@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -64,12 +63,7 @@ const volsyncCheckInterval = time.Minute
 func volsyncUnsupported(mapper meta.RESTMapper) string {
 	var unserved []string
 	for _, gvk := range volsyncKinds {
-		_, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
-		var partial *apiutil.ErrResourceDiscoveryFailed
-		if err == nil || !meta.IsNoMatchError(err) || errors.As(err, &partial) {
-			continue
-		}
-		versions := served.Versions(mapper, gvk.GroupKind())
+		versions := servedElsewhere(mapper, gvk)
 		if len(versions) == 0 {
 			continue
 		}

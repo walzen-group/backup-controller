@@ -201,16 +201,21 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 		return fmt.Errorf("add the readiness check: %w", err)
 	}
 
-	// An incompatible VolSync holds every run that touches VolSync objects
-	// with reason VolSyncUnsupported. The check also runs once when the
-	// manager starts, so the log says it before any run does.
+	// An incompatible VolSync ends or holds every run that touches VolSync
+	// objects with reason VolSyncUnsupported, and a Cluster the bootstrap
+	// webhook would not see created again ends or holds every restore of a
+	// database with reason ClusterVersionUnsupported. Both checks also run
+	// once when the manager starts, so the log says it before any run does.
 	if err := manager.Add(ctrlmanager.RunnableFunc(func(context.Context) error {
 		if message := runs.VolSyncUnsupported(manager.GetRESTMapper()); message != "" {
 			klog.Errorf("VolSync is not served at the version this controller uses: %s", message)
 		}
+		if message := runs.ClusterWebhookBlind(manager.GetRESTMapper()); message != "" {
+			klog.Errorf("the bootstrap webhook would not see a Cluster created: %s", message)
+		}
 		return nil
 	})); err != nil {
-		return fmt.Errorf("add the VolSync version check: %w", err)
+		return fmt.Errorf("add the served version checks: %w", err)
 	}
 
 	reader := manager.GetAPIReader()

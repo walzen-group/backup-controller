@@ -57,6 +57,14 @@ spec:
 # The second entry takes updates, where the handler drops the initdb that Flux
 # re-applies from git over a recovered Cluster. It ignores failures so an
 # unavailable controller blocks no update to any other Cluster.
+#
+# The rules name postgresql.cnpg.io v1 alone, the version whose fields the
+# handler reads and patches. With matchPolicy Equivalent, the API server
+# converts a Cluster sent at any other served version to v1 and calls the
+# webhook, for as long as it serves v1. A release of CloudNativePG that stops
+# serving v1 makes the API server skip the webhook; the controller then logs
+# that at startup, and a RestoreRun deletes no Cluster (reason
+# ClusterVersionUnsupported, see docs/compatibility.md).
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
@@ -73,6 +81,7 @@ webhooks:
     sideEffects: None
     failurePolicy: Fail
     timeoutSeconds: 15
+    matchPolicy: Equivalent
     rules:
       - apiGroups: ["postgresql.cnpg.io"]
         apiVersions: ["v1"]
@@ -90,6 +99,7 @@ webhooks:
     sideEffects: None
     failurePolicy: Ignore
     timeoutSeconds: 5
+    matchPolicy: Equivalent
     rules:
       - apiGroups: ["postgresql.cnpg.io"]
         apiVersions: ["v1"]

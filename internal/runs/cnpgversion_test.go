@@ -123,28 +123,6 @@ func TestANamespaceRunFindsClustersAtTheVersionCloudNativePGServes(t *testing.T)
 	}
 }
 
-// A database restore on such a cluster reads the Cluster and its barman-cloud
-// ObjectStore at the new version, finds the base backup, and deletes the
-// Cluster to recover it.
-func TestADatabaseRestoreReadsTheClusterAndStoreAtTheServedVersion(t *testing.T) {
-	c := newClientWithCRDs(t, crdsServedAtNext(t),
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }, asOf("2026-09-22T00:00:00Z")),
-		atNext(cluster()), atNext(objectStore()), storeSecret())
-	served := servingOnly(c)
-	r := &RestoreRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday}, Now: frozenNow}
-
-	restoreStep(t, r) // plan: a base backup is in reach
-	restoreStep(t, r) // delete
-
-	run := readRestoreRun(t, c)
-	if run.Status.Items[0].Phase != backupv1alpha1.ItemDeleted || run.Status.Items[0].BaseBackup != saturday.ID {
-		t.Fatalf("item = %+v, reason %q; want Deleted from base backup %s", run.Status.Items[0], readyReason(run.Status.Conditions), saturday.ID)
-	}
-	if _, ok := getUnstructured(t, c, nextGVK(ClusterGVK), ns, pgN); ok {
-		t.Error("the Cluster served at the new version was not deleted")
-	}
-}
-
 // clusterListGone wraps c so that the API server answers every Cluster list
 // at v1 with the plain-text 404 of a version it no longer serves, as after a
 // CloudNativePG upgrade the client's mapper has not seen yet.
