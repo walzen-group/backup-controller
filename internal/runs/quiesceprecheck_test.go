@@ -321,3 +321,67 @@ func TestAMissingRepositorySecretFailsTheItemBeforeTheAppStops(t *testing.T) {
 		t.Errorf("Deployment patches = %d, quiesced = %+v, suspended = %t; want the app never stopped", scaled, run.Status.Quiesced, suspended(t, c))
 	}
 }
+
+// countDeploymentPatches wraps c so that it counts the patches of a
+// Deployment, which is how quiesce and restart scale the app, and returns the
+// wrapped client and the counter.
+func countDeploymentPatches(c client.Client) (client.Client, *int) {
+	patches := 0
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok {
+				patches++
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	}), &patches
+}
+
+// A quiesced RestoreRun whose claim's repository Secret is gone by the time
+// it would stop the app fails that item in its pre-check, before it stops
+// anything, and with no item left to restore it never stops the app. Before,
+// the pre-check left the missing Secret to restoreVolume, so the run stopped
+// the app, failed the item, and gave the app back (UFX, like UF7 on a
+// BackupRun).
+func TestARestoreWhoseRepositorySecretIsGoneFailsBeforeTheAppStops(t *testing.T) {
+	c := newClient(t, quiescedRestore(), claim(), volumeRestore(), repository(), deployment(), kustomization(false))
+	watching, patches := countDeploymentPatches(c)
+	r := &RestoreRunReconciler{Client: watching, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
+
+	restoreStep(t, r) // plan
+	if err := c.Delete(context.Background(), repository()); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r) // quiesce: the pre-check fails the item
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.Items[0].Phase != backupv1alpha1.ItemFailed ||
+		!strings.Contains(run.Status.Items[0].Message, "repository Secret "+repoN) {
+		t.Fatalf("phase = %q, items = %+v; want Failed with the item naming repository Secret %s", run.Status.Phase, run.Status.Items, repoN)
+	}
+	if *patches != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
+		t.Errorf("Deployment patches = %d, quiesced = %+v, suspended = %t; want the app never stopped", *patches, run.Status.Quiesced, suspended(t, c))
+	}
+}
+
+// A quiesced RestoreRun that has no Pending item after its checks, here a
+// namespace whose only marked object is an opted-out Cluster, stops nothing
+// and ends Failed saying nothing was restored.
+func TestAQuiescedRestoreWithNothingToRestoreStopsNothing(t *testing.T) {
+	c := newClient(t, quiescedRestore(), cluster(optedOut), objectStore(), storeSecret(), deployment(), kustomization(false))
+	watching, patches := countDeploymentPatches(c)
+	r := &RestoreRunReconciler{Client: watching, Reader: c, Prober: prober{saturday}, Now: frozenNow}
+
+	restoreStep(t, r) // plan: the Cluster is Skipped
+	restoreStep(t, r)
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonNoBackupInReach {
+		t.Fatalf("phase = %q, reason = %q; want Failed, NoBackupInReach", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	if *patches != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
+		t.Errorf("Deployment patches = %d, quiesced = %+v, suspended = %t; want the app never stopped", *patches, run.Status.Quiesced, suspended(t, c))
+	}
+}

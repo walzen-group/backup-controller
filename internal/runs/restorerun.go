@@ -1740,7 +1740,11 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 // Before it records a plan, with nothing stopped, quiesce waits with reason
 // SourceBusy while a backup holds one of the run's claims or repositories,
 // while another run is in the way (see waitingOn), and while another run
-// holds the namespace's quiesce Lease.
+// holds the namespace's quiesce Lease. Before those waits, it fails a
+// Pending volume item whose repository Secret is gone. A run left with no
+// Pending item, by that or because the plan Skipped every item, stops
+// nothing: quiesce records status.quiescedAt and status.restartedAt at the
+// same moment, and work then finishes the run.
 func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if len(run.Status.Quiesced) == 0 {
 		targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
@@ -1755,20 +1759,38 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		// restoreVolume on. The run waits here instead, with the workloads
 		// still running. restoreVolume keeps its own check: this one is
 		// advisory, and the check at the mover object is the one that
-		// counts. A refusal is left to restoreVolume, which fails the item
-		// with it.
+		// counts. A repository Secret that is gone fails the item now, so
+		// the app is not stopped for a restore that cannot start; any other
+		// refusal is left to restoreVolume, which fails the item with it.
 		for i := range run.Status.Items {
 			item := &run.Status.Items[i]
 			if item.Kind != "PersistentVolumeClaim" || item.Phase != backupv1alpha1.ItemPending {
 				continue
 			}
 			held, err := r.backupHeldElsewhere(ctx, run, item.Name)
+			if isRefusal(err) {
+				message, err := r.failBeforeStart(ctx, run, item, destinationName(run.UID, i), err.Error())
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+				continue
+			}
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 			if held != "" {
 				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, held))
 			}
+		}
+		// With no item left to restore once the checks above failed the
+		// rest, or every item Skipped at the plan, there is nothing to stop.
+		// The run records the stop and the restart at the same moment, and
+		// work then finishes it.
+		if !anyRestorePending(run.Status.Items) {
+			now := metav1.NewTime(r.Now())
+			run.Status.QuiescedAt, run.Status.RestartedAt = &now, &now
+			return after(time.Second, r.writeStatus(ctx, run))
 		}
 		// A restore that waits for the Cluster it deleted keeps this run
 		// waiting with nothing stopped and no Lease held (see waitingOn).
@@ -1831,9 +1853,12 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 //     and spec.moverSecurityContext are used the way repositoryFor uses them.
 //   - claimName names the claim the item restores.
 //
-// A refusal from repositoryFor, and a repository Secret that does not exist,
-// give "": restoreVolume fails the item later. Any other failed read comes
-// back as an error, and the pass retries with nothing stopped.
+// A refusal from repositoryFor, for a claim or a VolumeRestore that is gone,
+// gives "": restoreVolume fails the item later. A repository Secret that
+// does not exist comes back as the refusal leaseNamesFor gives (see
+// isRefusal), and quiesce fails the item with it before anything is stopped.
+// Any other failed read comes back as an error, and the pass retries with
+// nothing stopped.
 //
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right
@@ -1853,11 +1878,7 @@ func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *bac
 	if backing != "" {
 		return backing, nil
 	}
-	held, err := leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, settings.Secret)
-	if isRefusal(err) {
-		return "", nil
-	}
-	return held, err
+	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, settings.Secret)
 }
 
 // restart gives the stopped workloads their replicas back, resumes the
