@@ -525,10 +525,14 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		run.Status.RestartPending = false
 	}
 
+	var notes []string
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
-		if item.Phase == backupv1alpha1.ItemRunning {
-			r.collectItem(ctx, run, item)
+		if item.Phase != backupv1alpha1.ItemRunning {
+			continue
+		}
+		if note := r.collectItem(ctx, run, item); note != "" {
+			notes = append(notes, note)
 		}
 	}
 
@@ -551,7 +555,11 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		}
 	case len(waits) > 0:
 		// Every wait is named, so one item's wait does not hide another's.
-		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, strings.Join(waits, "; ")))
+		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, strings.Join(append(waits, notes...), "; ")))
+	}
+	if len(notes) > 0 {
+		// A Backup in a phase that needs naming says why the run goes on.
+		message += "; " + strings.Join(notes, "; ")
 	}
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
@@ -823,7 +831,7 @@ func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1al
 // already failed with a message for this deadline, backupTimedOut returns
 // that message without the parts abort added for the item alone: the last
 // start error of a Pending item ("; last error: ") and the sentence
-// syncGoesOn adds for a Running one. Of several such items it returns the
+// runningNote adds for a Running one. Of several such items it returns the
 // shortest result, and with none it builds the message afresh.
 func backupTimedOut(run *backupv1alpha1.BackupRun, deadline time.Time) string {
 	base := timedOutMessage(deadline, nil)
@@ -833,7 +841,7 @@ func backupTimedOut(run *backupv1alpha1.BackupRun, deadline time.Time) string {
 			continue
 		}
 		message := item.Message
-		for _, tail := range []string{"; last error: ", ". VolSync keeps retrying the sync ", ". VolSync goes on with the sync "} {
+		for _, tail := range []string{"; last error: ", ". VolSync keeps retrying the sync ", ". VolSync goes on with the sync ", ". CloudNativePG reports status.phase "} {
 			if at := strings.Index(message[len(base):], tail); at >= 0 {
 				message = message[:len(base)+at]
 			}
@@ -1088,13 +1096,18 @@ func (r *BackupRunReconciler) syncGoesOn(ctx context.Context, run *backupv1alpha
 // snapshot is first moved to status.restartedAt and tagged quiesced, and the
 // item stays Running until that rewrite succeeds.
 //
-// A database item follows the phase of its CloudNativePG Backup.
-func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) {
+// A database item follows the phase of its CloudNativePG Backup (see
+// backupResult).
+//
+// It returns a sentence for the run's Ready message while the item waits in
+// a Backup phase that needs naming, such as one CloudNativePG 1.30 does not
+// have, and "" otherwise.
+func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) string {
 	switch item.Kind {
 	case "ReplicationSource":
 		source := &volsyncv1alpha1.ReplicationSource{}
 		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source); err != nil {
-			return
+			return ""
 		}
 		if lastManual(source) != item.Trigger {
 			if logs, failed := moverFailed(source, item.Trigger, run.Status.StartedAt); failed {
@@ -1111,17 +1124,17 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 				}
 				item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 			}
-			return
+			return ""
 		}
 		if source.Status.LatestMoverStatus != nil && source.Status.LatestMoverStatus.Result == volsyncv1alpha1.MoverResultFailed {
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, moverFailure(source, source.Status.LatestMoverStatus.Logs)
-			return
+			return ""
 		}
 		snapshot, empty := moverOutcome(source)
 		if empty {
 			item.Phase, item.Empty = backupv1alpha1.ItemSucceeded, true
 			item.Message = "the volume held no files, so VolSync took no snapshot"
-			return
+			return ""
 		}
 		if quiesced(run) {
 			// The item stays Running until the rewrite goes through. That way
@@ -1131,11 +1144,11 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 			if err != nil {
 				item.Message = fmt.Sprintf("snapshot %s is saved and waits to be moved to %s and tagged %s: %v",
 					snapshot, run.Status.RestartedAt.UTC().Format(time.RFC3339), restic.QuiescedTag, err)
-				return
+				return ""
 			}
 			item.Phase, item.Message = backupv1alpha1.ItemSucceeded, ""
 			item.Snapshot, item.SnapshotTime = moved.ShortID(), newTime(metav1.NewTime(moved.Time))
-			return
+			return ""
 		}
 		item.Phase, item.Snapshot = backupv1alpha1.ItemSucceeded, snapshot
 		if at, err := r.snapshotTime(ctx, run.Namespace, item.Name, snapshot); err != nil {
@@ -1147,13 +1160,16 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 	case "Cluster":
 		done, ok, message, err := backupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
 		switch {
-		case err != nil || !done:
+		case err != nil:
+		case !done:
+			return message
 		case ok:
 			item.Phase = backupv1alpha1.ItemSucceeded
 		default:
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
 		}
 	}
+	return ""
 }
 
 // quiesced reports whether the run stopped at least one workload and has
@@ -1233,6 +1249,30 @@ func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claim
 	return newTime(metav1.NewTime(found.Time)), nil
 }
 
+// runningNote returns a sentence for the message of a Running item that
+// abort fails, and "" when there is nothing to add.
+//
+// Parameters:
+//   - run is the BackupRun that ends.
+//   - item is the Running item.
+//
+// For a volume item it returns what syncGoesOn says of the sync VolSync
+// goes on with. For a database item whose Backup waits in a phase
+// CloudNativePG 1.30 does not have, it returns the sentence of
+// unknownBackupPhase, so a run that times out there says which phase it
+// waited in. A failed read gives "", since the sentence only explains the
+// item's failure.
+func (r *BackupRunReconciler) runningNote(ctx context.Context, run *backupv1alpha1.BackupRun, item backupv1alpha1.BackupItem) string {
+	if item.Kind != "Cluster" {
+		return r.syncGoesOn(ctx, run, item, nil)
+	}
+	done, _, note, err := backupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
+	if err != nil || done {
+		return ""
+	}
+	return note
+}
+
 // abort ends a run early as Failed. It marks every Pending or Running item as
 // Failed with the given message, then calls finish, which starts the stopped
 // workloads again and deletes the run's Workload so the queue gets its slot
@@ -1247,7 +1287,9 @@ func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claim
 // A Pending item whose last start attempt failed keeps that error: its
 // message becomes the given message, "; last error: " and the error. A
 // Running volume item's message also says what data a snapshot of the sync
-// VolSync goes on with holds (see syncGoesOn).
+// VolSync goes on with holds (see syncGoesOn), and a Running database
+// item's message names a Backup phase CloudNativePG 1.30 does not have
+// (see runningNote).
 func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
@@ -1259,7 +1301,7 @@ func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Bac
 			failed += "; last error: " + last
 		}
 		if item.Phase == backupv1alpha1.ItemRunning {
-			if note := r.syncGoesOn(ctx, run, *item, nil); note != "" {
+			if note := r.runningNote(ctx, run, *item); note != "" {
 				failed += ". " + note
 			}
 		}

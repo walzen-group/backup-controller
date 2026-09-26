@@ -235,7 +235,7 @@ waits ends at the run's timeout, so none of them can report success.
 
 | Project | Object and field | Read in | When the field is missing |
 | --- | --- | --- | --- |
-| CloudNativePG | Backup status.phase | backupResult, internal/runs/cnpg.go | Legitimate while empty or pending, started, running, finalizing or walArchivingFailing (the phases in CloudNativePG 1.30 api/v1/backup_types.go:32-58). Loud for any other value: the item fails naming status.phase and the value. |
+| CloudNativePG | Backup status.phase | backupResult, internal/runs/cnpg.go | Legitimate while empty or pending, started, running, finalizing or walArchivingFailing (the phases in CloudNativePG 1.30 api/v1/backup_types.go:32-58). Any other value, such as a phase a later CloudNativePG release adds, keeps the item Running: the run names status.phase and the value in its Ready message while it waits, and in the item's message if it reaches its timeout. |
 | CloudNativePG | Backup status.error | backupResult | Legitimate: a failed Backup without it gets a message naming its phase. |
 | CloudNativePG | Cluster status.phase | clusterPhase, internal/runs/cnpg.go | Legitimate: a RestoreRun waits for "Cluster in healthy state" and counts no other phase as healthy. |
 | CloudNativePG | Cluster metadata annotations cnpg.io/hibernation, backup.wlz.li/enabled | internal/runs/cnpg.go | Legitimate: annotations are optional. |

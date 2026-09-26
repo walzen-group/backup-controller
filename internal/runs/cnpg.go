@@ -230,10 +230,13 @@ func ensureBackup(ctx context.Context, c client.Client, namespace, cluster strin
 //     "walArchivingFailing" are not done: CloudNativePG has not reconciled
 //     the Backup yet, is taking it, or retries it, and the run waits up to
 //     its timeout.
-//   - Any other value is done and not ok, with a message that names
-//     status.phase and the value. A CloudNativePG release that renamed its
-//     phases would otherwise hold the run until its timeout and end it with
-//     a message that says nothing of why.
+//   - Any other value is not done, and message names status.phase and the
+//     value (see unknownBackupPhase). A CloudNativePG release may add a
+//     phase that changes nothing the run relies on, so the run waits for
+//     completed or failed. It names the phase in its Ready message while it
+//     waits, and in the item's message when it reaches its timeout.
+//
+// For a Backup that is not done, message is empty in every known phase.
 //
 // It returns an error when the Backup can't be read, a read at a version the
 // API server has stopped serving included.
@@ -255,9 +258,21 @@ func backupResult(ctx context.Context, c client.Reader, mapper meta.RESTMapper, 
 	case "", "pending", "started", "running", "finalizing", "walArchivingFailing":
 		return false, false, "", nil
 	}
-	return true, false, fmt.Sprintf("the Backup %s/%s reports status.phase %q, which is not a phase of CloudNativePG 1.30; "+
-		"a CloudNativePG release may have changed its phases, so the run can't tell whether the backup completed (see docs/compatibility.md)",
-		namespace, name, phase), nil
+	return false, false, unknownBackupPhase(namespace, name, phase), nil
+}
+
+// unknownBackupPhase returns the sentence for a Backup whose status.phase is
+// none of the phases of CloudNativePG 1.30.
+//
+// Parameters:
+//   - namespace and name name the Backup.
+//   - phase is the value of its status.phase, which the sentence quotes.
+//
+// The sentence says that the run waits for completed or failed, so a person
+// who reads it in the Ready message knows why the run goes on.
+func unknownBackupPhase(namespace, name, phase string) string {
+	return fmt.Sprintf("CloudNativePG reports status.phase %q on Backup %s/%s, which is not a phase of CloudNativePG 1.30; "+
+		"the run waits for completed or failed up to its timeout (see docs/compatibility.md)", phase, namespace, name)
 }
 
 // newTime returns a pointer to a copy of t, so a caller can set a *metav1.Time

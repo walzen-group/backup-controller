@@ -10,6 +10,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 )
 
@@ -153,27 +154,67 @@ func TestAQueuedRunThatKueueNeverAdmitsFails(t *testing.T) {
 }
 
 // A Backup whose status.phase is none of the phases CloudNativePG 1.30 sets,
-// as after a release that renames them, fails its item with a message that
-// names the field and the value. Read as "not done yet", it would hold the
-// run until its timeout and end it with a message that says nothing of why.
-func TestABackupInAPhaseTheControllerDoesNotKnowFailsNamingIt(t *testing.T) {
+// as after a release that adds a harmless phase, leaves its item Running:
+// the run waits, naming status.phase and the value in its Ready message,
+// and goes on once CloudNativePG reports completed. A run that reaches its
+// timeout in such a phase names it in the item's message.
+func TestABackupInAPhaseTheControllerDoesNotKnowWaitsNamingIt(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
 	step(t, r)
 	step(t, r)
 	step(t, r)
+	setBackupPhase(t, c, "uploading")
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
+		t.Fatalf("item = %+v, want it still Running", item)
+	}
+	if message := readyMessage(run.Status.Conditions); !strings.Contains(message, "status.phase") || !strings.Contains(message, `"uploading"`) {
+		t.Errorf("Ready message = %q, want it to name status.phase and \"uploading\"", message)
+	}
+
+	setBackupPhase(t, c, "completed")
+	step(t, r)
+	if run := readBackupRun(t, c); run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
+		t.Errorf("item = %+v, want it Succeeded once the Backup completed", run.Status.Items[0])
+	}
+}
+
+// A run past its timeout while its Backup is in a phase the controller
+// doesn't know fails the item with a message that names the phase.
+func TestABackupTimedOutInAnUnknownPhaseNamesIt(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
+	step(t, r)
+	step(t, r)
+	step(t, r)
+	setBackupPhase(t, c, "uploading")
+	step(t, r)
+
+	r.Now = func() time.Time { return frozen.Add(48 * time.Hour) }
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	item := run.Status.Items[0]
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || item.Phase != backupv1alpha1.ItemFailed {
+		t.Fatalf("phase = %q, item = %+v; want the run and the item Failed", run.Status.Phase, item)
+	}
+	if !strings.Contains(item.Message, "status.phase") || !strings.Contains(item.Message, `"uploading"`) {
+		t.Errorf("item message = %q, want it to name status.phase and \"uploading\"", item.Message)
+	}
+}
+
+// setBackupPhase sets status.phase of the run's CloudNativePG Backup of the
+// Cluster pgN, as CloudNativePG does.
+func setBackupPhase(t *testing.T, c client.Client, phase string) {
+	t.Helper()
 	backup, ok := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
 	if !ok {
 		t.Fatal("no Backup was created")
 	}
-	_ = unstructured.SetNestedField(backup.Object, "Completed", "status", "phase")
+	_ = unstructured.SetNestedField(backup.Object, phase, "status", "phase")
 	if err := c.Status().Update(context.Background(), backup); err != nil {
 		t.Fatal(err)
-	}
-	step(t, r)
-
-	item := readBackupRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "status.phase") || !strings.Contains(item.Message, `"Completed"`) {
-		t.Errorf("item = %+v, want it Failed naming status.phase and \"Completed\"", item)
 	}
 }
 
