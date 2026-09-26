@@ -242,7 +242,7 @@ func unconfirmedRestore(destination *volsyncv1alpha1.ReplicationDestination, rec
 	switch {
 	case len(others) > 0:
 		other := strings.Join(others, " and ")
-		return fmt.Sprintf("the mover restored snapshot %s, not %s, which the checks selected; claim %s now holds %s",
+		return fmt.Sprintf("the mover restored snapshot %s where the checks selected %s; claim %s now holds %s",
 			other, recorded, claim, other)
 	case len(ids) > 0 && !noneEligible:
 		return ""

@@ -175,7 +175,7 @@ func TestARestoreThatRestoredAnotherSnapshotFails(t *testing.T) {
 			restoreStep(t, r)
 			restoreStep(t, r)
 
-			expectItemFailed(t, c, "the mover restored snapshot 2edf5bab, not 6e473100, which the checks selected; claim "+
+			expectItemFailed(t, c, "the mover restored snapshot 2edf5bab where the checks selected 6e473100; claim "+
 				targetClaim(shape.into)+" now holds 2edf5bab")
 		})
 	}
@@ -302,7 +302,7 @@ func TestALegacyRunningItemIsCheckedAgainstItsMoversLog(t *testing.T) {
 	restoreStep(t, r)
 	restoreStep(t, r)
 
-	expectItemFailed(t, c, "the mover restored snapshot 6e473100, not 2edf5bab, which the checks selected")
+	expectItemFailed(t, c, "the mover restored snapshot 6e473100 where the checks selected 2edf5bab; claim "+claimN+" now holds 6e473100")
 }
 
 // A Running item that records no snapshot can't be confirmed from any log,
