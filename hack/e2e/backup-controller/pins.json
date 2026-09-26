@@ -1,0 +1,34 @@
+{
+  "backup-controller": {
+    "namespace": "backup-system",
+    "image": {
+      "name": "backup-controller:e2e",
+      "builtFrom": "Dockerfile at the worktree's HEAD, VERSION=e2e-<short sha>",
+      "baseImages": {
+        "build": {
+          "repository": "golang",
+          "tag": "1.26.8-alpine3.24",
+          "digest": "sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628"
+        },
+        "runtime": {
+          "repository": "scratch",
+          "note": "scratch is empty and has no digest"
+        }
+      },
+      "buildDownloads": "apk add ca-certificates (Alpine 3.24 repositories, unpinned) and go mod download (modules pinned by go.sum)"
+    },
+    "manifests": {
+      "crds": "config/crd",
+      "deploy": "deploy/ through hack/e2e/backup-controller/overlay"
+    },
+    "kueue": {
+      "namespaceLabel": "kueue-managed=true",
+      "localQueue": "backup",
+      "clusterQueue": "e2e"
+    },
+    "requires": {
+      "cert-manager": "v1.21.2 in namespace cert-manager (hack/e2e/cert-manager)",
+      "kueue": "v0.19.5 in namespace kueue-system (hack/e2e/kueue)"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+# The e2e install: deploy/ as prod renders it, with the image replaced by the
+# one backup-controller.sh builds from the worktree into the local Docker
+# engine, and the Kueue label prod's terragrunt module merges into the
+# controller's Namespace (docs/integration.md). The LocalQueue that label needs
+# is applied by backup-controller.sh once Kueue's CRDs are served, because this
+# render has to apply on a cluster that has no Kueue yet.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../../deploy
+
+# backup-controller.sh swaps this tag for e2e-<image id> when it applies the
+# render, so a rebuilt image is a new tag the kubelet has to fetch.
+images:
+  - name: ghcr.io/walzen-group/backup-controller
+    newName: backup-controller
+    newTag: e2e
+
+patches:
+  - target:
+      kind: Namespace
+      name: backup-system
+    patch: |-
+      - op: add
+        path: /metadata/labels/kueue-managed
+        value: "true"
