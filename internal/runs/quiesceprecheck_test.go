@@ -385,3 +385,67 @@ func TestAQuiescedRestoreWithNothingToRestoreStopsNothing(t *testing.T) {
 		t.Errorf("Deployment patches = %d, quiesced = %+v, suspended = %t; want the app never stopped", *patches, run.Status.Quiesced, suspended(t, c))
 	}
 }
+
+// A namespace BackupRun whose every volume item startItem would refuse fails
+// those items in its pre-check, with the message startItem gives, and never
+// stops the app: a ReplicationSource of the claim's name that the controller
+// did not write, a retention annotation that does not parse or none at all,
+// a claim not bound yet, a claim without its VolumeRestore, a volume without
+// node affinity, and a claim deleted since the plan. Before, the pre-check
+// left those to startItem, so the run stopped the app for a backup that
+// could not start (AB4).
+func TestAnItemStartItemWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
+	foreign := idleSource()
+	foreign.Labels = nil
+	unbound := claim()
+	unbound.Spec.VolumeName, unbound.Status.Phase = "", corev1.ClaimPending
+	badRetention, noRetention := claim(), claim()
+	badRetention.Annotations[backupv1alpha1.AnnotationRetainLast] = "zero"
+	delete(noRetention.Annotations, backupv1alpha1.AnnotationRetainLast)
+	noAffinity := volume()
+	noAffinity.Spec.NodeAffinity = nil
+	for _, tc := range []struct {
+		name    string
+		objects []client.Object
+		gone    bool
+		want    string
+	}{
+		{"source not the controller's", []client.Object{claim(), volume(), volumeRestore(), foreign}, false, "was not written by backup-controller"},
+		{"retention that does not parse", []client.Object{badRetention, volume(), volumeRestore()}, false, backupv1alpha1.AnnotationRetainLast},
+		{"no retention", []client.Object{noRetention, volume(), volumeRestore()}, false, "retain"},
+		{"claim not bound", []client.Object{unbound, volumeRestore()}, false, "is not bound to a volume yet"},
+		{"no VolumeRestore", []client.Object{claim(), volume()}, false, "VolumeRestore"},
+		{"volume without node affinity", []client.Object{claim(), noAffinity, volumeRestore()}, false, "declares no node affinity"},
+		{"claim deleted since the plan", []client.Object{claim(), volume(), volumeRestore()}, true, "no longer exists"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+				repository(), deployment(), kustomization(false)}, tc.objects...)
+			c := newClient(t, objects...)
+			watching, scaled := countDeploymentPatches(c)
+			br := &BackupRunReconciler{Client: watching, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
+
+			step(t, br) // plan
+			if tc.gone {
+				pvc := &corev1.PersistentVolumeClaim{}
+				get(t, c, ns, claimN, pvc)
+				if err := c.Delete(context.Background(), pvc); err != nil {
+					t.Fatal(err)
+				}
+			}
+			step(t, br) // admit
+			step(t, br) // quiesce: the pre-check fails the item
+			step(t, br) // finish
+
+			run := readBackupRun(t, c)
+			if run.Status.Phase != backupv1alpha1.RunPhaseFailed || len(run.Status.Items) != 1 ||
+				run.Status.Items[0].Phase != backupv1alpha1.ItemFailed || !strings.Contains(run.Status.Items[0].Message, tc.want) {
+				t.Fatalf("phase = %q (%s), items = %+v; want Failed with the item's message holding %q",
+					run.Status.Phase, readyMessage(run.Status.Conditions), run.Status.Items, tc.want)
+			}
+			if *scaled != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
+				t.Errorf("Deployment patches = %d, quiesced = %+v, suspended = %t; want the app never stopped", *scaled, run.Status.Quiesced, suspended(t, c))
+			}
+		})
+	}
+}

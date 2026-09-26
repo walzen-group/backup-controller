@@ -526,13 +526,23 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		// waits with the workloads still running. A volume busy with a
 		// backup no run waits for fails its item here, before anything is
 		// stopped, and the rest of the namespace goes on; the status write
-		// below records it. A source the controller didn't write is left
-		// to startItem, which refuses it. A read that fails is not evidence
-		// that the volume is idle, so it comes back as an error and nothing
-		// is stopped.
+		// below records it. An item startItem would refuse (see
+		// startRefusal) and one whose ReplicationSource the controller
+		// didn't write fail here as well, with the message startItem gives,
+		// so the app is not stopped for a backup that cannot start. A read
+		// that fails is not evidence that the volume is idle, so it comes
+		// back as an error and nothing is stopped.
 		for i := range run.Status.Items {
 			item := &run.Status.Items[i]
 			if item.Kind != "ReplicationSource" || item.Phase != backupv1alpha1.ItemPending {
+				continue
+			}
+			refused, err := r.startRefusal(ctx, run, item.Name)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if refused != "" {
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, refused
 				continue
 			}
 			// A restore of the claim or its repository holds the item the
@@ -559,8 +569,11 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			case err != nil:
 				return ctrl.Result{}, fmt.Errorf("get ReplicationSource %s/%s: %w", run.Namespace, item.Name, err)
 			}
-			if !inUse(source) || manualTag(source) == TriggerFor(run.UID) ||
-				source.Labels[backupv1alpha1.LabelManagedBy] != backupv1alpha1.ManagedByValue {
+			if source.Labels[backupv1alpha1.LabelManagedBy] != backupv1alpha1.ManagedByValue {
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, foreignSource(item.Name).Error()
+				continue
+			}
+			if !inUse(source) || manualTag(source) == TriggerFor(run.UID) {
 				continue
 			}
 			held := holder(ctx, r.Reader, source)
@@ -634,6 +647,42 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 	return ctrl.Result{RequeueAfter: time.Second}, nil
 }
 
+// startRefusal returns the message startItem would fail a volume item with
+// before it writes anything, or "" when startItem would go on. A namespace
+// run calls it in its quiesce pre-check, so an item that cannot start fails
+// before the app is stopped for it.
+//
+// Parameters:
+//   - run is the asking run; its namespace is read.
+//   - claimName names the item's claim.
+//
+// The message is the one startItem gives: the claim is gone (see
+// claimGone), or ensureSource refuses the claim's settings (see
+// sourceSettingsFor). A failed read comes back as an error, and the pass
+// retries with nothing stopped.
+func (r *BackupRunReconciler) startRefusal(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) (string, error) {
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
+		if apierrors.IsNotFound(err) {
+			return claimGone(claimName), nil
+		}
+		return "", fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
+	}
+	if _, err := sourceSettingsFor(ctx, r.Reader, claim); err != nil {
+		if isRefusal(err) {
+			return err.Error(), nil
+		}
+		return "", err
+	}
+	return "", nil
+}
+
+// claimGone returns the message of a volume item whose claim no longer
+// exists. claimName is the item's claim.
+func claimGone(claimName string) string {
+	return fmt.Sprintf("the claim %s no longer exists", claimName)
+}
+
 // heldElsewhere returns a message naming the run that holds the claim or its
 // repository, or "" when neither is held. A backup calls it before it stops
 // any workload, so that it waits with the app running where startItem would
@@ -644,12 +693,12 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 //   - claimName names the claim the run is about to back up.
 //
 // A claim that does not exist and a VolumeRestore the claim does not have
-// give "": startItem fails or retries the item, and ensureSource checks
-// again right before it writes the trigger. A repository Secret that does
-// not exist comes back as the refusal leaseNamesFor gives (see isRefusal),
-// and quiesce fails the item with it before anything is stopped. Any other
-// failed read comes back as an error, and the pass retries with nothing
-// stopped.
+// give "": quiesce has failed such an item through startRefusal before it
+// asks, and ensureSource checks again right before it writes the trigger.
+// A repository Secret that does not exist comes back as the refusal
+// leaseNamesFor gives (see isRefusal), and quiesce fails the item with it
+// before anything is stopped. Any other failed read comes back as an
+// error, and the pass retries with nothing stopped.
 //
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right
@@ -708,7 +757,7 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 			if !apierrors.IsNotFound(err) {
 				return "", fmt.Errorf("get claim %s: %w", item.Name, err)
 			}
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, fmt.Sprintf("the claim %s no longer exists", item.Name)
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, claimGone(item.Name)
 			return "", nil
 		}
 		tag := TriggerFor(run.UID)

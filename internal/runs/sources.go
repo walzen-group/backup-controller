@@ -380,6 +380,66 @@ func lastLines(logs string, n int) string {
 	return strings.Join(lines, " / ")
 }
 
+// sourceSettings are the parts of a claim's ReplicationSource that come from
+// outside the source: from the claim, its VolumeRestore, its volume and the
+// namespace.
+type sourceSettings struct {
+	// vr is the claim's VolumeRestore, which names the repository, the cache
+	// class and capacity, and the mover's security context.
+	vr *backupv1alpha1.VolumeRestore
+
+	// affinity places the mover on the node that holds the claim's volume.
+	affinity *corev1.Affinity
+
+	// retain is the retention policy from the claim's annotations.
+	retain *volsyncv1alpha1.ResticRetainPolicy
+
+	// pruneInterval is the namespace's prune interval in days.
+	pruneInterval int32
+}
+
+// sourceSettingsFor reads the settings of a claim's ReplicationSource.
+//
+// Parameters:
+//   - reader reads the claim's VolumeRestore and PersistentVolume and the
+//     Namespace. Callers pass the uncached Reader.
+//   - claim is the claim to back up, as stored.
+//
+// It returns a refusal when one of the settings is missing or does not
+// parse: the claim has no VolumeRestore (see volumeRestoreFor), is not bound
+// or its volume declares no node affinity (see volumeAffinity), its
+// retention annotations don't give a policy (see retention), or the
+// namespace's prune interval doesn't parse (see pruneIntervalFor). Any other
+// failed read comes back as a plain error, which the caller retries.
+// ensureSource and the quiesce pre-check both call it, so an item the one
+// refuses the other refuses with the same message.
+func sourceSettingsFor(ctx context.Context, reader client.Reader, claim *corev1.PersistentVolumeClaim) (sourceSettings, error) {
+	vr, err := volumeRestoreFor(ctx, reader, claim)
+	if err != nil {
+		return sourceSettings{}, err
+	}
+	affinity, err := volumeAffinity(ctx, reader, claim)
+	if err != nil {
+		return sourceSettings{}, err
+	}
+	retain, err := retention(claim)
+	if err != nil {
+		return sourceSettings{}, err
+	}
+	pruneInterval, err := pruneIntervalFor(ctx, reader, claim.Namespace)
+	if err != nil {
+		return sourceSettings{}, err
+	}
+	return sourceSettings{vr: vr, affinity: affinity, retain: retain, pruneInterval: pruneInterval}, nil
+}
+
+// foreignSource returns the refusal for a ReplicationSource of the claim's
+// name that this controller did not write, which it never writes over. name
+// is the claim's name, which the source shares.
+func foreignSource(name string) error {
+	return refuse("the ReplicationSource %s exists and was not written by backup-controller; remove it so the controller can write its own", name)
+}
+
 // ensureSource creates or updates the ReplicationSource that backs up a claim,
 // with the run's tag as its manual trigger. Setting the tag is what starts
 // VolSync's backup.
@@ -437,22 +497,11 @@ func lastLines(logs string, n int) string {
 // Something else declares it, and writing over it would start a fight that the
 // other writer wins on its next reconcile.
 func ensureSource(ctx context.Context, c client.Client, reader client.Reader, claim *corev1.PersistentVolumeClaim, tag string, lock leaseHolder) (*volsyncv1alpha1.ReplicationSource, error) {
-	vr, err := volumeRestoreFor(ctx, reader, claim)
+	settings, err := sourceSettingsFor(ctx, reader, claim)
 	if err != nil {
 		return nil, err
 	}
-	affinity, err := volumeAffinity(ctx, reader, claim)
-	if err != nil {
-		return nil, err
-	}
-	retain, err := retention(claim)
-	if err != nil {
-		return nil, err
-	}
-	pruneInterval, err := pruneIntervalFor(ctx, reader, claim.Namespace)
-	if err != nil {
-		return nil, err
-	}
+	vr := settings.vr
 
 	source := &volsyncv1alpha1.ReplicationSource{
 		ObjectMeta: metav1.ObjectMeta{Name: claim.Name, Namespace: claim.Namespace},
@@ -464,7 +513,7 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 		if source.ResourceVersion != "" {
 			switch {
 			case source.Labels[backupv1alpha1.LabelManagedBy] != backupv1alpha1.ManagedByValue:
-				return refuse("the ReplicationSource %s exists and was not written by backup-controller; remove it so the controller can write its own", claim.Name)
+				return foreignSource(claim.Name)
 			case manualTag(source) == tag:
 				// Unchanged, so CreateOrUpdate writes nothing.
 				return nil
@@ -526,13 +575,13 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 				// The field is written only here, onto a new or idle source,
 				// which has no mover Job for the change to replace.
 				Unlock:                tag,
-				PruneIntervalDays:     &pruneInterval,
-				Retain:                retain,
+				PruneIntervalDays:     &settings.pruneInterval,
+				Retain:                settings.retain,
 				CacheCapacity:         vr.Spec.CacheCapacity,
 				CacheStorageClassName: vr.Spec.CacheStorageClassName,
 				MoverConfig: volsyncv1alpha1.MoverConfig{
 					MoverSecurityContext: vr.Spec.MoverSecurityContext,
-					MoverAffinity:        affinity,
+					MoverAffinity:        settings.affinity,
 					MoverResources: &corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{corev1.ResourceCPU: moverCPU},
 					},
