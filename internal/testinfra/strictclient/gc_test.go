@@ -249,8 +249,8 @@ func TestBuiltInGeneration(t *testing.T) {
 	for _, obj := range []client.Object{dep, sts, job} {
 		created(t, c, obj)
 	}
-	if dep.Generation != 1 || sts.Generation != 1 || job.Generation != 0 {
-		t.Fatalf("generations after create = %d %d %d, want 1 1 0", dep.Generation, sts.Generation, job.Generation)
+	if dep.Generation != 1 || sts.Generation != 1 || job.Generation != 1 {
+		t.Fatalf("generations after create = %d %d %d, want 1 1 1", dep.Generation, sts.Generation, job.Generation)
 	}
 
 	step := func(name string, obj client.Object, mutate func(), want int64) {
@@ -270,7 +270,8 @@ func TestBuiltInGeneration(t *testing.T) {
 	step("deployment label", dep, func() { dep.Labels = map[string]string{"a": "b"} }, 3)
 	step("statefulset spec", sts, func() { sts.Spec.Replicas = &two }, 2)
 	step("statefulset annotation", sts, func() { sts.Annotations = map[string]string{"a": "b"} }, 2)
-	step("job spec", job, func() { job.Spec.Parallelism = &two }, 0)
+	step("job spec", job, func() { job.Spec.Parallelism = &two }, 2)
+	step("job annotation", job, func() { job.Annotations = map[string]string{"a": "b"} }, 2)
 
 	patch := client.MergeFrom(sts.DeepCopy())
 	sts.Spec.Replicas = &one

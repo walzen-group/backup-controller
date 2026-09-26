@@ -35,19 +35,26 @@
 //     that CRD's schema on every write, with the apiextensions pruning code.
 //     See Client.coerce. Build registers the status subresources those CRDs
 //     declare, and Create drops the status of such a kind.
-//   - apps Deployment and StatefulSet get generation 1 on create and one more
-//     on every write that changes their spec (and, for a Deployment, its
-//     annotations). See Client.generationRule.
+//   - apps Deployment and StatefulSet and batch Job get generation 1 on create
+//     and one more on every write that changes their spec (and, for a
+//     Deployment, its annotations). See Client.generationRule.
 //   - Every delete records the deleted object's dependents (Client.Cascades),
 //     and with Options.GarbageCollect they are orphaned, deleted in the
 //     background or deleted in the foreground as the garbage collector of
 //     kube-controller-manager 1.36.3 would, blockOwnerDeletion included. See
 //     Client.deleteCascading.
 //
-// It leaves out: generation for other built-in kinds (Job and
-// PersistentVolumeClaim among them; the wrapper keeps the stored value), the
-// finalizer check for server-side apply patches, CRD defaulting and metadata
-// coercion, per-kind default propagation policies, and a collector that runs
+// The built-in rules (generation, Job's default propagation, UID
+// preconditions, finalizers, garbage collection) are checked against a real
+// cluster by differential_e2e_test.go, and the CRD rules against envtest's
+// kube-apiserver by differential_envtest_test.go.
+//
+// It leaves out: generation for built-in kinds other than those above (the
+// wrapper keeps the stored value; a PersistentVolumeClaim's stays 0 on a real
+// server too), validation of built-in kinds (a Pending claim's spec is
+// immutable on a real server and writable here), the finalizer check for
+// server-side apply patches, CRD defaulting and metadata coercion, per-kind
+// default propagation policies other than Job's, and a collector that runs
 // again later (see Client.deleteCascading). Those are separate behaviours;
 // each one is added as a method or an Options field of Client, the way
 // Create, Update and Patch are here.
@@ -376,16 +383,14 @@ const (
 // generationRule returns the rule for obj's kind.
 //
 // Custom resources follow customResourceStrategy (see the package comment).
-// apps Deployment and StatefulSet follow their strategies in
-// k8s.io/kubernetes 1.36.3 (pkg/registry/apps/deployment/strategy.go and
-// pkg/registry/apps/statefulset/strategy.go): PrepareForCreate sets
-// generation to 1 and PrepareForUpdate raises it by one when
-// apiequality.Semantic.DeepEqual finds the spec changed; the Deployment
-// strategy also raises it when the annotations change, since the deployment
-// controller copies them to its ReplicaSets. That source is not in the
-// module cache, so these rules were not checked against it line by line.
-// Job and PersistentVolumeClaim are left out: the wrapper keeps their stored
-// generation.
+// For built-in kinds the rules are what the docker-desktop cluster
+// (Kubernetes 1.36.4) showed in differential_e2e_test.go: Deployment,
+// StatefulSet and batch Job get generation 1 on create and one more on an
+// update that changes the spec; a Deployment also gets one more on an
+// annotation change, the other two do not; a status write changes none of
+// them. A PersistentVolumeClaim keeps generation 0 through create,
+// annotation and status writes, which is generationKept. Other built-in
+// kinds are not covered by the suite and keep their stored generation.
 func (c *Client) generationRule(obj client.Object) (generationRule, error) {
 	gvk, err := apiutil.GVKForObject(obj, c.Scheme())
 	if err != nil {
@@ -397,7 +402,8 @@ func (c *Client) generationRule(obj client.Object) (generationRule, error) {
 	switch gvk.GroupKind() {
 	case schema.GroupKind{Group: "apps", Kind: "Deployment"}:
 		return generationSpecOrAnnotations, nil
-	case schema.GroupKind{Group: "apps", Kind: "StatefulSet"}:
+	case schema.GroupKind{Group: "apps", Kind: "StatefulSet"},
+		schema.GroupKind{Group: "batch", Kind: "Job"}:
 		return generationSpec, nil
 	}
 	return generationKept, nil

@@ -51,9 +51,11 @@ func (c *Client) Cascades() []Cascade {
 // foregroundDeletion finalizer the stored object has, then the default,
 // Background (shouldOrphanDependents and shouldDeleteDependents,
 // k8s.io/apiserver@v0.36.3/pkg/registry/generic/registry/store.go:891-975).
-// Per-kind defaults other than Background (DefaultGarbageCollectionPolicy of
-// the built-in strategies) are left out.
-func propagation(obj client.Object, requested *metav1.DeletionPropagation) metav1.DeletionPropagation {
+// A batch Job defaults to Orphan: on the docker-desktop cluster (Kubernetes
+// 1.36.4) a Job deleted without a propagationPolicy left its Pod in place
+// with the ownerReference removed (differential_e2e_test.go). Other per-kind
+// defaults of the built-in strategies are left out.
+func propagation(obj client.Object, gk schema.GroupKind, requested *metav1.DeletionPropagation) metav1.DeletionPropagation {
 	if requested != nil {
 		return *requested
 	}
@@ -64,6 +66,9 @@ func propagation(obj client.Object, requested *metav1.DeletionPropagation) metav
 		case metav1.FinalizerDeleteDependents:
 			return metav1.DeletePropagationForeground
 		}
+	}
+	if gk == (schema.GroupKind{Group: "batch", Kind: "Job"}) {
+		return metav1.DeletePropagationOrphan
 	}
 	return metav1.DeletePropagationBackground
 }
@@ -77,7 +82,10 @@ func propagation(obj client.Object, requested *metav1.DeletionPropagation) metav
 // the DeletionPropagation and OwnerReference.BlockOwnerDeletion comments in
 // k8s.io/apimachinery@v0.36.0/pkg/apis/meta/v1/types.go:330-339,530-547;
 // kube-controller-manager's garbagecollector package (k8s.io/kubernetes) is
-// not in the module cache, so its code was not read:
+// not in the module cache, so its code was not read. differential_e2e_test.go
+// checks the three policies below, with a dependent that blocks owner
+// deletion and one that does not, against the docker-desktop cluster
+// (Kubernetes 1.36.4):
 //
 //   - Orphan: the collector removes the owner's reference from every
 //     dependent, then the owner goes.
@@ -96,11 +104,11 @@ func propagation(obj client.Object, requested *metav1.DeletionPropagation) metav
 // nothing re-runs the collector when that finalizer, or a blocking
 // dependent's own finalizer, is later removed.
 func (c *Client) deleteCascading(ctx context.Context, owner client.Object, o *client.DeleteOptions, opts []client.DeleteOption) error {
-	policy := propagation(owner, o.PropagationPolicy)
 	ownerRef, err := c.ref(owner)
 	if err != nil {
 		return err
 	}
+	policy := propagation(owner, ownerRef.GroupKind(), o.PropagationPolicy)
 	deps, err := c.dependents(ctx, owner)
 	if err != nil {
 		return err
