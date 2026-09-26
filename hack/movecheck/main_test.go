@@ -150,7 +150,11 @@ func TestAChangedBodyChangesTheHash(t *testing.T) {
 }
 
 func TestAChangedCommentChangesTheHash(t *testing.T) {
-	for comment, key := range map[string]string{"// X is one.": "const X", "// Y is two.": "const Y"} {
+	for comment, key := range map[string]string{
+		"// X is one.":                           "const X",
+		"// Y is two.":                           "const Y",
+		"// G is moved or changed by the cases.": "func G",
+	} {
 		after := edited(t, comment, comment+" Changed.")
 		got := changed(fingerprints(t, writePkg(t, before)), fingerprints(t, writePkg(t, map[string]string{"a.go": after})))
 		if len(got) != 1 || got[0] != key {
