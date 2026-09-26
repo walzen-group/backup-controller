@@ -200,37 +200,33 @@ func kustomizationSuspended(t *testing.T, namespace, name string) bool {
 	return kustomization.Spec.Suspend
 }
 
-// quiesceLeases returns the Lease backup-controller-quiesce in namespace, the
-// app's namespace, with the run it names, or nothing when the namespace
-// holds none. It matches the Lease by its name as well as by the quiesce
-// label, so no other Lease can make a poll count two.
-func quiesceLeases(t *testing.T, namespace string) []string {
+// quiesceLeaseHolder returns the run that holds the Lease
+// backup-controller-quiesce in namespace, the app's namespace, as its kind
+// and name ("RestoreRun restore"), or "" when the namespace holds no such
+// Lease.
+//
+// Parameters:
+//   - namespace is the app's namespace, where the runs take the Lease.
+//
+// It reads the Lease by its name, and the holder from the
+// backup.wlz.li/lease-holder-kind label and the
+// backup.wlz.li/lease-holder-name annotation the controller writes on it.
+func quiesceLeaseHolder(t *testing.T, namespace string) string {
 	t.Helper()
-	out := mustKubectl(t, "", "-n", namespace, "get", "leases",
-		"-l", "backup.wlz.li/lease-scope=quiesce", "-o", "json")
-	var list struct {
-		Items []struct {
-			Metadata struct {
-				Namespace, Name string
-				Labels          map[string]string `json:"labels"`
-				Annotations     map[string]string `json:"annotations"`
-			} `json:"metadata"`
-		} `json:"items"`
+	out := mustKubectl(t, "", "-n", namespace, "get", "lease", "backup-controller-quiesce", "-o", "json", "--ignore-not-found")
+	if strings.TrimSpace(out) == "" {
+		return ""
 	}
-	if err := json.Unmarshal([]byte(out), &list); err != nil {
-		t.Fatalf("decode the quiesce Leases: %v", err)
+	var lease struct {
+		Metadata struct {
+			Labels      map[string]string `json:"labels"`
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
 	}
-	var held []string
-	for _, lease := range list.Items {
-		if lease.Metadata.Name != "backup-controller-quiesce" {
-			continue
-		}
-		held = append(held, fmt.Sprintf("%s/%s held by %s %s",
-			lease.Metadata.Namespace, lease.Metadata.Name,
-			lease.Metadata.Labels["backup.wlz.li/lease-holder-kind"],
-			lease.Metadata.Annotations["backup.wlz.li/lease-holder-name"]))
+	if err := json.Unmarshal([]byte(out), &lease); err != nil {
+		t.Fatalf("decode the quiesce Lease: %v", err)
 	}
-	return held
+	return lease.Metadata.Labels["backup.wlz.li/lease-holder-kind"] + " " + lease.Metadata.Annotations["backup.wlz.li/lease-holder-name"]
 }
 
 // readBackupRun reads a BackupRun as the API server holds it, or nil when it
@@ -426,12 +422,26 @@ spec:
   timeout: 10m
 `, ns.Name))
 
-	// The backup waits with the app down, and at most one quiesce Lease
-	// exists at any poll (the design asks for this check to be sampled).
-	maxLeases, waited := 0, false
+	// The backup waits with the app down. Until the restore has finished,
+	// the second BackupRun never holds the quiesce Lease: a poll that finds
+	// it the holder fails the test (the design asks for this check to be
+	// sampled).
+	// The Lease is read before the restore, so a poll fails only when the
+	// restore was still unfinished after the backup held the Lease.
+	backupHoldsEarly := func() error {
+		if quiesceLeaseHolder(t, ns.Name) != "BackupRun second" {
+			return nil
+		}
+		restore, err := readRestoreRun(t, ns.Name, "restore")
+		if err != nil || restore == nil || restore.Status.Phase.Finished() {
+			return nil
+		}
+		return fmt.Errorf("the second BackupRun holds the quiesce Lease while the restore is unfinished (phase %s)", restore.Status.Phase)
+	}
+	waited := false
 	waitFor(t, "the second BackupRun to report the restore's wait", 3*time.Minute, 2*time.Second, func() (bool, string, error) {
-		if held := len(quiesceLeases(t, ns.Name)); held > maxLeases {
-			maxLeases = held
+		if err := backupHoldsEarly(); err != nil {
+			return false, "", err
 		}
 		run, err := readBackupRun(t, ns.Name, "second")
 		if err != nil {
@@ -458,8 +468,8 @@ spec:
 	// The restore gives the app back and ends; only then does the backup plan
 	// the replicas the app has.
 	waitFor(t, "the restore to succeed", 12*time.Minute, 3*time.Second, func() (bool, string, error) {
-		if held := len(quiesceLeases(t, ns.Name)); held > maxLeases {
-			maxLeases = held
+		if err := backupHoldsEarly(); err != nil {
+			return false, "", err
 		}
 		restore, err := readRestoreRun(t, ns.Name, "restore")
 		if err != nil {
@@ -479,9 +489,6 @@ spec:
 
 	var second backupv1alpha1.BackupRun
 	waitFor(t, "the second BackupRun to succeed", 12*time.Minute, 3*time.Second, func() (bool, string, error) {
-		if held := len(quiesceLeases(t, ns.Name)); held > maxLeases {
-			maxLeases = held
-		}
 		run, err := readBackupRun(t, ns.Name, "second")
 		if err != nil {
 			return false, firstLine(err.Error()), nil
@@ -501,9 +508,6 @@ spec:
 	}
 	if replicas := appReplicas(t, ns.Name, app); replicas != 2 {
 		t.Fatalf("the app stands at %d replicas after both runs, want 2", replicas)
-	}
-	if maxLeases > 1 {
-		t.Errorf("%d quiesce Leases existed at one poll, want at most 1", maxLeases)
 	}
 
 	// The Kustomization the runs suspended is resumed, and Flux keeps the app
