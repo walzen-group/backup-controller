@@ -243,7 +243,7 @@ spec:
 | `quiesce` | no | Deployments and StatefulSets, as `{kind, name}`, to stop while the run restores; not with `into`. The run gives them back once the volumes are restored and the databases deleted |
 | `timeout` | no | how long to wait for the movers and the recovered databases, counted from when the run passes its checks, or from its creation while its checks keep failing; defaults to `4h` |
 | `moverSecurityContext` | no | passed to the restore's ReplicationDestination; omitted, the source claim's VolumeRestore supplies it |
-| `ttlSecondsAfterFinished` | no | delete the run that long after it finishes; an `into` claim and its VolumeRestore go with it |
+| `ttlSecondsAfterFinished` | no | delete the run that long after it finishes; an `into` claim goes with it, and so does the VolumeRestore a v0.8.1 controller created for an `into` restore |
 
 | Status field | Holds |
 | --- | --- |
