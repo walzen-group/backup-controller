@@ -36,11 +36,6 @@ import (
 // Dockerfile passes its VERSION build argument through to it.
 var version = "dev"
 
-// prefix is the domain of the annotations and finalizers the populator library
-// writes onto the claims it fills. It is the API group, so every mark this
-// controller leaves on an object can be traced to this project.
-const prefix = "backup.wlz.li"
-
 // main parses the flags, starts the run controllers, and then runs the
 // populator library until it stops.
 func main() {
@@ -79,7 +74,7 @@ func main() {
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
-	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, *healthAddr, hook, exitOnFailure); err != nil {
+	if err := startRunControllers(runs, kubeconfig(), *namespace, *runsMetrics, *healthAddr, hook, exitOnFailure); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)
 	}
@@ -97,7 +92,7 @@ func main() {
 		HttpEndpoint: *metricsAddr,
 		MetricsPath:  *metricsPath,
 		Namespace:    *namespace,
-		Prefix:       prefix,
+		Prefix:       populator.Prefix,
 		Gk:           schema.GroupKind{Group: backupv1alpha1.GroupVersion.Group, Kind: "VolumeRestore"},
 		Gvr:          backupv1alpha1.GroupVersion.WithResource("volumerestores"),
 		ProviderFunctionConfig: &populatormachinery.ProviderFunctionConfig{

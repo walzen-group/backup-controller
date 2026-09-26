@@ -44,7 +44,9 @@ type Operations interface {
 // up before it handles a deleted claim, and when the VolumeRestore is gone it
 // returns without calling Cleanup and leaves its own finalizer on the claim.
 // This finalizer keeps the VolumeRestore in place until Cleanup has deleted
-// the claim's ReplicationDestination and Secret copy.
+// the claim's ReplicationDestination and Secret copy. Populate adds it only
+// once the prime claim is bound, so a VolumeRestore deleted before that goes
+// at once; OrphanReconciler then finishes the cleanup for its claims.
 const Finalizer = "backup.wlz.li/volume-populator"
 
 // Callbacks holds the three functions that the volume populator library calls
@@ -167,7 +169,7 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 		}
 	}
 
-	destinationName := "restore-" + internalvolsync.Trigger(claim)
+	destinationName := DestinationName(claim.UID)
 	existing, err := c.operations.GetReplicationDestination(ctx, c.namespace, destinationName)
 	if err == nil {
 		// The library calls Complete right after this, with the same cached
@@ -233,7 +235,7 @@ func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.Popu
 	if err := validateParams(params); err != nil {
 		return false, err
 	}
-	rdName := "restore-" + internalvolsync.Trigger(params.Pvc)
+	rdName := DestinationName(params.Pvc.UID)
 	rd, err := c.operations.GetReplicationDestination(ctx, c.namespace, rdName)
 	if err != nil {
 		return false, fmt.Errorf("get ReplicationDestination %s/%s: %w", c.namespace, rdName, err)
@@ -276,7 +278,7 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 		return err
 	}
 	claim := params.Pvc
-	if err := c.operations.DeleteReplicationDestination(ctx, c.namespace, "restore-"+internalvolsync.Trigger(claim)); err != nil && !apierrors.IsNotFound(err) {
+	if err := c.operations.DeleteReplicationDestination(ctx, c.namespace, DestinationName(claim.UID)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete ReplicationDestination: %w", err)
 	}
 	if err := c.operations.DeleteSecret(ctx, c.namespace, internalvolsync.SecretCopyName(claim.UID)); err != nil && !apierrors.IsNotFound(err) {
@@ -348,7 +350,7 @@ func (c *Callbacks) summarize(vr *backupv1alpha1.VolumeRestore) {
 		if status.Phase == backupv1alpha1.RestorePhaseFailed {
 			return
 		}
-		destinations = append(destinations, "restore-"+string(status.UID))
+		destinations = append(destinations, DestinationName(status.UID))
 	}
 	noun := "ReplicationDestination"
 	if len(destinations) > 1 {

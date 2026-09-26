@@ -35,7 +35,7 @@ func TestAManagerThatStopsOnItsOwnIsReported(t *testing.T) {
 
 	failed := make(chan error, 1)
 	fail := func(err error) { failed <- err }
-	if err := startRunControllers(ctx, testKubeconfig(t, server.URL), taken.Addr().String(), "0", BootstrapWebhook{}, fail); err != nil {
+	if err := startRunControllers(ctx, testKubeconfig(t, server.URL), "backup-system", taken.Addr().String(), "0", BootstrapWebhook{}, fail); err != nil {
 		t.Fatalf("startRunControllers: %v", err)
 	}
 
@@ -69,7 +69,7 @@ func TestTheManagerServesHealthAndReadiness(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	fail := func(err error) { t.Errorf("the manager stopped: %v", err) }
-	if err := startRunControllers(ctx, testKubeconfig(t, server.URL), "0", addr, BootstrapWebhook{}, fail); err != nil {
+	if err := startRunControllers(ctx, testKubeconfig(t, server.URL), "backup-system", "0", addr, BootstrapWebhook{}, fail); err != nil {
 		t.Fatalf("startRunControllers: %v", err)
 	}
 

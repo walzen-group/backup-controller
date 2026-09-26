@@ -46,6 +46,18 @@ var grants = []grant{
 	{"backup.wlz.li", "volumerestores/status", []string{"patch", "update"}, "the conditions reported on a VolumeRestore"},
 	{"volsync.backube", "replicationdestinations", []string{"get", "list", "watch", "create", "delete"}, "one destination per restore"},
 
+	// populator.OrphanReconciler, in the run manager, for a claim being
+	// deleted whose VolumeRestore is gone. It watches claims and
+	// VolumeRestores through the manager's cache, reads both and lists the
+	// mover's pods through the API reader, and deletes the claim's objects in
+	// the controller namespace before it patches the library's finalizer off.
+	{"", "persistentvolumeclaims", []string{"get", "list", "watch", "patch", "delete"}, "the orphan reconciler: claims being deleted, their prime claim, and the library's finalizer"},
+	{"backup.wlz.li", "volumerestores", []string{"get", "list", "watch"}, "the orphan reconciler: the live check that the VolumeRestore is gone, and its delete events"},
+	{"", "pods", []string{"list"}, "the orphan reconciler: the mover pod it waits for"},
+	{"", "secrets", []string{"delete"}, "the orphan reconciler: the Secret copy of a claim whose VolumeRestore is gone"},
+	{"volsync.backube", "replicationdestinations", []string{"delete"}, "the orphan reconciler: the destination of a claim whose VolumeRestore is gone"},
+	{"events.k8s.io", "events", []string{"create", "patch"}, "the orphan reconciler's WaitingForMover and DataSourceGone events"},
+
 	{"volsync.backube", "replicationsources", []string{"get", "list", "watch", "create", "update", "patch"}, "each enabled claim's source, which the controller writes and triggers"},
 	{"backup.wlz.li", "backupruns", []string{"get", "list", "watch", "create", "update", "delete"}, "the runs, the finalizer each carries, and the scheduled runs"},
 	{"backup.wlz.li", "restoreruns", []string{"get", "list", "watch", "update", "delete"}, "the runs, the finalizer each carries, and the webhook's lookup of a waiting run"},

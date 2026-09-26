@@ -8,6 +8,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/runs"
 	appsv1 "k8s.io/api/apps/v1"
@@ -68,7 +69,8 @@ type BootstrapWebhook struct {
 }
 
 // startRunControllers starts the controller-runtime manager that reconciles
-// BackupRun and RestoreRun, runs the namespace scheduler, and serves the
+// BackupRun and RestoreRun, finishes the cleanup of claims whose VolumeRestore
+// is gone, runs the namespace scheduler, and serves the
 // bootstrap webhook when one is configured. It returns as soon as the manager
 // is starting, and the manager keeps running in a goroutine.
 //
@@ -80,6 +82,10 @@ type BootstrapWebhook struct {
 //     panics.
 //   - kubeconfig is the path from the --kubeconfig flag. Empty means the
 //     in-cluster configuration.
+//   - namespace is the controller namespace from the --namespace flag, where
+//     the populator keeps its prime claims, Secret copies and
+//     ReplicationDestinations. populator.OrphanReconciler cleans up there
+//     after a claim whose VolumeRestore is gone.
 //   - metricsAddr is the address where the manager serves the scheduler's
 //     metrics. The populator library serves its own registry on another port,
 //     and nothing else can register metrics into that one.
@@ -96,7 +102,7 @@ type BootstrapWebhook struct {
 // It returns an error when the client configuration can't be built, a scheme
 // fails to register, or the manager or one of its controllers can't be set
 // up. An error from a manager stopped by the context is only logged.
-func startRunControllers(ctx context.Context, kubeconfig, metricsAddr, healthAddr string, hook BootstrapWebhook, fail func(error)) error {
+func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr, healthAddr string, hook BootstrapWebhook, fail func(error)) error {
 	config, err := restConfig(kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client configuration: %w", err)
@@ -183,6 +189,11 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr, healthAdd
 	}
 	if err := (&runs.Scheduler{Client: manager.GetClient(), Reader: reader, Recorder: recorder}).SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the scheduler: %w", err)
+	}
+
+	orphans := &populator.OrphanReconciler{Client: manager.GetClient(), Reader: reader, Recorder: recorder, Namespace: namespace}
+	if err := orphans.SetupWithManager(manager); err != nil {
+		return fmt.Errorf("register the populator orphan controller: %w", err)
 	}
 
 	go func() {
