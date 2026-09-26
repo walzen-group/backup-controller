@@ -29,12 +29,3 @@ func PrimeClaimName(claimUID types.UID) string {
 func DestinationName(claimUID types.UID) string {
 	return "restore-" + string(claimUID)
 }
-
-// moverJobName returns the name of the Job VolSync runs for the restic mover
-// of the ReplicationDestination named destination. VolSync names it
-// "volsync-dst-" followed by the destination's name and owns it by the
-// destination (volsync v0.16.0 internal/controller/mover/restic/mover.go:333-341).
-// The Job's pods carry the label job-name with this value.
-func moverJobName(destination string) string {
-	return "volsync-dst-" + destination
-}

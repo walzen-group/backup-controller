@@ -11,6 +11,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
+	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -91,8 +92,8 @@ func leftovers() []client.Object {
 func moverPod(phase corev1.PodPhase) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: moverJobName(DestinationName(orphanClaimUID)) + "-x7k2p", Namespace: orphanControllerNS,
-			Labels: map[string]string{"job-name": moverJobName(DestinationName(orphanClaimUID))},
+			Name: internalvolsync.MoverJobName(DestinationName(orphanClaimUID)) + "-x7k2p", Namespace: orphanControllerNS,
+			Labels: map[string]string{"job-name": internalvolsync.MoverJobName(DestinationName(orphanClaimUID))},
 		},
 		Status: corev1.PodStatus{Phase: phase},
 	}

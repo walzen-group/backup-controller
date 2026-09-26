@@ -168,7 +168,7 @@ func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	pods := &corev1.PodList{}
-	if err := r.Reader.List(ctx, pods, client.InNamespace(r.Namespace), client.MatchingLabels{"job-name": moverJobName(destination)}); err != nil {
+	if err := r.Reader.List(ctx, pods, client.InNamespace(r.Namespace), client.MatchingLabels{"job-name": internalvolsync.MoverJobName(destination)}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list the mover pods of ReplicationDestination %s/%s: %w", r.Namespace, destination, err)
 	}
 	if len(pods.Items) > 0 {

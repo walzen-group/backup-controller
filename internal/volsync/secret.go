@@ -14,6 +14,15 @@ func SecretCopyName(claimUID types.UID) string {
 	return string(claimUID)
 }
 
+// MoverJobName returns the name of the Job VolSync runs for the restic mover
+// of the ReplicationDestination named destination. VolSync names it
+// "volsync-dst-" followed by the destination's name and owns it by the
+// destination (volsync v0.16.0 internal/controller/mover/restic/mover.go:333-341).
+// The Job's pods carry the label job-name with this value.
+func MoverJobName(destination string) string {
+	return "volsync-dst-" + destination
+}
+
 // SecretCopy builds a copy of a claim's repository Secret for the controller
 // namespace. VolSync looks up a ReplicationDestination's repository Secret in
 // the destination's own namespace, which is the controller's, so the restore

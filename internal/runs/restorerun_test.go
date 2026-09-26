@@ -289,10 +289,7 @@ func writerPod() *corev1.Pod {
 // quiescedRestore returns a namespace restore whose spec.quiesce lists the
 // app's Deployment.
 func quiescedRestore() *backupv1alpha1.RestoreRun {
-	return restoreRun(func(r *backupv1alpha1.RestoreRun) {
-		r.Spec.All = true
-		r.Spec.Quiesce = []backupv1alpha1.WorkloadRef{{Kind: "Deployment", Name: appN}}
-	})
+	return restoreRun(quiescedInPlace)
 }
 
 // replicasOf returns the replica count of the app's Deployment.
