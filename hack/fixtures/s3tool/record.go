@@ -162,9 +162,21 @@ func (r *recorder) at(step string) {
 // writes every exchange to out: the requests Survey and BaseBackups
 // make, and RustFS's answers.
 func writeTranscript(ctx context.Context, endpoint, bucket, prefix, server, out string) error {
-	rec, err := startRecorder(endpoint)
+	exchanges, err := recordTranscript(ctx, endpoint, bucket, prefix, server)
 	if err != nil {
 		return err
+	}
+	return writeJSON(out, exchanges)
+}
+
+// recordTranscript runs bootstrap.S3Prober's Survey and then
+// BaseBackups against one server under prefix, through a recording proxy to
+// the endpoint, and returns every exchange. It returns an error when the
+// proxy can't start or a prober call fails.
+func recordTranscript(ctx context.Context, endpoint, bucket, prefix, server string) ([]barmanstore.Exchange, error) {
+	rec, err := startRecorder(endpoint)
+	if err != nil {
+		return nil, err
 	}
 	defer rec.stop()
 
@@ -175,15 +187,17 @@ func writeTranscript(ctx context.Context, endpoint, bucket, prefix, server, out 
 		AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
 		SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
 	}
-	rec.at("prober-has-base-backup")
+	rec.at("prober-survey")
 	if _, err := (bootstrap.S3Prober{}).Survey(ctx, at, nil); err != nil {
-		return fmt.Errorf("Survey: %w", err)
+		return nil, fmt.Errorf("Survey: %w", err)
 	}
 	rec.at("prober-base-backups")
 	if _, err := (bootstrap.S3Prober{}).BaseBackups(ctx, at); err != nil {
-		return fmt.Errorf("BaseBackups: %w", err)
+		return nil, fmt.Errorf("BaseBackups: %w", err)
 	}
-	return writeJSON(out, rec.exchanges)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return rec.exchanges, nil
 }
 
 // writeBehaviour writes 1005 small objects and the odd keys under behaviour/

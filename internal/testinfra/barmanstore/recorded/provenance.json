@@ -8,5 +8,10 @@
   },
   "bucket": "recorded",
   "server": "app-pg",
-  "backupArguments": "barman-cloud-backup --cloud-provider aws-s3 --endpoint-url <rustfs> --user postgres --name <backup> --immediate-checkpoint s3://recorded/<store>/ <server>"
+  "backupArguments": "barman-cloud-backup --cloud-provider aws-s3 --endpoint-url <rustfs> --user postgres --name <backup> --immediate-checkpoint s3://recorded/<store>/ <server>",
+  "transcripts": {
+    "recorded": "2026-09-26T07:46:38Z",
+    "proberCommit": "8e46c9d",
+    "method": "--transcripts-only: each recorded manifest written into RustFS, bodiless objects as zeros, the manifest's ETags and times put back in RustFS's answers"
+  }
 }

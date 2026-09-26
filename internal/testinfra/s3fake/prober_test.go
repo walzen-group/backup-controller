@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -23,11 +24,12 @@ import (
 // hack/fixtures/barman-stores.sh.
 //
 // A continuation token is compared by the key it resumes after, since the
-// fake's tokens carry their own marker.
+// fake's tokens carry their own marker. The prober reads backup.info files
+// with several GETs in flight, so each run of backup.info GETs is compared
+// as a set; the first run, Survey's, is compared by its newest key only,
+// since Survey stops at the first DONE backup and how many other GETs
+// reach the server before it cancels them depends on timing.
 func TestProberRequestsMatchRecordedTranscripts(t *testing.T) {
-	t.Skip("finding: the transcripts predate 0b938be, whose Survey lists base/ with delimiter=/ " +
-		"and lists the whole prefix with max-keys=1 when base/ is empty; re-record them with hack/fixtures/barman-stores.sh " +
-		"and remove this skip")
 	names, err := barmanstore.Names()
 	if err != nil {
 		t.Fatal(err)
@@ -74,6 +76,7 @@ func TestProberRequestsMatchRecordedTranscripts(t *testing.T) {
 				}
 				mu.Lock()
 				defer mu.Unlock()
+				sent, want = infoRuns(sent), infoRuns(want)
 				for i := range max(len(sent), len(want)) {
 					var got, rec string
 					if i < len(sent) {
@@ -109,4 +112,35 @@ func requestLine(t *testing.T, method, path, rawQuery string) string {
 		parts[i] = "continuation-token=<after " + tokenKey(t, token) + ">"
 	}
 	return method + " " + path + "?" + strings.Join(parts, "&")
+}
+
+// infoRuns returns request lines with each run of consecutive backup.info
+// GETs collapsed into one line: the first run into its newest key, the key
+// Survey always reads first, and every later run into its keys in
+// sorted order.
+func infoRuns(lines []string) []string {
+	var out, run []string
+	first := true
+	flush := func() {
+		if len(run) == 0 {
+			return
+		}
+		sort.Strings(run)
+		if first {
+			out = append(out, "GET newest backup.info "+run[len(run)-1])
+		} else {
+			out = append(out, "GET backup.info "+strings.Join(run, " "))
+		}
+		first, run = false, nil
+	}
+	for _, l := range lines {
+		if strings.HasPrefix(l, "GET ") && strings.Contains(l, "/backup.info?") {
+			run = append(run, strings.TrimPrefix(l, "GET "))
+			continue
+		}
+		flush()
+		out = append(out, l)
+	}
+	flush()
+	return out
 }

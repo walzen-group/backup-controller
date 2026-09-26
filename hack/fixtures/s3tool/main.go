@@ -14,6 +14,7 @@
 //	s3tool proxy <listen> <upstream> <bucket> <key prefix>
 //	s3tool manifest <endpoint> <bucket> <prefix> <out.json>
 //	s3tool transcript <endpoint> <bucket> <prefix> <server> <out.json>
+//	s3tool transcripts <endpoint> <bucket> <out dir>
 //	s3tool behaviour <endpoint> <bucket> <out.json>
 //	s3tool wait-key <endpoint> <bucket> <prefix> <suffix>
 package main
@@ -59,6 +60,8 @@ func run(args []string) error {
 		return writeManifest(ctx, args[1], args[2], args[3], args[4])
 	case args[0] == "transcript" && len(args) == 6:
 		return writeTranscript(ctx, args[1], args[2], args[3], args[4], args[5])
+	case args[0] == "transcripts" && len(args) == 4:
+		return writeTranscripts(ctx, args[1], args[2], args[3])
 	case args[0] == "behaviour" && len(args) == 4:
 		return writeBehaviour(ctx, args[1], args[2], args[3])
 	case args[0] == "wait-key" && len(args) == 5:

@@ -14,7 +14,7 @@ FIXTURES := nix develop .\#fixtures -c
 # copy, because kustomize and helm both read a directory of their own. Every
 # generated file is copied, so a new kind needs no edit here.
 
-.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic fixtures-barman fixtures-crds e2e e2e-fetch e2e-up e2e-check e2e-down demo
+.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic fixtures-barman fixtures-transcripts fixtures-crds e2e e2e-fetch e2e-up e2e-check e2e-down demo
 
 ## build: compile every package.
 build:
@@ -49,6 +49,10 @@ fixtures-restic:
 ## fixtures-barman: re-record the barman stores, barman's verdicts and RustFS's answers under internal/testinfra/barmanstore/recorded.
 fixtures-barman:
 	$(FIXTURES) hack/fixtures/barman-stores.sh
+
+## fixtures-transcripts: re-record only the S3Prober transcripts of the recorded barman stores, against a fresh RustFS; the stores stay as they are. Run it after the prober changes its requests.
+fixtures-transcripts:
+	$(FIXTURES) hack/fixtures/barman-stores.sh --transcripts-only
 
 ## fixtures-crds: copy the pinned third-party CRDs, and our CRDs at old tags, under internal/testinfra/crds.
 fixtures-crds:

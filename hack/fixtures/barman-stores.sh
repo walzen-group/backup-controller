@@ -35,7 +35,21 @@
 # bootstrap.S3Prober makes against RustFS, with RustFS's answers). It also
 # writes rustfs-behaviour.json, RustFS's answers to paging, delimiter, range
 # and error requests, and provenance.json with the tool versions.
+#
+# With --transcripts-only it records the transcripts again and nothing else:
+# it writes each store from its recorded manifest.json into a fresh RustFS
+# (objects recorded without a body as zeros of their size), records the
+# current bootstrap.S3Prober against it, and puts back the manifest's ETags
+# and times in RustFS's answers, since RustFS sets its own on upload. Run it
+# through make fixtures-transcripts after a change to the prober's requests.
 set -euo pipefail
+
+transcripts_only=false
+case ${1:-} in
+--transcripts-only) transcripts_only=true ;;
+"") ;;
+*) echo "usage: $0 [--transcripts-only]" >&2; exit 2 ;;
+esac
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 out="$root/internal/testinfra/barmanstore/recorded"
@@ -283,6 +297,25 @@ record_after_recovery() {
 	stop "$dir"
 }
 
+# transcripts writes provenance.json's transcripts entry: when the
+# transcripts were recorded, the last commit that changed internal/bootstrap
+# (the prober they record), and how.
+transcripts() {
+	local how=$1
+	jq --arg recorded "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		--arg commit "$(git -C "$root" log -1 --format=%h -- internal/bootstrap)" --arg how "$how" \
+		'. + {transcripts: {recorded: $recorded, proberCommit: $commit, method: $how}}' \
+		"$out/provenance.json" >"$work/provenance.json"
+	mv "$work/provenance.json" "$out/provenance.json"
+}
+
+if $transcripts_only; then
+	"$s3tool" transcripts "127.0.0.1:$rustfs_port" "$bucket" "$out"
+	transcripts "--transcripts-only: each recorded manifest written into RustFS, bodiless objects as zeros, the manifest's ETags and times put back in RustFS's answers"
+	echo "wrote the transcripts under $out"
+	exit 0
+fi
+
 # record writes one store's files: manifest, verdicts and transcripts.
 record() {
 	local store=$1
@@ -327,4 +360,5 @@ jq -n --arg generator hack/fixtures/barman-stores.sh --arg recorded "$(date -u +
 	  bucket: "recorded", server: "app-pg",
 	  backupArguments: "barman-cloud-backup --cloud-provider aws-s3 --endpoint-url <rustfs> --user postgres --name <backup> --immediate-checkpoint s3://recorded/<store>/ <server>"}' \
 	>"$out/provenance.json"
+transcripts "recorded with the stores, from barman's own writes"
 echo "wrote $out"

@@ -1,6 +1,6 @@
 [
   {
-    "step": "prober-has-base-backup",
+    "step": "prober-survey",
     "method": "GET",
     "path": "/recorded/",
     "query": "location=",
@@ -12,19 +12,19 @@
     "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cLocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003eus-east-1\u003c/LocationConstraint\u003e"
   },
   {
-    "step": "prober-has-base-backup",
+    "step": "prober-survey",
     "method": "GET",
     "path": "/recorded/",
-    "query": "delimiter=\u0026encoding-type=url\u0026fetch-owner=true\u0026list-type=2\u0026prefix=failed-base%2Fapp-pg%2Fbase%2F",
+    "query": "delimiter=%2F\u0026encoding-type=url\u0026fetch-owner=true\u0026list-type=2\u0026prefix=failed-base%2Fapp-pg%2Fbase%2F",
     "status": 200,
     "headers": {
-      "Content-Length": "651",
+      "Content-Length": "408",
       "Content-Type": "application/xml"
     },
-    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003e\u003cName\u003erecorded\u003c/Name\u003e\u003cPrefix\u003efailed-base/app-pg/base/\u003c/Prefix\u003e\u003cMaxKeys\u003e1000\u003c/MaxKeys\u003e\u003cKeyCount\u003e1\u003c/KeyCount\u003e\u003cIsTruncated\u003efalse\u003c/IsTruncated\u003e\u003cContents\u003e\u003cETag\u003e\"afd96a943245c18cfe5a6e6b5e7955e0\"\u003c/ETag\u003e\u003cKey\u003efailed-base/app-pg/base/20260925T215203/backup.info\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:52:03.726Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e987\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cEncodingType\u003eurl\u003c/EncodingType\u003e\u003c/ListBucketResult\u003e"
+    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003e\u003cName\u003erecorded\u003c/Name\u003e\u003cPrefix\u003efailed-base/app-pg/base/\u003c/Prefix\u003e\u003cMaxKeys\u003e1000\u003c/MaxKeys\u003e\u003cKeyCount\u003e1\u003c/KeyCount\u003e\u003cIsTruncated\u003efalse\u003c/IsTruncated\u003e\u003cCommonPrefixes\u003e\u003cPrefix\u003efailed-base/app-pg/base/20260925T215203/\u003c/Prefix\u003e\u003c/CommonPrefixes\u003e\u003cDelimiter\u003e/\u003c/Delimiter\u003e\u003cEncodingType\u003eurl\u003c/EncodingType\u003e\u003c/ListBucketResult\u003e"
   },
   {
-    "step": "prober-has-base-backup",
+    "step": "prober-survey",
     "method": "GET",
     "path": "/recorded/failed-base/app-pg/base/20260925T215203/backup.info",
     "query": "",
@@ -54,13 +54,13 @@
     "step": "prober-base-backups",
     "method": "GET",
     "path": "/recorded/",
-    "query": "delimiter=\u0026encoding-type=url\u0026fetch-owner=true\u0026list-type=2\u0026prefix=failed-base%2Fapp-pg%2Fbase%2F",
+    "query": "delimiter=%2F\u0026encoding-type=url\u0026fetch-owner=true\u0026list-type=2\u0026prefix=failed-base%2Fapp-pg%2Fbase%2F",
     "status": 200,
     "headers": {
-      "Content-Length": "651",
+      "Content-Length": "408",
       "Content-Type": "application/xml"
     },
-    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003e\u003cName\u003erecorded\u003c/Name\u003e\u003cPrefix\u003efailed-base/app-pg/base/\u003c/Prefix\u003e\u003cMaxKeys\u003e1000\u003c/MaxKeys\u003e\u003cKeyCount\u003e1\u003c/KeyCount\u003e\u003cIsTruncated\u003efalse\u003c/IsTruncated\u003e\u003cContents\u003e\u003cETag\u003e\"afd96a943245c18cfe5a6e6b5e7955e0\"\u003c/ETag\u003e\u003cKey\u003efailed-base/app-pg/base/20260925T215203/backup.info\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:52:03.726Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e987\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cEncodingType\u003eurl\u003c/EncodingType\u003e\u003c/ListBucketResult\u003e"
+    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003e\u003cName\u003erecorded\u003c/Name\u003e\u003cPrefix\u003efailed-base/app-pg/base/\u003c/Prefix\u003e\u003cMaxKeys\u003e1000\u003c/MaxKeys\u003e\u003cKeyCount\u003e1\u003c/KeyCount\u003e\u003cIsTruncated\u003efalse\u003c/IsTruncated\u003e\u003cCommonPrefixes\u003e\u003cPrefix\u003efailed-base/app-pg/base/20260925T215203/\u003c/Prefix\u003e\u003c/CommonPrefixes\u003e\u003cDelimiter\u003e/\u003c/Delimiter\u003e\u003cEncodingType\u003eurl\u003c/EncodingType\u003e\u003c/ListBucketResult\u003e"
   },
   {
     "step": "prober-base-backups",
