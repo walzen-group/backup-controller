@@ -168,8 +168,8 @@ restartedAt: "2026-09-24T22:15:45Z"
    replicas it has now, and the Flux Kustomizations to suspend in
    `status.suspendedKustomizations`. Before that write it takes the
    namespace's quiesce Lease and one Lease per planned Kustomization, and waits
-   with reason SourceBusy while another run holds one or still owes this
-   namespace's workloads their replicas
+   with reason SourceBusy while another run holds one, or while another
+   unfinished run still owes this namespace's workloads their replicas
    ([One quiesce at a time](#one-quiesce-at-a-time)). Then it suspends those
    Kustomizations and scales the workloads to zero, and waits until none of
    their pods is left, terminating ones included: a pod shutting down can
@@ -645,11 +645,13 @@ by hand while its holder is still running reopens the bug the Leases prevent:
 the next run takes the Lease, records the zero replicas the holder stopped,
 and both runs can end with the app still at zero.
 
-A run left in flight by v0.8.x holds no Lease and continues without one, and a
-new run waits for it through the status check above. During the controller
-upgrade itself, an old pod that is still terminating takes no Lease either, so
-wait until it is gone before creating runs in a namespace. A run that finds
-the workloads already stopped records the counts it finds.
+A run a v0.8.x controller left in flight with a recorded plan holds no Lease
+and continues without one, and a new run waits for it through the status check
+above; one that has not planned yet takes the Lease on its first pass under
+v0.9. During the controller upgrade itself, an old pod that is still
+terminating takes no Lease either, so wait until it is gone before creating
+runs in a namespace. A run that finds the workloads already stopped records the
+counts it finds.
 
 ## Restore
 
