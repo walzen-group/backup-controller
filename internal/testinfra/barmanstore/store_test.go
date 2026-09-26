@@ -68,7 +68,7 @@ func TestEveryRecordedStoreLoads(t *testing.T) {
 // TestTheProberAgreesWithBarman uploads every recorded store into s3fake and
 // runs the controller's S3Prober against each server in it. BaseBackups has
 // to list exactly the DONE backups barman-cloud-backup-list listed, with the
-// same IDs and end times, and HasBaseBackup has to be true exactly when
+// same IDs and end times, and Survey has to find a DONE backup exactly when
 // there is one.
 func TestTheProberAgreesWithBarman(t *testing.T) {
 	names, err := barmanstore.Names()
@@ -93,12 +93,12 @@ func TestTheProberAgreesWithBarman(t *testing.T) {
 					if describe(got, time.Second) != describe(want, 0) {
 						t.Errorf("BaseBackups = %s, barman lists DONE %s", describe(got, time.Second), describe(want, 0))
 					}
-					has, err := bootstrap.S3Prober{}.HasBaseBackup(context.Background(), at)
+					archive, err := bootstrap.S3Prober{}.Survey(context.Background(), at, nil)
 					if err != nil {
-						t.Fatalf("HasBaseBackup: %v", err)
+						t.Fatalf("Survey: %v", err)
 					}
-					if has != (len(want) > 0) {
-						t.Errorf("HasBaseBackup = %v, barman lists %d DONE backups", has, len(want))
+					if has := archive.Found != nil; has != (len(want) > 0) {
+						t.Errorf("Survey found a DONE backup: %v, barman lists %d DONE backups", has, len(want))
 					}
 				})
 			}
@@ -108,8 +108,8 @@ func TestTheProberAgreesWithBarman(t *testing.T) {
 
 // TestAStoreLeftToInitdbPassesBarmansArchiveCheck checks the webhook's
 // decision against barman's: the webhook leaves a Cluster to initdb only
-// where HasBaseBackup finds no completed base backup and Contents finds
-// nothing at all under the prefix, and CloudNativePG then runs
+// where Survey finds no completed base backup and nothing at all under the
+// prefix, and CloudNativePG then runs
 // barman-cloud-check-wal-archive, which must pass on every such store or the
 // Cluster never archives. Finding W1, designs/webhook.md A.
 func TestAStoreLeftToInitdbPassesBarmansArchiveCheck(t *testing.T) {
@@ -127,15 +127,11 @@ func TestAStoreLeftToInitdbPassesBarmansArchiveCheck(t *testing.T) {
 			for server, verdict := range s.Verdicts {
 				t.Run(server, func(t *testing.T) {
 					at := location(srv, server)
-					has, err := bootstrap.S3Prober{}.HasBaseBackup(context.Background(), at)
+					archive, err := bootstrap.S3Prober{}.Survey(context.Background(), at, nil)
 					if err != nil {
-						t.Fatalf("HasBaseBackup: %v", err)
+						t.Fatalf("Survey: %v", err)
 					}
-					contents, err := bootstrap.S3Prober{}.Contents(context.Background(), at)
-					if err != nil {
-						t.Fatalf("Contents: %v", err)
-					}
-					initdb := !has && !contents.Any
+					initdb := archive.Found == nil && archive.Empty
 					if initdb && verdict.CheckWalArchive.ExitCode != 0 {
 						t.Errorf("the webhook leaves the Cluster to initdb, but barman-cloud-check-wal-archive fails on the store (exit %d: %s), so the Cluster could never archive",
 							verdict.CheckWalArchive.ExitCode, strings.TrimSpace(verdict.CheckWalArchive.Output))

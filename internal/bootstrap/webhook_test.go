@@ -42,10 +42,6 @@ type stubProber struct {
 	err error
 }
 
-func (s stubProber) HasBaseBackup(context.Context, Location) (bool, error) {
-	return s.has, s.err
-}
-
 func (s stubProber) BaseBackups(context.Context, Location) ([]BaseBackup, error) {
 	return nil, s.err
 }
@@ -979,7 +975,9 @@ func TestAClusterThatArchivesNowhereIsLeftAlone(t *testing.T) {
 //
 // The store is the recorded done-base store behind an s3fault proxy that
 // answers every request with 503 SlowDown, so the real S3Prober gets the
-// error after minio-go has spent its own retries.
+// error after minio-go has spent its own retries. The refusal has to name the
+// 503 and SlowDown, and the same store without the rule has to recover the
+// Cluster, so the refusal is known to come from the 503.
 func TestAnUnreadableStoreRefusesTheCluster(t *testing.T) {
 	endpoint, proxy := faultyS3(t, recordedS3(t, barmanstore.MustLoad(t, "done-base")))
 	unavailable := proxy.Add(s3fault.Rule{Status: http.StatusServiceUnavailable, Code: "SlowDown"})
@@ -991,6 +989,19 @@ func TestAnUnreadableStoreRefusesTheCluster(t *testing.T) {
 	}
 	if unavailable.Hits() == 0 {
 		t.Error("the store was refused without a request reaching the 503 rule")
+	}
+	for _, want := range []string{"503", "SlowDown"} {
+		if !strings.Contains(response.Result.Message, want) {
+			t.Errorf("the refusal %q does not name the store's answer %q", response.Result.Message, want)
+		}
+	}
+
+	// The control: the same store behind the same proxy, without the rule,
+	// recovers the Cluster, so the refusal above came from the 503.
+	unavailable.Remove()
+	response = decideWith(t, cluster(t, nil), S3Prober{}, storeAt(endpoint))
+	if !response.Allowed || len(response.Patches) == 0 {
+		t.Fatalf("the cluster was not recovered once the store answered: %v", response.Result)
 	}
 }
 

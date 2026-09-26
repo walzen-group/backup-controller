@@ -80,9 +80,6 @@ func (l Location) BasePrefix() string {
 // S3Prober is the real one. The interface exists so the webhook and the
 // RestoreRun controller can be tested without an object store.
 type Prober interface {
-	// HasBaseBackup reports whether the location holds at least one
-	// completed base backup, one whose backup.info has status DONE.
-	HasBaseBackup(ctx context.Context, at Location) (bool, error)
 	// BaseBackups lists the location's completed base backups, oldest
 	// first.
 	BaseBackups(ctx context.Context, at Location) ([]BaseBackup, error)
@@ -98,16 +95,6 @@ type ArchiveProber interface {
 	// backup, one finished at or before target when target is not nil.
 	// When its context ends first, it returns an *OutOfTimeError.
 	Survey(ctx context.Context, at Location, target *time.Time) (Archive, error)
-}
-
-// Contents is what S3Prober.Contents found under a database's prefix. The
-// webhook builds one from Survey's Archive to word its refusal.
-type Contents struct {
-	// Any is true when at least one object exists under the server prefix.
-	Any bool
-	// BaseDirs counts the base backup directories under base/, in any
-	// state. It is counted only when Any is true.
-	BaseDirs int
 }
 
 // ServerPrefix returns the key prefix of everything barman writes for the

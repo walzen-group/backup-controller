@@ -131,8 +131,8 @@ func TestTheProberSeesAddedBackups(t *testing.T) {
 }
 
 // TestTheProberTellsAnAddedFailedBackupFromADoneOne builds on the empty
-// store: with only an added FAILED backup HasBaseBackup is false, and with an
-// added DONE backup it is true.
+// store: with only an added FAILED backup Survey finds no DONE backup, and with an
+// added DONE backup it finds one.
 func TestTheProberTellsAnAddedFailedBackupFromADoneOne(t *testing.T) {
 	const server = "app-pg"
 	at := time.Date(2026, 10, 1, 3, 0, 0, 0, time.UTC)
@@ -153,12 +153,12 @@ func TestTheProberTellsAnAddedFailedBackupFromADoneOne(t *testing.T) {
 		if err := c.store.Upload(srv, testBucket, testPrefix); err != nil {
 			t.Fatalf("%s: upload: %v", c.name, err)
 		}
-		has, err := bootstrap.S3Prober{}.HasBaseBackup(context.Background(), location(srv, server))
+		archive, err := bootstrap.S3Prober{}.Survey(context.Background(), location(srv, server), nil)
 		if err != nil {
-			t.Fatalf("%s: HasBaseBackup: %v", c.name, err)
+			t.Fatalf("%s: Survey: %v", c.name, err)
 		}
-		if has != c.want {
-			t.Errorf("%s: HasBaseBackup = %v, want %v", c.name, has, c.want)
+		if has := archive.Found != nil; has != c.want {
+			t.Errorf("%s: Survey found a DONE backup: %v, want %v", c.name, has, c.want)
 		}
 	}
 }

@@ -34,15 +34,21 @@ type Archive struct {
 
 // OutOfTimeError is what Survey returns when its context ends before it has
 // an answer. Backups and Read are the counts so far, which the webhook's
-// refusal names.
+// refusal names. Failed is the last backup.info read that failed with
+// something other than the context ending, or nil; the file it names might
+// have been the completed backup, so the refusal names it.
 type OutOfTimeError struct {
 	Backups int
 	Read    int
+	Failed  error
 	Err     error
 }
 
 // Error words the error with the counts.
 func (e *OutOfTimeError) Error() string {
+	if e.Failed != nil {
+		return fmt.Sprintf("ran out of time after reading %d of %d backup.info files, one of which failed (%v): %v", e.Read, e.Backups, e.Failed, e.Err)
+	}
 	return fmt.Sprintf("ran out of time after reading %d of %d backup.info files: %v", e.Read, e.Backups, e.Err)
 }
 
@@ -85,7 +91,7 @@ func (p S3Prober) Survey(ctx context.Context, at Location, target *time.Time) (A
 		out.Empty = true
 		for object := range client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.ServerPrefix(), Recursive: true, MaxKeys: 1}) {
 			if object.Err != nil {
-				return Archive{}, outOfTime(ctx, fmt.Errorf("list %s/%s: %w", at.Bucket, at.ServerPrefix(), object.Err), 0, 0)
+				return Archive{}, outOfTime(ctx, fmt.Errorf("list %s/%s: %w", at.Bucket, at.ServerPrefix(), s3Answer(object.Err)), 0, 0)
 			}
 			out.Empty = false
 			break
@@ -115,14 +121,6 @@ func (p S3Prober) Survey(ctx context.Context, at Location, target *time.Time) (A
 	}
 	out.Oldest = oldest
 	return out, nil
-}
-
-// HasBaseBackup reports whether the location holds at least one completed
-// base backup. It is Survey without a target, kept for the callers that only
-// need the yes or no.
-func (p S3Prober) HasBaseBackup(ctx context.Context, at Location) (bool, error) {
-	archive, err := p.Survey(ctx, at, nil)
-	return archive.Found != nil, err
 }
 
 // BaseBackups lists the completed base backups of one database, oldest
@@ -158,8 +156,13 @@ func (p S3Prober) BaseBackups(ctx context.Context, at Location) ([]BaseBackup, e
 }
 
 // outOfTime wraps err in an *OutOfTimeError when ctx has ended, and returns
-// it unchanged otherwise.
+// it unchanged otherwise. An err that already is an *OutOfTimeError, as
+// readInfos returns, is returned as it is.
 func outOfTime(ctx context.Context, err error, backups, read int) error {
+	var late *OutOfTimeError
+	if errors.As(err, &late) {
+		return err
+	}
 	if ctx.Err() != nil {
 		return &OutOfTimeError{Backups: backups, Read: read, Err: ctx.Err()}
 	}
@@ -174,7 +177,7 @@ func backupIDs(ctx context.Context, client *minio.Client, at Location) ([]string
 	var ids []string
 	for object := range client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.BasePrefix()}) {
 		if object.Err != nil {
-			return nil, fmt.Errorf("list %s/%s: %w", at.Bucket, at.BasePrefix(), object.Err)
+			return nil, fmt.Errorf("list %s/%s: %w", at.Bucket, at.BasePrefix(), s3Answer(object.Err))
 		}
 		if strings.HasSuffix(object.Key, "/") {
 			ids = append(ids, path.Base(strings.TrimSuffix(object.Key, "/")))
@@ -200,9 +203,10 @@ type infoResult struct {
 //     backup. It returns true to stop reading.
 //
 // It returns how many files were read, a missing one included. It returns
-// the first GET or parse error, unless visit stopped the reading, and the
-// context's error when ctx ended before every file was read. When it returns,
-// every worker has stopped.
+// the first GET or parse error, unless visit stopped the reading. When ctx
+// ends before every file was read, it returns an *OutOfTimeError carrying
+// the counts and the last read that failed for another reason. When it
+// returns, every worker has stopped.
 func readInfos(ctx context.Context, client *minio.Client, at Location, ids []string, visit func(BaseBackup) bool) (int, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	jobs := make(chan string)
@@ -230,7 +234,7 @@ func readInfos(ctx context.Context, client *minio.Client, at Location, ids []str
 			for id := range jobs {
 				key := at.BasePrefix() + id + "/backup.info"
 				backup, done, err := readBaseBackup(ctx, client, at.Bucket, key)
-				if err != nil && minio.ToErrorResponse(errors.Unwrap(err)).Code == "NoSuchKey" {
+				if s3Code(err) == "NoSuchKey" {
 					err = nil
 				}
 				results <- infoResult{backup: backup, done: done, err: err}
@@ -239,7 +243,7 @@ func readInfos(ctx context.Context, client *minio.Client, at Location, ids []str
 	}
 
 	read := 0
-	var first error
+	var first, last error
 	for read < len(ids) {
 		select {
 		case r := <-results:
@@ -248,14 +252,38 @@ func readInfos(ctx context.Context, client *minio.Client, at Location, ids []str
 				if first == nil {
 					first = r.err
 				}
+				if !errors.Is(r.err, context.DeadlineExceeded) && !errors.Is(r.err, context.Canceled) {
+					last = r.err
+				}
 				continue
 			}
 			if r.done && visit(r.backup) {
 				return read, nil
 			}
 		case <-ctx.Done():
-			return read, ctx.Err()
+			return read, &OutOfTimeError{Backups: len(ids), Read: read, Failed: last, Err: ctx.Err()}
 		}
 	}
 	return read, first
+}
+
+// s3Code returns the S3 error code anywhere in err's chain, such as NoSuchKey
+// or SlowDown, or "" when err carries none.
+func s3Code(err error) string {
+	var answer minio.ErrorResponse
+	if errors.As(err, &answer) {
+		return answer.Code
+	}
+	return ""
+}
+
+// s3Answer adds the HTTP status and S3 error code of the store's answer to
+// err's message, since minio-go's own message leaves them out, and returns
+// err unchanged when it carries no S3 answer. The result wraps err.
+func s3Answer(err error) error {
+	var answer minio.ErrorResponse
+	if !errors.As(err, &answer) || answer.Code == "" {
+		return err
+	}
+	return fmt.Errorf("%w (HTTP %d %s)", err, answer.StatusCode, answer.Code)
 }

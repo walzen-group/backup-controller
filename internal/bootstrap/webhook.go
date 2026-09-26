@@ -121,9 +121,12 @@ const DefaultBudget = 10 * time.Second
 // Failures to read the store, list Clusters or RestoreRuns, or talk to the
 // object store return an HTTP 500 error response, which the API server treats
 // as a refusal. A body that isn't a valid Cluster returns an HTTP 400. A
-// create gets Budget (DefaultBudget when zero) to decide; when the object
-// store survey runs out of it, the create is refused with the counts read so
-// far and how to clear the failed backups (see surveyFailed).
+// create gets Budget (DefaultBudget when zero) to decide. When a Kubernetes
+// read runs out of it, the HTTP 500 says "the webhook ran out of its <budget>
+// budget while <step>" (see readFailed). When the object store survey runs
+// out of it, the create is refused with the counts read so far, the last
+// backup.info that failed to read, if any, and how to clear the failed
+// backups (see surveyFailed).
 func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.Response {
 	logger := log.FromContext(ctx).WithValues(
 		"cluster", fmt.Sprintf("%s/%s", req.Namespace, req.Name),
@@ -179,8 +182,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		// The store is named and unreadable. Refusing is the failure that gets
 		// noticed; allowing would create an empty database beside a full
 		// archive and report success.
-		logger.Error(err, "cannot read the object store")
-		return admission.Errored(http.StatusInternalServerError, err)
+		return readFailed(ctx, logger, budget, fmt.Sprintf("reading the ObjectStore %s/%s and its Secrets", req.Namespace, store), err)
 	}
 
 	// Two databases archiving to one prefix interleave their WAL and leave the
@@ -190,8 +192,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	// bootstraps, so a Cluster declaring its own bootstrap is checked too.
 	holder, err := archiveHolder(ctx, d.Client, req.Namespace, req.Name, at)
 	if err != nil {
-		logger.Error(err, "cannot check which databases archive here")
-		return admission.Errored(http.StatusInternalServerError, err)
+		return readFailed(ctx, logger, budget, "listing the Clusters and reading their ObjectStores", err)
 	}
 	if holder != "" {
 		logger.Info("refusing the Cluster", "reason", "another database archives here", "holder", holder, "prefix", at.Prefix)
@@ -224,8 +225,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 
 	run, err := waitingRun(ctx, d.Client, req.Namespace, req.Name)
 	if err != nil {
-		logger.Error(err, "cannot read the namespace's RestoreRuns")
-		return admission.Errored(http.StatusInternalServerError, err)
+		return readFailed(ctx, logger, budget, "listing the RestoreRuns in "+req.Namespace, err)
 	}
 
 	// A Cluster that already names a bootstrap other than initdb was written
@@ -275,7 +275,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		// from. An empty prefix is the only place initdb is safe.
 		if !archive.Empty {
 			logger.Info("refusing the Cluster", "reason", "an archive with no completed base backup", "prefix", at.ServerPrefix())
-			return admission.Denied(noDoneBackup(at, serverName, Contents{Any: true, BaseDirs: archive.Backups}))
+			return admission.Denied(noDoneBackup(at, serverName, archive.Backups))
 		}
 		logger.Info("leaving the Cluster to initdb", "reason", "no completed base backup in the store", "prefix", at.BasePrefix())
 		return admission.Allowed("no base backup")
@@ -654,6 +654,26 @@ func setRecovery(cluster *unstructured.Unstructured, store, serverName string, t
 	return nil
 }
 
+// readFailed answers a create whose Kubernetes read failed, with an HTTP
+// 500, which the API server treats as a refusal.
+//
+// Parameters:
+//   - ctx is Handle's context, the one the budget bounds.
+//   - budget is the budget Handle gave itself, which the message names.
+//   - step says what the read was, such as "listing the Clusters".
+//   - err is the read's error, which the response carries.
+//
+// When ctx has passed its deadline, the message starts with "the webhook ran
+// out of its <budget> budget while <step>", so a stalled API server is told
+// apart from a read that failed.
+func readFailed(ctx context.Context, logger logr.Logger, budget time.Duration, step string, err error) admission.Response {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		err = fmt.Errorf("the webhook ran out of its %s budget while %s: %w", budget, step, err)
+	}
+	logger.Error(err, "cannot decide the Cluster")
+	return admission.Errored(http.StatusInternalServerError, err)
+}
+
 // surveyFailed answers a create whose Survey failed. An *OutOfTimeError is
 // refused with a message a person can act on: the counts read so far, and
 // how to clear the failed backups barman never deletes. Any other error is
@@ -664,11 +684,17 @@ func surveyFailed(logger logr.Logger, at Location, err error) admission.Response
 		logger.Error(err, "cannot read the object store")
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	logger.Info("refusing the Cluster", "reason", "the survey ran out of time", "backups", late.Backups, "read", late.Read)
+	logger.Info("refusing the Cluster", "reason", "the survey ran out of time", "backups", late.Backups, "read", late.Read, "failed", late.Failed)
 	base := fmt.Sprintf("s3://%s/%s", at.Bucket, at.BasePrefix())
 	if late.Backups == 0 {
 		return admission.Denied(fmt.Sprintf(
 			"Checking %s ran out of time before the object store listed its base backups. Check that the object store answers, then create the Cluster again.", base,
+		))
+	}
+	if late.Failed != nil {
+		return admission.Denied(fmt.Sprintf(
+			"Checking %s ran out of time: %d base backups are there, %d backup.info files were read with no completed backup among them, and one failed to read: %v. That file might be the completed backup. Check that the object store serves it, then create the Cluster again. If the store also holds many failed or unfinished backups, which barman never deletes, delete the base/<id>/ directories whose backup.info does not say status=DONE (barman-cloud-backup-delete --backup-id <id> deletes one).",
+			base, late.Backups, late.Read, late.Failed,
 		))
 	}
 	return admission.Denied(fmt.Sprintf(
@@ -684,16 +710,17 @@ func surveyFailed(logger logr.Logger, at Location, err error) admission.Response
 //   - at is the database's Location.
 //   - serverName is the directory the Cluster archives under, which the
 //     message suggests changing.
-//   - contents is what the prefix holds. BaseDirs picks the wording of the
+//   - backups counts the base backup directories under base/, in any
+//     state, as Survey's Archive.Backups does. It picks the wording of the
 //     parenthesis.
-func noDoneBackup(at Location, serverName string, contents Contents) string {
+func noDoneBackup(at Location, serverName string, backups int) string {
 	what := "(no base backup under base/, but other objects, such as WAL, under the prefix)"
-	switch contents.BaseDirs {
+	switch backups {
 	case 0:
 	case 1:
 		what = "(1 base backup under base/, not DONE)"
 	default:
-		what = fmt.Sprintf("(%d base backups under base/, none DONE)", contents.BaseDirs)
+		what = fmt.Sprintf("(%d base backups under base/, none DONE)", backups)
 	}
 	prefix := fmt.Sprintf("s3://%s/%s", at.Bucket, at.ServerPrefix())
 	return fmt.Sprintf(

@@ -61,8 +61,8 @@ func TestProberRequestsMatchRecordedTranscripts(t *testing.T) {
 					AccessKey: srv.AccessKey, SecretKey: srv.SecretKey,
 				}
 				ctx := context.Background()
-				if _, err := (bootstrap.S3Prober{}).HasBaseBackup(ctx, at); err != nil {
-					t.Fatalf("HasBaseBackup: %v", err)
+				if _, err := (bootstrap.S3Prober{}).Survey(ctx, at, nil); err != nil {
+					t.Fatalf("Survey: %v", err)
 				}
 				if _, err := (bootstrap.S3Prober{}).BaseBackups(ctx, at); err != nil {
 					t.Fatalf("BaseBackups: %v", err)

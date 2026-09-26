@@ -176,11 +176,6 @@ func (r *retimer) Retime(_ context.Context, _ *corev1.Secret, short string, at t
 // list, with no object store behind it.
 type prober []bootstrap.BaseBackup
 
-// HasBaseBackup reports whether the list holds any base backup.
-func (p prober) HasBaseBackup(context.Context, bootstrap.Location) (bool, error) {
-	return len(p) > 0, nil
-}
-
 // BaseBackups returns the fixed list.
 func (p prober) BaseBackups(context.Context, bootstrap.Location) ([]bootstrap.BaseBackup, error) {
 	return p, nil

@@ -138,7 +138,7 @@ func TestAStoreWithADoneBaseBackupRecoversTheCluster(t *testing.T) {
 // for a prefix with several base backup directories and none DONE.
 func TestTheRefusalCountsTheBaseBackups(t *testing.T) {
 	at := Location{Bucket: "backups", Prefix: "app/app-pg"}
-	message := noDoneBackup(at, "app-pg", Contents{Any: true, BaseDirs: 3})
+	message := noDoneBackup(at, "app-pg", 3)
 	if want := "s3://backups/app/app-pg/ holds an archive with no completed base backup (3 base backups under base/, none DONE)."; !strings.HasPrefix(message, want) {
 		t.Errorf("refusal %q does not start with %q", message, want)
 	}

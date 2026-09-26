@@ -159,7 +159,7 @@ func (r *recorder) at(step string) {
 
 // writeTranscript runs the controller's S3 reader, bootstrap.S3Prober,
 // against one server of a recorded store through a recording proxy, and
-// writes every exchange to out: the requests HasBaseBackup and BaseBackups
+// writes every exchange to out: the requests Survey and BaseBackups
 // make, and RustFS's answers.
 func writeTranscript(ctx context.Context, endpoint, bucket, prefix, server, out string) error {
 	rec, err := startRecorder(endpoint)
@@ -176,8 +176,8 @@ func writeTranscript(ctx context.Context, endpoint, bucket, prefix, server, out 
 		SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
 	}
 	rec.at("prober-has-base-backup")
-	if _, err := (bootstrap.S3Prober{}).HasBaseBackup(ctx, at); err != nil {
-		return fmt.Errorf("HasBaseBackup: %w", err)
+	if _, err := (bootstrap.S3Prober{}).Survey(ctx, at, nil); err != nil {
+		return fmt.Errorf("Survey: %w", err)
 	}
 	rec.at("prober-base-backups")
 	if _, err := (bootstrap.S3Prober{}).BaseBackups(ctx, at); err != nil {

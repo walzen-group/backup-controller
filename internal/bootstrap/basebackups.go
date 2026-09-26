@@ -35,12 +35,12 @@ type BaseBackup struct {
 func readBaseBackup(ctx context.Context, client *minio.Client, bucket, key string) (BaseBackup, bool, error) {
 	reader, err := client.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
 	if err != nil {
-		return BaseBackup{}, false, fmt.Errorf("get %s/%s: %w", bucket, key, err)
+		return BaseBackup{}, false, fmt.Errorf("get %s/%s: %w", bucket, key, s3Answer(err))
 	}
 	raw, err := io.ReadAll(reader)
 	_ = reader.Close()
 	if err != nil {
-		return BaseBackup{}, false, fmt.Errorf("read %s/%s: %w", bucket, key, err)
+		return BaseBackup{}, false, fmt.Errorf("read %s/%s: %w", bucket, key, s3Answer(err))
 	}
 	backup, done, err := baseBackupAt(key, raw)
 	if err != nil {

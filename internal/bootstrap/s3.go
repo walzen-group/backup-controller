@@ -1,7 +1,6 @@
 package bootstrap
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -17,48 +16,6 @@ import (
 // through minio-go. It keeps no state. Each call builds a client from the
 // Location it's given.
 type S3Prober struct{}
-
-// Contents reports what a database's prefix holds at all: whether any
-// object exists under Location.ServerPrefix (WAL, base backup directories in
-// any state, or anything else), and how many directories it holds under
-// base/. The webhook calls it before it lets a new database start empty,
-// because CloudNativePG runs barman's empty-archive check before the first
-// WAL upload, and that check fails on any WAL under the prefix.
-//
-// The at argument is the database's Location, as ResolveLocation returns it.
-//
-// It asks for one key of a recursive listing of the server prefix. Only when
-// there is one does it list base/ with a delimiter and count the directories,
-// which the webhook's refusal names. It returns an error when the client
-// can't be built from the location or when a listing fails.
-func (p S3Prober) Contents(ctx context.Context, at Location) (Contents, error) {
-	client, err := p.client(at)
-	if err != nil {
-		return Contents{}, err
-	}
-
-	var out Contents
-	for object := range client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.ServerPrefix(), Recursive: true, MaxKeys: 1}) {
-		if object.Err != nil {
-			return Contents{}, fmt.Errorf("list %s/%s: %w", at.Bucket, at.ServerPrefix(), object.Err)
-		}
-		out.Any = true
-		break
-	}
-	if !out.Any {
-		return out, nil
-	}
-
-	for object := range client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.BasePrefix()}) {
-		if object.Err != nil {
-			return Contents{}, fmt.Errorf("list %s/%s: %w", at.Bucket, at.BasePrefix(), object.Err)
-		}
-		if strings.HasSuffix(object.Key, "/") {
-			out.BaseDirs++
-		}
-	}
-	return out, nil
-}
 
 // client builds a minio client for the location's endpoint and credentials.
 // For an HTTPS endpoint it trusts the public roots plus the location's
