@@ -425,43 +425,11 @@ pod mounts it: Kubernetes keeps the claim, Terminating, until that pod is gone
 ### When VolSync stops serving v1alpha1
 
 The controller reads and writes ReplicationDestinations only at
-volsync.backube/v1alpha1 (see [compatibility](compatibility.md)). When a
-VolSync upgrade leaves the API server serving the kind at another version
-alone, a RestoreRun that is not a database-only run stops at its next pass:
-
-- A run with no ReplicationDestination, named by an item or present under an
-  item's name, ends Failed with reason VolSyncUnsupported. It starts the
-  workloads it stopped and resumes the Kustomizations it suspended.
-- A run whose ReplicationDestination is still there holds with Ready False
-  and reason VolSyncUnsupported, and the app stays stopped. The run can
-  neither delete the destination nor read whether its mover finished, and
-  giving the app back while the mover writes would let the app read a
-  half-restored claim. The hold lasts past spec.timeout.
-
-A held run that you delete keeps its finalizer for the same reason, with
-reason WaitingForShutdown and the same destination in its message.
-
-To end a held run, check the mover first. Its pod carries the label
-job-name=volsync-dst-<destination>:
-
-```
-kubectl -n <namespace> get pods -l job-name=volsync-dst-<destination>
-```
-
-Once the pod has finished, or you accept stopping it mid-restore, delete the
-ReplicationDestination the message names:
-
-```
-kubectl -n <namespace> delete replicationdestinations.volsync.backube <destination>
-```
-
-Expected result: within two minutes, the run ends Failed with reason
-VolSyncUnsupported and the app comes back; a deleted run goes away. The run
-waits first until no Job owned by the destination, no Job named
-volsync-dst-<destination> and no running pod of that Job is left, and until
-10 seconds have passed since it found the destination gone. A claim whose
-mover you stopped mid-restore holds partly restored data: restore it again
-once the controller supports the VolSync version.
+volsync.backube/v1alpha1 (see [compatibility](compatibility.md)). A RestoreRun
+that meets an API server serving VolSync's kinds at another version fails
+every VolSync request with an error naming the kind and v1alpha1, and retries
+it with the app stopped until v1alpha1 is served again. Upgrade the controller
+before VolSync, and no run meets that error.
 
 ## Databases restore themselves
 

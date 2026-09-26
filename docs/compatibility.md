@@ -46,16 +46,15 @@ loudly only when it meets a real incompatibility.
 | Kinds | How the controller finds the version | When the version it used is gone |
 | --- | --- | --- |
 | Flux Kustomization; Kueue Workload and LocalQueue; CloudNativePG Cluster and Backup; barman-cloud ObjectStore | served.Kind looks the kind up by group and kind in the manager's RESTMapper, which caches the answer, and every request goes out at that version (internal/served/served.go). | The API server answers "404 page not found". served.VersionGone turns that into an error the run retries, makes the mapper read discovery again, and the next pass uses the new version. The 404 never counts as a missing object. |
-| VolSync ReplicationSource and ReplicationDestination | The controller has Go types for volsync.backube/v1alpha1 only, from github.com/backube/volsync v0.16.0. | volsyncUnsupported (internal/runs/volsynccheck.go) checks every unfinished run that is not a database-only run. A BackupRun ends Failed with Ready reason VolSyncUnsupported and a message that names each kind and the versions served; it starts the workloads it stopped first, since that needs no VolSync object. A RestoreRun ends the same way once no mover of its own can write, and holds with that reason while its ReplicationDestination, the mover's Job or a pod of it is still there (see [restores](restores.md#when-volsync-stops-serving-v1alpha1)). No run creates or deletes a VolSync object until v1alpha1 is served again or a controller release that knows the new version is installed. The controller also logs the message once at startup. |
+| VolSync ReplicationSource and ReplicationDestination | The controller has Go types for volsync.backube/v1alpha1 only, from github.com/backube/volsync v0.16.0. | volsyncUnsupported (internal/runs/volsynccheck.go) checks every unfinished BackupRun that is not a database-only run. The run ends Failed with Ready reason VolSyncUnsupported and a message that names each kind and the versions served; it starts the workloads it stopped first, since that needs no VolSync object. A RestoreRun sends its VolSync requests at v1alpha1 as always: each one fails with an error naming the kind and v1alpha1, and the run retries it with the app stopped until v1alpha1 is served again (see [restores](restores.md#when-volsync-stops-serving-v1alpha1)). The controller also logs the message once at startup. |
 
 | Core Kubernetes kinds (apps/v1, v1, batch/v1, coordination/v1, apiextensions.k8s.io/v1) | Fixed. These versions are GA and Kubernetes keeps serving them. | served.Client and served.Reader turn the 404 into a retried error for every kind, typed ones included. |
 
 VolSync has published only v1alpha1, in every tag up to v0.16.0 and on its
 main branch as of 2026-09-26 (api/ holds v1alpha1 alone, and the CRDs under
 config/crd/bases serve that version only). The controller therefore has no
-other version to fall back to. It ends or holds the run as the table says, and
-reads a ReplicationDestination at the served version only to learn whether it
-exists. It never sends a request at a version it guessed.
+other version to fall back to. It ends a BackupRun or lets a RestoreRun retry
+as the table says, and it never sends a request at a version it guessed.
 
 Every create, update and patch the controller sends carries
 fieldValidation=Strict (clientOptions in cmd/backup-controller/main.go).

@@ -185,12 +185,13 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 		return fmt.Errorf("add the readiness check: %w", err)
 	}
 
-	// An incompatible VolSync ends or holds every run that touches VolSync
-	// objects with reason VolSyncUnsupported, and a Cluster the bootstrap
+	// An incompatible VolSync ends every BackupRun that touches VolSync
+	// objects with reason VolSyncUnsupported; a RestoreRun's VolSync
+	// requests then fail, and the run retries them. A Cluster the bootstrap
 	// webhook would not see created again ends or holds every restore of a
 	// database with reason ClusterVersionUnsupported. Both checks also run
-	// once when the manager starts, so the log says it before any run does, and
-	// the startup warms the mapper for the bootstrap webhook (see
+	// once when the manager starts, so the log says it before any run does,
+	// and the startup warms the mapper for the bootstrap webhook (see
 	// bootstrap.Warm).
 	if err := manager.Add(ctrlmanager.RunnableFunc(func(context.Context) error {
 		checkServedVersions(manager.GetRESTMapper())

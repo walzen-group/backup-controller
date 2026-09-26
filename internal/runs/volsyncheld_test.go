@@ -8,11 +8,8 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -24,9 +21,10 @@ import (
 // The tests in this file check what a run does when VolSync, in the middle
 // of the run, stops serving v1alpha1, the one version the controller's
 // VolSync types come from. Giving the app back needs no VolSync object, so
-// a BackupRun ends and restarts what it stopped. A RestoreRun holds only
-// while a mover of its own may still write, since it can't stop that mover
-// through an API it has no types for.
+// a BackupRun ends and restarts what it stopped. A RestoreRun can't stop
+// its mover through an API it has no types for, so each pass fails loudly
+// and retries, with the app down, until v1alpha1 is served again. VolSync
+// is upgraded after the controller, so a supported cluster never gets here.
 
 // volsyncMovedMapper serves VolSync's kinds at v1beta1 alone, as the API
 // server's discovery does after a VolSync release that drops v1alpha1. Every
@@ -173,158 +171,51 @@ func movedDestinationExists(t *testing.T, c client.Client) bool {
 	return err == nil
 }
 
-// deleteMovedDestination deletes the run's ReplicationDestination for its
-// first item at v1beta1, as a person does with kubectl.
-func deleteMovedDestination(t *testing.T, c client.Client) {
+// checkVolSyncRefused fails the test unless err is the error of a request
+// for a VolSync kind at v1alpha1, which the API server no longer serves: an
+// error the reconcile returns for a retry, naming the kind and the version.
+func checkVolSyncRefused(t *testing.T, err error, kind string) {
 	t.Helper()
-	destination := &unstructured.Unstructured{}
-	destination.SetAPIVersion(volsyncv1alpha1.GroupVersion.Group + "/v1beta1")
-	destination.SetKind("ReplicationDestination")
-	destination.SetNamespace(ns)
-	destination.SetName(destinationName(restoreUID, 0))
-	if err := c.Delete(context.Background(), destination); err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("the pass returned no error, want the unserved VolSync version refused and retried")
 	}
-}
-
-// A quiesced RestoreRun that stopped the app but created no
-// ReplicationDestination yet has no mover that could write, so it ends at
-// once with reason VolSyncUnsupported and gives the app back.
-func TestARestoreThatCreatedNothingEndsWhenVolSyncDropsV1alpha1(t *testing.T) {
-	run, _ := quiescedMidRestore()
-	run.Status.Items[0].Phase, run.Status.Items[0].Destination = backupv1alpha1.ItemPending, ""
-	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true))
-
-	for range 2 {
-		if err := tryRestoreStep(r); err != nil {
-			t.Fatalf("reconcile: %v", err)
+	if apierrors.IsNotFound(err) {
+		t.Errorf("error = %v, want one that never reads as a missing object", err)
+	}
+	for _, want := range []string{kind, "volsync.backube/v1alpha1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %s", err, want)
 		}
-	}
-
-	after := readRestoreRun(t, c)
-	checkVolSyncUnsupported(t, after.Status.Conditions, "ReplicationDestination")
-	if after.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Errorf("phase = %q, want Failed", after.Status.Phase)
-	}
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d, want the app's 2 back", got)
-	}
-	if suspended(t, c) {
-		t.Error("the Kustomization is still suspended")
 	}
 }
 
 // A RestoreRun whose ReplicationDestination is still there when VolSync
-// stops serving v1alpha1 holds, with the app down and the reason naming the
-// destination, however far past its timeout, since its mover may still
-// write into the claim. Once a person deletes the destination and its mover
-// is gone, the run ends and gives the app back.
-func TestARestoreWithADestinationHoldsUntilTheDestinationIsGone(t *testing.T) {
+// stops serving v1alpha1 can neither read nor stop its mover. Each pass
+// fails with an error naming ReplicationDestination and v1alpha1, and the
+// run stays unfinished with the app down and the destination left alone,
+// however far past its timeout, until v1alpha1 is served again.
+func TestARestoreFailsLoudlyAndKeepsTheAppDownWhenVolSyncDropsV1alpha1(t *testing.T) {
 	run, _ := quiescedMidRestore()
 	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true),
 		destinationAt(t, run, claimN, "v1beta1"))
 	r.Now = func() time.Time { return frozen.Add(48 * time.Hour) }
 
 	for range 3 {
-		if err := tryRestoreStep(r); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
+		checkVolSyncRefused(t, tryRestoreStep(r), "ReplicationDestination")
 	}
 
-	held := readRestoreRun(t, c)
-	checkVolSyncUnsupported(t, held.Status.Conditions, "ReplicationDestination")
-	if message := readyMessage(held.Status.Conditions); !strings.Contains(message, destinationName(restoreUID, 0)) {
-		t.Errorf("message = %q, want it to name the destination", message)
-	}
-	if held.Status.Phase.Finished() || replicasOf(t, c) != 0 || !movedDestinationExists(t, c) {
-		t.Fatalf("phase = %q, replicas = %d, destination there = %v; want the run held, the app down and the destination left alone",
-			held.Status.Phase, replicasOf(t, c), movedDestinationExists(t, c))
-	}
-
-	deleteMovedDestination(t, c)
-	for range 3 {
-		if err := tryRestoreStep(r); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-	}
-
-	ended := readRestoreRun(t, c)
-	if ended.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(ended.Status.Conditions) != backupv1alpha1.ReasonVolSyncUnsupported {
-		t.Errorf("phase = %q, reason = %q; want Failed with %s", ended.Status.Phase, readyReason(ended.Status.Conditions), backupv1alpha1.ReasonVolSyncUnsupported)
-	}
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d, want the app's 2 back", got)
+	after := readRestoreRun(t, c)
+	if after.Status.Phase.Finished() || replicasOf(t, c) != 0 || !suspended(t, c) || !movedDestinationExists(t, c) {
+		t.Errorf("phase = %q, replicas = %d, suspended = %v, destination there = %v; "+
+			"want the run unfinished, the app down and the destination left alone",
+			after.Status.Phase, replicasOf(t, c), suspended(t, c), movedDestinationExists(t, c))
 	}
 }
 
-// A destination the run created and lost the status write of, which its
-// item doesn't name, holds the run the same way.
-func TestARestoreWithALostDestinationHoldsWhenVolSyncDropsV1alpha1(t *testing.T) {
-	run, _ := quiescedMidRestore()
-	run.Status.Items[0].Phase, run.Status.Items[0].Destination = backupv1alpha1.ItemPending, ""
-	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true),
-		destinationAt(t, run, claimN, "v1beta1"))
-
-	for range 2 {
-		if err := tryRestoreStep(r); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-	}
-
-	held := readRestoreRun(t, c)
-	checkVolSyncUnsupported(t, held.Status.Conditions, "ReplicationDestination")
-	if held.Status.Phase.Finished() || replicasOf(t, c) != 0 {
-		t.Errorf("phase = %q, replicas = %d; want the run held with the app down", held.Status.Phase, replicasOf(t, c))
-	}
-}
-
-// A mover Job that VolSync owns by the destination keeps the run held after
-// the destination is gone, whatever VolSync named it, until the Job is gone.
-func TestARestoreHoldsForAMoverJobOwnedByItsDestination(t *testing.T) {
-	run, _ := quiescedMidRestore()
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: "mover-by-another-name", Namespace: ns, OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: volsyncv1alpha1.GroupVersion.Group + "/v1beta1", Kind: "ReplicationDestination",
-			Name: destinationName(restoreUID, 0), UID: "destination-uid",
-		}}},
-		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever, Containers: []corev1.Container{{Name: "restic", Image: "volsync"}},
-		}}},
-	}
-	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true), job)
-
-	for range 3 {
-		if err := tryRestoreStep(r); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-	}
-
-	held := readRestoreRun(t, c)
-	if held.Status.Phase.Finished() || replicasOf(t, c) != 0 {
-		t.Fatalf("phase = %q, replicas = %d; want the run held while Job %s is there", held.Status.Phase, replicasOf(t, c), job.Name)
-	}
-	if message := readyMessage(held.Status.Conditions); !strings.Contains(message, job.Name) {
-		t.Errorf("message = %q, want it to name Job %s", message, job.Name)
-	}
-
-	if err := c.Delete(context.Background(), job); err != nil {
-		t.Fatal(err)
-	}
-	for range 3 {
-		if err := tryRestoreStep(r); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-	}
-	if ended := readRestoreRun(t, c); ended.Status.Phase != backupv1alpha1.RunPhaseFailed || replicasOf(t, c) != 2 {
-		t.Errorf("phase = %q, replicas = %d; want the run Failed and the app back", ended.Status.Phase, replicasOf(t, c))
-	}
-}
-
-// A held RestoreRun that is deleted keeps its finalizer while its
-// destination is there, and names the destination and the way out. Once a
-// person deletes the destination and its mover is gone, the deletion
-// completes and the app comes back.
-func TestADeletedRestoreHeldByVolSyncCompletesOnceNoMoverCanRun(t *testing.T) {
+// A RestoreRun deleted while VolSync serves only v1alpha1's successor keeps
+// its finalizer and the app down, and each pass fails with an error naming
+// ReplicationDestination: its mover may still write into the claim.
+func TestADeletedRestoreKeepsItsFinalizerWhenVolSyncDropsV1alpha1(t *testing.T) {
 	run, _ := quiescedMidRestore()
 	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true),
 		destinationAt(t, run, claimN, "v1beta1"))
@@ -333,51 +224,12 @@ func TestADeletedRestoreHeldByVolSyncCompletesOnceNoMoverCanRun(t *testing.T) {
 	}
 
 	for range 3 {
-		if err := tryRestoreStep(r); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-	}
-	held := readRestoreRun(t, c)
-	if message := readyMessage(held.Status.Conditions); !strings.Contains(message, destinationName(restoreUID, 0)) || !strings.Contains(message, "kubectl") {
-		t.Errorf("message = %q, want it to name the destination and how to delete it", message)
-	}
-	if replicasOf(t, c) != 0 || !movedDestinationExists(t, c) {
-		t.Fatalf("replicas = %d, destination there = %v; want the app down and the destination left alone", replicasOf(t, c), movedDestinationExists(t, c))
+		checkVolSyncRefused(t, tryRestoreStep(r), "ReplicationDestination")
 	}
 
-	deleteMovedDestination(t, c)
-	for range 3 {
-		if err := tryRestoreStep(r); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-	}
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d, want the app's 2 back", got)
-	}
-	err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{})
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("get the deleted run: %v, want it gone", err)
-	}
-}
-
-// A finished RestoreRun deleted while VolSync serves only v1beta1 goes at
-// once: it has no destination, and none is there under its items' names.
-func TestADeletedFinishedRestoreGoesWhenVolSyncDropsV1alpha1(t *testing.T) {
-	run, _ := quiescedMidRestore()
-	completed := metav1.NewTime(frozen)
-	run.Status.Phase, run.Status.CompletedAt = backupv1alpha1.RunPhaseSucceeded, &completed
-	run.Status.RestartedAt = &completed
-	run.Status.Items[0].Phase, run.Status.Items[0].Destination = backupv1alpha1.ItemSucceeded, ""
-	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), deployment())
-	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := tryRestoreStep(r); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{})
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("get the deleted run: %v, want it gone", err)
+	after := readRestoreRun(t, c)
+	if len(after.Finalizers) == 0 || replicasOf(t, c) != 0 || !movedDestinationExists(t, c) {
+		t.Errorf("finalizers = %v, replicas = %d, destination there = %v; want the finalizer kept, the app down and the destination left alone",
+			after.Finalizers, replicasOf(t, c), movedDestinationExists(t, c))
 	}
 }

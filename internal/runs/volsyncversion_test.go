@@ -106,23 +106,33 @@ func TestABackupEndsWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
 	}
 }
 
-// A RestoreRun on such a cluster that has created nothing ends the same
-// way, naming ReplicationDestination, and creates nothing.
-func TestARestoreEndsWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
+// A RestoreRun on such a cluster fails each pass with an error naming
+// v1alpha1 and the VolSync kind it met first, the ReplicationSources its
+// plan lists to find a backup of the claim still running, and puts that
+// error on its Ready condition. It stays unfinished and creates no
+// destination.
+func TestARestoreRetriesLoudlyWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
 	c := newClientWithCRDs(t, crdsWithVolSyncAt(t, "v1beta1"),
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
 		claim(), volumeRestore(), repository())
 	served := servingOnly(c)
 	r := &RestoreRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
 
+	var err error
 	for range 3 {
-		_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
+		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
 	}
 
+	checkVolSyncRefused(t, err, "ReplicationSource")
 	run := readRestoreRun(t, c)
-	checkVolSyncUnsupported(t, run.Status.Conditions, "ReplicationDestination")
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Errorf("phase = %q, want Failed", run.Status.Phase)
+	if run.Status.Phase.Finished() {
+		t.Errorf("phase = %q, want the run unfinished", run.Status.Phase)
+	}
+	if message := readyMessage(run.Status.Conditions); !strings.Contains(message, "volsync.backube/v1alpha1") {
+		t.Errorf("Ready message = %q, want the refused VolSync version on it", message)
+	}
+	if movedDestinationExists(t, c) {
+		t.Error("a ReplicationDestination was created")
 	}
 }
 
@@ -163,5 +173,36 @@ func TestARestoreNeverTakesAVersionGoneForADeletedDestination(t *testing.T) {
 	}
 	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
 		t.Errorf("item = %+v, want it still Running", item)
+	}
+}
+
+// A RestoreRun deleted while the API server answers its
+// ReplicationDestination read with the 404 of a version it no longer serves
+// keeps its finalizer and its destination: finalize never counts the mover
+// gone on that answer, and retries.
+func TestADeletedRestoreNeverTakesAVersionGoneForADeletedDestination(t *testing.T) {
+	r, c := restoreReconciler(t, nil,
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
+		claim(), volumeRestore(), repository())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // restore: the destination exists, the item runs
+	run := readRestoreRun(t, c)
+	if err := c.Delete(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	gone := destinationGone(c)
+	r.Client, r.Reader = gone, gone
+	r.serve()
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
+	if err == nil {
+		t.Error("the pass returned no error, want the unserved version retried")
+	}
+	if after := readRestoreRun(t, c); len(after.Finalizers) == 0 || after.Status.Items[0].Destination == "" {
+		t.Errorf("finalizers = %v, item = %+v; want the finalizer and the item's destination kept", after.Finalizers, after.Status.Items[0])
+	}
+	destination := &volsyncv1alpha1.ReplicationDestination{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: run.Status.Items[0].Destination}, destination); err != nil {
+		t.Errorf("get the destination: %v, want it left alone", err)
 	}
 }

@@ -114,12 +114,12 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // Whenever the Ready reason changes during a reconcile, Reconcile records an
 // event on the run.
 //
-// An unfinished run with no spec.database that is not being deleted first
-// goes through volsyncUnsupported. While VolSync serves its kinds only at a
-// version other than v1alpha1, endForVolSync holds the run with reason
-// VolSyncUnsupported while a mover of its own may still write, and ends it
-// otherwise. A run being deleted goes to finalize, whose stopMovers waits
-// the same way until no mover of the run can write.
+// While VolSync serves its kinds only at a version other than v1alpha1, a
+// pass that reads, creates or deletes a VolSync object gets an error naming
+// the kind and v1alpha1, which it returns for a retry (see serve). The run
+// changes nothing on that error and keeps the app stopped until v1alpha1 is
+// served again. VolSync is upgraded after the controller, so a supported
+// cluster never gets there.
 func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.RestoreRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -127,15 +127,6 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	before := readyReason(run.Status.Conditions)
 	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Restore") }()
-	// A run that may touch VolSync objects can't go on while VolSync serves
-	// its kinds only at a version this controller has no Go types for (see
-	// endForVolSync). A database-only run needs no VolSync object and goes
-	// on.
-	if !run.Status.Phase.Finished() && run.DeletionTimestamp.IsZero() && run.Spec.Database == "" {
-		if message := volsyncUnsupported(r.RESTMapper()); message != "" {
-			return r.endForVolSync(ctx, run, message)
-		}
-	}
 	if !run.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, run)
 	}
@@ -2319,7 +2310,7 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // such an item is not finished, so work ends the run only through abort,
 // which fails the item with the note from clusterLeftDeleted first.
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
-	left, err := r.stopMovers(ctx, run)
+	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
 	}
@@ -2391,7 +2382,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
 	}
-	left, err := r.stopMovers(ctx, run)
+	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
 	}
@@ -2555,19 +2546,6 @@ type moverLeft struct {
 	// and no pod of the mover, or did not look, and pollInterval has not
 	// passed since it deleted the destination.
 	what string
-
-	// unserved is true for a mover unservedMovers found while VolSync is
-	// not served at v1alpha1. The run did not delete its destination and
-	// can't, so the message says how a person does (see unservedMessage).
-	unserved bool
-
-	// kept is true when unservedMovers found the destination itself still
-	// there at the version the API server serves.
-	kept bool
-
-	// namespace is the run's namespace, for the command unservedMessage
-	// gives. Only unservedMovers sets it.
-	namespace string
 }
 
 // moverList holds the movers a run has stopped that are not gone yet, in the
@@ -2628,9 +2606,6 @@ func (l moverList) message() string {
 		return ""
 	}
 	m := l[0]
-	if m.unserved {
-		return m.unservedMessage()
-	}
 	still := fmt.Sprintf("the run deleted the destination, and looks for the mover's Job and pods once %s have passed since the delete", pollInterval)
 	if m.what != "" {
 		still = "its " + m.what + " is still there"
