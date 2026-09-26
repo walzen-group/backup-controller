@@ -46,8 +46,9 @@ const (
 	// ReasonQueued reports a run waiting for Kueue to admit it.
 	ReasonQueued = "Queued"
 
-	// ReasonSourceBusy reports a run waiting for another run's backup of the
-	// same volume to finish.
+	// ReasonSourceBusy reports a run waiting for another run: a backup or
+	// restore of the same claim or repository, or a run that has stopped this
+	// namespace's workloads and has not given them back yet.
 	ReasonSourceBusy = "SourceBusy"
 
 	// ReasonNoBackupInReach reports a restore whose moment is older than every

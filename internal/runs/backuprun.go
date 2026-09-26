@@ -346,7 +346,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, err
 	}
 	if over {
-		return ctrl.Result{}, r.abort(ctx, run, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
+		return ctrl.Result{}, r.abort(ctx, run, timedOutMessage(deadline, run.Status.Conditions))
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
 	// restore of that claim need not wait for the rest of the run. This is
@@ -356,6 +356,18 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(name string) bool { return backupItemDone(run, name) }); err != nil {
 		log.FromContext(ctx).Error(err, "could not release the Leases of the run's finished items; the run goes on",
 			"namespace", run.Namespace, "name", run.Name)
+	}
+	// The quiesce Leases go once the stored status shows every workload back
+	// and this run will not touch them again (see owesRestart). Best effort
+	// as well: a Lease left behind is stale under holderLive's rule and the
+	// next run takes it over.
+	if durablyRestarted(run) {
+		if owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run); err == nil && !owes {
+			if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
+				log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
+					"namespace", run.Namespace, "name", run.Name)
+			}
+		}
 	}
 
 	if run.Spec.All && run.Status.QuiescedAt == nil {
@@ -442,6 +454,16 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 			return ctrl.Result{}, r.releaseFailed(ctx, run, err, true)
 		}
 		run.Status.RestartPending = false
+	} else if owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run); err != nil {
+		return ctrl.Result{}, err
+	} else if owes && durablyRestarted(run) {
+		// The stored status reads restarted, but the plan does not read back:
+		// the restart did not reach the workloads, as it cannot on a CRD that
+		// drops status.restartPending. The run repeats its restart, and
+		// restartWorkloads skips what already stands at its count.
+		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
+			return ctrl.Result{}, r.releaseFailed(ctx, run, err, true)
+		}
 	}
 
 	for i := range run.Status.Items {
@@ -553,6 +575,28 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		if len(targets) == 0 {
 			run.Status.QuiescedAt, run.Status.RestartedAt = newTime(now), newTime(now)
 			return after(time.Second, r.writeStatus(ctx, run))
+		}
+		// The namespace's quiesce Lease lets one run at a time stop its
+		// workloads. It is taken before the plan and held until the stored
+		// status shows the workloads back, so a second run waits here with
+		// the app running rather than recording the count the first stopped
+		// it at.
+		busy, err := acquireQuiesceLease(ctx, r.Client, r.Reader, run, "BackupRun")
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if busy != "" {
+			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy))
+		}
+		// A run left by an older controller holds no Lease, and a run that
+		// has not finished may still give the app back. Wait for the first
+		// such run rather than plan over it.
+		stopped, err := stoppedElsewhere(ctx, r.Reader, r.RESTMapper(), run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if stopped != "" {
+			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, stopped))
 		}
 		stop, suspend, err := planStop(ctx, r.Reader, r.RESTMapper(), targets)
 		if err != nil {
@@ -1032,6 +1076,15 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 	if err := r.writeStatus(ctx, run); err != nil {
 		return err
 	}
+	// The stored status now shows the workloads back, so the quiesce Leases
+	// may go, and must go before the finalizer: a run whose finalizer is
+	// dropped while it still holds them keeps other runs out of the
+	// namespace until the Lease's holder reads as gone. Best effort, as in
+	// work: a Lease left behind is stale under holderLive's rule.
+	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
+		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
+			"namespace", run.Namespace, "name", run.Name)
+	}
 	return dropFinalizer(ctx, r.Client, run)
 }
 
@@ -1062,7 +1115,10 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 // Every step is safe to repeat.
 func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.BackupRun) error {
 	var restartErr error
-	holding := (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil
+	holding, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run)
+	if err != nil {
+		return err
+	}
 	if holding || run.Status.RestartPending {
 		restartErr = restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 		if restartErr == nil {
@@ -1138,7 +1194,18 @@ func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.
 	if err := r.release(ctx, run); err != nil {
 		return r.releaseFailed(ctx, run, err, false)
 	}
-	return dropFinalizer(ctx, r.Client, run)
+	if err := dropFinalizer(ctx, r.Client, run); err != nil {
+		return err
+	}
+	// After dropFinalizer, and not before: finalize writes no status, so a
+	// release that happened while the drop still failed would let another run
+	// take the Lease and then watch this run repeat its restart on the retry.
+	// Best effort: a Lease left behind is stale under holderLive's rule.
+	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
+		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the deletion goes on",
+			"namespace", run.Namespace, "name", run.Name)
+	}
+	return nil
 }
 
 // releaseFailed reports on the run that it could not put back what it

@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
@@ -104,6 +105,87 @@ func TestTwoRunsWhoseChecksPassTogetherStartOneMover(t *testing.T) {
 			if readyReason(loserConditions) != backupv1alpha1.ReasonSourceBusy || !strings.Contains(readyMessage(loserConditions), holderName) {
 				t.Errorf("the waiting run %s has reason %q, message %q; want SourceBusy naming %s",
 					loser, readyReason(loserConditions), readyMessage(loserConditions), holderName)
+			}
+		})
+	}
+}
+
+// blindToQuiesce wraps c so that its lists of ReplicationSources,
+// ReplicationDestinations, BackupRuns and RestoreRuns come back empty. A
+// reconciler reading through it stands in for a pass whose pre-check and
+// stoppedElsewhere ran in the same instant as the other run's: neither sees
+// the other's runs or mover objects, and only the quiesce Lease, which goes
+// through c, keeps them apart. Gets are not hidden: holderLive reads the run
+// a Lease names, and hiding that Get would let a run take over a live
+// holder's Lease.
+func blindToQuiesce(c client.Client) client.Client {
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			switch list.(type) {
+			case *volsyncv1alpha1.ReplicationSourceList, *volsyncv1alpha1.ReplicationDestinationList,
+				*backupv1alpha1.BackupRunList, *backupv1alpha1.RestoreRunList:
+				return nil
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+}
+
+// A backup and a restore that both want to stop the same app quiesce one at a
+// time even when neither sees the other's run or mover object: of the two
+// only the one that creates the namespace's quiesce Lease first records a
+// plan and stops the app, and the other waits naming it. The namespace Lease
+// alone keeps them apart, in either order.
+func TestOnlyTheLeaseKeepsTwoQuiescesApart(t *testing.T) {
+	objects := func() []client.Object {
+		return []client.Object{
+			backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+			quiescedRestoreOf(),
+			claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false),
+		}
+	}
+	for name, order := range map[string][]string{
+		"backup quiesces first":  {"b", "b", "b", "b", "r", "r", "r"},
+		"restore quiesces first": {"r", "r", "b", "b", "b"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newClient(t, objects()...)
+			blind := blindToQuiesce(c)
+			br := &BackupRunReconciler{Client: c, Reader: blind, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
+			rr := &RestoreRunReconciler{Client: c, Reader: blind, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
+			for _, who := range order {
+				var err error
+				if who == "b" {
+					_, err = br.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}})
+				} else {
+					_, err = rr.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
+				}
+				if err != nil {
+					t.Fatalf("reconcile %s: %v", who, err)
+				}
+			}
+
+			backup, restore := readBackupRun(t, c), readRestoreRun(t, c)
+			plans := 0
+			if len(backup.Status.Quiesced) > 0 {
+				plans++
+			}
+			if len(restore.Status.Quiesced) > 0 {
+				plans++
+			}
+			if plans != 1 {
+				t.Fatalf("backup planned %+v and restore planned %+v; want exactly one plan",
+					backup.Status.Quiesced, restore.Status.Quiesced)
+			}
+			loserReason, loserMessage := readyReason(restore.Status.Conditions), readyMessage(restore.Status.Conditions)
+			winner := "BackupRun before-upgrade"
+			if len(restore.Status.Quiesced) > 0 {
+				winner = "RestoreRun back-to-monday"
+				loserReason, loserMessage = readyReason(backup.Status.Conditions), readyMessage(backup.Status.Conditions)
+			}
+			if loserReason != backupv1alpha1.ReasonSourceBusy || !strings.Contains(loserMessage, winner) {
+				t.Errorf("the waiting run has reason %q, message %q; want SourceBusy naming the holder %s",
+					loserReason, loserMessage, winner)
 			}
 		})
 	}
@@ -300,7 +382,7 @@ func TestALeaseIsLiveOnlyForTheVolumeItemThatTookIt(t *testing.T) {
 			c := newClient(t, tc.holder.(client.Object))
 			lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: claimLeaseName("claim-uid"), Namespace: ns}}
 			stamp(lease, leaseHolder{kind: tc.kind, run: tc.holder, item: claimN}, []string{claimN})
-			live, err := holderLive(context.Background(), c, lease)
+			live, err := holderLive(context.Background(), c, nil, lease)
 			if err != nil || live != tc.live {
 				t.Errorf("holderLive = %t, %v; want %t", live, err, tc.live)
 			}

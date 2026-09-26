@@ -23,6 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // RestoreRunReconciler runs RestoreRuns. A RestoreRun puts volumes and
@@ -691,12 +692,24 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // Succeeded, Failed or Skipped. A run past spec.timeout is aborted.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if deadline, over := r.overdue(run); over {
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)))
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, timedOutMessage(deadline, run.Status.Conditions))
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
 	// backup of that claim need not wait for the rest of the run.
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(name string) bool { return restoreItemDone(run, name) }); err != nil {
 		return ctrl.Result{}, err
+	}
+	// The quiesce Leases go once the stored status shows every workload back
+	// and this run will not touch them again (see owesRestart). Best effort:
+	// a Lease left behind is stale under holderLive's rule and the next run
+	// takes it over.
+	if durablyRestarted(run) {
+		if owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run); err == nil && !owes {
+			if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
+				log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
+					"namespace", run.Namespace, "name", run.Name)
+			}
+		}
 	}
 
 	if len(run.Spec.Quiesce) > 0 && run.Status.QuiescedAt == nil {
@@ -789,10 +802,18 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	// A database comes back only when its owner creates it again, and a
 	// Kustomization this run suspended creates nothing. So the app is given
 	// back once every volume is restored and every database is deleted, down
-	// to its last instance pod and PVC.
-	if stopped(run) && volumesDone && !anyRestorePending(run.Status.Items) && len(shuttingDown) == 0 {
-		if err := r.restart(ctx, run); err != nil {
+	// to its last instance pod and PVC. owesRestart also repeats a restart
+	// whose plan does not read back, so a workload a person stopped, or one
+	// whose scale-up was refused, is put back.
+	if volumesDone && !anyRestorePending(run.Status.Items) && len(shuttingDown) == 0 {
+		owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		if owes {
+			if err := r.restart(ctx, run); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
@@ -1636,6 +1657,28 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 			}
 			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 		}
+		// The namespace's quiesce Lease lets one run at a time stop its
+		// workloads. It is taken before the plan and held until the stored
+		// status shows the workloads back, so a second run waits here with
+		// the app running rather than recording the count the first stopped
+		// it at.
+		busy, err := acquireQuiesceLease(ctx, r.Client, r.Reader, run, "RestoreRun")
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if busy != "" {
+			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy))
+		}
+		// A run left by an older controller holds no Lease, and a run that
+		// has not finished may still give the app back. Wait for the first
+		// such run rather than plan over it.
+		stopped, err := stoppedElsewhere(ctx, r.Reader, r.RESTMapper(), run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if stopped != "" {
+			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, stopped))
+		}
 		stop, suspend, err := planStop(ctx, r.Reader, r.RESTMapper(), targets)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -1711,7 +1754,11 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return err
 	}
-	if stopped(run) {
+	owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run)
+	if err != nil {
+		return err
+	}
+	if owes {
 		if err := r.restart(ctx, run); err != nil {
 			return err
 		}
@@ -1725,6 +1772,13 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, reason, message)
 	if err := r.writeStatus(ctx, run); err != nil {
 		return err
+	}
+	// The stored status now shows the workloads back, so the quiesce Leases
+	// may go, before the finalizer: another run then takes the namespace over
+	// at once. Best effort, as in work.
+	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
+		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
+			"namespace", run.Namespace, "name", run.Name)
 	}
 	return dropFinalizer(ctx, r.Client, run)
 }
@@ -1749,12 +1803,27 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return err
 	}
-	if stopped(run) {
+	owes, err := owesRestart(ctx, r.Reader, r.RESTMapper(), run)
+	if err != nil {
+		return err
+	}
+	if owes {
 		if err := r.restart(ctx, run); err != nil {
 			return err
 		}
 	}
-	return dropFinalizer(ctx, r.Client, run)
+	if err := dropFinalizer(ctx, r.Client, run); err != nil {
+		return err
+	}
+	// After dropFinalizer, and not before: finalize writes no status, so a
+	// release that happened while the drop still failed would let another run
+	// take the Lease and then watch this run repeat its restart on the retry.
+	// Best effort: a Lease left behind is stale under holderLive's rule.
+	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
+		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the deletion goes on",
+			"namespace", run.Namespace, "name", run.Name)
+	}
+	return nil
 }
 
 // removeDestinations deletes the ReplicationDestination that each item
