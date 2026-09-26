@@ -82,11 +82,12 @@ func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-
 //
 // It returns "" once the run holds every Lease, and otherwise a message for
 // the Ready condition that names the run that holds one. The run then waits
-// with reason SourceBusy and tries again on a later pass. A claim or Secret
-// that does not exist takes no Lease, so a run whose claim or repository is
-// gone goes as far as startItem or restoreVolume, which fails its item with a
-// message naming the missing object. Any other failed API call comes back as
-// an error, and the caller retries.
+// with reason SourceBusy and tries again on a later pass. A claim that does
+// not exist takes no Lease, so a run whose claim is gone goes as far as
+// startItem or restoreVolume, which fails its item with a message naming the
+// claim. A repository Secret that does not exist comes back as a refusal
+// (see leaseNamesFor), and the caller fails the item with nothing started.
+// Any other failed API call comes back as an error, and the caller retries.
 //
 // The claim Lease is taken before the repository Lease, always. A run that
 // holds a repository Lease therefore already holds its claim Lease, and never
@@ -126,8 +127,11 @@ func acquireLeases(ctx context.Context, c client.Client, reader client.Reader, h
 //   - claim names the claim; empty takes no claim Lease.
 //   - secret names the repository Secret; empty takes no repository Lease.
 //
-// A claim or Secret that reads NotFound takes no Lease. Any other failed read
-// comes back as an error.
+// A claim that reads NotFound takes no Lease: nothing can write to it. A
+// repository Secret that reads NotFound comes back as a refusal (see
+// isRefusal), since a mover started without the repository Lease would be
+// unguarded once the Secret appears; the caller fails the item with nothing
+// started. Any other failed read comes back as an error.
 func leaseNamesFor(ctx context.Context, reader client.Reader, namespace, claim, secret string) ([]string, error) {
 	var names []string
 	if claim != "" {
@@ -146,7 +150,10 @@ func leaseNamesFor(ctx context.Context, reader client.Reader, namespace, claim, 
 		switch {
 		case err == nil:
 			names = append(names, repositoryLeaseName(s.UID))
-		case !apierrors.IsNotFound(err):
+		case apierrors.IsNotFound(err):
+			return nil, refuse("repository Secret %s does not exist in this namespace, so the run can't take the Lease that keeps other runs' movers off the repository",
+				secret)
+		default:
 			return nil, fmt.Errorf("get repository Secret %s/%s: %w", namespace, secret, err)
 		}
 	}
@@ -438,8 +445,10 @@ func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Re
 //
 // The Lease names come from leaseNamesFor, the same function acquireLeases
 // resolves them with, so this check can never look at a Lease the run would
-// not take. A failed read comes back as an error, and the caller retries with
-// nothing stopped.
+// not take. A repository Secret that does not exist comes back as the
+// refusal leaseNamesFor gives; the caller leaves it to the item's start,
+// which fails the item. Any other failed read comes back as an error, and
+// the caller retries with nothing stopped.
 func leaseHeldElsewhere(ctx context.Context, reader client.Reader, run metav1.Object, namespace, claim, secret string) (string, error) {
 	names, err := leaseNamesFor(ctx, reader, namespace, claim, secret)
 	if err != nil {

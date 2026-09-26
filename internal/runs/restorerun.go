@@ -891,7 +891,8 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // otherwise (see unconfirmedRestore). It also fails when its destination
 // is gone. restoreVolume leaves the destination in place, and work deletes it
 // once the item's end is in the status. A claim that is gone, or whose
-// VolumeRestore is missing, fails the item. So does a destination with the
+// VolumeRestore or repository Secret is missing, fails the item before the
+// destination exists. So does a destination with the
 // item's name that the run did not create (see ownsDestination), found at
 // the create or on a later pass; the item then names no destination, so
 // nothing the run does afterwards touches it.
@@ -927,6 +928,10 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 		// instant, only one creates each Lease.
 		busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: "RestoreRun", run: run, item: item.Name},
 			run.Namespace, item.Name, settings.Secret)
+		if isRefusal(err) {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()+nothingWritten(item.Name)
+			return "", "", nil
+		}
 		if err != nil {
 			return "", "", err
 		}
@@ -1294,8 +1299,8 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 // finds the item's end recorded only finishes the run. It is aborted with
 // reason TimedOut when the restore has not finished by spec.timeout, and the
 // deadline is checked before anything is created. A source claim that is
-// gone before anything was created, or whose VolumeRestore is, aborts the run
-// with reason Failed.
+// gone before anything was created, or whose VolumeRestore or repository
+// Secret is, aborts the run with reason Failed.
 // While a backup of the source claim or the repository is in progress (see
 // otherMover), the run waits with reason SourceBusy before it creates
 // anything. Right before the claim is created, the repository is listed
@@ -1405,7 +1410,11 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	if leased == "" {
 		leased = run.Spec.Into
 	}
-	if waiting, err := r.waitForBackup(ctx, run, leased, settings.Secret); waiting || err != nil {
+	waiting, err := r.waitForBackup(ctx, run, leased, settings.Secret)
+	if isRefusal(err) {
+		return r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error()+nothingWritten(run.Spec.Into))
+	}
+	if waiting || err != nil {
 		return after(pollInterval, err)
 	}
 	why, err := r.recheckSnapshot(ctx, run, item, settings.Secret)
@@ -1677,9 +1686,9 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 //     and spec.moverSecurityContext are used the way repositoryFor uses them.
 //   - claimName names the claim the item restores.
 //
-// A refusal from repositoryFor gives "": restoreVolume fails the item with it
-// later. Any other failed read comes back as an error, and the pass retries
-// with nothing stopped.
+// A refusal from repositoryFor, and a repository Secret that does not exist,
+// give "": restoreVolume fails the item later. Any other failed read comes
+// back as an error, and the pass retries with nothing stopped.
 //
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right
@@ -1699,7 +1708,11 @@ func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *bac
 	if backing != "" {
 		return backing, nil
 	}
-	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, settings.Secret)
+	held, err := leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, settings.Secret)
+	if isRefusal(err) {
+		return "", nil
+	}
+	return held, err
 }
 
 // restart gives the stopped workloads their replicas back, resumes the
@@ -2037,8 +2050,10 @@ func (r *RestoreRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.
 //
 // It returns true when the run has to wait. It has then moved the run to
 // Waiting with reason SourceBusy and a message naming the run that holds a
-// Lease or the BackupRun. A failed read, write or status write comes back as
-// an error, which the caller retries.
+// Lease or the BackupRun. A repository Secret that does not exist comes back
+// as the refusal acquireLeases gives, and the caller ends the run. A failed
+// read, write or status write comes back as an error, which the caller
+// retries.
 func (r *RestoreRunReconciler) waitForBackup(ctx context.Context, run *backupv1alpha1.RestoreRun, claim, secret string) (bool, error) {
 	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: "RestoreRun", run: run, item: run.Status.Items[0].Name},
 		run.Namespace, claim, secret)

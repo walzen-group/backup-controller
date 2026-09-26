@@ -646,10 +646,11 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 //   - run is the asking run; its namespace and UID are read.
 //   - claimName names the claim the run is about to back up.
 //
-// A claim that does not exist and a VolumeRestore the claim does not have
-// give "": startItem fails or retries the item, and ensureSource checks again
-// right before it writes the trigger. Any other failed read comes back as an
-// error, and the pass retries with nothing stopped.
+// A claim that does not exist, a VolumeRestore the claim does not have and a
+// repository Secret that does not exist give "": startItem fails or retries
+// the item, and ensureSource checks again right before it writes the
+// trigger. Any other failed read comes back as an error, and the pass
+// retries with nothing stopped.
 //
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right
@@ -676,7 +677,11 @@ func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1al
 	if restoring != "" {
 		return restoring, nil
 	}
-	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, vr.Spec.Repository)
+	held, err := leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, vr.Spec.Repository)
+	if isRefusal(err) {
+		return "", nil
+	}
+	return held, err
 }
 
 // startItem starts the backup of one Pending item and sets the item's phase.

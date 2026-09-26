@@ -389,3 +389,44 @@ func TestALeaseIsLiveOnlyForTheVolumeItemThatTookIt(t *testing.T) {
 		})
 	}
 }
+
+// A backup whose repository Secret does not exist fails its item and writes
+// no ReplicationSource: without the Secret the run can't take the Lease that
+// keeps a restore of the same repository off it, and a mover it started
+// then would be unguarded once the Secret appears. Before, the run took no
+// repository Lease and wrote the source anyway (BRF1F3).
+func TestABackupWithoutItsRepositorySecretStartsNoMover(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+		claim(), volume(), volumeRestore())
+	step(t, r) // plan
+	step(t, r) // admit
+	step(t, r) // start
+
+	run := readBackupRun(t, c)
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "repository Secret "+repoN) {
+		t.Fatalf("item = %+v; want Failed naming repository Secret %s", item, repoN)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: claimN}, &volsyncv1alpha1.ReplicationSource{}); !apierrors.IsNotFound(err) {
+		t.Errorf("ReplicationSource %s: %v, want none written", claimN, err)
+	}
+}
+
+// A restore whose repository Secret is deleted after its checks fails its
+// item before it creates a ReplicationDestination, and names the Secret.
+func TestARestoreWhoseRepositorySecretIsGoneStartsNoMover(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
+		claim(), volumeRestore(), repository())
+	restoreStep(t, r) // plan
+	if err := c.Delete(context.Background(), repository()); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "repository Secret "+repoN) {
+		t.Fatalf("item = %+v; want Failed naming repository Secret %s", item, repoN)
+	}
+	if names := destinations(t, c); len(names) != 0 {
+		t.Errorf("destinations = %v, want none", names)
+	}
+}
