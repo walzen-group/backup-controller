@@ -1,5 +1,5 @@
 {
-  "about": "The versions of every component the controller depends on, as walzen prod runs them, and of every tool the tests take from the flake. flake.nix reads the pins and hashes here, and the tests read the versions to check that each recorded fixture came from these tools. After a bump, change the entry here (and its hashes), regenerate the recorded fixtures with make fixtures, and run make check and make envtest.",
+  "about": "The versions of every component the controller depends on, as walzen prod runs them, and of every tool the tests take from the flake. flake.nix reads the pins and hashes here, and the tests read the versions to check that each recorded fixture came from these tools. The e2e components under hack/e2e pin these versions again in their pins.json, and a test in internal/testinfra/versions fails when the two disagree. After a bump, change the entry here (and its hashes) and in the e2e pins.json that name it, regenerate the recorded fixtures with make fixtures, and run make check and make envtest.",
   "components": {
     "kubernetes": {
       "version": "1.36.3",
@@ -20,6 +20,10 @@
         }
       }
     },
+    "kubernetes-e2e": {
+      "version": "1.36.4",
+      "e2e": "the kind node of the Docker Desktop cluster (kubectl context docker-desktop) the e2e suites run against, one patch ahead of prod; nothing in the repo installs it"
+    },
     "etcd": {
       "version": "3.6.14",
       "prod": "Talos v1.14 runs its own etcd; Kubernetes 1.36.3 is built against etcd 3.6.8 (build/dependencies.yaml)",
@@ -27,15 +31,25 @@
     },
     "flux": {
       "version": "2.9.5",
-      "prod": "environments/prod/cluster/flux/inputs.yaml (flux_version)"
+      "prod": "environments/prod/cluster/flux/inputs.yaml (flux_version)",
+      "e2e": "hack/e2e/flux/pins.json"
+    },
+    "cert-manager": {
+      "version": "1.21.2",
+      "prod": "environments/prod/cluster/cert-manager/inputs.yaml (chart_version v1.21.2)",
+      "e2e": "hack/e2e/cert-manager/pins.json, and the requirement in hack/e2e/backup-controller/pins.json"
     },
     "cloudnative-pg": {
       "version": "1.30.0",
-      "prod": "environments/prod/cluster/cloudnative-pg/inputs.yaml (chart 0.29.0, whose appVersion is 1.30.0)"
+      "chart": "0.29.0",
+      "prod": "environments/prod/cluster/cloudnative-pg/inputs.yaml (chart 0.29.0, whose appVersion is 1.30.0)",
+      "e2e": "hack/e2e/cnpg/pins.json (operator)"
     },
     "plugin-barman-cloud": {
       "version": "0.15.0",
-      "prod": "environments/prod/cluster/barman-cloud-plugin/inputs.yaml (chart 0.8.0, whose appVersion is v0.15.0)"
+      "chart": "0.8.0",
+      "prod": "environments/prod/cluster/barman-cloud-plugin/inputs.yaml (chart 0.8.0, whose appVersion is v0.15.0)",
+      "e2e": "hack/e2e/cnpg/pins.json (plugin)"
     },
     "barman": {
       "version": "3.20.0",
@@ -50,17 +64,20 @@
     },
     "kueue": {
       "version": "0.19.5",
-      "prod": "environments/prod/cluster/kueue/inputs.yaml (chart_version)"
+      "prod": "environments/prod/cluster/kueue/inputs.yaml (chart_version)",
+      "e2e": "hack/e2e/kueue/pins.json, and the requirement in hack/e2e/backup-controller/pins.json"
     },
     "volsync": {
       "version": "0.16.0",
       "prod": "environments/prod/cluster/volsync/inputs.yaml (chart_version)",
-      "tests": "the Go module github.com/backube/volsync v0.16.0 in go.mod; the recorders run its mover-restic/entry.sh from the module cache"
+      "tests": "the Go module github.com/backube/volsync v0.16.0 in go.mod; the recorders run its mover-restic/entry.sh from the module cache",
+      "e2e": "hack/e2e/volsync/pins.json"
     },
     "restic-mover": {
       "version": "0.18.1",
       "prod": "the restic inside the VolSync v0.16.0 mover image (mover-restic/SOURCE_VERSIONS)",
       "tests": "the restic release binary, pinned in nix/test-tools.nix as restic-0.18.1",
+      "e2e": "hack/e2e/volsync/pins.json (restic), inside the VolSync mover image",
       "hashes": {
         "x86_64-linux": "sha256-aAg48Z1nFRrboifhVwzdivEsGc8XNXg+0bqSi8QfNj0=",
         "aarch64-linux": "sha256-h/U/3d44dkCV6cBYo7MYNAUsN+WCbSrPNOGJI8AGvUU=",
@@ -77,6 +94,7 @@
       "version": "1.0.0",
       "prod": "the S3 store at http://quasar.wan.walzen.org:10172 (shared-secrets/backup/backup.yaml)",
       "tests": "the RustFS release binary, pinned in nix/test-tools.nix; there is no x86_64-darwin build",
+      "e2e": "hack/e2e/rustfs/pins.json",
       "hashes": {
         "x86_64-linux": "sha256-wwqVt2VG8lEiyco4cJDdsww5HKVgViGw18iBcDwPIcg=",
         "aarch64-linux": "sha256-iCAsBEbQqjH6R1sdyM25L20y5i1vNKY/IBiJnBlD8QA=",
@@ -86,6 +104,14 @@
     "bubblewrap": {
       "version": "0.12.0",
       "tests": "nixpkgs bubblewrap; it gives a mover run the container's /data, PID 1 and hostname"
+    },
+    "csi-driver-host-path": {
+      "version": "1.18.0",
+      "e2e": "hack/e2e/csi/pins.json (the driver's manifests); prod runs zfs-localpv, which the e2e cluster replaces with the host path driver for claims and snapshots"
+    },
+    "external-snapshotter": {
+      "version": "8.6.0",
+      "e2e": "hack/e2e/csi/pins.json: the snapshot CRDs, the snapshot-controller and the csi-snapshotter sidecar"
     }
   }
 }

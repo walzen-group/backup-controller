@@ -24,6 +24,11 @@ type Component struct {
 	Prod string `json:"prod"`
 	// Tests says where the tests take it from.
 	Tests string `json:"tests"`
+	// Chart is the version of the Helm chart prod installs it with, when that
+	// differs from Version.
+	Chart string `json:"chart"`
+	// E2E says which hack/e2e component pins it for the e2e cluster.
+	E2E string `json:"e2e"`
 }
 
 // File is versions.json as a whole.
