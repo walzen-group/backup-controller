@@ -146,13 +146,12 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // retry, and returns the error the reconcile hands back.
 //
 // A run whose checks keep failing never records status.startedAt, so overdue
-// never fires for it. planFailed therefore counts spec.timeout from the run's
-// creation. Once that has passed, it ends the run as Failed with reason
-// TimedOut and the error in the message. Until then it sets Ready to False with
-// reason Retrying and the error as the message, so `kubectl get` shows why the
-// run has not started, and returns the error for a retry. It writes the
-// condition only when it changed, because every write starts another
-// reconcile.
+// never fires for it. Once the deadline from checksOverdue has passed,
+// planFailed ends the run as Failed with reason TimedOut and the error in the
+// message. Until then it sets Ready to False with reason Retrying and the
+// error as the message, so `kubectl get` shows why the run has not started,
+// and returns the error for a retry. It writes the condition only when it
+// changed, because every write starts another reconcile.
 //
 // An error from a pass that had already given the run a phase, such as a lost
 // status write, is returned unchanged.
@@ -160,17 +159,10 @@ func (r *RestoreRunReconciler) planFailed(ctx context.Context, run *backupv1alph
 	if run.Status.Phase != "" {
 		return err
 	}
-	if run.Spec.Timeout != nil && !run.CreationTimestamp.IsZero() {
-		deadline := run.CreationTimestamp.Add(run.Spec.Timeout.Duration)
-		if !r.Now().Before(deadline) {
-			return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut,
-				fmt.Sprintf("the run had not passed its checks by %s: %v", deadline.UTC().Format(time.RFC3339), err))
-		}
+	if deadline, over := r.checksOverdue(run); over {
+		return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, checksTimedOut(deadline, err.Error()))
 	}
-	before := meta.FindStatusCondition(run.Status.Conditions, backupv1alpha1.ConditionReady)
-	unchanged := before != nil && before.Status == metav1.ConditionFalse &&
-		before.Reason == backupv1alpha1.ReasonRetrying && before.Message == err.Error()
-	if unchanged {
+	if !readyChanged(run, backupv1alpha1.ReasonRetrying, err.Error()) {
 		return err
 	}
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRetrying, err.Error())
@@ -178,6 +170,59 @@ func (r *RestoreRunReconciler) planFailed(ctx context.Context, run *backupv1alph
 		return errors.Join(err, werr)
 	}
 	return err
+}
+
+// checksOverdue returns the deadline of a run that has not passed its checks,
+// its creation plus spec.timeout, and reports whether the run has worked past
+// it. Such a run has no status.startedAt, so overdue never fires for it. A run
+// with no timeout, or with no creation time yet, is never overdue.
+func (r *RestoreRunReconciler) checksOverdue(run *backupv1alpha1.RestoreRun) (time.Time, bool) {
+	if run.Spec.Timeout == nil || run.CreationTimestamp.IsZero() {
+		return time.Time{}, false
+	}
+	deadline := run.CreationTimestamp.Add(run.Spec.Timeout.Duration)
+	return deadline, !r.Now().Before(deadline)
+}
+
+// checksTimedOut returns the Ready message of a run that ends TimedOut
+// before it passed its checks: the deadline from checksOverdue, and why the
+// checks had not passed, which is the text given in why.
+func checksTimedOut(deadline time.Time, why string) string {
+	return fmt.Sprintf("the run had not passed its checks by %s: %s", deadline.UTC().Format(time.RFC3339), why)
+}
+
+// readyChanged reports whether setting the run's Ready condition to False
+// with the given reason and message would change it. A caller that waits
+// writes the status only then, because every write starts another reconcile.
+func readyChanged(run *backupv1alpha1.RestoreRun, reason, message string) bool {
+	before := meta.FindStatusCondition(run.Status.Conditions, backupv1alpha1.ConditionReady)
+	return before == nil || before.Status != metav1.ConditionFalse || before.Reason != reason || before.Message != message
+}
+
+// waitAtChecks holds a run that has not passed its checks while a backup of
+// a repository it restores from is in progress, and returns the result the
+// reconcile hands back. The run selects its snapshot once that backup has
+// finished, so after the backup's restic forget and its retime.
+//
+// Parameters:
+//   - busy is otherMover's message naming the backup, which becomes the
+//     Ready message.
+//
+// The run keeps its empty phase, because Reconcile plans a run whose phase
+// is empty. waitAtChecks sets Ready to False with reason SourceBusy and the
+// message, writes the status when that changed, and requeues after
+// pollInterval. Once the deadline from checksOverdue has passed, it ends the
+// run as Failed with reason TimedOut and the message instead. A failed status
+// write comes back as an error.
+func (r *RestoreRunReconciler) waitAtChecks(ctx context.Context, run *backupv1alpha1.RestoreRun, busy string) (ctrl.Result, error) {
+	if deadline, over := r.checksOverdue(run); over {
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, checksTimedOut(deadline, busy))
+	}
+	if !readyChanged(run, backupv1alpha1.ReasonSourceBusy, busy) {
+		return ctrl.Result{RequeueAfter: pollInterval}, nil
+	}
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonSourceBusy, busy)
+	return after(pollInterval, r.writeStatus(ctx, run))
 }
 
 // target parses the run's spec.restoreAsOf. It returns nil when the field is
@@ -206,6 +251,14 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 // fails, plan marks every other Pending item Skipped and ends the run as
 // Failed with reason NoBackupInReach, naming each item it cannot reach.
 // Nothing has been deleted or overwritten at that point.
+//
+// A backup's mover runs restic forget after it saves, and a quiesced
+// BackupRun retimes its snapshot after the mover, so a snapshot selected
+// during a backup may be gone by the time the restore's mover starts. So
+// before it checks a volume, plan looks for a backup of the claim or its
+// repository in progress (see volumeBackedUp), and while there is one it
+// waits with reason SourceBusy and leaves the run unplanned (see
+// waitAtChecks), until spec.timeout from the run's creation ends it TimedOut.
 //
 // With spec.syncDatabaseToVolume set, each volume may only select a snapshot
 // tagged quiesced, and all the selected snapshots must carry the same time.
@@ -251,6 +304,15 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 		var reason string
 		switch item.Kind {
 		case "PersistentVolumeClaim":
+			// The snapshot is selected once no backup of the repository is in
+			// progress, so after that backup's forget and retime.
+			busy, busyErr := r.volumeBackedUp(ctx, run, item.Name)
+			if busyErr != nil {
+				return ctrl.Result{}, busyErr
+			}
+			if busy != "" {
+				return r.waitAtChecks(ctx, run, busy)
+			}
 			var snapshot restic.Snapshot
 			snapshot, reason, err = r.checkVolume(ctx, run, item.Name, at, sync)
 			item.Snapshot = snapshot.ShortID()
@@ -405,6 +467,24 @@ func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alp
 	return r.selectSnapshot(ctx, run, settings.Secret, at, quiescedOnly)
 }
 
+// volumeBackedUp returns otherMover's message naming a backup of the claim
+// named claimName, or of the repository it restores from, that is in
+// progress, and "" when there is none.
+//
+// It reads the repository the way checkVolume does. When repositoryFor
+// refuses the claim, it returns "", so that checkVolume reports the refusal
+// as the item's reason. Any other failed read comes back as an error.
+func (r *RestoreRunReconciler) volumeBackedUp(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (string, error) {
+	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
+	if err != nil {
+		if isRefusal(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return otherMover(ctx, r.Reader, run.Namespace, claimName, settings.Secret, backupMover)
+}
+
 // selectSnapshot returns the snapshot the run would restore, picked the way
 // the VolSync mover picks it from restoreAsOf and previous.
 //
@@ -430,16 +510,9 @@ func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alp
 // the Secret can't be read for another reason and when listing the repository
 // fails.
 func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
-	secret := &corev1.Secret{}
-	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: secretName}, secret); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return restic.Snapshot{}, "", fmt.Errorf("read repository Secret %s: %w", secretName, err)
-		}
-		return restic.Snapshot{}, fmt.Sprintf("no repository Secret %s in this namespace", secretName), nil
-	}
-	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
-	if err != nil {
-		return restic.Snapshot{}, "", fmt.Errorf("list the snapshots in %s: %w", secretName, err)
+	snapshots, reason, err := r.listRepository(ctx, run, secretName)
+	if reason != "" || err != nil {
+		return restic.Snapshot{}, reason, err
 	}
 	all := snapshots
 	if quiescedOnly {
@@ -475,6 +548,74 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 		return restic.Snapshot{}, why, nil
 	}
 	return snapshots[index], "", nil
+}
+
+// listRepository returns every snapshot in the restic repository whose
+// Secret, in the run's namespace, is named secretName, oldest first.
+//
+// It returns a reason, and no error, when the Secret doesn't exist. It
+// returns an error when the Secret can't be read for another reason and when
+// listing the repository fails.
+func (r *RestoreRunReconciler) listRepository(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string) ([]restic.Snapshot, string, error) {
+	secret := &corev1.Secret{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: secretName}, secret); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, "", fmt.Errorf("read repository Secret %s: %w", secretName, err)
+		}
+		return nil, fmt.Sprintf("no repository Secret %s in this namespace", secretName), nil
+	}
+	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
+	if err != nil {
+		return nil, "", fmt.Errorf("list the snapshots in %s: %w", secretName, err)
+	}
+	return snapshots, "", nil
+}
+
+// recheckSnapshot lists the repository again right before the run creates
+// the object whose mover restores item, and returns why that mover would not
+// restore the snapshot the checks recorded, or "" when it would.
+//
+// Parameters:
+//   - item is the volume item. item.Snapshot is the short ID the checks
+//     recorded, and item.SnapshotTime the time the object pins the mover to.
+//     An item with no snapshotTime, which a v0.7.2 controller planned, gets
+//     the time of the listed snapshot with that short ID here, so its object
+//     is pinned to that snapshot's second like any other.
+//   - secretName names the repository Secret in the run's namespace.
+//
+// Time passes between the checks and the create: a pod may hold the claim,
+// or a backup may run first. In that time a backup's restic forget may
+// remove the snapshot, a quiesced BackupRun may retime it under another ID
+// and time, or another snapshot may join it in its second. The reason says
+// which (see changedSince), and names no claim; the caller adds what was left
+// untouched. A Secret that is gone is a reason too.
+//
+// It returns an error, and leaves the item as it was, when the Secret can't
+// be read for another reason or listing the repository fails; the caller
+// retries.
+func (r *RestoreRunReconciler) recheckSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, secretName string) (string, error) {
+	snapshots, reason, err := r.listRepository(ctx, run, secretName)
+	if reason != "" || err != nil {
+		return reason, err
+	}
+	// Only an in-place synced run picks among quiesced snapshots; the advice
+	// in the reason keeps to them then.
+	quiescedOnly := run.Spec.SyncDatabaseToVolume && run.Spec.Into == ""
+	recorded, why := changedSince(snapshots, *item, quiescedOnly)
+	if why != "" {
+		return why, nil
+	}
+	if item.SnapshotTime == nil {
+		item.SnapshotTime = &metav1.Time{Time: recorded.Time}
+	}
+	return "", nil
+}
+
+// nothingWritten returns the end of the message of an item that
+// recheckSnapshot failed before its mover's object existed: nothing was
+// written to the claim named claim, and a new RestoreRun selects again.
+func nothingWritten(claim string) string {
+	return fmt.Sprintf(". Nothing was written to claim %s. Create a new RestoreRun to select again", claim)
 }
 
 // checkDatabase finds the base backup that a recovery of one Cluster would
@@ -679,7 +820,12 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 //   - item is the volume item, which restoreVolume updates in place.
 //
 // A Pending item waits until no pod mounts the claim. restoreVolume then
-// creates the item's ReplicationDestination and moves the item to Running.
+// lists the repository again (see recheckSnapshot), creates the item's
+// ReplicationDestination and moves the item to Running. A snapshot the mover
+// would no longer restore, because it was forgotten, retimed or shadowed in
+// its second since the checks, fails the item before the destination exists;
+// a destination an earlier pass created and lost the record of is named on
+// the item then, so work deletes it.
 // A Running item succeeds once the destination has completed the run's
 // trigger, or fails with the mover's logs. It also fails when its destination
 // is gone. restoreVolume leaves the destination in place, and work deletes it
@@ -739,6 +885,31 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			return backupv1alpha1.ReasonSourceBusy, backing, nil
 		}
 		name := destinationName(run.UID, index)
+		why, err := r.recheckSnapshot(ctx, run, item, settings.Secret)
+		if err != nil {
+			return "", "", err
+		}
+		if why != "" {
+			// A pass that created the destination and then lost the status
+			// write that recorded it leaves the item Pending. Named on the
+			// item, that destination is deleted once the item's end is in
+			// the status (see work); unnamed, its mover would run on with
+			// nothing tracking it.
+			left := &volsyncv1alpha1.ReplicationDestination{}
+			err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, left)
+			switch {
+			case err == nil && ownsDestination(run, left):
+				item.Destination = name
+				why = fmt.Sprintf("%s. ReplicationDestination %s, which an earlier pass created before its status write was lost, is deleted, "+
+					"and its mover may have written part of claim %s. Create a new RestoreRun to restore it", why, name, item.Name)
+			case err == nil || apierrors.IsNotFound(err):
+				why += nothingWritten(item.Name)
+			default:
+				return "", "", fmt.Errorf("get ReplicationDestination %s: %w", name, err)
+			}
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, why
+			return "", "", nil
+		}
 		refusal, err := r.createDestination(ctx, run, directDestination(run, *item, settings, name))
 		if err != nil {
 			return "", "", err
@@ -967,6 +1138,10 @@ func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster client
 // snapshot in reach, or whose snapshot VolSync's mover would not restore when
 // pinned to its second, ends with reason NoBackupInReach. Any other failed read,
 // and a failed listing of the repository, is returned for a retry.
+//
+// Before it selects the snapshot, planIntoNewClaim waits, as plan does, while
+// a backup of the source claim or the repository is in progress (see
+// otherMover and waitAtChecks).
 func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	run.Status.Target = run.Spec.Into
 	refusal, err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim")
@@ -993,6 +1168,15 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 	at, err := target(run)
 	if err != nil {
 		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	}
+	// The snapshot is selected once no backup of the repository is in
+	// progress, so after that backup's forget and retime.
+	busy, err := otherMover(ctx, r.Reader, run.Namespace, run.Spec.Claim, settings.Secret, backupMover)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if busy != "" {
+		return r.waitAtChecks(ctx, run, busy)
 	}
 	snapshot, reason, err := r.selectSnapshot(ctx, run, settings.Secret, at, false)
 	if err != nil {
@@ -1032,7 +1216,9 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 // it. A source claim deleted before the new claim was created ends the run as
 // Failed. While a backup of the source claim or its repository is in progress
 // (see otherMover), the run waits with reason SourceBusy before it creates
-// anything.
+// anything. Right before the VolumeRestore is created, the repository is
+// listed again (see recheckSnapshot), and a snapshot the mover would no
+// longer restore aborts the run with reason Failed.
 //
 // The run writes only through a VolumeRestore and into a claim it created:
 // a Bound claim counts as restored only when the run controls it. A claim
@@ -1079,6 +1265,13 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 	if waiting, err := r.waitForBackup(ctx, run, run.Spec.Claim, settings.Secret); waiting || err != nil {
 		return after(pollInterval, err)
 	}
+	why, err := r.recheckSnapshot(ctx, run, &run.Status.Items[0], settings.Secret)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if why != "" {
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, why+nothingWritten(run.Spec.Into))
+	}
 	vr := pointInTimeRestore(run, run.Status.Items[0], settings)
 	refusal, err := r.createOwned(ctx, run, vr, &backupv1alpha1.VolumeRestore{}, "VolumeRestore")
 	if err != nil {
@@ -1119,7 +1312,10 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 // gives. It is aborted with reason TimedOut when the restore has not finished
 // by spec.timeout, and the deadline is checked before anything is created.
 // While a backup of the repository is in progress (see otherMover), the run
-// waits with reason SourceBusy before it creates anything.
+// waits with reason SourceBusy before it creates anything. Right before the
+// claim is created, the repository is listed again (see recheckSnapshot),
+// and a snapshot the mover would no longer restore aborts the run with
+// reason Failed.
 //
 // The run writes only into a claim it created and only through a
 // destination it created. A claim named spec.into that the run did not
@@ -1191,6 +1387,13 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	}
 	if waiting, err := r.waitForBackup(ctx, run, run.Spec.Into, settings.Secret); waiting || err != nil {
 		return after(pollInterval, err)
+	}
+	why, err := r.recheckSnapshot(ctx, run, item, settings.Secret)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if why != "" {
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, why+nothingWritten(run.Spec.Into))
 	}
 	// The destination is created only once the claim is known to be the
 	// run's: its mover deletes every file the snapshot lacks.

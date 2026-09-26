@@ -103,13 +103,44 @@ func TestABackupWaitsWhileARestoreOfTheClaimRuns(t *testing.T) {
 	}
 }
 
-// A restore started while a backup of the claim's repository runs waits with
-// reason SourceBusy, names the backup, and creates no ReplicationDestination.
+// startOtherBackup stands in for the BackupRun manual-notes (see otherRun)
+// starting after a restore's checks: it creates the run and the claim's
+// ReplicationSource with the run's open trigger (see backingUp), each with
+// its status. The API server gives the created run a UID of its own, and the
+// trigger is made from it.
+func startOtherBackup(t *testing.T, c client.Client) {
+	t.Helper()
+	ctx := context.Background()
+	run, source := otherRun(), backingUp()
+	if err := c.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	run.Status = otherRun().Status
+	run.Status.Items[0].Trigger = TriggerFor(run.UID)
+	if err := c.Status().Update(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	source.Spec.Trigger.Manual = TriggerFor(run.UID)
+	if err := c.Create(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	source.Status = backingUp().Status
+	if err := c.Status().Update(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A restore past its checks whose claim's repository a backup started on
+// since waits with reason SourceBusy, names the backup, and creates no
+// ReplicationDestination. (A backup already running at the checks holds the
+// checks themselves; see
+// TestARestoreSelectsItsSnapshotOnlyOnceABackupOfItsRepositoryHasFinished.)
 func TestARestoreWaitsWhileABackupRuns(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
-		claim(), volumeRestore(), repository(), otherRun(), backingUp())
-	restoreStep(t, r)
+		claim(), volumeRestore(), repository())
+	restoreStep(t, r) // plan
+	startOtherBackup(t, c)
 	restoreStep(t, r)
 
 	run := readRestoreRun(t, c)
@@ -227,12 +258,13 @@ func TestAFinishedOrDeletedRunDoesNotBlock(t *testing.T) {
 // frozenNow returns the frozen clock's time.
 func frozenNow() time.Time { return frozen }
 
-// A restore into a new claim from a repository that a backup is writing
-// waits, creates neither the claim nor the destination, and goes on once
-// the backup has finished.
+// A restore into a new claim from a repository that a backup started writing
+// after the checks waits, creates neither the claim nor the destination, and
+// goes on once the backup has finished.
 func TestAnIntoRestoreWaitsWhileItsRepositoryIsBackedUp(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository(), otherRun(), backingUp())
+	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
 	restoreStep(t, r) // plan
+	startOtherBackup(t, c)
 	restoreStep(t, r) // waits
 
 	run := readRestoreRun(t, c)

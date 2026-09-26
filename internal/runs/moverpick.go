@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
 )
 
@@ -98,4 +99,65 @@ func unpinnable(all []restic.Snapshot, s restic.Snapshot, quiescedOnly bool) str
 			"and VolSync's mover picks by the whole second, so it may restore %s. Choose a snapshot in another second",
 			id, second, strings.Join(names, " and snapshot "), which)
 	}
+}
+
+// changedSince checks, against the repository as it is listed now, the
+// snapshot a RestoreRun's checks recorded on a volume item, and says why
+// VolSync's mover would no longer restore it.
+//
+// Parameters:
+//   - all is every snapshot in the repository now, unfiltered.
+//   - item is the volume item. item.Snapshot is the recorded short ID, and
+//     item.SnapshotTime the time the run pins the mover to. An item planned
+//     by v0.7.2 has no time, and the listed snapshot's own time stands in.
+//   - quiescedOnly is passed on to unpinnable for its advice.
+//
+// It returns the listed snapshot with the recorded short ID, and "" when the
+// mover, pinned to the item's time, restores it. Otherwise it returns the
+// reason, which says what happened after the checks:
+//
+//   - the recorded ID is gone and a snapshot whose original field starts
+//     with it is listed: a retime (or restic rewrite) wrote it again under
+//     another ID and time. The run does not follow the copy: the run
+//     recorded no tree to compare, and a rewrite can change the tree.
+//   - the recorded ID is gone otherwise: a backup's restic forget removed it.
+//   - the snapshot is there, and the mover would pick another one in its
+//     second, or can't be predicted (see unpinnable).
+//
+// An item with no recorded snapshot gets a reason too, since the run can't
+// pin the mover to anything. It does not change all.
+func changedSince(all []restic.Snapshot, item backupv1alpha1.RestoreItem, quiescedOnly bool) (restic.Snapshot, string) {
+	id := item.Snapshot
+	if id == "" {
+		return restic.Snapshot{}, "the item records no snapshot, so the run can't pin the mover to one"
+	}
+	recorded, ok := restic.ByShortID(all, id)
+	if !ok {
+		for _, s := range all {
+			if s.Original != "" && strings.HasPrefix(s.Original, id) {
+				return restic.Snapshot{}, fmt.Sprintf("snapshot %s, which the checks selected, was rewritten as %s at %s by a quiesced backup after the checks",
+					id, s.ShortID(), s.Time.UTC().Format(time.RFC3339))
+			}
+		}
+		when := ""
+		if item.SnapshotTime != nil {
+			when = fmt.Sprintf(" (%s)", item.SnapshotTime.UTC().Format(time.RFC3339))
+		}
+		return restic.Snapshot{}, fmt.Sprintf("snapshot %s%s, which the checks selected, is no longer in the repository; "+
+			"a backup's retention (restic forget) removed it after the checks", id, when)
+	}
+	pin := recorded.Time
+	if item.SnapshotTime != nil {
+		pin = item.SnapshotTime.Time
+	}
+	if picked, ok := restic.MoverPick(all, pin); ok && picked.ID == recorded.ID {
+		return recorded, ""
+	}
+	if why := unpinnable(all, recorded, quiescedOnly); why != "" {
+		return recorded, "the repository changed after the checks: " + why
+	}
+	// The snapshot is still the mover's pick for its own second, so the
+	// item's time points at another second.
+	return recorded, fmt.Sprintf("snapshot %s is from %s, and the item pins the mover to %s, where it would not restore it",
+		id, recorded.Time.UTC().Format(time.RFC3339), pin.UTC().Format(time.RFC3339))
 }
