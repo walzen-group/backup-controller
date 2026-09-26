@@ -245,6 +245,56 @@ func TestAClaimNotMarkedEnabledIsRefused(t *testing.T) {
 	}
 }
 
+// A run refused at plan time whose release fails keeps its refusal: the
+// pass that refused it records the ending Invalid and fails to read the run
+// again, the claim is marked in between, and the next pass ends the run
+// Invalid with the refusal's message. It never plans the run again into
+// Queued.
+func TestARefusedRunWhoseReleaseFailedEndsInvalid(t *testing.T) {
+	unmarked := claim()
+	unmarked.Annotations = nil
+	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) {
+		b.Spec.Source = claimN
+		b.Finalizers = []string{Finalizer}
+	}), unmarked)
+	failRead := true
+	reader := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*backupv1alpha1.BackupRun); ok && failRead {
+				return apierrors.NewInternalError(errors.New("the API server cannot read the BackupRun"))
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := &BackupRunReconciler{Client: c, Reader: reader, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{},
+		Now: func() time.Time { return frozen }}
+
+	if err := tryStep(r); err == nil {
+		t.Fatal("the pass whose release failed returned no error")
+	}
+	stored := readBackupRun(t, c)
+	if stored.Status.Ending == nil || stored.Status.Ending.Reason != backupv1alpha1.ReasonInvalid {
+		t.Fatalf("ending = %+v after the failed release, want reason Invalid", stored.Status.Ending)
+	}
+	refusal := stored.Status.Ending.Message
+
+	marked := &corev1.PersistentVolumeClaim{}
+	get(t, c, ns, claimN, marked)
+	marked.Annotations = enabled()
+	if err := c.Update(context.Background(), marked); err != nil {
+		t.Fatal(err)
+	}
+	failRead = false
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
+		readyMessage(run.Status.Conditions) != refusal {
+		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, %q", run.Status.Phase,
+			readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), refusal)
+	}
+}
+
 // A volume with no files, which VolSync skips without taking a snapshot,
 // succeeds with Empty set and no snapshot ID.
 func TestAnEmptyVolumeSucceedsWithoutASnapshot(t *testing.T) {
