@@ -185,9 +185,29 @@ ERROR: WAL archive check failed for server <serverName>: Expected empty archive
 ```
 
 Only this container logs that text. The condition and the postgres
-container's log carry the rpc error above. When the search prints nothing,
-archiving fails for another reason: read the rest of the same log for it, and
-leave that Cluster out of step 7.
+container's log carry the rpc error above.
+
+When the search prints nothing, the Cluster's archiving fails for another
+reason. The same container's log names it:
+
+| Line in the plugin-barman-cloud log | What failed |
+| --- | --- |
+| `ERROR: Barman cloud WAL archive check exception: <what the store answered>`, for example `Permission denied when accessing bucket '<bucket>'. Verify that the configured credentials have sufficient permissions: <answer>` | the check reached the store and the store refused it, because of the credentials the ObjectStore names or of a bucket those credentials may not create or use |
+| `ERROR: Can't connect to cloud provider: <error>` | the check cannot reach the endpointURL the ObjectStore names |
+| `ERROR: Barman cloud WAL archiver exception: <what the store answered>` | the check passed and the upload of a segment was refused, for example after the credentials changed or the bucket was deleted |
+| `no permission to download the backup credentials, retrying` | the sidecar may not read the ObjectStore or the Secret it names |
+
+A line naming something else, such as a missing ObjectStore or Secret, names
+its own cause. The condition's `exit status` tells the same classes apart
+with CloudNativePG 1.30.0, plugin-barman-cloud 0.15.0 and barman 3.20.0: 1
+when the check refused a prefix that holds WAL, 2 when it could not reach
+the endpoint, and 4 for the store's other answers and for a refused upload.
+
+Step 7 repairs only a Cluster whose log shows the `Expected empty archive`
+line. For any other failure, repair the cause and read the log again: a
+Cluster that has never archived keeps the marker file in PGDATA, so once the
+store answers, the check prints its verdict on the prefix, and a line with
+`Expected empty archive` means the Cluster needs step 7 after all.
 
 ### Step 7: Give each such Cluster an empty archive
 
