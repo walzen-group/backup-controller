@@ -12,6 +12,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,7 +45,7 @@ var orphanCRDs = []string{
 func orphanScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, volsyncv1alpha1.AddToScheme, backupv1alpha1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, batchv1.AddToScheme, volsyncv1alpha1.AddToScheme, backupv1alpha1.AddToScheme} {
 		if err := add(s); err != nil {
 			t.Fatalf("register types: %v", err)
 		}
@@ -282,6 +283,48 @@ func TestAMoverStillThereIsWaitedFor(t *testing.T) {
 				t.Errorf("claim finalizers = %v, want %s removed", got, ClaimFinalizer)
 			}
 		})
+	}
+}
+
+// X2: a mover Job that is still there holds the cleanup even with no pod,
+// since it may not have started its first pod yet or be between two of its
+// retries. The Secret copy, the prime and the finalizer stay, and the claim
+// is requeued with a WaitingForMover event naming the Job. Once the Job is
+// gone the cleanup finishes. Before, only the Job's pods were looked for.
+func TestAMoverJobWithoutAPodIsWaitedFor(t *testing.T) {
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: internalvolsync.MoverJobName(DestinationName(orphanClaimUID)), Namespace: orphanControllerNS}}
+	c := newOrphanClient(t, append(leftovers(), stuckClaim(), job)...)
+	r, recorder := newOrphanReconciler(c, c)
+
+	res, err := reconcileClaim(t, r)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("result = %+v, want a requeue", res)
+	}
+	for _, obj := range leftovers()[1:] {
+		if !present(t, c, obj) {
+			t.Errorf("%T %s deleted while the mover Job is there", obj, obj.GetName())
+		}
+	}
+	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
+		t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
+	}
+	got := drain(recorder)
+	if len(got) != 1 || !strings.HasPrefix(got[0], "Normal WaitingForMover") || !strings.Contains(got[0], "mover Job "+orphanControllerNS+"/"+job.Name) {
+		t.Errorf("events = %q, want one Normal WaitingForMover naming Job %s", got, job.Name)
+	}
+
+	if err := c.Delete(context.Background(), job); err != nil {
+		t.Fatalf("delete Job: %v", err)
+	}
+	if _, err := reconcileClaim(t, r); err != nil {
+		t.Fatalf("reconcile after the Job went: %v", err)
+	}
+	assertLeftovers(t, c, false)
+	if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
+		t.Errorf("claim finalizers = %v, want %s removed", got, ClaimFinalizer)
 	}
 }
 

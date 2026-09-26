@@ -20,6 +20,7 @@ import (
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -367,8 +368,8 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 // apiserver stops when the test ends.
 //
 // It returns the environment, its rest config, a scheme with the core,
-// storage, VolSync and backup types, a direct client, and the StorageClass's
-// name. It fails the test when a step fails.
+// batch, storage, VolSync and backup types, a direct client, and the
+// StorageClass's name. It fails the test when a step fails.
 func startOrphanEnvtest(ctx context.Context, t *testing.T) (*envtest.Environment, *rest.Config, *runtime.Scheme, client.Client, string) {
 	t.Helper()
 	env := &envtest.Environment{
@@ -385,7 +386,7 @@ func startOrphanEnvtest(ctx context.Context, t *testing.T) (*envtest.Environment
 	t.Cleanup(func() { _ = env.Stop() })
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, storagev1.AddToScheme, volsyncv1alpha1.AddToScheme, backupv1alpha1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, batchv1.AddToScheme, storagev1.AddToScheme, volsyncv1alpha1.AddToScheme, backupv1alpha1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatal(err)
 		}

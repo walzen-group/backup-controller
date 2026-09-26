@@ -26,7 +26,7 @@ In the app's namespace:
 | ReplicationSource named after each claim marked `backup.wlz.li/enabled` | each BackupRun, owned by the claim and labelled `app.kubernetes.io/managed-by: backup-controller` | stays, and goes with the claim; a failed mover leaves it in place, and VolSync keeps retrying |
 | CloudNativePG Backup `<cluster>-<suffix>` | each BackupRun, one per Cluster marked `backup.wlz.li/enabled` | stays, as CloudNativePG's backup record |
 | ReplicationDestination | a RestoreRun that restores a volume: in place, or with `claim:` and `into:`, or with `repository:` and `into:` | deleted once the item's end is in the run's status |
-| Lease `backup-controller-claim-<claim uid>` and `backup-controller-repo-<secret uid>` | a run, right before it creates its mover object for an item | released once the item's end is in the run's status, and taken over by another run when its holder is gone or finished |
+| Lease `backup-controller-claim-<claim uid>` and `backup-controller-repo-<secret uid>` | a run, right before it creates its mover object for an item | released once the item's end is in the run's status and its stopped mover's Job and pods are gone, and taken over by another run when its holder is gone or finished |
 | Lease `backup-controller-quiesce` in the run's namespace | a run, before it records the plan that stops the workloads of a BackupRun with `all: true`, or of a RestoreRun that lists `quiesce` | released once the run's stored status shows the workloads back; taken over when its holder has finished, is gone or has given the workloads back |
 | a scratch claim named by `into:` | a RestoreRun with `into:`, owned by the run; it carries no data source, and the run's ReplicationDestination fills it | deleted with the RestoreRun, the claim's dataset included |
 
@@ -48,7 +48,7 @@ On objects the controller does not own:
 | a recovered Cluster | the `initdb` a GitOps tool applies again, dropped | on UPDATE, in the webhook |
 | a Cluster in a database RestoreRun | deleted, so it is created again and recovered | when the restore starts |
 | a claim being filled | the library's `backup.wlz.li` annotations and finalizer | while the fill runs |
-| a claim being deleted whose VolumeRestore is gone | the library's finalizer `backup.wlz.li/populate-target-protection` removed by the orphan reconciler, and its WaitingForMover and DataSourceGone events | once the claim's destination, mover pod, Secret copy and prime claim are gone |
+| a claim being deleted whose VolumeRestore is gone | the library's finalizer `backup.wlz.li/populate-target-protection` removed by the orphan reconciler, and its WaitingForMover and DataSourceGone events | once the claim's destination, mover pod, mover Job, Secret copy and prime claim are gone |
 | the VolumeRestore a claim fills from | the finalizer `backup.wlz.li/volume-populator` | while any claim is listed in its `status.claims`; the populator adds it on its first call for a claim, which the library makes once the claim's prime claim is bound |
 
 Before a run changes anything, the run manager reads the installed CRD of the
@@ -56,10 +56,11 @@ run's kind straight from the API server and compares its schema with the fields
 the Go type writes. A run whose CRD lacks one of those fields ends Failed with
 reason CRDOutdated before it stops or creates anything, because the API server
 would drop that field from every write: a run that lost `status.quiesced` would
-stop an app and record nothing to start it again. The same reason covers a controller that may not read the CRD, and one whose
-CRD is not installed. Applying the CRDs of the controller's release fixes each;
-Helm upgrades no CRD on its own. [packaging.md](packaging.md#rbac-the-controller-needs)
-lists the rule this needs.
+stop an app and record nothing to start it again. The same reason covers a
+controller that may not read the CRD, and one whose CRD is not installed.
+Applying the CRDs of the controller's release fixes each; Helm upgrades no CRD
+on its own. [packaging.md](packaging.md#rbac-the-controller-needs) lists the
+rule this needs.
 
 A backup and a restore of one claim or repository never run at once. Each run
 takes a `coordination.k8s.io` Lease for the claim and one for the repository
@@ -471,21 +472,23 @@ NotFound for the VolumeRestore. A VolumeRestore that exists in any state leaves
 the claim to the library. Then, in the controller's namespace, it:
 
 1. deletes the ReplicationDestination `restore-<uid>`;
-2. lists the pods of the mover Job `volsync-dst-restore-<uid>`, and while any is
-   left records WaitingForMover on the claim and looks again 30 seconds later;
+2. lists the pods of the mover Job `volsync-dst-restore-<uid>`, and once no pod
+   is left reads the Job itself; while a pod or the Job is left, it records
+   WaitingForMover on the claim and looks again 30 seconds later;
 3. deletes the Secret copy and the prime claim `prime-<uid>`;
 4. removes `backup.wlz.li/populate-target-protection` from the claim, and
    records DataSourceGone.
 
 The reconciler deletes the Secret copy and the prime claim only once the mover
-pod is gone; a restic restore killed half way leaves its lock in the
-repository. Every delete accepts an object that is already gone, and the
-finalizer goes last, so a pass that fails part way starts again from step 1 and
-finishes on a later pass.
+pod and its Job are gone. A restic restore killed half way leaves its lock in
+the repository, and a Job with no pod, before its first pod or between two
+retries, can still start one. Every delete accepts an object that is already
+gone, and the finalizer goes last, so a pass that fails part way starts again
+from step 1 and finishes on a later pass.
 
 | Event | Type | Message |
 | --- | --- | --- |
-| WaitingForMover | Normal | `VolumeRestore <name> is gone; waiting for mover pod <namespace>/<pod> (phase <phase>) of ReplicationDestination restore-<uid> to go before the cleanup finishes` |
+| WaitingForMover | Normal | `VolumeRestore <name> is gone; waiting for mover pod <namespace>/<pod> (phase <phase>) of ReplicationDestination restore-<uid> to go before the cleanup finishes`, or `mover Job <namespace>/volsync-dst-restore-<uid>` in place of the pod once only the Job is left |
 | DataSourceGone | Warning | `VolumeRestore <name> was deleted before the populator finished with this claim; deleted ReplicationDestination restore-<uid>, Secret copy <secret> and prime claim prime-<uid> in <namespace>, and removed finalizer backup.wlz.li/populate-target-protection` |
 
 To follow one claim's cleanup, read the claim's events:

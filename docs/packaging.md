@@ -140,6 +140,7 @@ caller in the controller:
 | `replicationsources.volsync.backube` | get, list, watch, create, update, patch | writing each enabled claim's source and its manual trigger; v0.8.2 dropped delete, which v0.8.0 and v0.8.1 used after a failed mover |
 | `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill and one per volume restore, in place or with `into:`; the orphan reconciler deletes the destination of a claim whose VolumeRestore is gone |
 | `leases` (coordination.k8s.io) | get, list, create, update, delete | the Lease a BackupRun or RestoreRun takes on a claim and on its repository Secret right before it starts a mover, so a backup and a restore of either never run at once, and the Lease `backup-controller-quiesce` a run acquires in its namespace before it stops that namespace's workloads (internal/runs/lease.go). Runs live in every namespace, so the rule is cluster-wide, and `update` takes over the Lease of a run that has finished |
+| `jobs` (batch) | get | a RestoreRun and the orphan reconciler reading the Job of a mover they stopped by name, and waiting while it is there, since a Job with no pod can still start one |
 | `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
 | `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |
 | `clusters.postgresql.cnpg.io` | get, list, delete | the webhook's shared-archive check, a database run, and a database restore deleting its Cluster |

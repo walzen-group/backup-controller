@@ -8,6 +8,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -131,17 +132,18 @@ func (r *OrphanReconciler) orphaned(claim *corev1.PersistentVolumeClaim) bool {
 // VolumeRestore lets it go on. It then, in the controller namespace:
 //
 //  1. deletes the ReplicationDestination DestinationName(uid);
-//  2. lists the pods of that destination's mover Job, and while any is
-//     still there records a Normal WaitingForMover event and requeues after
-//     MoverPoll, because a restic restore killed mid-way leaves its
-//     repository lock (rule X2);
+//  2. lists the pods of that destination's mover Job, and reads the Job
+//     itself once no pod is left, and while a pod or the Job is still there
+//     records a Normal WaitingForMover event and requeues after MoverPoll,
+//     because a restic restore killed mid-way leaves its repository lock
+//     and a Job with no pod can still start one (rule X2);
 //  3. deletes the Secret copy and the prime claim PrimeClaimName(uid);
 //  4. removes ClaimFinalizer from the claim with a merge patch that carries
 //     the resourceVersion it read, and records a Warning DataSourceGone event.
 //
 // Every delete ignores NotFound and the finalizer goes last, so a pass that
 // fails anywhere is repeated from the start and converges. It returns an
-// error when a read, a delete, the pod list or the patch fails; a conflict on
+// error when a read, a delete, the pod list, the Job read or the patch fails; a conflict on
 // the patch is returned the same way.
 func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	claim := &corev1.PersistentVolumeClaim{}
@@ -171,11 +173,24 @@ func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err := r.Reader.List(ctx, pods, client.InNamespace(r.Namespace), client.MatchingLabels{"job-name": internalvolsync.MoverJobName(destination)}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list the mover pods of ReplicationDestination %s/%s: %w", r.Namespace, destination, err)
 	}
+	left := ""
 	if len(pods.Items) > 0 {
 		pod := pods.Items[0]
+		left = fmt.Sprintf("mover pod %s/%s (phase %s)", r.Namespace, pod.Name, pod.Status.Phase)
+	} else {
+		job := internalvolsync.MoverJobName(destination)
+		err := r.Reader.Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: job}, &batchv1.Job{})
+		switch {
+		case err == nil:
+			left = fmt.Sprintf("mover Job %s/%s", r.Namespace, job)
+		case !apierrors.IsNotFound(err):
+			return ctrl.Result{}, fmt.Errorf("get the mover Job %s/%s of ReplicationDestination %s: %w", r.Namespace, job, destination, err)
+		}
+	}
+	if left != "" {
 		r.Recorder.Eventf(claim, nil, corev1.EventTypeNormal, "WaitingForMover", "Cleanup",
-			"VolumeRestore %s is gone; waiting for mover pod %s/%s (phase %s) of ReplicationDestination %s to go before the cleanup finishes",
-			vrKey.Name, r.Namespace, pod.Name, pod.Status.Phase, destination)
+			"VolumeRestore %s is gone; waiting for %s of ReplicationDestination %s to go before the cleanup finishes",
+			vrKey.Name, left, destination)
 		poll := r.MoverPoll
 		if poll <= 0 {
 			poll = defaultMoverPoll

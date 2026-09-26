@@ -66,7 +66,7 @@ var grants = []grant{
 	{"backup.wlz.li", "restoreruns/status", []string{"patch", "update"}, "a RestoreRun's phase and conditions"},
 	{"events.k8s.io", "events", []string{"create", "patch"}, "an event on a run each time its Ready reason changes"},
 	{"", "pods", []string{"list"}, "a RestoreRun: the pods of a mover it stopped, which it waits for before it gives the app back"},
-	{"batch", "jobs", []string{"get"}, "a RestoreRun: the Job of a mover it stopped, which it waits for before it gives the app back"},
+	{"batch", "jobs", []string{"get"}, "a RestoreRun and the orphan reconciler: the Job of a mover they stopped, which they wait for"},
 
 	{"", "namespaces", []string{"get", "list", "watch"}, "the scheduler reads each namespace's backup.wlz.li/schedule"},
 	{"postgresql.cnpg.io", "clusters", []string{"get", "list", "delete"}, "a database run reads its Cluster, and a restore deletes it"},

@@ -127,7 +127,8 @@ rules:
     resources: ["replicationdestinations"]
     verbs: ["get", "list", "watch", "create", "delete"]
   # A RestoreRun that stops a restore mover (moverRemains in
-  # internal/runs/restorerun.go) reads the mover's Job by name, and waits
+  # internal/runs/restorerun.go) and the populator orphan reconciler
+  # (internal/populator/orphans.go) read the mover's Job by name, and wait
   # while it is there: a Job without a pod can still start one. Only get,
   # through the uncached reader, so no list or watch.
   - apiGroups: ["batch"]

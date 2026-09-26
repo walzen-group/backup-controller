@@ -127,8 +127,8 @@ keeps the CRDs of its first install.
 A cluster that ran v0.8.0 or v0.8.1 under the v0.7.2 BackupRun CRDs needs a look
 before the upgrade: that schema has no `status.restartPending`, so a status
 write there drops the field, and a run that stopped workloads could finish
-while the app was still at zero replicas. List the workloads that are marked
-for quiesce and stand at zero:
+while the app was still at zero replicas. Before and after the upgrade, list
+the workloads that are marked for quiesce and stand at zero:
 
 ```
 kubectl get deployments,statefulsets -A -o json | jq -r '.items[] | select((.metadata.annotations? // {})["backup.wlz.li/quiesce"] == "true" and ((.spec.replicas? // 1) == 0)) | "\(.metadata.namespace)/\(.kind)/\(.metadata.name)"'
@@ -159,7 +159,7 @@ the message. The annotation holds a Go duration, such as `20m`.
 A run that stops workloads now refuses, with reason `Invalid` and before it
 stops anything, when the Flux Kustomization of one of its workloads also
 applies a Deployment or a StatefulSet in another namespace
-([namespace-backups.md](namespace-backups.md#flux-kustomizations)). List such
+([namespace-backups.md](namespace-backups.md#which-kustomization-a-run-suspends)). List such
 Kustomizations:
 
 ```

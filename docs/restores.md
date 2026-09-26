@@ -203,7 +203,6 @@ the run, and so does a claim of that name that appears after the checks:
 claim canary-backup-friday already exists and this run did not create it. spec.into names a new claim for the run to create, and a restore never writes into a claim it did not create. Choose a name no claim in this namespace has. To overwrite an existing claim, restore it in place with spec.claim.
 ```
 
-
 Before it creates anything, a run lists the repository's snapshots and fails
 with reason NoBackupInReach when none is at or before `restoreAsOf`. VolSync's
 mover would otherwise print `No eligible snapshots found`, exit 0, and report
@@ -244,6 +243,16 @@ mounts it.`
 reach Succeeded before you mount it. A mover that fails ends the run Failed
 with its logs, and a restore still unfinished at `timeout` ends it TimedOut with
 `claim scratch had not been restored by <time>`.
+
+Before a run records its end, and before a deleted run drops its finalizer, the
+run deletes its ReplicationDestination and waits in phase Waiting, with reason
+WaitingForShutdown, until the mover's Job and that Job's pods are gone. A Job
+with no pod can still start one, and a restic restore killed half way leaves
+its lock in the repository. The message names what is left:
+
+```text
+waiting for the mover of ReplicationDestination restore-9b7d4e21-0, which the run stopped while it restored scratch, to go: its Job volsync-dst-restore-9b7d4e21-0 is still there. The run gives the app back and lets other runs at the claim only after that
+```
 
 ### Which snapshot a run restores
 
