@@ -35,6 +35,11 @@ type restoreSettings struct {
 	// leaves a dataset behind after every restore.
 	CacheStorageClassName *string
 
+	// CacheCapacity is the size of the mover's metadata cache claim, from
+	// the VolumeRestore. When it is nil, VolSync makes the cache 1Gi (volsync
+	// v0.16.0 internal/controller/mover/restic/mover.go:199-200).
+	CacheCapacity *resource.Quantity
+
 	// MoverPodLabels are the labels put on the mover pod. They place the mover
 	// in the cluster's backup queue.
 	MoverPodLabels map[string]string
@@ -80,7 +85,8 @@ type restoreSettings struct {
 //
 // Naming a claim is the ordinary case, and it states nothing twice. The
 // claim's dataSourceRef names its VolumeRestore, and that object already
-// carries the repository Secret, the cache class and the queue label. Naming
+// carries the repository Secret, the cache class and capacity, and the queue
+// label. Naming
 // a repository directly covers a restore from a repository that no claim in
 // the namespace backs up to.
 func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, repository string, moverContext *corev1.PodSecurityContext) (restoreSettings, error) {
@@ -122,6 +128,7 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 		settings.Secret = vr.Spec.Repository
 	}
 	settings.CacheStorageClassName = vr.Spec.CacheStorageClassName
+	settings.CacheCapacity = vr.Spec.CacheCapacity
 	settings.MoverPodLabels = vr.Spec.MoverLabels()
 	if settings.MoverSecurityContext == nil {
 		settings.MoverSecurityContext = vr.Spec.MoverSecurityContext
@@ -182,6 +189,7 @@ func directDestination(run *backupv1alpha1.RestoreRun, item backupv1alpha1.Resto
 				Repository:            settings.Secret,
 				RestoreAsOf:           selectedMoment(item),
 				CacheStorageClassName: settings.CacheStorageClassName,
+				CacheCapacity:         settings.CacheCapacity,
 				EnableFileDeletion:    true,
 				CleanupCachePVC:       true,
 				MoverConfig: volsyncv1alpha1.MoverConfig{

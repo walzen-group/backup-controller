@@ -123,9 +123,11 @@ ReplicationDestination restore-1a2b3c4d-0 is restoring into claim notes-data
 ```
 
 That check also catches a destination someone created by hand. Once the first
-run has deleted its destination, it keeps the claim's Lease until its mover's
-Job and pods are gone, and the second run waits with reason SourceBusy and a
-message naming the first run. The second run then starts on its own.
+run has deleted its destination, the mover pod of the first run may still mount
+the claim, and the second run waits with reason ClaimInUse and a message naming
+that pod. The first run keeps the claim's Lease until its mover's Job and pods
+are gone, so once the pod has gone the second run waits with reason SourceBusy
+and a message naming the first run. The second run then starts on its own.
 
 A run stops the app only when it can go on. On the pass that records its
 plan, before it stops anything, it checks every volume item it has not started:
@@ -209,13 +211,17 @@ ReplicationDestination of the run's own, with `copyMethod: Direct`, writes the
 selected snapshot into that claim through a mover pod the scheduler places on
 that node, so the mover's log says which snapshot it restored and the run
 confirms it the way it does in place. Mount `canary-backup-friday` from a
-throwaway pod once the run reaches Succeeded and compare. The claim and the
-destination are owned by the RestoreRun, so deleting the run deletes the claim
-and its dataset with it; keep the run until the comparison is done.
+throwaway pod once the run reaches Succeeded and compare. The claim carries an
+ownerReference to the RestoreRun, so deleting the run deletes the claim and its
+dataset with it; keep the run until the comparison is done. The
+ReplicationDestination carries no ownerReference: the run deletes it itself
+when the restore ends, or when the run is deleted, and waits for its mover to
+stop.
 
-The run writes only into a claim it created itself. A claim or
-ReplicationDestination of the name `into` that the run does not control fails
-the run, and so does a claim of that name that appears after the checks:
+The run writes only into a claim it created itself. A claim named `into`, or a
+ReplicationDestination named restore-<first 8 characters of the run's UID>-<item
+index>, that the run does not control fails the run, and so does a claim named
+`into` that appears after the checks:
 
 ```text
 claim canary-backup-friday already exists and this run did not create it. spec.into names a new claim for the run to create, and a restore never writes into a claim it did not create. Choose a name no claim in this namespace has. To overwrite an existing claim, restore it in place with spec.claim.

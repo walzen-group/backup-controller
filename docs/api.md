@@ -65,7 +65,7 @@ carrying the claim's own name.
 | `repository` | yes | `spec.restic.repository` of every source and destination for the claim; the populator copies the Secret into its own namespace first |
 | `restoreAsOf` | no | the populator's ReplicationDestination `spec.restic.restoreAsOf`, unless the claim carries `backup.wlz.li/restore-as-of`, which wins |
 | `cacheStorageClassName` | no | `cacheStorageClassName` of every source and destination, and the source's clone class |
-| `cacheCapacity` | no | `cacheCapacity` of the claim's ReplicationSource and of the populator's destination; an in-place RestoreRun's destination leaves it to VolSync |
+| `cacheCapacity` | no | `cacheCapacity` of the claim's ReplicationSource, of the populator's destination, and of the destination of a RestoreRun that names the claim in `claim`; unset, VolSync makes the cache 1Gi |
 | `moverPodLabels` | no | the restore destinations' `moverPodLabels`; a source carries none, because its run was admitted as a whole |
 | `moverSecurityContext` | no | `moverSecurityContext` of every source and destination |
 
@@ -232,7 +232,7 @@ spec:
 | Field | Required | Holds |
 | --- | --- | --- |
 | `claim` | one of `claim`/`repository`, `database` and `all` | the claim whose repository to restore from, and the claim to write into unless `into` names another |
-| `repository` | the same | the restic Secret in this namespace, for a repository no claim here owns; needs `into` and `intoSize` |
+| `repository` | the same | the restic Secret in this namespace to restore from, in place of the one the claim's VolumeRestore names. With `claim` as well, the run restores that claim in place from this repository; without `claim`, the run needs `into` and `intoSize` and fills a new claim |
 | `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository`. No claim of that name may exist yet, and with `claim` no VolumeRestore of that name either, since a VolumeRestore describes the backups of the claim of its name; the run creates no VolumeRestore for it. The run creates it empty and writes the selected snapshot into it through its own ReplicationDestination with `copyMethod: Direct`, so the mover's log confirms what the claim holds. With `claim` the run copies the source claim's size and the node its volume is on, and the scheduler places the mover pod with that volume; with `repository` there is no source node, and the mover pod is the claim's first consumer |
 | `intoSize` | with `repository` and `into` | the size of that claim; omitted with `claim`, the source claim's request |
 | `database` | one of the three | the Cluster to restore; the run deletes it and it recovers when it is created again. A Cluster carrying `backup.wlz.li/bootstrap: initdb`, or declaring its own bootstrap method such as `pg_basebackup`, ends the run Invalid, and so does a Cluster another unfinished RestoreRun is restoring |
@@ -273,9 +273,10 @@ names the recorded snapshot in its log. A mover that restored another snapshot,
 that found none, or whose log names none, fails the item and the message says
 what the claim holds;
 [restores.md](restores.md#what-the-mover-restored) lists the messages. A run
-writes only into a claim it created itself: a claim or ReplicationDestination
-of the name `spec.into` that the run does not control fails the run, and the
-message says what to do instead.
+writes only into a claim it created itself: a claim named `spec.into`, or a
+ReplicationDestination named restore-<first 8 characters of the run's UID>-<item
+index>, that the run does not control fails the run, and the message says what
+to do instead.
 
 ### Ready reasons of a RestoreRun
 
@@ -304,8 +305,7 @@ and `all`; `previous` only with one volume; `into` only with `claim` or
 `repository`; `intoSize` with `repository` and `into`; `syncDatabaseToVolume`
 only with `all`; `quiesce` not with `into`. The fourth rejects a run without
 `intoSize` with `into from a repository needs intoSize, because there is no
-source claim to copy a size from`, and a run the API server admitted before that
-rule existed ends Invalid at its checks, naming `spec.intoSize`.
+source claim to copy a size from`.
 
 The `quiesced[]` and `suspendedKustomizations[]` of a RestoreRun follow the
 same rules as a [BackupRun's](#backuprun): written as the plan before anything

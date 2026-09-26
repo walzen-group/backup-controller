@@ -5,9 +5,11 @@ import (
 	"strings"
 	"testing"
 
+	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // inPlace is a mutate function for restoreRun that makes it an in-place
@@ -99,5 +101,36 @@ func TestAnInPlaceRestoreIntoItsOwnClaimSucceeds(t *testing.T) {
 
 	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemSucceeded {
 		t.Errorf("item = %+v, want it Succeeded", item)
+	}
+}
+
+// A restore's ReplicationDestination gets the cache capacity of the claim's
+// VolumeRestore, as a backup's ReplicationSource and the populator's
+// destination do. Without it VolSync sizes the mover's cache at its default
+// of 1Gi, which a large repository outgrows. A restore from a repository
+// alone has no VolumeRestore to copy from and leaves the field unset.
+func TestARestoreDestinationGetsTheCacheCapacity(t *testing.T) {
+	for _, shape := range restoreShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			vr := volumeRestore()
+			capacity := resource.MustParse("4Gi")
+			vr.Spec.CacheCapacity = &capacity
+			r, c := restoreReconciler(t, nil, restoreRun(shape.mutate), claim(), vr, repository())
+			restoreStep(t, r) // plan
+			restoreStep(t, r) // create
+
+			rd := &volsyncv1alpha1.ReplicationDestination{}
+			get(t, c, ns, readRestoreRun(t, c).Status.Items[0].Destination, rd)
+			got := rd.Spec.Restic.CacheCapacity
+			if shape.into != "" && shape.name == "into from a repository" {
+				if got != nil {
+					t.Errorf("cacheCapacity = %v, want it unset with no VolumeRestore", got)
+				}
+				return
+			}
+			if got == nil || got.Cmp(capacity) != 0 {
+				t.Errorf("cacheCapacity = %v, want %s", got, capacity.String())
+			}
+		})
 	}
 }

@@ -494,7 +494,7 @@ finds the destination already gone goes on to step 2.
 
 | Event | Type | Message |
 | --- | --- | --- |
-| WaitingForMover | Normal | `VolumeRestore <name> is gone; deleted ReplicationDestination restore-<uid>, and the next pass looks for its mover before the cleanup goes on` on the pass that deletes the destination; after it, `VolumeRestore <name> is gone; waiting for mover pod <namespace>/<pod> (phase <phase>) of ReplicationDestination restore-<uid> to go before the cleanup finishes`, or `mover Job <namespace>/volsync-dst-restore-<uid>` in place of the pod once only the Job is left |
+| WaitingForMover | Normal | `VolumeRestore <name> is gone; deleted ReplicationDestination restore-<uid>, and looks for its mover once 30s have passed before the cleanup goes on` on the pass that deletes the destination; once 30 seconds have passed since that delete, `VolumeRestore <name> is gone; waiting for mover pod <namespace>/<pod> (phase <phase>) of ReplicationDestination restore-<uid> to go before the cleanup finishes`, or `mover Job <namespace>/volsync-dst-restore-<uid>` in place of the pod once only the Job is left |
 | DataSourceGone | Warning | `VolumeRestore <name> was deleted before the populator finished with this claim; deleted ReplicationDestination restore-<uid>, Secret copy <secret> and prime claim prime-<uid> in <namespace>, and removed finalizer backup.wlz.li/populate-target-protection` |
 
 To follow one claim's cleanup, read the claim's events:
