@@ -94,8 +94,8 @@ const DefaultBudget = 10 * time.Second
 //     (see Archiver).
 //   - A create is refused when the ObjectStore can't be resolved, when
 //     another Cluster anywhere already archives to the same bucket and prefix
-//     on any endpoint, or when another Cluster's ObjectStore can't be read
-//     for a reason other than NotFound (see archiveHolder).
+//     on any endpoint, or when the Cluster list or the ObjectStore list that
+//     the collision check reads fails (see archiveHolder).
 //   - A Cluster that carries OptOutAnnotation set to OptOutValue and declares
 //     no bootstrap other than initdb is allowed unchanged when nothing exists
 //     under its prefix, and refused when anything does, since CloudNativePG

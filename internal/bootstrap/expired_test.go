@@ -4,8 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/minio/minio-go/v7"
 
 	"github.com/walzen-group/backup-controller/internal/testinfra/barmanstore"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -142,5 +148,105 @@ func TestAReadThatEndsAtTheDeadlineNeverAdmitsInitdbOverAnArchive(t *testing.T) 
 				t.Fatalf("the cluster was admitted over the done-base archive: patches = %d, result = %v", len(response.Patches), response.Result)
 			}
 		})
+	}
+}
+
+// expiresAfterNextCheck is a context that ends right after the first Err
+// call made once it is armed. That call still sees the context live; every
+// later one sees it canceled. It models a deadline that passes between a
+// check of the context and the next use of it, which a real deadline hits
+// only by chance.
+type expiresAfterNextCheck struct {
+	context.Context
+	cancel context.CancelFunc
+	armed  atomic.Bool
+	fired  atomic.Bool
+}
+
+// Err returns nil and cancels the context on the first call after arming,
+// and the embedded context's error otherwise.
+func (c *expiresAfterNextCheck) Err() error {
+	if c.armed.Load() && c.fired.CompareAndSwap(false, true) {
+		c.cancel()
+		return nil
+	}
+	return c.Context.Err()
+}
+
+// armOnBaseListing passes every request to next, and arms ctx when the
+// client closes the answer to the listing of base/. minio-go closes that
+// answer before backupIDs checks the context, so the context ends right
+// after that check and before the next listing starts.
+type armOnBaseListing struct {
+	next http.RoundTripper
+	ctx  *expiresAfterNextCheck
+}
+
+// RoundTrip serves one request as the type's comment says.
+func (a armOnBaseListing) RoundTrip(r *http.Request) (*http.Response, error) {
+	response, err := a.next.RoundTrip(r)
+	query := r.URL.Query()
+	if err != nil || query.Get("list-type") != "2" || !strings.HasSuffix(query.Get("prefix"), "/base/") {
+		return response, err
+	}
+	response.Body = armOnClose{ReadCloser: response.Body, ctx: a.ctx}
+	return response, nil
+}
+
+// armOnClose is a response body that arms ctx when it is closed.
+type armOnClose struct {
+	io.ReadCloser
+	ctx *expiresAfterNextCheck
+}
+
+// Close closes the body and arms ctx.
+func (a armOnClose) Close() error {
+	err := a.ReadCloser.Close()
+	a.ctx.armed.Store(true)
+	return err
+}
+
+// TestAContextThatEndsAfterTheBaseListingNeverReadsAsAnEmptyPrefix checks
+// Survey on the recorded wal-only store, whose prefix holds WAL and no
+// base/, when the context ends after backupIDs has returned and before the
+// one-key listing of the server prefix. minio-go then ends that listing
+// with no item and no error, and a Survey that took the silence as an empty
+// prefix would let the webhook admit initdb into a prefix that holds WAL.
+// minio.DefaultTransport is swapped for the test so the client minio.New
+// builds for the http endpoint goes through armOnBaseListing. Finding W7.
+func TestAContextThatEndsAfterTheBaseListingNeverReadsAsAnEmptyPrefix(t *testing.T) {
+	server := recordedS3(t, barmanstore.MustLoad(t, "wal-only"))
+	at := Location{Endpoint: server.URL, Bucket: "backups", Prefix: "app/app-pg",
+		AccessKey: server.AccessKey, SecretKey: server.SecretKey}
+
+	parent, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ctx := &expiresAfterNextCheck{Context: parent, cancel: cancel}
+
+	original := minio.DefaultTransport
+	t.Cleanup(func() { minio.DefaultTransport = original })
+	minio.DefaultTransport = func(secure bool) (*http.Transport, error) {
+		transport := &http.Transport{}
+		transport.RegisterProtocol("http", armOnBaseListing{next: http.DefaultTransport, ctx: ctx})
+		return transport, nil
+	}
+
+	archive, err := S3Prober{}.Survey(ctx, at, nil)
+
+	if !ctx.fired.Load() {
+		t.Fatalf("the context never ended after the base/ listing, so the test checked nothing (err = %v)", err)
+	}
+	if err == nil {
+		t.Fatalf("Survey gave no error after the context ended: empty = %v, backups = %d", archive.Empty, archive.Backups)
+	}
+	if archive.Empty {
+		t.Errorf("Survey read the wal-only prefix as empty")
+	}
+	var late *OutOfTimeError
+	if !errors.As(err, &late) {
+		t.Errorf("err = %v, want an *OutOfTimeError", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want it to wrap context.Canceled", err)
 	}
 }
