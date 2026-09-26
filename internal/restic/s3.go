@@ -152,7 +152,8 @@ func (s *S3Store) key(name string) string {
 
 // List returns the names of the files directly under dir, and leaves out
 // anything in a deeper directory. When dir doesn't exist, the listing is
-// empty.
+// empty. It returns an error when the listing fails, or when ctx ends
+// before the listing is complete.
 func (s *S3Store) List(ctx context.Context, dir string) ([]string, error) {
 	prefix := s.key(dir) + "/"
 	var names []string
@@ -164,6 +165,11 @@ func (s *S3Store) List(ctx context.Context, dir string) ([]string, error) {
 		if name != "" && !strings.Contains(name, "/") {
 			names = append(names, name)
 		}
+	}
+	// minio-go ends the listing with no error when ctx is done between two
+	// pages, so the names so far may not be all of them.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("list %s/%s: the listing stopped early: %w", s.at.Bucket, prefix, err)
 	}
 	return names, nil
 }

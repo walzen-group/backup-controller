@@ -72,7 +72,8 @@ func (e *OutOfTimeError) Unwrap() error { return e.Err }
 // With no backup directory at all, it asks for one key under the server
 // prefix to fill in Empty.
 //
-// It returns an *OutOfTimeError when ctx ends before an answer. It returns
+// It returns an *OutOfTimeError when ctx ends before an answer, during a
+// listing too, so an expired ctx never reads as an empty prefix. It returns
 // an error when the client can't be built, when a listing fails, or when a
 // GET failed and no qualifying backup was found, since the unread file might
 // have been the DONE one.
@@ -95,6 +96,11 @@ func (p S3Prober) Survey(ctx context.Context, at Location, target *time.Time) (A
 			}
 			out.Empty = false
 			break
+		}
+		// minio-go ends the listing with no error item when ctx is done, so
+		// finding nothing proves the prefix empty only while ctx is live.
+		if out.Empty && ctx.Err() != nil {
+			return Archive{}, outOfTime(ctx, ctx.Err(), 0, 0)
 		}
 		return out, nil
 	}
@@ -133,8 +139,9 @@ func (p S3Prober) Survey(ctx context.Context, at Location, target *time.Time) (A
 // backup.info files with surveyParallel GETs in flight, but reads every one.
 // A missing backup.info counts as not DONE. It returns an error when the
 // listing fails, when a backup.info can't be downloaded or read, or when a
-// DONE backup's end_time doesn't parse. A location with no completed backup
-// gives an empty list and no error.
+// DONE backup's end_time doesn't parse, and one wrapping ctx's error when
+// ctx ends before every file was listed and read. A location with no
+// completed backup gives an empty list and no error.
 func (p S3Prober) BaseBackups(ctx context.Context, at Location) ([]BaseBackup, error) {
 	client, err := p.client(at)
 	if err != nil {
@@ -172,7 +179,9 @@ func outOfTime(ctx context.Context, err error, backups, read int) error {
 // backupIDs lists the backup directories under the location's base/ with the
 // "/" delimiter and returns their IDs newest first. barman names a directory
 // by the backup's start time, so the IDs sort by time as strings. It reads
-// every page before it returns. It returns an error when the listing fails.
+// every page before it returns. It returns an error when the listing fails,
+// and one wrapping ctx's error when ctx ended during the listing, since
+// minio-go then stops without saying so and the IDs read are not all.
 func backupIDs(ctx context.Context, client *minio.Client, at Location) ([]string, error) {
 	var ids []string
 	for object := range client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.BasePrefix()}) {
@@ -182,6 +191,11 @@ func backupIDs(ctx context.Context, client *minio.Client, at Location) ([]string
 		if strings.HasSuffix(object.Key, "/") {
 			ids = append(ids, path.Base(strings.TrimSuffix(object.Key, "/")))
 		}
+	}
+	// minio-go ends the listing with no error item when ctx is done, before
+	// the first page or between two, so the IDs so far may be none or some.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("list %s/%s: the listing stopped early: %w", at.Bucket, at.BasePrefix(), err)
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
 	return ids, nil
