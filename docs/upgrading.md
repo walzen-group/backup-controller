@@ -132,11 +132,11 @@ always used the direct path.
 
 A volume restore now succeeds only when the log of the mover that completed its
 trigger names the snapshot the run's checks selected, so a VolSync that cuts
-that log too short fails every restore instead of confirming one. VolSync keeps
-the last `MOVER_LOG_MAX_BYTES` bytes of the filtered log, 1024 by default. Leave
-the default, or set it to at least a few kilobytes; a value of 0 leaves the log
-empty and every restore then fails with `the mover finished, but its logs name
-no snapshot, so the run cannot confirm what claim <claim> holds`.
+that log too short leaves every restore unconfirmed, and the run fails it.
+VolSync keeps the last `MOVER_LOG_MAX_BYTES` bytes of the filtered log, 1024 by
+default. Leave the default, or set it to at least a few kilobytes; a value of 0
+leaves the log empty and every restore then fails with `the mover finished, but
+its logs name no snapshot, so the run cannot confirm what claim <claim> holds`.
 
 ### Step 6: Find Clusters v0.8.x admitted over an old archive
 

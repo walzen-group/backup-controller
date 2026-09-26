@@ -398,7 +398,7 @@ their mover; two movers on one volume write the same files, and one run's clone
 can be cut while the other writes. The Lease closes that window without holding
 either run back otherwise: it names its holder by UID, so a run created again
 under the same name does not inherit it, and a Lease whose holder has finished
-or is gone is taken over rather than waited on.
+or is gone is taken over by the next run that wants it.
 
 ## Confirm a restore from the mover's log
 
@@ -412,8 +412,8 @@ The alternative is to trust the completed trigger, which is how a restore
 reported success over a volume holding what it held before. VolSync leaves no
 other evidence: it keeps no exit status of a mover that succeeded, and the log
 is all that remains of it. It also keeps only the last `MOVER_LOG_MAX_BYTES`
-bytes of that log, so a VolSync installed with a small value fails every
-restore instead of confirming one, and the failure names that setting.
+bytes of that log, so a VolSync installed with a small value leaves every
+restore unconfirmed, every one fails, and the failure names that setting.
 
 ## Give the app back when the quiesce limit runs out
 

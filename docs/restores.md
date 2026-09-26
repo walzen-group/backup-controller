@@ -327,8 +327,8 @@ VolSync keeps only the last `MOVER_LOG_MAX_BYTES` bytes of the filtered log,
 `the mover finished, but its logs name no snapshot, so the run cannot confirm
 what claim canary-backup holds. VolSync keeps only the last MOVER_LOG_MAX_BYTES
 bytes (1024 by default) of the filtered log. Logs: ...`. A VolSync installed
-with `MOVER_LOG_MAX_BYTES` set to 0 or a very small value therefore fails every
-restore rather than confirming one.
+with `MOVER_LOG_MAX_BYTES` set to 0 or a very small value therefore leaves every
+restore unconfirmed, and each one fails.
 
 ## Databases restore themselves
 
