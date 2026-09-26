@@ -322,10 +322,12 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 // bootstrap method (see leftAlone).
 //
 // items returns a refusal when spec.repository is set and spec.claim is not,
-// because a restore in place needs a claim to write into, and when nothing in
-// the namespace is marked. It also returns a refusal when spec.database names
-// a Cluster that opts out of the bootstrap webhook. A failed read comes back
-// as a plain error.
+// because a restore in place needs a claim to write into; the refusal sends
+// the user to spec.into with a name no claim has, or to spec.claim to
+// overwrite an existing claim in place. It also returns a refusal when
+// nothing in the namespace is marked, and when spec.database names a Cluster
+// that opts out of the bootstrap webhook. A failed read comes back as a plain
+// error.
 func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	pending := func(kind, name string) backupv1alpha1.RestoreItem {
 		return backupv1alpha1.RestoreItem{Kind: kind, Name: name, Phase: backupv1alpha1.ItemPending}
@@ -334,7 +336,8 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	case run.Spec.Claim != "":
 		return []backupv1alpha1.RestoreItem{pending("PersistentVolumeClaim", run.Spec.Claim)}, nil
 	case run.Spec.Repository != "":
-		return nil, refuse("spec.into is required when spec.repository names the source, because there is no claim to restore in place")
+		return nil, refuse("spec.repository alone restores into a new claim, so spec.into is required, and it must name a claim that does not exist yet. " +
+			"To overwrite an existing claim from this repository, set spec.claim to it as well; the run then restores it in place once no pod mounts it.")
 	case run.Spec.Database != "":
 		cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, run.Spec.Database)
 		if err != nil {
@@ -669,7 +672,10 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // trigger, or fails with the mover's logs. It also fails when its destination
 // is gone. restoreVolume leaves the destination in place, and work deletes it
 // once the item's end is in the status. A claim that is gone, or whose
-// VolumeRestore is missing, fails the item.
+// VolumeRestore is missing, fails the item. So does a destination with the
+// item's name that the run did not create (see ownsDestination), found at
+// the create or on a later pass; the item then names no destination, so
+// nothing the run does afterwards touches it.
 //
 // It returns reason ClaimInUse and a message naming the pod while a pod
 // mounts the claim, and reason SourceBusy and a message naming the other run
@@ -721,8 +727,13 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			return backupv1alpha1.ReasonSourceBusy, backing, nil
 		}
 		name := destinationName(run.UID, index)
-		if err := r.Create(ctx, directDestination(run, *item, settings, name)); err != nil && !apierrors.IsAlreadyExists(err) {
-			return "", "", fmt.Errorf("create ReplicationDestination %s: %w", name, err)
+		refusal, err := r.createDestination(ctx, run, directDestination(run, *item, settings, name))
+		if err != nil {
+			return "", "", err
+		}
+		if refusal != "" {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, refusal
+			return "", "", nil
 		}
 		item.Phase, item.Destination = backupv1alpha1.ItemRunning, name
 
@@ -735,6 +746,11 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			// The run records an item's end before it deletes the
 			// destination, so something else deleted this one.
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, fmt.Sprintf("the ReplicationDestination %s was deleted before its mover finished", item.Destination)
+			return "", "", nil
+		}
+		if !ownsDestination(run, destination) {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, replacedDestination(item.Destination)
+			item.Destination = ""
 			return "", "", nil
 		}
 		if reason, failed := failedMover(destination); failed {
@@ -853,13 +869,27 @@ func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster client
 // report success. For a restore from spec.repository alone, the item also
 // names the ReplicationDestination that restoreIntoEmptyClaim creates.
 //
-// A spec that can't work ends the run as Failed with reason Invalid: a source
-// claim or VolumeRestore that is missing, a restoreAsOf that doesn't parse, or
-// a restore from spec.repository alone without spec.intoSize. A run with no
+// A spec that can't work ends the run as Failed with reason Invalid: a claim
+// named spec.into that exists and that the run did not create (for a restore
+// through the populator, a VolumeRestore of that name as well; see
+// notCreatedByRun), a source claim or VolumeRestore that is missing, a
+// restoreAsOf that doesn't parse, or a restore from spec.repository alone
+// without spec.intoSize. The run writes only into a claim it creates itself,
+// so it never overwrites or takes over one it finds. A run with no
 // snapshot in reach ends with reason NoBackupInReach. Any other failed read,
 // and a failed listing of the repository, is returned for a retry.
 func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	run.Status.Target = run.Spec.Into
+	refusal, err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim")
+	if err == nil && refusal == "" && run.Spec.Claim != "" {
+		refusal, err = r.intoTaken(ctx, run, &backupv1alpha1.VolumeRestore{}, "VolumeRestore")
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if refusal != "" {
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonInvalid, refusal)
+	}
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
 		if !isRefusal(err) {
@@ -914,6 +944,13 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 // Failed. While a backup of the source claim or its repository is in progress
 // (see otherMover), the run waits with reason SourceBusy before it creates
 // anything.
+//
+// The run writes only through a VolumeRestore and into a claim it created:
+// a Bound claim counts as restored only when the run controls it. A claim
+// or VolumeRestore named spec.into that the run did not create (see
+// notCreatedByRun), found at the create or on any later pass, aborts the run
+// with reason Failed. Such an object was created after the checks, which
+// refuse one that already existed.
 func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if run.Spec.Claim == "" {
 		return r.restoreIntoEmptyClaim(ctx, run)
@@ -921,6 +958,11 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 	bound := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
 	readErr := r.Reader.Get(ctx, key, bound)
+	if readErr == nil {
+		if refusal := notCreatedByRun(run, "claim", bound); refusal != "" {
+			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
+		}
+	}
 	if readErr == nil && bound.Status.Phase == corev1.ClaimBound {
 		for i := range run.Status.Items {
 			run.Status.Items[i].Phase = backupv1alpha1.ItemSucceeded
@@ -949,12 +991,19 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 		return after(pollInterval, err)
 	}
 	vr := pointInTimeRestore(run, run.Status.Items[0], settings)
-	if err := r.Create(ctx, vr); err != nil && !apierrors.IsAlreadyExists(err) {
-		return ctrl.Result{}, fmt.Errorf("create VolumeRestore %s/%s: %w", vr.Namespace, vr.Name, err)
+	refusal, err := r.createOwned(ctx, run, vr, &backupv1alpha1.VolumeRestore{}, "VolumeRestore")
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	claim := scratchClaim(run, settings, vr.Name)
-	if err := r.Create(ctx, claim); err != nil && !apierrors.IsAlreadyExists(err) {
-		return ctrl.Result{}, fmt.Errorf("create PersistentVolumeClaim %s/%s: %w", claim.Namespace, claim.Name, err)
+	if refusal != "" {
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
+	}
+	refusal, err = r.createOwned(ctx, run, scratchClaim(run, settings, vr.Name), &corev1.PersistentVolumeClaim{}, "claim")
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if refusal != "" {
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
 	}
 	return after(pollInterval, r.resume(ctx, run))
 }
@@ -982,6 +1031,17 @@ func (r *RestoreRunReconciler) reconcileIntoNewClaim(ctx context.Context, run *b
 // by spec.timeout, and the deadline is checked before anything is created.
 // While a backup of the repository is in progress (see otherMover), the run
 // waits with reason SourceBusy before it creates anything.
+//
+// The run writes only into a claim it created and only through a
+// destination it created. A claim named spec.into that the run did not
+// create (see notCreatedByRun), found before the create or at it, aborts the
+// run with reason Failed before any destination exists; the checks refuse
+// one that existed before them. A destination with the item's name that the
+// run did not create (see ownsDestination) aborts it too, and is left alone.
+// Once the destination exists, every pass reads the claim again, and a claim
+// that is gone, being deleted or replaced fails the run (see claimLost), so
+// a mover that completed never counts as a restore into a claim that is no
+// longer the run's.
 func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	item := &run.Status.Items[0]
 	done := fmt.Sprintf("claim %s holds the restored data", run.Spec.Into)
@@ -992,6 +1052,19 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	destination := &volsyncv1alpha1.ReplicationDestination{}
 	readErr := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Destination}, destination)
 	if readErr == nil {
+		if !ownsDestination(run, destination) {
+			message := takenDestination(item.Destination)
+			item.Destination = ""
+			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, message)
+		}
+		lost, err := r.claimLost(ctx, run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if lost != "" {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, lost
+			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
+		}
 		if reason, failed := failedMover(destination); failed {
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, reason
 			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
@@ -1018,17 +1091,144 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// A claim that appeared since the checks ends the run before it waits
+	// for anything: it is not the run's to write into.
+	refusal, err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim")
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if refusal != "" {
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
+	}
 	if waiting, err := r.waitForBackup(ctx, run, run.Spec.Into, settings.Secret); waiting || err != nil {
 		return after(pollInterval, err)
 	}
-	claim := scratchClaim(run, settings, "")
-	if err := r.Create(ctx, claim); err != nil && !apierrors.IsAlreadyExists(err) {
-		return ctrl.Result{}, fmt.Errorf("create PersistentVolumeClaim %s/%s: %w", claim.Namespace, claim.Name, err)
+	// The destination is created only once the claim is known to be the
+	// run's: its mover deletes every file the snapshot lacks.
+	refusal, err = r.createOwned(ctx, run, scratchClaim(run, settings, ""), &corev1.PersistentVolumeClaim{}, "claim")
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	if err := r.Create(ctx, directDestination(run, *item, settings, item.Destination)); err != nil && !apierrors.IsAlreadyExists(err) {
-		return ctrl.Result{}, fmt.Errorf("create ReplicationDestination %s: %w", item.Destination, err)
+	if refusal != "" {
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
+	}
+	refusal, err = r.createDestination(ctx, run, directDestination(run, *item, settings, item.Destination))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if refusal != "" {
+		item.Destination = ""
+		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
 	}
 	return after(pollInterval, r.resume(ctx, run))
+}
+
+// intoTaken reads the object named spec.into into object, and returns the
+// refusal from notCreatedByRun when it exists and the run did not create it.
+// It returns "" when the object does not exist or the run controls it.
+//
+// Parameters:
+//   - object is an empty claim or VolumeRestore, of the kind to read.
+//   - kind is "claim" or "VolumeRestore", for the message.
+//
+// The read goes through the uncached Reader, so an object created a moment
+// ago is seen. A failed read comes back as an error, and the caller retries.
+func (r *RestoreRunReconciler) intoTaken(ctx context.Context, run *backupv1alpha1.RestoreRun, object client.Object, kind string) (string, error) {
+	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
+	if err := r.Reader.Get(ctx, key, object); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get %s %s: %w", kind, key, err)
+	}
+	return notCreatedByRun(run, kind, object), nil
+}
+
+// createOwned creates object, which carries the run's controller reference,
+// and returns "" once an object of that name exists that the run controls.
+//
+// Parameters:
+//   - object is the claim or VolumeRestore to create.
+//   - existing is an empty object of the same kind, which the stored object
+//     is read into when the create finds one.
+//   - kind is "claim" or "VolumeRestore", for the message.
+//
+// A create that finds the name taken reads the stored object. The run's own,
+// left by a pass whose create went through but whose answer was lost, is
+// fine; any other gives the refusal from notCreatedByRun, and nothing is
+// written to it. A failed create or read comes back as an error, and the
+// caller retries.
+func (r *RestoreRunReconciler) createOwned(ctx context.Context, run *backupv1alpha1.RestoreRun, object, existing client.Object, kind string) (string, error) {
+	err := r.Create(ctx, object)
+	if err == nil {
+		return "", nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return "", fmt.Errorf("create %s %s/%s: %w", kind, object.GetNamespace(), object.GetName(), err)
+	}
+	if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(object), existing); err != nil {
+		return "", fmt.Errorf("get %s %s/%s: %w", kind, object.GetNamespace(), object.GetName(), err)
+	}
+	return notCreatedByRun(run, kind, existing), nil
+}
+
+// createDestination creates the run's ReplicationDestination, and returns
+// "" once a destination of that name exists that the run owns (see
+// ownsDestination). A destination of that name with another trigger belongs
+// to something else; createDestination returns a refusal naming it, and the
+// caller must not record it on the item, because finish deletes the
+// destination an item names. A failed create or read comes back as an error.
+func (r *RestoreRunReconciler) createDestination(ctx context.Context, run *backupv1alpha1.RestoreRun, destination *volsyncv1alpha1.ReplicationDestination) (string, error) {
+	err := r.Create(ctx, destination)
+	if err == nil {
+		return "", nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return "", fmt.Errorf("create ReplicationDestination %s: %w", destination.Name, err)
+	}
+	stored := &volsyncv1alpha1.ReplicationDestination{}
+	if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(destination), stored); err != nil {
+		return "", fmt.Errorf("get ReplicationDestination %s: %w", destination.Name, err)
+	}
+	if !ownsDestination(run, stored) {
+		return takenDestination(destination.Name), nil
+	}
+	return "", nil
+}
+
+// takenDestination returns the message for a ReplicationDestination with
+// the name the run gives its own that the run did not create.
+func takenDestination(name string) string {
+	return fmt.Sprintf("ReplicationDestination %s already exists and does not carry this run's trigger; nothing was written", name)
+}
+
+// replacedDestination returns the message for an item whose
+// ReplicationDestination was replaced, while the item ran, by one the run
+// did not create.
+func replacedDestination(name string) string {
+	return fmt.Sprintf("ReplicationDestination %s was replaced by one that does not carry this run's trigger; the run leaves it alone", name)
+}
+
+// claimLost returns a message when the claim spec.into names is gone, is
+// being deleted, or is not the one the run created (see notCreatedByRun),
+// and "" while the run's own claim is there. An into restore from a
+// repository checks it on every pass after its destination exists, so a
+// mover that finished never counts as a restore into a claim that is no
+// longer the run's. A failed read comes back as an error.
+func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha1.RestoreRun) (string, error) {
+	lost := fmt.Sprintf("claim %s was deleted (or replaced) while the mover wrote into it", run.Spec.Into)
+	claim := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
+	if err := r.Reader.Get(ctx, key, claim); err != nil {
+		if apierrors.IsNotFound(err) {
+			return lost, nil
+		}
+		return "", fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
+	}
+	if claim.DeletionTimestamp != nil || !metav1.IsControlledBy(claim, run) {
+		return lost, nil
+	}
+	return "", nil
 }
 
 // abort ends a run early as Failed. It marks every item that has not finished
@@ -1198,19 +1398,35 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 
 // removeDestinations deletes the ReplicationDestination that each item
 // chosen by the function given in which still names, and clears the item's
-// destination. finish and finalize pass anyItem, and work passes finished. A
-// destination that is already gone is not an error.
+// destination. finish and finalize pass anyItem, and work passes finished.
+//
+// It reads each destination first and deletes it only when the run owns it
+// (see ownsDestination); one with another trigger is left alone, and the
+// item's destination is cleared all the same. The delete carries the UID it
+// read as a precondition, so a destination created under the name since the
+// read is never deleted. A destination that is already gone is not an error.
+// A failed read or delete, and a delete whose precondition failed, come back
+// as an error, and the next pass reads the destination again.
 func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) error {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		if item.Destination == "" || !which(*item) {
 			continue
 		}
-		destination := &volsyncv1alpha1.ReplicationDestination{
-			ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: item.Destination},
+		destination := &volsyncv1alpha1.ReplicationDestination{}
+		key := types.NamespacedName{Namespace: run.Namespace, Name: item.Destination}
+		if err := r.Reader.Get(ctx, key, destination); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("get ReplicationDestination %s: %w", item.Destination, err)
+			}
+			item.Destination = ""
+			continue
 		}
-		if err := r.Delete(ctx, destination); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete ReplicationDestination %s: %w", item.Destination, err)
+		if ownsDestination(run, destination) {
+			uid := destination.UID
+			if err := r.Delete(ctx, destination, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete ReplicationDestination %s: %w", item.Destination, err)
+			}
 		}
 		item.Destination = ""
 	}
