@@ -145,7 +145,7 @@ func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 // quiet is a snapshot tagged quiesced, as a quiesced BackupRun leaves it after
 // moving it to its restart moment. Its time falls between sunday's and
 // monday's.
-var quiet = restic.Snapshot{ID: "c0ffee00" + "00000000", Time: time.Date(2026, 9, 21, 3, 0, 5, 0, time.UTC), Tags: []string{restic.QuiescedTag}}
+var quiet = restic.Snapshot{ID: "c0ffee00" + "00000000", Time: time.Date(2026, 9, 21, 3, 0, 5, 0, time.UTC), Hostname: "volsync", Paths: []string{"/data"}, Tags: []string{restic.QuiescedTag}}
 
 // A synced restore selects the newest quiesced snapshot and passes over
 // monday's newer untagged one. It records that snapshot's time in syncedTo and
@@ -1097,7 +1097,7 @@ func TestAClaimRestoreHandsTheMoverTheSnapshotItSelected(t *testing.T) {
 	r.Snapshots = snapshots{early, monday}
 	restoreStep(t, r) // plan
 
-	tuesday := restic.Snapshot{ID: "7a11ce00" + "00000000", Time: monday.Time.Add(24 * time.Hour)}
+	tuesday := restic.Snapshot{ID: "7a11ce00" + "00000000", Time: monday.Time.Add(24 * time.Hour), Hostname: "volsync", Paths: []string{"/data"}}
 	r.Snapshots = snapshots{early, monday, tuesday}
 	restoreStep(t, r) // restore
 

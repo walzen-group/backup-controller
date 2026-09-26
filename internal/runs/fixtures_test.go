@@ -158,11 +158,11 @@ func (s snapshots) Snapshots(context.Context, *corev1.Secret) ([]restic.Snapshot
 	return s, nil
 }
 
-// sunday and monday are two snapshots taken a day apart, each at 05:00:02
-// UTC.
+// sunday and monday are two snapshots a VolSync mover took a day apart, each
+// of /data from host volsync at 05:00:02 UTC.
 var (
-	sunday = restic.Snapshot{ID: "2edf5bab" + "00000000", Time: time.Date(2026, 9, 20, 5, 0, 2, 0, time.UTC)}
-	monday = restic.Snapshot{ID: "6e473100" + "00000000", Time: time.Date(2026, 9, 21, 5, 0, 2, 0, time.UTC)}
+	sunday = restic.Snapshot{ID: "2edf5bab" + "00000000", Time: time.Date(2026, 9, 20, 5, 0, 2, 0, time.UTC), Hostname: "volsync", Paths: []string{"/data"}}
+	monday = restic.Snapshot{ID: "6e473100" + "00000000", Time: time.Date(2026, 9, 21, 5, 0, 2, 0, time.UTC), Hostname: "volsync", Paths: []string{"/data"}}
 )
 
 // retimeCall holds the arguments of one call to retimer.Retime.

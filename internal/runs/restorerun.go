@@ -200,11 +200,12 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 //
 // For a volume, the check selects the snapshot the restore would use and
 // records its ID on the item. For a database, it selects the base backup the
-// recovery would start from and records its ID. An item with nothing in reach
-// is marked Failed with the reason. If any item fails, plan marks every other
-// Pending item Skipped and ends the run as Failed with reason NoBackupInReach,
-// naming each item it cannot reach. Nothing has been deleted or overwritten
-// at that point.
+// recovery would start from and records its ID. An item with nothing in reach,
+// or whose snapshot VolSync's mover would not restore when pinned to its
+// second (see selectSnapshot), is marked Failed with the reason. If any item
+// fails, plan marks every other Pending item Skipped and ends the run as
+// Failed with reason NoBackupInReach, naming each item it cannot reach.
+// Nothing has been deleted or overwritten at that point.
 //
 // With spec.syncDatabaseToVolume set, each volume may only select a snapshot
 // tagged quiesced, and all the selected snapshots must carry the same time.
@@ -416,9 +417,16 @@ func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alp
 // When spec.previous is set, selectSnapshot then steps that many snapshots
 // further back. It relies on the lister returning the snapshots oldest first.
 //
+// The run later pins the mover to the selected snapshot's time in whole
+// seconds, and the mover picks again from that second among every snapshot in
+// the repository. So selectSnapshot also checks, with unpinnable, that the
+// mover's pick for that second is the selected snapshot.
+//
 // It returns a reason, and no error, when the Secret doesn't exist, when no
-// snapshot qualifies, when none is at or before the moment, and when
-// spec.previous reaches past the oldest snapshot. It returns an error when
+// snapshot qualifies, when none is at or before the moment, when
+// spec.previous reaches past the oldest snapshot, and when the mover pinned
+// to the selected snapshot's second would restore another snapshot, or one
+// the run can't predict. It returns an error when
 // the Secret can't be read for another reason and when listing the repository
 // fails.
 func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
@@ -433,6 +441,7 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 	if err != nil {
 		return restic.Snapshot{}, "", fmt.Errorf("list the snapshots in %s: %w", secretName, err)
 	}
+	all := snapshots
 	if quiescedOnly {
 		snapshots = slices.DeleteFunc(slices.Clone(snapshots), func(s restic.Snapshot) bool { return !slices.Contains(s.Tags, restic.QuiescedTag) })
 		if len(snapshots) == 0 {
@@ -461,6 +470,9 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 		if index < 0 {
 			return restic.Snapshot{}, fmt.Sprintf("previous %d reaches past the oldest snapshot", *run.Spec.Previous), nil
 		}
+	}
+	if why := unpinnable(all, snapshots[index], quiescedOnly); why != "" {
+		return restic.Snapshot{}, why, nil
 	}
 	return snapshots[index], "", nil
 }
@@ -952,7 +964,8 @@ func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster client
 // restoreAsOf that doesn't parse, or a restore from spec.repository alone
 // without spec.intoSize. The run writes only into a claim it creates itself,
 // so it never overwrites or takes over one it finds. A run with no
-// snapshot in reach ends with reason NoBackupInReach. Any other failed read,
+// snapshot in reach, or whose snapshot VolSync's mover would not restore when
+// pinned to its second, ends with reason NoBackupInReach. Any other failed read,
 // and a failed listing of the repository, is returned for a retry.
 func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	run.Status.Target = run.Spec.Into

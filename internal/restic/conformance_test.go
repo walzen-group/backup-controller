@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +30,7 @@ type recordedSnapshot struct {
 	ID       string    `json:"id"`
 	ShortID  string    `json:"short_id"`
 	Time     time.Time `json:"time"`
+	Hostname string    `json:"hostname"`
 	Paths    []string  `json:"paths"`
 	Tags     []string  `json:"tags"`
 	Original string    `json:"original"`
@@ -161,7 +160,7 @@ func TestTheRecordingsCameFromThePinnedTools(t *testing.T) {
 // TestSnapshotsReadsWhatResticLists checks that Snapshots reads every
 // recorded repository the way restic snapshots --json lists it: the same
 // snapshots, oldest first, with the same full IDs, the same times to the
-// nanosecond, paths, tags and original. The subtests run in parallel, so
+// nanosecond, hosts, paths, tags and original. The subtests run in parallel, so
 // the first Open of each fixture, which derives its key with scrypt, runs on
 // its own core.
 func TestSnapshotsReadsWhatResticLists(t *testing.T) {
@@ -180,7 +179,7 @@ func TestSnapshotsReadsWhatResticLists(t *testing.T) {
 				for i, w := range want {
 					g := got[i]
 					if g.ID != w.ID || g.ShortID() != w.ShortID || !g.Time.Equal(w.Time) || g.Time.Nanosecond() != w.Time.Nanosecond() ||
-						!slices.Equal(g.Paths, w.Paths) || !slices.Equal(g.Tags, w.Tags) || g.Original != w.Original {
+						g.Hostname != w.Hostname || !slices.Equal(g.Paths, w.Paths) || !slices.Equal(g.Tags, w.Tags) || g.Original != w.Original {
 						t.Errorf("snapshot %d = %+v, restic lists %+v", i, g, w)
 					}
 				}
@@ -233,19 +232,25 @@ func TestAtOrBeforePicksWhatTheMoverPicks(t *testing.T) {
 
 // TestPinningASnapshotsSecondMakesTheMoverRestoreIt checks the assumption a
 // RestoreRun makes when it hands the mover a snapshot's whole-second time as
-// restoreAsOf: that the mover then restores that snapshot. For each snapshot
-// of each recorded repository, the recorded entry.sh run with RESTORE_AS_OF
-// at the snapshot's second must have selected it.
+// restoreAsOf: that the mover then restores that snapshot whenever MoverPick
+// says it does. For each snapshot of each recorded repository, the recorded
+// entry.sh run with RESTORE_AS_OF at the snapshot's second must have selected
+// the snapshot MoverPick picks for that second, and at least one recorded
+// repository must hold a snapshot the mover can't be pinned to that way.
 //
 // The mover maps each second to the last snapshot listed in it, so a
-// snapshot followed by another in the same second can't be reached that way.
-// That is finding R5; the rows it affects are skipped until the fix lands,
-// and any other mismatch fails.
+// snapshot followed by another in the same second can't be reached through
+// its second (finding R5). MoverPick names the later one, and a RestoreRun's
+// checks refuse the earlier one.
 func TestPinningASnapshotsSecondMakesTheMoverRestoreIt(t *testing.T) {
+	shadowed := 0
 	for _, kind := range []string{"timed", "same-second"} {
 		for _, f := range fixtures(t, kind) {
 			t.Run(f.name, func(t *testing.T) {
-				snapshots := f.snapshots(t)
+				snapshots, err := f.open(t).Snapshots(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
 				var rows []selectionRow
 				f.readJSON(t, "selection.json", &rows)
 				selected := map[string]string{}
@@ -254,28 +259,25 @@ func TestPinningASnapshotsSecondMakesTheMoverRestoreIt(t *testing.T) {
 						selected[row.RestoreAsOf] = row.Selected
 					}
 				}
-				var r5 []string
-				for i, s := range snapshots {
-					pin := s.Time.UTC().Truncate(time.Second).Format(time.RFC3339)
-					got, ok := selected[pin]
+				for _, s := range snapshots {
+					pin := s.Time.UTC().Truncate(time.Second)
+					got, ok := selected[pin.Format(time.RFC3339)]
 					if !ok {
-						t.Fatalf("no recorded restore at %s", pin)
+						t.Fatalf("no recorded restore at %s", pin.Format(time.RFC3339))
 					}
-					if got == s.ShortID {
-						continue
+					picked, ok := MoverPick(snapshots, pin)
+					if !ok || picked.ShortID() != got {
+						t.Errorf("RESTORE_AS_OF %s restored %q; MoverPick picks %q (%v)", pin.Format(time.RFC3339), got, picked.ShortID(), ok)
 					}
-					if i+1 < len(snapshots) && snapshots[i+1].Time.Unix() == s.Time.Unix() {
-						r5 = append(r5, fmt.Sprintf("pinning %s restores %s, taken later in the same second", pin, got))
-						continue
+					if got != s.ShortID() {
+						shadowed++
 					}
-					t.Errorf("RESTORE_AS_OF %s restored %q, want the snapshot taken then, %s", pin, got, s.ShortID)
-				}
-				if len(r5) > 0 && !t.Failed() {
-					t.Skipf("R5 (designs/restorerun.md C, same second; designs/tests.md section 4, phase 1 item 1): %s",
-						strings.Join(r5, "; "))
 				}
 			})
 		}
+	}
+	if shadowed == 0 {
+		t.Error("no recorded snapshot is shadowed by a later one in its second; the same-second fixture should hold one")
 	}
 }
 

@@ -51,6 +51,9 @@ type Snapshot struct {
 	// Time is the time restic stamped on the snapshot when the backup started,
 	// or the time Retime gave it.
 	Time time.Time
+	// Hostname is the host restic recorded for the snapshot. A VolSync mover
+	// records "volsync".
+	Hostname string
 	// Paths are the directories the snapshot holds.
 	Paths []string
 	// Tags are the snapshot's restic tags.
@@ -117,6 +120,7 @@ func Open(ctx context.Context, store Store, password string) (*Repository, error
 // snapshotJSON holds the fields of a snapshot document that this package reads.
 type snapshotJSON struct {
 	Time     time.Time `json:"time"`
+	Hostname string    `json:"hostname"`
 	Paths    []string  `json:"paths"`
 	Tags     []string  `json:"tags"`
 	Original string    `json:"original"`
@@ -186,7 +190,7 @@ func parseSnapshot(id string, document []byte) (snapshotFile, error) {
 		return snapshotFile{}, err
 	}
 	return snapshotFile{
-		snapshot: Snapshot{ID: id, Time: doc.Time, Paths: doc.Paths, Tags: doc.Tags, Original: doc.Original},
+		snapshot: Snapshot{ID: id, Time: doc.Time, Hostname: doc.Hostname, Paths: doc.Paths, Tags: doc.Tags, Original: doc.Original},
 		fields:   fields,
 	}, nil
 }
