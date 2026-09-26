@@ -12,8 +12,8 @@ import (
 	"github.com/go-logr/logr"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -192,7 +192,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	// bootstraps, so a Cluster declaring its own bootstrap is checked too.
 	holder, err := archiveHolder(ctx, d.Client, req.Namespace, req.Name, at)
 	if err != nil {
-		return readFailed(ctx, logger, budget, "listing the Clusters and reading their ObjectStores", err)
+		return readFailed(ctx, logger, budget, "listing the Clusters and their ObjectStores", err)
 	}
 	if holder != "" {
 		logger.Info("refusing the Cluster", "reason", "another database archives here", "holder", holder, "prefix", at.Prefix)
@@ -471,21 +471,23 @@ func keepRecovery(req admission.Request) admission.Response {
 //   - at is where the admitted Cluster would archive, from ResolveLocation.
 //
 // It returns the holder as "namespace/name", or an empty string when no
-// Cluster archives there. It returns an error when the Cluster list fails, or
-// when another Cluster's ObjectStore can't be read for any reason other than
-// NotFound, such as a server timeout. That Cluster may archive to the same
-// prefix, so the caller refuses the create instead of missing a collision.
+// Cluster archives there. It returns an error when the Cluster list or the
+// ObjectStore list fails for any reason, such as a server timeout. Another
+// Cluster may archive to the same prefix, so the caller refuses the create
+// instead of missing a collision.
 //
-// It lists every Cluster in every namespace, reads each archiving one's
-// ObjectStore with archiveAt, and compares the two with sameArchive: bucket
-// and prefix, never the endpoint, since two endpoint names can reach one
-// service. Two Clusters can reach one prefix through differently named
-// ObjectStores, so comparing store names would miss them. The check reads no
-// Secret. Where a Cluster archives is written in its ObjectStore, so a holder
-// whose credentials are missing is still found, and each other Cluster costs
-// one read, which keeps a create on a cluster with many databases inside the
-// webhook's timeout. A Cluster whose ObjectStore does not exist or names no
-// s3:// destination archives nowhere, so it is skipped.
+// It lists every Cluster in every namespace and, once there is an archiving
+// one, every ObjectStore in every namespace. Each archiving Cluster's store is
+// looked up by namespace and name in that list, and the two locations are
+// compared with sameArchive: bucket and prefix, never the endpoint, since two
+// endpoint names can reach one service. Two Clusters can reach one prefix
+// through differently named ObjectStores, so comparing store names would miss
+// them. The check reads no Secret. Where a Cluster archives is written in its
+// ObjectStore, so a holder whose credentials are missing is still found. The
+// whole check costs two list calls however many databases the cluster holds,
+// which keeps a disaster-recovery recreate of every Cluster at once inside
+// the webhook's budget. A Cluster whose ObjectStore is not in the list or
+// names no s3:// destination archives nowhere, so it is skipped.
 func archiveHolder(
 	ctx context.Context,
 	c client.Reader,
@@ -498,6 +500,9 @@ func archiveHolder(
 		return "", fmt.Errorf("list the Clusters: %w", err)
 	}
 
+	// The ObjectStores are listed once, on the first archiving Cluster, so a
+	// cluster with no other archiving Cluster lists none.
+	var stores map[types.NamespacedName]*unstructured.Unstructured
 	for i := range clusters.Items {
 		other := &clusters.Items[i]
 		if other.GetNamespace() == namespace && other.GetName() == name {
@@ -507,9 +512,20 @@ func archiveHolder(
 		if !found {
 			continue
 		}
-		theirs, _, err := archiveAt(ctx, c, other.GetNamespace(), store, serverName)
+		if stores == nil {
+			var err error
+			if stores, err = objectStores(ctx, c); err != nil {
+				return "", err
+			}
+		}
+		theirStore, ok := stores[types.NamespacedName{Namespace: other.GetNamespace(), Name: store}]
+		if !ok {
+			// Not in the list is what NotFound means for a single read.
+			continue
+		}
+		theirs, err := storeLocation(theirStore, serverName)
 		var noDestination *destinationError
-		if apierrors.IsNotFound(err) || errors.As(err, &noDestination) {
+		if errors.As(err, &noDestination) {
 			continue
 		}
 		if err != nil {
@@ -520,6 +536,27 @@ func archiveHolder(
 		}
 	}
 	return "", nil
+}
+
+// objectStores lists every Barman Cloud ObjectStore in every namespace, for
+// the collision check.
+//
+// It returns the stores keyed by namespace and name. The map is never nil, so
+// the caller can tell a list made from one not made yet. It returns an error
+// when the list fails for any reason, NotFound included: without the list the
+// check can't know where the other Clusters archive, so the caller refuses.
+func objectStores(ctx context.Context, c client.Reader) (map[types.NamespacedName]*unstructured.Unstructured, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(ObjectStoreListGVK)
+	if err := c.List(ctx, list); err != nil {
+		return nil, fmt.Errorf("list the ObjectStores: %w", err)
+	}
+	stores := make(map[types.NamespacedName]*unstructured.Unstructured, len(list.Items))
+	for i := range list.Items {
+		store := &list.Items[i]
+		stores[types.NamespacedName{Namespace: store.GetNamespace(), Name: store.GetName()}] = store
+	}
+	return stores, nil
 }
 
 // Archiver finds where a Cluster archives its WAL. It looks in spec.plugins for

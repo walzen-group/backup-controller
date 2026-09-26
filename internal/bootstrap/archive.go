@@ -45,6 +45,15 @@ var ObjectStoreGVK = schema.GroupVersionKind{
 	Kind:    "ObjectStore",
 }
 
+// ObjectStoreListGVK is the GroupVersionKind of the Barman Cloud plugin's
+// ObjectStoreList. The webhook's collision check lists every ObjectStore with
+// it once, instead of reading each other Cluster's store in turn.
+var ObjectStoreListGVK = schema.GroupVersionKind{
+	Group:   "barmancloud.cnpg.io",
+	Version: "v1",
+	Kind:    "ObjectStoreList",
+}
+
 // Location holds everything needed to ask an object store which base backups
 // one database has. ResolveLocation builds it from a Cluster's ObjectStore and
 // the Secrets that store names.
@@ -158,8 +167,7 @@ func ResolveLocation(
 }
 
 // archiveAt works out where one database archives from its ObjectStore alone,
-// reading no Secret. The webhook's collision check calls it for every
-// archiving Cluster on the cluster, and ResolveLocation builds on it.
+// reading no Secret. ResolveLocation builds on it.
 //
 // The arguments are those of ResolveLocation. It returns a Location with only
 // Endpoint, Bucket and Prefix set, and the ObjectStore it read so the caller
@@ -179,14 +187,34 @@ func archiveAt(
 		return Location{}, nil, fmt.Errorf("read ObjectStore %s/%s: %w", namespace, objectStore, err)
 	}
 
+	at, err := storeLocation(store, serverName)
+	if err != nil {
+		return Location{}, nil, err
+	}
+	return at, store, nil
+}
+
+// storeLocation works out where one database archives from an ObjectStore
+// already read. archiveAt calls it on the store it fetched, and the webhook's
+// collision check calls it on each store of one cluster-wide list.
+//
+// Parameters:
+//   - store is the ObjectStore. Its namespace and name only appear in errors.
+//   - serverName is the directory the database archives under inside the
+//     store's prefix, from Archiver.
+//
+// It returns a Location with only Endpoint, Bucket and Prefix set. It returns
+// a *destinationError when spec.configuration.destinationPath is missing or
+// isn't an s3:// URL with a bucket.
+func storeLocation(store *unstructured.Unstructured, serverName string) (Location, error) {
 	destination, _, err := unstructured.NestedString(store.Object, "spec", "configuration", "destinationPath")
 	if err != nil || destination == "" {
-		return Location{}, nil, &destinationError{fmt.Errorf("ObjectStore %s/%s has no spec.configuration.destinationPath", namespace, objectStore)}
+		return Location{}, &destinationError{fmt.Errorf("ObjectStore %s/%s has no spec.configuration.destinationPath", store.GetNamespace(), store.GetName())}
 	}
 
 	bucket, prefix, err := splitDestination(destination)
 	if err != nil {
-		return Location{}, nil, &destinationError{err}
+		return Location{}, &destinationError{err}
 	}
 
 	endpoint, _, _ := unstructured.NestedString(store.Object, "spec", "configuration", "endpointURL")
@@ -195,10 +223,10 @@ func archiveAt(
 		Endpoint: endpoint,
 		Bucket:   bucket,
 		Prefix:   strings.Trim(prefix+"/"+serverName, "/"),
-	}, store, nil
+	}, nil
 }
 
-// destinationError is the error archiveAt returns when an ObjectStore it read
+// destinationError is the error storeLocation returns when an ObjectStore
 // names no usable s3:// destination. A Cluster archiving through such a store
 // archives nowhere, so the collision check can tell it apart from a store it
 // failed to read.

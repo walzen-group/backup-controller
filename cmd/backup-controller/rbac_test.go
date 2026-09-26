@@ -67,6 +67,7 @@ var grants = []grant{
 
 	{"", "namespaces", []string{"get", "list", "watch"}, "the scheduler reads each namespace's backup.wlz.li/schedule"},
 	{"postgresql.cnpg.io", "clusters", []string{"get", "list", "delete"}, "a database run reads its Cluster, and a restore deletes it"},
+	{"barmancloud.cnpg.io", "objectstores", []string{"get", "list"}, "the webhook reads the admitted Cluster's ObjectStore, and lists them all once for the collision check"},
 	{"postgresql.cnpg.io", "backups", []string{"get", "create"}, "a base backup on demand"},
 	{"apps", "deployments", []string{"get", "list", "patch"}, "quiesce scales a marked Deployment to zero and back"},
 	{"apps", "statefulsets", []string{"get", "list", "patch"}, "quiesce scales a marked StatefulSet to zero and back"},

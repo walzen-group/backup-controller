@@ -147,12 +147,13 @@ rules:
     resources: ["events"]
     verbs: ["create", "patch"]
   # The bootstrap webhook reads the object store a Cluster archives through, to
-  # find the bucket, the endpoint and the Secret holding its keys. get alone,
-  # because the handler fetches one store by the name the Cluster gave it and
-  # goes through the uncached reader.
+  # find the bucket, the endpoint and the Secret holding its keys: get for the
+  # admitted Cluster's own store, and list for the collision check, which reads
+  # every other Cluster's store in one call. Both go through the uncached
+  # reader, so no watch.
   - apiGroups: ["barmancloud.cnpg.io"]
     resources: ["objectstores"]
-    verbs: ["get"]
+    verbs: ["get", "list"]
   # Before admitting a Cluster the webhook checks that no other database
   # already archives to the same bucket and prefix, which would interleave
   # their WAL and leave the archive unrestorable. That question is only

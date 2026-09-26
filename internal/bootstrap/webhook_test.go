@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"strings"
@@ -74,6 +75,7 @@ func scheme(t *testing.T) *runtime.Scheme {
 	// The handler reads both kinds as unstructured, so the fake client knows
 	// them by GVK. There are no Go types for them.
 	s.AddKnownTypeWithName(ObjectStoreGVK, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(ObjectStoreListGVK, &unstructured.UnstructuredList{})
 	s.AddKnownTypeWithName(ClusterListGVK, &unstructured.UnstructuredList{})
 	s.AddKnownTypeWithName(ClusterListGVK.GroupVersion().WithKind("Cluster"), &unstructured.Unstructured{})
 	return s
@@ -331,6 +333,69 @@ func TestTheCollisionCheckReadsNoSecretOfAnotherCluster(t *testing.T) {
 	}
 }
 
+// TestTheCollisionCheckListsTheObjectStoresOnce checks that finding who else
+// archives to a prefix costs one list of the ObjectStores, however many other
+// Clusters archive. The only ObjectStore read by name is the admitted
+// Cluster's own. Finding W6.
+//
+// A disaster-recovery recreate creates every Cluster at once, often against a
+// slow API server. One uncached read per other archiving Cluster, one after
+// another, could use the webhook's whole 10 s budget on its own, and each
+// later create in the batch had more Clusters to read.
+func TestTheCollisionCheckListsTheObjectStoresOnce(t *testing.T) {
+	const holders = 5
+	objects := []runtime.Object{store()}
+	for i := 0; i < holders; i++ {
+		namespace := fmt.Sprintf("other%d", i)
+		other, otherStore := elsewhere(t, func(configuration map[string]any) {
+			configuration["destinationPath"] = "s3://backups/" + namespace + "/"
+		})
+		other.SetNamespace(namespace)
+		otherStore.SetNamespace(namespace)
+		objects = append(objects, other, otherStore)
+	}
+
+	raw, err := json.Marshal(cluster(t, nil))
+	if err != nil {
+		t.Fatalf("marshal the cluster: %v", err)
+	}
+	gets, lists := 0, 0
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).
+		WithObjects(secret()).
+		WithRuntimeObjects(objects...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if obj.GetObjectKind().GroupVersionKind().Kind == ObjectStoreGVK.Kind {
+					gets++
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if list.GetObjectKind().GroupVersionKind().Kind == ObjectStoreListGVK.Kind {
+					lists++
+				}
+				return c.List(ctx, list, opts...)
+			},
+		}).Build()
+
+	decider := &Decider{Client: c, Prober: stubProber{has: false}}
+	response := decider.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: admissionv1.Create,
+			Namespace: "app",
+			Name:      "app-pg",
+			Object:    runtime.RawExtension{Raw: raw},
+		},
+	})
+
+	if !response.Allowed {
+		t.Fatalf("the cluster was refused: %v", response.Result)
+	}
+	if gets != 1 || lists != 1 {
+		t.Errorf("with %d other archiving Clusters the webhook read %d ObjectStores by name and listed them %d times, want the admitted Cluster's own read and 1 list", holders, gets, lists)
+	}
+}
+
 // TestAHolderWithoutItsSecretStillCollides checks that a Cluster archiving to
 // the same prefix is found even when the Secret its ObjectStore names is
 // missing. Where a Cluster archives is written in its ObjectStore, and a
@@ -443,9 +508,10 @@ func TestAnotherPrefixOnTheSameEndpointIsNoCollision(t *testing.T) {
 }
 
 // TestAnUnreadableHolderStoreRefusesTheCluster checks that a Cluster is
-// refused with HTTP 500 when another Cluster's ObjectStore can't be read for a
-// reason other than NotFound. That Cluster may archive to the same prefix, and
-// admitting on a transient API error would let the collision through.
+// refused with HTTP 500 when the other Clusters' ObjectStores can't be listed,
+// here because of a server timeout. That Cluster may archive to the same
+// prefix, and admitting on a transient API error would let the collision
+// through.
 func TestAnUnreadableHolderStoreRefusesTheCluster(t *testing.T) {
 	other, otherStore := elsewhere(t, nil)
 
@@ -457,11 +523,11 @@ func TestAnUnreadableHolderStoreRefusesTheCluster(t *testing.T) {
 		WithObjects(secret()).
 		WithRuntimeObjects(store(), otherStore, other).
 		WithInterceptorFuncs(interceptor.Funcs{
-			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if key.Namespace == "other" {
-					return apierrors.NewServerTimeout(schema.GroupResource{Group: ObjectStoreGVK.Group, Resource: "objectstores"}, "get", 1)
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if list.GetObjectKind().GroupVersionKind().Kind == ObjectStoreListGVK.Kind {
+					return apierrors.NewServerTimeout(schema.GroupResource{Group: ObjectStoreGVK.Group, Resource: "objectstores"}, "list", 1)
 				}
-				return c.Get(ctx, key, obj, opts...)
+				return c.List(ctx, list, opts...)
 			},
 		}).Build()
 
