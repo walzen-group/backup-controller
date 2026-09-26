@@ -42,6 +42,38 @@ func deleteVolumeRestore(t *testing.T, c client.Client) {
 	}
 }
 
+// deleteRepositorySecret deletes the repository Secret, which the case
+// seeded.
+func deleteRepositorySecret(t *testing.T, c client.Client) {
+	t.Helper()
+	if err := c.Delete(context.Background(), repository()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// deleteCluster deletes the Cluster notes-pg, which the case seeded.
+func deleteCluster(t *testing.T, c client.Client) {
+	t.Helper()
+	if err := c.Delete(context.Background(), cluster()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// restoreItemOfKind runs one pass of a RestoreRun over the given objects
+// and returns its first item of the given kind.
+func restoreItemOfKind(t *testing.T, run *backupv1alpha1.RestoreRun, kind string, objects ...client.Object) endedItem {
+	t.Helper()
+	r, c := restoreReconciler(t, prober{saturday}, append([]client.Object{run}, objects...)...)
+	restoreStep(t, r)
+	for _, item := range readRestoreRun(t, c).Status.Items {
+		if item.Kind == kind {
+			return endedItem{item.Phase, item.Reason, item.Message}
+		}
+	}
+	t.Fatalf("the run has no %s item", kind)
+	return endedItem{}
+}
+
 // backupItemAfter runs a BackupRun over the given objects for four passes,
 // calling between after the plan, and returns its first item.
 func backupItemAfter(t *testing.T, run *backupv1alpha1.BackupRun, between func(*testing.T, client.Client), objects ...client.Object) endedItem {
@@ -78,8 +110,11 @@ func restoreItemAfter(t *testing.T, run *backupv1alpha1.RestoreRun, between func
 // before the reason existed. Each case goes through one of the start checks
 // that return a typed refusal: startItem's claimGone, both startRefusals,
 // sourceSettingsFor, volumeAffinity, the quiesce pre-check's foreign
-// source, startItem's hibernated Cluster, checkVolume's repositoryFor and
-// restoreDatabase's clustersRestoredElsewhere.
+// source, startItem's hibernated and missing Cluster, checkVolume's
+// repositoryFor, the in-place quiesce pre-check's Lease of a repository
+// Secret that is gone, and restoreDatabase's clustersRestoredElsewhere. An
+// item that fails for a reason not yet typed records no reason, even when
+// another item failed with one in the same pass.
 func TestARefusedItemRecordsItsReason(t *testing.T) {
 	quiescing := backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true })
 	unbound := claim()
@@ -136,6 +171,22 @@ func TestARefusedItemRecordsItsReason(t *testing.T) {
 			return backupItemAfter(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), nil, sleeping)
 		}, endedItem{backupv1alpha1.ItemSkipped, backupv1alpha1.ItemReasonClusterHibernated,
 			"the Cluster is hibernated; CloudNativePG fails a Backup of a hibernated Cluster"}},
+
+		{"BackupRun, Cluster deleted after plan", func(t *testing.T) endedItem {
+			return backupItemAfter(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), deleteCluster, cluster())
+		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonClusterMissing,
+			"the Cluster " + pgN + " no longer exists"}},
+
+		{"synced RestoreRun, a claim's VolumeRestore missing: the Cluster records no reason", func(t *testing.T) endedItem {
+			run := restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true })
+			return restoreItemOfKind(t, run, backupv1alpha1.ItemKindCluster, claim(), repository(), cluster(), objectStore(), storeSecret())
+		}, endedItem{backupv1alpha1.ItemFailed, "",
+			"no volume selected a quiesced snapshot, so there is no moment to recover the database to"}},
+
+		{"in-place RestoreRun with quiesce, repository Secret deleted after plan", func(t *testing.T) endedItem {
+			return restoreItemAfter(t, quiescedRestore(), deleteRepositorySecret, claim(), volumeRestore(), repository(), deployment(), kustomization(false))
+		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonRepositorySecretMissing,
+			"repository Secret " + repoN + " does not exist in this namespace, so the run can't take the Lease that keeps other runs' movers off the repository" + nothingWrittenEnd}},
 
 		{"in-place RestoreRun, VolumeRestore missing at plan", func(t *testing.T) endedItem {
 			return restoreItemAfter(t, inPlace(), nil, claim(), repository())

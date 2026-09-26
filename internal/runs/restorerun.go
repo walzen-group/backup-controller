@@ -362,7 +362,10 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 		if item.Phase != backupv1alpha1.ItemPending {
 			continue
 		}
+		// Each item's check sets its own reason and error, so an item never
+		// fails with the refusal of the item before it.
 		var reason string
+		var err error
 		switch item.Kind {
 		case "PersistentVolumeClaim":
 			// The snapshot is selected once no backup of the repository is in
