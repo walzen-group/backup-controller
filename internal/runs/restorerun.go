@@ -1171,19 +1171,23 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 }
 
 // inPlaceClaimLost returns a message when the claim an in-place item
-// restored is gone, is being deleted, or is not the claim the mover wrote
-// into, and "" while that claim is there.
+// restored is gone, is being deleted, or is not the claim the run checked
+// and took its Lease on, and "" while that claim is there.
 //
 // Parameters:
 //   - run is the RestoreRun. Its claim Leases are the ones labelled with its
 //     UID.
 //   - claimName names the claim, which is also the item's name.
 //
-// The claim the mover wrote into is the one the run took its claim Lease on
+// The claim the run checked is the one it took its claim Lease on
 // right before it created the item's ReplicationDestination: the Lease is
 // named after that claim's UID (see claimLeaseName) and lists the item. A
 // claim whose UID is not among the run's claim Leases for the item was
-// created after that create, so it replaced the claim the mover wrote into.
+// created after that create, so it replaced the claim the run checked. The
+// mover mounts the claim by name, so a mover pod that started after the
+// replacement may have written into the new claim, and the message asks for
+// that claim's data to be checked.
+//
 // A run that holds no claim Lease for the item can't tell which claim the
 // mover wrote into, and gets a message too, since the item must not succeed
 // without that evidence. A failed read of the claim or the Leases comes back
@@ -1220,8 +1224,9 @@ func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backup
 		return fmt.Sprintf("claim %s was deleted while the mover wrote into it, and the restored data goes with it once the claim is released", claimName), nil
 	}
 	if !slices.Contains(leased, string(claim.UID)) {
-		return fmt.Sprintf("claim %s was replaced while the mover wrote into it: the claim there now (UID %s) is not the one the mover wrote into (UID %s), "+
-			"and nothing was restored into it", claimName, claim.UID, strings.Join(leased, ", ")), nil
+		return fmt.Sprintf("claim %[1]s was replaced while the mover wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
+			"and took its Lease on (UID %[3]s). The mover mounts claim %[1]s by name, so it may have written into it; check its data, "+
+			"and create a new RestoreRun to restore it", claimName, claim.UID, strings.Join(leased, ", ")), nil
 	}
 	return "", nil
 }
@@ -2183,17 +2188,10 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 //     shows is no longer needed.
 //  6. It removes the run's finalizer.
 //
-// A Cluster item still in phase Deleted fails with the note from
-// clusterLeftDeleted, which says how the webhook recovers that Cluster now
-// that no run waits for it.
+// A run never reaches finish with a Cluster item still in phase Deleted:
+// such an item is not finished, so work ends the run only through abort,
+// which fails the item with the note from clusterLeftDeleted first.
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
-	// abort has already failed a Deleted Cluster item with the note; any
-	// other caller that ends a run with one gets the note here.
-	for i := range run.Status.Items {
-		if item := &run.Status.Items[i]; item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemDeleted {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, clusterLeftDeleted(item.Name)
-		}
-	}
 	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err, false)
@@ -2257,7 +2255,11 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 // Right before it drops the finalizer, finalize records a Warning event with
 // reason ClusterLeftDeleted for each Cluster item still in phase Deleted,
 // with the note from clusterLeftDeleted. The run is about to go, so the
-// event is the only place that note can appear.
+// event is the only place that note can appear. It reads the Cluster first:
+// one its owner has created again, with a UID other than the item's
+// clusterUID, gets no event, since the note speaks of a creation still to
+// come. A failed read comes back as an error, and the finalizer stays until
+// a retry gets past it.
 func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
@@ -2280,7 +2282,16 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	}
 	if r.Recorder != nil {
 		for _, item := range run.Status.Items {
-			if item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemDeleted {
+			if item.Kind != "Cluster" || item.Phase != backupv1alpha1.ItemDeleted {
+				continue
+			}
+			// A Cluster its owner has created again is back, and the note
+			// about its next creation would be wrong.
+			cluster, found, err := getCluster(ctx, r.Reader, run.Namespace, item.Name)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !found || cluster.GetUID() == types.UID(item.ClusterUID) {
 				r.Recorder.Eventf(run, nil, corev1.EventTypeWarning, "ClusterLeftDeleted", "Restore", "%s", fitNote(clusterLeftDeleted(item.Name)))
 			}
 		}
@@ -2369,6 +2380,10 @@ func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *back
 			left = append(left, moverLeft{item: item.Name, destination: item.Destination})
 			continue
 		}
+		// The time of the pass is taken before the look, so a look that
+		// starts before pollInterval has passed since the delete never
+		// counts the mover gone, however long it lasts.
+		now := r.Now()
 		what, err := moverRemains(ctx, r.Reader, run.Namespace, item.Destination)
 		if err != nil {
 			return nil, destinationReleaseError(item.Destination, err)
@@ -2377,7 +2392,7 @@ func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *back
 			left = append(left, moverLeft{item: item.Name, destination: item.Destination, what: what})
 			continue
 		}
-		if !r.stops.Gone(stopKey(run, item.Destination), r.Now(), pollInterval) {
+		if !r.stops.Gone(stopKey(run, item.Destination), now, pollInterval) {
 			left = append(left, moverLeft{item: item.Name, destination: item.Destination})
 			continue
 		}
@@ -2387,10 +2402,15 @@ func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *back
 }
 
 // stopKey returns the key under which the reconciler's stops record the
-// ReplicationDestination named destination: the run's namespace and that
-// name, as namespace/name.
+// ReplicationDestination named destination for the run: the run's
+// namespace, that name and the run's UID, as namespace/name/uid.
+//
+// A destination's name holds only the first eight characters of its run's
+// UID (see destinationName), so two runs whose UIDs share them name their
+// destinations alike. The full UID keeps their records apart: one run's
+// delete never counts toward the wait of the other.
 func stopKey(run *backupv1alpha1.RestoreRun, destination string) string {
-	return run.Namespace + "/" + destination
+	return run.Namespace + "/" + destination + "/" + string(run.UID)
 }
 
 // moverLeft is a restore mover the run has stopped that is not gone yet.
@@ -2437,11 +2457,12 @@ func (r *RestoreRunReconciler) stoppedMovers(ctx context.Context, run *backupv1a
 		if item.Destination == "" || !which(item) {
 			continue
 		}
+		now := r.Now() // before the look, as in removeDestinations
 		what, err := moverRemains(ctx, r.Reader, run.Namespace, item.Destination)
 		if err != nil {
 			return nil, destinationReleaseError(item.Destination, err)
 		}
-		if what != "" || !r.stops.Settled(stopKey(run, item.Destination), r.Now(), pollInterval) {
+		if what != "" || !r.stops.Settled(stopKey(run, item.Destination), now, pollInterval) {
 			left = append(left, moverLeft{item: item.Name, destination: item.Destination, what: what})
 		}
 	}

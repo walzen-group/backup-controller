@@ -278,6 +278,17 @@ its lock in the repository. The message names what is left:
 waiting for the mover of ReplicationDestination restore-9b7d4e21-0, which the run stopped while it restored scratch, to go: its Job volsync-dst-restore-9b7d4e21-0 is still there. The run gives the app back and lets other runs at the claim only after that
 ```
 
+Every restore that created a destination shows this wait at its end, even
+when the mover finished long ago. VolSync may still be in the middle of a
+reconcile of the destination when the run deletes it, and can create the
+mover's Job a moment later. So the run looks for the Job and its pods only
+once 10 seconds have passed since the delete, and until then the message says
+so:
+
+```text
+waiting for the mover of ReplicationDestination restore-9b7d4e21-0, which the run stopped while it restored scratch, to go: the run deleted the destination, and looks for the mover's Job and pods once 10s have passed since the delete. The run gives the app back and lets other runs at the claim only after that
+```
+
 When the run fails to delete the destination, or to read the Job and its pods,
 it stays unfinished and tries again on every pass. It reports RestartFailed while a
 workload it stopped is still down, and ReleaseFailed once the app is back or
@@ -403,7 +414,7 @@ for the item holds. The message says which:
 ```text
 claim notes-data was deleted while the mover wrote into it, and the restored data went with it
 claim notes-data was deleted while the mover wrote into it, and the restored data goes with it once the claim is released
-claim notes-data was replaced while the mover wrote into it: the claim there now (UID <new>) is not the one the mover wrote into (UID <old>), and nothing was restored into it
+claim notes-data was replaced while the mover wrote into it: the claim there now (UID <new>) is not the one the run checked and took its Lease on (UID <old>). The mover mounts claim notes-data by name, so it may have written into it; check its data, and create a new RestoreRun to restore it
 the run holds no claim Lease for claim notes-data, so it can't tell whether the mover wrote into the claim that is there now. Check the claim's data, and create a new RestoreRun to restore it
 ```
 
@@ -454,7 +465,7 @@ the table: the Cluster recovers to the end of its archive, or to the time in
 its own `backup.wlz.li/restore-as-of` annotation, and the moment the run chose
 no longer applies. The run's item says so, after the reason the run ended, and
 a run that was deleted records a Warning event with reason ClusterLeftDeleted
-that says the same:
+that says the same, unless its owner has created the Cluster again by then:
 
 ```text
 Cluster notes-pg was deleted, and the run ended before it was created again. No run waits for it now, so when Flux or tofu creates it, the bootstrap webhook recovers it to the end of its archive, or to the time in its own backup.wlz.li/restore-as-of annotation; the moment this run chose no longer applies

@@ -288,7 +288,7 @@ to do instead.
 | Running | work is under way; the message is `restoring`, `restoring into claim <into>` for an `into` restore, or `waiting for pod <pod> to stop before anything is restored` while a pod of a workload the run stopped is still terminating |
 | SourceBusy | a backup of the run's claim or repository is in progress, another run holds the Lease of either, another run has stopped this namespace's workloads, or a RestoreRun has deleted a Cluster in this namespace and waits for it to be created again; the message names that run and what it holds |
 | ClaimInUse | an in-place restore waits for its claim: `claim <claim> is mounted by pod <pod>; stop the workload and this restore starts on its own`, or `ReplicationDestination <name> is restoring into claim <claim>` while another restore writes into it |
-| WaitingForShutdown | the run waits for something to be gone before it goes on: the instance pods and PVCs of a Cluster it deleted, or the Job and pods of a restore mover it stopped; the app stays stopped and the run keeps its Leases until then |
+| WaitingForShutdown | the run waits for something to be gone before it goes on: the instance pods and PVCs of a Cluster it deleted, or the Job and pods of a restore mover it stopped; the app stays stopped and the run keeps its Leases until then. Every restore that created a destination shows it at its end, for at least 10 seconds after it deleted the destination: `the run deleted the destination, and looks for the mover's Job and pods once 10s have passed since the delete`; [restores.md](restores.md#submitting-a-restore) says why |
 | WaitingForRecreate | the run deleted a Cluster and waits for its owner to create it again: `recreate <cluster> to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it` |
 | RestartFailed | the run could not give a workload it stopped its replicas back, could not resume a Kustomization it suspended, or could not stop a restore mover while the app is down; the message names what failed and what to scale, resume or delete by hand |
 | ReleaseFailed | the app is back, and the run cannot finish because it could not release its Leases or stop a restore mover; the message says what to delete by hand |
@@ -300,11 +300,11 @@ to do instead.
 | Failed | an item failed; the message names each failed item and its message |
 
 A RestoreRun records an event at each new Ready reason, the same way a
-[BackupRun](#backuprun) does. A run deleted after it deleted a Cluster, and before
-the Cluster was created again, also records a Warning event with reason
-ClusterLeftDeleted for each such Cluster, right before it drops its finalizer;
-the note says the webhook now recovers that Cluster to the end of its archive,
-or to the time in its own `backup.wlz.li/restore-as-of` annotation.
+[BackupRun](#backuprun) does. A run deleted after it deleted a Cluster also
+records a Warning event with reason ClusterLeftDeleted, right before it drops
+its finalizer, for each such Cluster its owner has not created again yet. The
+note says the webhook now recovers that Cluster to the end of its archive, or
+to the time in its own `backup.wlz.li/restore-as-of` annotation.
 [restores.md](restores.md#databases-restore-themselves) quotes it.
 
 Six CEL rules on the CRD: exactly one of `claim` or `repository`, `database`

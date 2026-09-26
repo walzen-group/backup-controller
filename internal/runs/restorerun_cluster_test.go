@@ -488,3 +488,39 @@ func TestADeletedRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
 		t.Errorf("events = %q, want one saying %q", recorded(recorder), endedBeforeRecreate)
 	}
 }
+
+// A run deleted after its owner created the deleted Cluster again records no
+// ClusterLeftDeleted event: the Cluster is back, and a note about its next
+// creation would be wrong. A Cluster that is still the one the run deleted,
+// such as one whose deletion has not completed, keeps the event.
+func TestADeletedRunSkipsTheEventWhenItsClusterIsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		uid   types.UID
+		event bool
+	}{
+		{"created again", "new-cluster-uid", false},
+		{"still the old one", "old-cluster-uid", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			back := cluster()
+			back.SetUID(tc.uid)
+			r, c := restoreReconciler(t, prober{saturday}, restoreRun(deletedDatabaseRun), objectStore(), storeSecret(), back)
+			recorder := events.NewFakeRecorder(10)
+			r.Recorder = recorder
+			if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
+				t.Fatal(err)
+			}
+
+			restoreStep(t, r)
+
+			found := false
+			for _, event := range recorded(recorder) {
+				found = found || strings.Contains(event, "ClusterLeftDeleted")
+			}
+			if found != tc.event {
+				t.Errorf("ClusterLeftDeleted recorded = %t, want %t", found, tc.event)
+			}
+		})
+	}
+}

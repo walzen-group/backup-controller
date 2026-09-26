@@ -31,8 +31,10 @@ type Stops struct {
 // Deleted records that a pass deleted the destination named by key at now.
 //
 // Parameters:
-//   - key names the destination, as namespace/name, so that destinations of
-//     two namespaces never share a record.
+//   - key names the destination, at least as namespace/name, so that
+//     destinations of two namespaces never share a record. A caller whose
+//     destination names can repeat across its runs adds the run's UID, as
+//     a RestoreRun does.
 //   - now is the time of the pass that issued the delete. A later delete of
 //     the same destination moves the record forward to its own time.
 func (s *Stops) Deleted(key string, now time.Time) {
@@ -46,7 +48,7 @@ func (s *Stops) Deleted(key string, now time.Time) {
 // by key was deleted, for a pass that found the destination gone.
 //
 // Parameters:
-//   - key names the destination, as namespace/name.
+//   - key names the destination, as Deleted was given it.
 //   - now is the time of the pass.
 //   - wait is the least time between the delete and a look for the mover
 //     that may count it gone.
@@ -75,7 +77,7 @@ func (s *Stops) Gone(key string, now time.Time, wait time.Duration) bool {
 // no record has not settled.
 //
 // Parameters:
-//   - key names the destination, as namespace/name.
+//   - key names the destination, as Deleted was given it.
 //   - now is the time of the pass.
 //   - wait is the least time between the delete and a look for the mover
 //     that may count it gone.

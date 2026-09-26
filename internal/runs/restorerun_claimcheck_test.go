@@ -55,8 +55,9 @@ func TestAnInPlaceRestoreIntoADeletedClaimFails(t *testing.T) {
 }
 
 // An in-place item whose claim was replaced by another of the same name
-// while the mover wrote fails once the mover completes: the mover wrote into
-// the claim the checks saw, and the claim there now is another one.
+// while the mover wrote fails once the mover completes. The mover mounts the
+// claim by name, so it may have written into the new claim as well; the
+// message says so and asks for the claim's data to be checked.
 func TestAnInPlaceRestoreIntoAReplacedClaimFails(t *testing.T) {
 	r, c := startedRestore(t, inPlace)
 	if err := c.Delete(context.Background(), claim()); err != nil {
@@ -72,7 +73,8 @@ func TestAnInPlaceRestoreIntoAReplacedClaimFails(t *testing.T) {
 
 	restoreStep(t, r)
 
-	expectVolumeFailed(t, readRestoreRun(t, c), "claim "+claimN, "replaced")
+	expectVolumeFailed(t, readRestoreRun(t, c), "claim "+claimN, "replaced", "not the one the run checked and took its Lease on",
+		"may have written into it", "check its data")
 }
 
 // An in-place item whose run no longer holds a claim Lease for it can't tell
