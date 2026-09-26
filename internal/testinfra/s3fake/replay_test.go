@@ -26,9 +26,17 @@ func TestReplayRustFSBehaviour(t *testing.T) {
 	for _, o := range b.Objects {
 		obj := s3fake.Object{Size: o.Size, LastModified: o.LastModified, ETag: o.ETag}
 		if o.Body != nil {
-			obj.Body = []byte(*o.Body)
+			// The fake computes the ETag of an object with a body itself,
+			// and that ETag must be the one RustFS recorded.
+			obj.Body, obj.ETag = []byte(*o.Body), ""
 		}
 		srv.Put(b.Bucket, o.Key, obj)
+		if o.Body == nil {
+			continue
+		}
+		if stored, _ := srv.Get(b.Bucket, o.Key); stored.ETag != o.ETag {
+			t.Errorf("%s: fake ETag %s, RustFS %s", o.Key, stored.ETag, o.ETag)
+		}
 	}
 	if len(b.Exchanges) == 0 {
 		t.Fatal("the recording has no exchanges")
