@@ -178,7 +178,8 @@ func ResolveLocation(
 // Endpoint, Bucket and Prefix set, and the ObjectStore it read so the caller
 // can follow its Secret references. It returns an error when the ObjectStore
 // can't be read, or when its spec.configuration.destinationPath is missing or
-// isn't an s3:// URL with a bucket.
+// isn't an s3:// URL with a bucket. The second kind is a *destinationError,
+// and the first wraps the error the read returned.
 func archiveAt(
 	ctx context.Context,
 	c client.Reader,
@@ -193,12 +194,12 @@ func archiveAt(
 
 	destination, _, err := unstructured.NestedString(store.Object, "spec", "configuration", "destinationPath")
 	if err != nil || destination == "" {
-		return Location{}, nil, fmt.Errorf("ObjectStore %s/%s has no spec.configuration.destinationPath", namespace, objectStore)
+		return Location{}, nil, &destinationError{fmt.Errorf("ObjectStore %s/%s has no spec.configuration.destinationPath", namespace, objectStore)}
 	}
 
 	bucket, prefix, err := splitDestination(destination)
 	if err != nil {
-		return Location{}, nil, err
+		return Location{}, nil, &destinationError{err}
 	}
 
 	endpoint, _, _ := unstructured.NestedString(store.Object, "spec", "configuration", "endpointURL")
@@ -210,23 +211,33 @@ func archiveAt(
 	}, store, nil
 }
 
-// sameArchive reports whether two Locations name one archive: the same bucket
-// and prefix on the same S3 service. Endpoints are compared by host and port,
-// ignoring letter case, so https://s3.example.com and S3.example.com are one
-// service. An endpoint that splitEndpoint can't read is compared as written.
-func (l Location) sameArchive(other Location) bool {
-	return l.Bucket == other.Bucket && l.Prefix == other.Prefix &&
-		endpointHost(l.Endpoint) == endpointHost(other.Endpoint)
+// destinationError is the error archiveAt returns when an ObjectStore it read
+// names no usable s3:// destination. A Cluster archiving through such a store
+// archives nowhere, so the collision check can tell it apart from a store it
+// failed to read.
+type destinationError struct {
+	error
 }
 
-// endpointHost returns the host and port an endpointURL points at, in lower
-// case, or the endpointURL itself in lower case when splitEndpoint refuses it.
-func endpointHost(endpoint string) string {
-	host, _, err := splitEndpoint(endpoint)
-	if err != nil {
-		host = endpoint
-	}
-	return strings.ToLower(host)
+// Unwrap returns the error that says what is wrong with the destination.
+func (e *destinationError) Unwrap() error {
+	return e.error
+}
+
+// sameArchive reports whether two Locations name one archive: the same bucket,
+// compared without letter case, and exactly the same prefix.
+//
+// The endpoint is not compared. No comparison of two endpointURLs can prove
+// they are different services: https://s3.example.com and its :443 form, a
+// Service name with and without .cluster.local, an empty endpoint and
+// s3.amazonaws.com, a regional and the global AWS name, a name with a trailing
+// dot, an Ingress host and a Service name, or an IP and a DNS name can all
+// reach one store. Calling such a pair different lets two databases write WAL
+// into one prefix, which leaves both archives unrecoverable without any
+// error. S3 and MinIO bucket names are lower case, so ignoring case only ever
+// finds more collisions.
+func (l Location) sameArchive(other Location) bool {
+	return strings.EqualFold(l.Bucket, other.Bucket) && l.Prefix == other.Prefix
 }
 
 // endpointCA reads the PEM bundle that the ObjectStore's

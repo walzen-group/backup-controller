@@ -12,6 +12,7 @@ import (
 	"github.com/go-logr/logr"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -91,8 +92,10 @@ const DefaultBudget = 10 * time.Second
 //   - A dry-run create is allowed unchanged without reading anything.
 //   - A create is allowed unchanged when the Cluster has no archiving plugin
 //     (see Archiver).
-//   - A create is refused when the ObjectStore can't be resolved, or when
-//     another Cluster anywhere already archives to the same bucket and prefix.
+//   - A create is refused when the ObjectStore can't be resolved, when
+//     another Cluster anywhere already archives to the same bucket and prefix
+//     on any endpoint, or when another Cluster's ObjectStore can't be read
+//     for a reason other than NotFound (see archiveHolder).
 //   - A Cluster that carries OptOutAnnotation set to OptOutValue and declares
 //     no bootstrap other than initdb is allowed unchanged when nothing exists
 //     under its prefix, and refused when anything does, since CloudNativePG
@@ -193,8 +196,8 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	if holder != "" {
 		logger.Info("refusing the Cluster", "reason", "another database archives here", "holder", holder, "prefix", at.Prefix)
 		return admission.Denied(fmt.Sprintf(
-			"%s already archives to %s/%s. Two databases writing one archive interleave their WAL and leave it unrestorable. Give this Cluster an archive of its own, or a serverName that is not %q.",
-			holder, at.Bucket, at.Prefix, serverName,
+			"%s already archives to %s/%s. Two databases writing one archive interleave their WAL and leave it unrestorable. Give this Cluster an archive of its own, or a serverName that is not %q. The check compares bucket and prefix whatever the endpointURL says, because two endpoints can name one service; if %s really archives to a different S3 service, give one of the two its own prefix in destinationPath.",
+			holder, at.Bucket, at.Prefix, serverName, holder,
 		))
 	}
 
@@ -457,9 +460,9 @@ func keepRecovery(req admission.Request) admission.Response {
 }
 
 // archiveHolder finds an existing Cluster that already archives to the same
-// bucket and prefix, on the same S3 service, as the Cluster being admitted.
-// Two databases archiving to one prefix interleave their WAL and leave the
-// archive unrestorable.
+// bucket and prefix as the Cluster being admitted, whatever endpointURL either
+// names. Two databases archiving to one prefix interleave their WAL and leave
+// the archive unrestorable.
 //
 // Parameters:
 //   - namespace and name identify the Cluster being admitted. A Cluster with
@@ -468,20 +471,21 @@ func keepRecovery(req admission.Request) admission.Response {
 //   - at is where the admitted Cluster would archive, from ResolveLocation.
 //
 // It returns the holder as "namespace/name", or an empty string when no
-// Cluster archives there. It returns an error only when the Cluster list
-// fails.
+// Cluster archives there. It returns an error when the Cluster list fails, or
+// when another Cluster's ObjectStore can't be read for any reason other than
+// NotFound, such as a server timeout. That Cluster may archive to the same
+// prefix, so the caller refuses the create instead of missing a collision.
 //
 // It lists every Cluster in every namespace, reads each archiving one's
-// ObjectStore with archiveAt, and compares the two with sameArchive: endpoint,
-// bucket and prefix. Two Clusters can reach one prefix through differently
-// named ObjectStores, so comparing store names would miss them. The check
-// reads no Secret. Where a Cluster archives is written in its ObjectStore, so
-// a holder whose credentials are missing is still found, and each other
-// Cluster costs one read, which keeps a create on a cluster with many
-// databases inside the webhook's timeout. A Cluster whose ObjectStore can't be
-// read or names no s3:// destination is skipped. Refusing a new database
-// because an unrelated one is misconfigured would block work this check has no
-// reason to block.
+// ObjectStore with archiveAt, and compares the two with sameArchive: bucket
+// and prefix, never the endpoint, since two endpoint names can reach one
+// service. Two Clusters can reach one prefix through differently named
+// ObjectStores, so comparing store names would miss them. The check reads no
+// Secret. Where a Cluster archives is written in its ObjectStore, so a holder
+// whose credentials are missing is still found, and each other Cluster costs
+// one read, which keeps a create on a cluster with many databases inside the
+// webhook's timeout. A Cluster whose ObjectStore does not exist or names no
+// s3:// destination archives nowhere, so it is skipped.
 func archiveHolder(
 	ctx context.Context,
 	c client.Reader,
@@ -504,8 +508,12 @@ func archiveHolder(
 			continue
 		}
 		theirs, _, err := archiveAt(ctx, c, other.GetNamespace(), store, serverName)
-		if err != nil {
+		var noDestination *destinationError
+		if apierrors.IsNotFound(err) || errors.As(err, &noDestination) {
 			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("find where %s/%s archives: %w", other.GetNamespace(), other.GetName(), err)
 		}
 		if theirs.sameArchive(at) {
 			return fmt.Sprintf("%s/%s", other.GetNamespace(), other.GetName()), nil

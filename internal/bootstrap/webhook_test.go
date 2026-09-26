@@ -22,9 +22,11 @@ import (
 	"github.com/walzen-group/backup-controller/internal/testinfra/s3fault"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -350,11 +352,18 @@ func TestAHolderWithoutItsSecretStillCollides(t *testing.T) {
 	}
 }
 
-// TestTheSamePrefixOnAnotherEndpointIsNoCollision checks that a Cluster is
-// admitted when another Cluster uses the same bucket and prefix on a different
-// S3 service. The two archives are separate, and refusing would block a
-// database for nothing.
-func TestTheSamePrefixOnAnotherEndpointIsNoCollision(t *testing.T) {
+// TestTheSamePrefixOnAnotherEndpointIsACollision checks that a Cluster is
+// refused when another Cluster uses the same bucket and prefix behind a
+// different endpointURL, and that the refusal tells the owner to give one of
+// the two its own prefix.
+//
+// No comparison of two endpoint names can prove they are different services:
+// an Ingress host and a Service name, an IP and a DNS name, or a CNAME can all
+// front one store. When they do, barman overwrites WAL segments by name and
+// the two databases' WAL interleave in one prefix, silently leaving every base
+// backup behind them unrecoverable. The check refuses instead, and an owner
+// with two genuinely separate services moves one of them to another prefix.
+func TestTheSamePrefixOnAnotherEndpointIsACollision(t *testing.T) {
 	other, otherStore := elsewhere(t, func(configuration map[string]any) {
 		configuration["endpointURL"] = "https://another-store.example"
 	})
@@ -364,26 +373,130 @@ func TestTheSamePrefixOnAnotherEndpointIsNoCollision(t *testing.T) {
 
 	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore, otherSecret)
 
-	if !response.Allowed {
-		t.Fatalf("a Cluster was refused over an archive on another S3 service: %v", response.Result)
+	if response.Allowed {
+		t.Fatal("a Cluster was admitted while another database archives to its bucket and prefix behind another endpointURL")
+	}
+	for _, want := range []string{"other/app-pg", "destinationPath", "whatever the endpointURL says"} {
+		if !strings.Contains(response.Result.Message, want) {
+			t.Errorf("the refusal does not say %q: %q", want, response.Result.Message)
+		}
 	}
 }
 
-// TestTheSameEndpointWrittenTwoWaysIsACollision checks that endpointURLs
-// naming one service in two spellings, with and without https:// and in
-// another letter case, count as the same endpoint.
+// TestTheSameEndpointWrittenTwoWaysIsACollision checks that endpointURLs that
+// name one S3 service in two spellings never let two Clusters share a bucket
+// and prefix. Each pair reaches one service, and v0.8.1's host comparison
+// admitted all but the first.
 func TestTheSameEndpointWrittenTwoWaysIsACollision(t *testing.T) {
+	pairs := []struct{ ours, theirs string }{
+		{"https://store.example", "Store.example"},
+		{"https://s3.example.com", "https://s3.example.com:443"},
+		{"http://minio.minio.svc:9000", "http://minio.minio.svc.cluster.local:9000"},
+		{"", "https://s3.amazonaws.com"},
+		{"https://s3.amazonaws.com", "https://s3.eu-central-1.amazonaws.com"},
+		{"https://s3.example.com", "https://s3.example.com."},
+	}
+	for _, pair := range pairs {
+		t.Run(pair.ours+" and "+pair.theirs, func(t *testing.T) {
+			ours := store()
+			_ = unstructured.SetNestedField(ours.Object, pair.ours, "spec", "configuration", "endpointURL")
+			other, otherStore := elsewhere(t, func(configuration map[string]any) {
+				configuration["endpointURL"] = pair.theirs
+			})
+
+			response := decideWith(t, cluster(t, nil), stubProber{has: false}, ours, other, otherStore)
+
+			if response.Allowed {
+				t.Fatalf("a Cluster on %q was admitted while other/app-pg archives to its prefix on %q", pair.ours, pair.theirs)
+			}
+			if !strings.Contains(response.Result.Message, "other/app-pg") {
+				t.Errorf("the refusal does not name the holder: %q", response.Result.Message)
+			}
+		})
+	}
+}
+
+// TestABucketNameInAnotherCaseIsACollision checks that bucket names are
+// compared without letter case. S3 and MinIO bucket names are lower case, so
+// Backups and backups can only name one bucket.
+func TestABucketNameInAnotherCaseIsACollision(t *testing.T) {
 	other, otherStore := elsewhere(t, func(configuration map[string]any) {
-		configuration["endpointURL"] = "Store.example"
+		configuration["destinationPath"] = "s3://Backups/app/"
 	})
 
-	otherSecret := secret()
-	otherSecret.Namespace = "other"
-
-	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore, otherSecret)
+	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore)
 
 	if response.Allowed {
-		t.Fatal("a Cluster was admitted while another database archives to its prefix on the same service")
+		t.Fatal("a Cluster was admitted while another database archives to its prefix in a bucket spelled Backups")
+	}
+}
+
+// TestAnotherPrefixOnTheSameEndpointIsNoCollision checks that a Cluster is
+// admitted when another Cluster archives to a different prefix of the same
+// bucket on the same endpoint.
+func TestAnotherPrefixOnTheSameEndpointIsNoCollision(t *testing.T) {
+	other, otherStore := elsewhere(t, func(configuration map[string]any) {
+		configuration["destinationPath"] = "s3://backups/other/"
+	})
+
+	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore)
+
+	if !response.Allowed {
+		t.Fatalf("a Cluster was refused over an archive at another prefix: %v", response.Result)
+	}
+}
+
+// TestAnUnreadableHolderStoreRefusesTheCluster checks that a Cluster is
+// refused with HTTP 500 when another Cluster's ObjectStore can't be read for a
+// reason other than NotFound. That Cluster may archive to the same prefix, and
+// admitting on a transient API error would let the collision through.
+func TestAnUnreadableHolderStoreRefusesTheCluster(t *testing.T) {
+	other, otherStore := elsewhere(t, nil)
+
+	raw, err := json.Marshal(cluster(t, nil))
+	if err != nil {
+		t.Fatalf("marshal the cluster: %v", err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).
+		WithObjects(secret()).
+		WithRuntimeObjects(store(), otherStore, other).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Namespace == "other" {
+					return apierrors.NewServerTimeout(schema.GroupResource{Group: ObjectStoreGVK.Group, Resource: "objectstores"}, "get", 1)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+
+	decider := &Decider{Client: c, Prober: stubProber{has: false}}
+	response := decider.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: admissionv1.Create,
+			Namespace: "app",
+			Name:      "app-pg",
+			Object:    runtime.RawExtension{Raw: raw},
+		},
+	})
+
+	if response.Allowed {
+		t.Fatal("a Cluster was admitted while another Cluster's ObjectStore could not be read")
+	}
+	if response.Result.Code != http.StatusInternalServerError {
+		t.Errorf("code = %d, want %d", response.Result.Code, http.StatusInternalServerError)
+	}
+}
+
+// TestAHolderWhoseStoreIsGoneIsSkipped checks that another Cluster whose
+// ObjectStore does not exist is skipped. It cannot archive anywhere, so it
+// holds no prefix.
+func TestAHolderWhoseStoreIsGoneIsSkipped(t *testing.T) {
+	other, _ := elsewhere(t, nil)
+
+	response := decide(t, cluster(t, nil), stubProber{has: false}, other)
+
+	if !response.Allowed {
+		t.Fatalf("a Cluster was refused over another Cluster whose ObjectStore is gone: %v", response.Result)
 	}
 }
 
