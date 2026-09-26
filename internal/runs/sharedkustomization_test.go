@@ -1,6 +1,7 @@
 package runs
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -125,5 +126,32 @@ func TestAQuiescedRestoreRefusesAKustomizationSharedAcrossNamespaces(t *testing.
 	expectSharedRefusal(t, c, run.Status.Phase, run.Status.Conditions, false)
 	if names := destinations(t, c); len(names) != 0 {
 		t.Errorf("destinations = %v, want none", names)
+	}
+}
+
+// otherNamespaces counts the apps Deployments and StatefulSets a
+// Kustomization's inventory lists in another namespace, and no other kind:
+// a StatefulSet there is a workload a run in that namespace stops too.
+func TestOtherNamespacesCountsDeploymentsAndStatefulSets(t *testing.T) {
+	for name, tc := range map[string]struct {
+		id   string
+		want []string
+	}{
+		"Deployment":           {id: wikiNS + "_wiki_apps_Deployment", want: []string{ns, wikiNS}},
+		"StatefulSet":          {id: wikiNS + "_wiki-db_apps_StatefulSet", want: []string{ns, wikiNS}},
+		"ConfigMap":            {id: wikiNS + "_wiki__ConfigMap", want: nil},
+		"DaemonSet":            {id: wikiNS + "_wiki_apps_DaemonSet", want: nil},
+		"another group's kind": {id: wikiNS + "_wiki_example.com_StatefulSet", want: nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			k := kustomization(false)
+			_ = unstructured.SetNestedSlice(k.Object, []any{
+				map[string]any{"id": ns + "_" + appN + "_apps_Deployment", "v": "v1"},
+				map[string]any{"id": tc.id, "v": "v1"},
+			}, "status", "inventory", "entries")
+			if got := otherNamespaces(k, ns); !slices.Equal(got, tc.want) {
+				t.Errorf("otherNamespaces = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

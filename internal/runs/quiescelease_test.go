@@ -641,3 +641,154 @@ func TestARestoreNeverRepeatsARestartItsStatusShowsDone(t *testing.T) {
 		t.Errorf("replicas = %d, suspended = %t; want the other stop left alone", got, suspended(t, c))
 	}
 }
+
+// A namespace BackupRun waits, with the app running and no quiesce Lease
+// taken, while a RestoreRun in its namespace has deleted a Cluster and waits
+// for it to be created again: the Kustomization the backup would suspend may
+// be the one Flux needs to create that Cluster (see waitingOn).
+func TestANamespaceBackupWaitsForARestoreThatDeletedItsCluster(t *testing.T) {
+	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		restoreRun(func(r *backupv1alpha1.RestoreRun) {
+			r.Finalizers = []string{Finalizer}
+			r.Spec.Database = pgN
+			r.Status.Phase = backupv1alpha1.RunPhaseWaiting
+			r.Status.StartedAt = atFrozen(-time.Minute)
+			r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "Cluster", Name: pgN, Phase: backupv1alpha1.ItemDeleted, ClusterUID: "old-cluster-uid"}}
+		}),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
+	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
+
+	step(t, br) // plan
+	step(t, br) // admit
+	step(t, br) // quiesce: waits for the restore
+
+	backup := readBackupRun(t, c)
+	want := "RestoreRun back-to-monday has deleted Cluster " + pgN + " and waits for it to be created again"
+	if readyReason(backup.Status.Conditions) != backupv1alpha1.ReasonSourceBusy || !strings.Contains(readyMessage(backup.Status.Conditions), want) {
+		t.Fatalf("reason = %q, message = %q; want SourceBusy holding %q",
+			readyReason(backup.Status.Conditions), readyMessage(backup.Status.Conditions), want)
+	}
+	if len(backup.Status.Quiesced) != 0 || quiesceLeaseIn(t, c, ns) != nil {
+		t.Errorf("quiesced = %+v, quiesce Lease = %v; want no plan and no Lease while the restore waits", backup.Status.Quiesced, quiesceLeaseIn(t, c, ns))
+	}
+	if got := replicasOf(t, c); got != 2 || suspended(t, c) {
+		t.Errorf("replicas = %d, suspended = %t; want the app running and its Kustomization left alone", got, suspended(t, c))
+	}
+}
+
+// pendingRestartBackup returns the BackupRun before-upgrade as a pass whose
+// restart failed left it: the app recorded at 2, restartedAt chosen with
+// restartPending still set, its Kustomization suspended, and the run past
+// its one-hour timeout under the given clock.
+func pendingRestartBackup() *backupv1alpha1.BackupRun {
+	return quiescedBackup(func(b *backupv1alpha1.BackupRun) {
+		b.Finalizers = []string{Finalizer}
+		b.Status.StartedAt = atFrozen(0)
+		b.Status.RestartedAt, b.Status.RestartPending = atFrozen(0), true
+		b.Status.SuspendedKustomizations = []string{"flux-system/" + appN}
+	})
+}
+
+// seedQuiesceLease creates the namespace's quiesce Lease, stamped for run.
+func seedQuiesceLease(t *testing.T, c client.Client, kind string, run metav1.Object) {
+	t.Helper()
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: quiesceLeaseName, Namespace: ns}}
+	stamp(lease, leaseHolder{kind: kind, run: run, scope: scopeQuiesce}, nil)
+	if err := c.Create(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A BackupRun whose restart is still pending when its timeout ends it gives
+// the app back: its stored restartedAt says only that the restart moment was
+// chosen, and restartPending says the workloads may still be down, so
+// release starts them again.
+func TestATimeoutDuringAPendingRestartGivesTheAppBack(t *testing.T) {
+	c := newClient(t, pendingRestartBackup(), claim(), volume(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true))
+	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{},
+		Now: func() time.Time { return frozen.Add(time.Hour + time.Second) }}
+
+	step(t, br)
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.RestartPending {
+		t.Fatalf("phase = %q, restartPending = %t (%s); want Failed with the restart done",
+			run.Status.Phase, run.Status.RestartPending, readyMessage(run.Status.Conditions))
+	}
+	if got := replicasOf(t, c); got != 2 || suspended(t, c) {
+		t.Errorf("replicas = %d, suspended = %t; want the app back at 2 and its Kustomization resumed", got, suspended(t, c))
+	}
+}
+
+// A run keeps the namespace's quiesce Lease when the status write that ends
+// it is lost: the stored status still shows a restart the run owes, so
+// another run that took the Lease then could stop the app and see the retry
+// scale it back up. The retry stores the end and releases the Lease.
+func TestAFinishWhoseStatusWriteIsLostKeepsTheQuiesceLease(t *testing.T) {
+	t.Run("BackupRun", func(t *testing.T) {
+		c := newClient(t, pendingRestartBackup(), claim(), volume(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true))
+		br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{},
+			Now: func() time.Time { return frozen.Add(time.Hour + time.Second) }}
+		seedQuiesceLease(t, c, "BackupRun", pendingRestartBackup())
+
+		br.Client = loseStatusWriteAt(c, 2)
+		if err := tryStep(br); err == nil {
+			t.Fatal("the pass succeeded although the status write that ends the run was lost")
+		}
+		stored := readBackupRun(t, c)
+		if stored.Status.Phase.Finished() || !stored.Status.RestartPending || replicasOf(t, c) != 2 {
+			t.Fatalf("phase = %q, restartPending = %t, replicas = %d; want the app back and the lost end unstored",
+				stored.Status.Phase, stored.Status.RestartPending, replicasOf(t, c))
+		}
+		if got := leaseHolderOf(t, c, quiesceLeaseName); got != string(runUID) {
+			t.Fatalf("the quiesce Lease holder = %q after the lost end, want the run still holding it", got)
+		}
+
+		br.Client = c
+		step(t, br)
+		if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+			t.Fatalf("phase = %q after the retry, want Failed", run.Status.Phase)
+		}
+		if got := leaseHolderOf(t, c, quiesceLeaseName); got != "" {
+			t.Errorf("the quiesce Lease holder = %q after the run ended, want it released", got)
+		}
+	})
+
+	t.Run("RestoreRun", func(t *testing.T) {
+		stopping := func() *backupv1alpha1.RestoreRun {
+			return checkedRestore(func(r *backupv1alpha1.RestoreRun) {
+				r.Finalizers = []string{Finalizer}
+				r.Spec.Claim = claimN
+				r.Spec.Quiesce = []backupv1alpha1.WorkloadRef{{Kind: "Deployment", Name: appN}}
+				r.Status.QuiescedAt = atFrozen(0)
+				r.Status.Quiesced = []backupv1alpha1.QuiescedWorkload{{Kind: "Deployment", Name: appN, Replicas: 2}}
+			})
+		}
+		c := newClient(t, stopping(), claim(), volumeRestore(), repository(), stoppedDeployment())
+		rr := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday},
+			Now: func() time.Time { return frozen.Add(4*time.Hour + time.Second) }}
+		seedQuiesceLease(t, c, "RestoreRun", stopping())
+
+		rr.Client = loseNextStatusWrite(c)
+		if _, err := rr.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+			t.Fatal("the pass succeeded although the status write that ends the run was lost")
+		}
+		stored := readRestoreRun(t, c)
+		if stored.Status.Phase.Finished() || stored.Status.RestartedAt != nil || replicasOf(t, c) != 2 {
+			t.Fatalf("phase = %q, restartedAt = %v, replicas = %d; want the app back and the lost end unstored",
+				stored.Status.Phase, stored.Status.RestartedAt, replicasOf(t, c))
+		}
+		if got := leaseHolderOf(t, c, quiesceLeaseName); got != string(restoreUID) {
+			t.Fatalf("the quiesce Lease holder = %q after the lost end, want the run still holding it", got)
+		}
+
+		rr.Client = c
+		restoreStep(t, rr)
+		if run := readRestoreRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+			t.Fatalf("phase = %q after the retry, want Failed", run.Status.Phase)
+		}
+		if got := leaseHolderOf(t, c, quiesceLeaseName); got != "" {
+			t.Errorf("the quiesce Lease holder = %q after the run ended, want it released", got)
+		}
+	})
+}
