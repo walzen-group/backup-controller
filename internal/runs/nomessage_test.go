@@ -15,11 +15,14 @@ import (
 // messageRuleScope is the code TestNoDecisionReadsAMessage reads: the
 // non-test Go files of each directory, or only the named files when a scope
 // lists them. It covers what restic-jobs steps 3 and 4 left free of message
-// reads; steps 7b and 10 widen it until it holds every non-test file of
-// internal/runs and internal/populator.
+// reads, and internal/restorejob from step 5, whose Read renders the
+// termination message restic leaves and must never decide on it; steps 7b
+// and 10 widen it until it holds every non-test file of internal/runs and
+// internal/populator.
 var messageRuleScope = []messageRuleDir{
 	{dir: ".", files: []string{"backuprun.go", "restorerun.go"}},
 	{dir: "../populator"},
+	{dir: "../restorejob"},
 }
 
 // messageRuleDir is one directory the rule reads.

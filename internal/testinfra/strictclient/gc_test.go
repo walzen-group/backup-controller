@@ -282,3 +282,55 @@ func TestBuiltInGeneration(t *testing.T) {
 		t.Errorf("statefulset spec patch: generation = %d, want 3", sts.Generation)
 	}
 }
+
+// A Job deleted with Foreground propagation stays, with its
+// deletionTimestamp and the foregroundDeletion finalizer, while a pod it
+// controls is left. The pod has a controller reference with
+// blockOwnerDeletion, as every pod the Job controller creates does. On the
+// docker-desktop cluster (Kubernetes 1.36.4) a running pod of a Job deleted
+// this way stayed, Running with a deletionTimestamp, for its grace period,
+// and the Job stayed with it. The client runs no kubelet, so the pod's
+// batch.kubernetes.io/job-tracking finalizer stands in for that grace period
+// and keeps it in place. The restore Job's stop (internal/restorejob)
+// deletes a Job this way and does not wait for it to go.
+func TestForegroundDeleteOfAJobWaitsForItsPods(t *testing.T) {
+	ctx := context.Background()
+	c := newGCClient(t, true)
+	job := created(t, c, &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "restore", Namespace: "app"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "restore", Image: "restic"}}},
+		}},
+	})
+	yes := true
+	pod := created(t, c, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "restore-x", Namespace: "app",
+			Labels:     map[string]string{batchv1.ControllerUidLabel: string(job.GetUID())},
+			Finalizers: []string{"batch.kubernetes.io/job-tracking"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: "restore",
+				UID: job.GetUID(), Controller: &yes, BlockOwnerDeletion: &yes}},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{Name: "restore", Image: "restic"}}},
+	})
+
+	if err := c.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
+		t.Fatal(err)
+	}
+	stored := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "restore", Namespace: "app"}}
+	if !exists(t, c, stored) {
+		t.Fatal("the Job went while its pod is left")
+	}
+	if stored.DeletionTimestamp == nil || !slices.Contains(stored.Finalizers, metav1.FinalizerDeleteDependents) {
+		t.Errorf("Job = %v %v, want a deletionTimestamp and the foregroundDeletion finalizer",
+			stored.DeletionTimestamp, stored.Finalizers)
+	}
+	if !exists(t, c, pod) || pod.GetDeletionTimestamp() == nil {
+		t.Error("the pod should be left with a deletionTimestamp")
+	}
+	got := c.Cascades()
+	if len(got) != 2 || got[0].Owner.Kind != "Job" || got[0].Propagation != metav1.DeletePropagationForeground ||
+		got[1].Owner.Kind != "Pod" || got[1].Propagation != metav1.DeletePropagationForeground {
+		t.Errorf("cascades = %+v, want the Job, then its pod, both with Foreground", got)
+	}
+}
