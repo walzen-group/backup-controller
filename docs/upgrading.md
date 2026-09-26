@@ -73,8 +73,8 @@ RBAC is applied.
 
 v0.8.x admitted a Cluster as `initdb` over a prefix holding WAL but no
 completed base backup, and over any prefix when it carried
-`backup.wlz.li/bootstrap: initdb`. Such a Cluster runs, and its archiving has
-failed since it started
+`backup.wlz.li/bootstrap: initdb`. Such a Cluster runs and serves traffic, and
+its archiving has failed since it started
 ([restores.md](restores.md#a-database-that-could-never-archive)). v0.9.0 acts
 only on creates, so it does not repair a Cluster that already exists.
 
@@ -86,14 +86,139 @@ kubectl get clusters.postgresql.cnpg.io -A -o json | jq -r '.items[] | .status.c
 
 Expected result: no output.
 
-ContinuousArchivingFailing has other causes too, such as wrong credentials.
-For this one, the condition's message or the instance pod's log names
-`Expected empty archive`.
+Each line names a Cluster and its condition's message. With CloudNativePG
+1.30.0 and plugin-barman-cloud 0.15.0, a Cluster started over an old archive
+shows this message:
+
+```text
+rpc error: code = Unknown desc = unexpected failure invoking barman-cloud-wal-archive: exit status 1
+```
+
+The message leaves out the cause, and ContinuousArchivingFailing has other
+causes too, such as wrong credentials. The plugin-barman-cloud container in
+the Cluster's primary pod logs the cause. Find the primary pod:
+
+```
+kubectl -n <namespace> get clusters.postgresql.cnpg.io <cluster> -o jsonpath='{.status.currentPrimary}'
+```
+
+Search that container's log:
+
+```
+kubectl -n <namespace> logs <primary pod> -c plugin-barman-cloud | grep 'Expected empty archive'
+```
+
+Expected result for a Cluster started over an old archive: a JSON line for
+every attempt PostgreSQL made to archive a segment, whose msg field ends in:
+
+```text
+ERROR: WAL archive check failed for server <serverName>: Expected empty archive
+```
+
+Only this container logs that text. The condition and the postgres
+container's log carry the rpc error above. When the search prints nothing,
+archiving fails for another reason: read the rest of the same log for it, and
+leave that Cluster out of step 5.
+
+### Step 5: Give each such Cluster an empty archive
 
 The database in such a Cluster holds writes no backup has captured, so
-deleting the Cluster loses them. Point its archive at an empty prefix instead:
-set a `serverName` no archive uses yet to keep the old archive, or delete
-everything under the old prefix if it is worth nothing. PostgreSQL keeps every
-segment it could not archive in `pg_wal`, so the plugin archives them once its
-check passes. When ContinuousArchiving turns True, take a base backup with a
-BackupRun naming the database.
+deleting the Cluster loses them. Repair the Cluster in place. It archives to
+`<destinationPath>/<serverName>/`: destinationPath comes from the ObjectStore
+its barmanObjectName names, and serverName defaults to the Cluster's name.
+Pick one of two repairs:
+
+| The old archive | Repair |
+| --- | --- |
+| should stay | set a new serverName in the Cluster's barman-cloud plugin parameters |
+| is worth nothing | delete everything under `<destinationPath>/<serverName>/` |
+
+To keep the old archive, add a serverName no archive uses yet, such as
+`<cluster>-v2`, to the plugin entry in the manifest Flux applies:
+
+```yaml
+spec:
+  plugins:
+  - name: barman-cloud.cloudnative-pg.io
+    isWALArchiver: true
+    parameters:
+      barmanObjectName: <store>
+      serverName: <cluster>-v2
+```
+
+To discard the old archive, delete it. Keep the trailing slash, so that a
+sibling prefix such as `<serverName>-old/` stays:
+
+```
+aws s3 rm --recursive --endpoint-url <endpointURL> <destinationPath>/<serverName>/
+```
+
+Check the condition:
+
+```
+kubectl -n <namespace> get clusters.postgresql.cnpg.io <cluster> -o jsonpath='{.status.conditions[?(@.type=="ContinuousArchiving")].reason}'
+```
+
+Expected result, within a minute of the change: `ContinuousArchivingSuccess`.
+The instance keeps running through the repair.
+
+PostgreSQL keeps every segment its archive_command failed on in pg_wal, marked
+.ready, and retries the oldest. While the marker file .check-empty-wal-archive
+exists in PGDATA, the plugin runs barman-cloud-check-wal-archive before each
+attempt. Against an empty prefix the check passes, and the plugin archives the
+waiting segments in order, starting with the first one the database wrote
+after initdb. The instance deletes the marker once ContinuousArchiving is
+True. On the e2e cluster, a Cluster recovered from the repaired archive held
+every row written before the repair.
+
+### Step 6: Take a base backup
+
+The new archive holds WAL but no base backup, so a recovery has nothing to
+start from yet. Create a BackupRun naming the database:
+
+```yaml
+apiVersion: backup.wlz.li/v1alpha1
+kind: BackupRun
+metadata:
+  name: after-archive-repair
+  namespace: <namespace>
+spec:
+  database: <cluster>
+```
+
+Check the run:
+
+```
+kubectl -n <namespace> get brun after-archive-repair
+```
+
+Expected result: the phase column shows Succeeded.
+
+A run that ends Failed with `the Cluster <cluster> is not marked
+backup.wlz.li/enabled: "true"` names a Cluster without that annotation. Add
+the annotation and create the run again.
+
+### When the serverName changes back
+
+Set the new serverName in the Cluster's manifest in Git, so that every apply of
+the manifest keeps it. Two behaviours depend on the serverName the Cluster
+carries:
+
+- The instance deleted the marker when archiving succeeded, so the plugin no
+  longer checks the prefix. A Cluster whose serverName goes back to the old one
+  archives its new segments into the old archive, and ContinuousArchiving
+  stays True. barman overwrites the old segments that have the same names.
+- When a Cluster is recreated, the webhook finds its base backups under the
+  serverName the new Cluster declares, so a disaster-recovery rebuild from the
+  manifest in Git looks in the archive that manifest names.
+
+The serverName belongs in the Cluster. A validation rule in the
+ObjectStore CRD refuses an ObjectStore that sets one in spec.configuration:
+
+```text
+spec.configuration.serverName: Forbidden: use the 'serverName' plugin parameter in the Cluster resource
+```
+
+hack/e2e/cnpg/empty-archive-repair.sh starts a Cluster over an old archive on
+the e2e cluster, repairs it either way step 5 gives, runs step 6, and recovers
+a second Cluster from the repaired archive to count its rows.
