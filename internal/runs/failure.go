@@ -16,21 +16,18 @@ type refusalError struct {
 	reason backupv1alpha1.ItemReason
 	// text says what is wrong, for a person. No decision reads it.
 	text string
-	// spared is what the run left as it was when it refused. Error states
-	// it after text, so a person knows nothing needs repair.
-	spared spared
 }
 
-// sparedKind says which object a refusal left untouched, if any.
+// Error returns the refusal's text.
+func (e *refusalError) Error() string { return e.text }
+
+// sparedKind says which object a refusal left untouched.
 type sparedKind int
 
 const (
-	// sparedNothing is a refusal that says nothing about what it left
-	// untouched. Error adds nothing to the text.
-	sparedNothing sparedKind = iota
 	// sparedClaim is a refusal of a volume restore before anything was
 	// written to its claim.
-	sparedClaim
+	sparedClaim sparedKind = iota
 	// sparedCluster is a refusal of a database restore before the run
 	// deleted anything of the Cluster.
 	sparedCluster
@@ -38,24 +35,35 @@ const (
 
 // spared names what a refusal left untouched.
 type spared struct {
-	// kind is sparedNothing, sparedClaim or sparedCluster.
+	// kind is sparedClaim or sparedCluster.
 	kind sparedKind
 	// claim names the claim for sparedClaim.
 	claim string
 }
 
-// Error returns the refusal's text, followed by the sentence that says what
-// the run left untouched when spared names something.
-func (e *refusalError) Error() string {
-	switch e.spared.kind {
-	case sparedClaim:
-		return e.text + nothingWritten(e.spared.claim)
-	case sparedCluster:
-		return e.text + ". The run deleted nothing"
-	case sparedNothing:
-	}
-	return e.text
+// sparedError is an error that holds a refusal, marked with what the run
+// left as it was when it refused, so a person knows nothing needs repair.
+// It unwraps to the error it marks, so errors.As still finds the
+// *refusalError and its reason.
+type sparedError struct {
+	// err is the marked error: the refusal itself, or an error that wraps
+	// it. Its text comes first in the message.
+	err error
+	// spared is what the run left untouched.
+	spared spared
 }
+
+// Error returns the marked error's text, followed by the sentence that says
+// what the run left untouched.
+func (e *sparedError) Error() string {
+	if e.spared.kind == sparedCluster {
+		return e.err.Error() + ". The run deleted nothing"
+	}
+	return e.err.Error() + nothingWritten(e.spared.claim)
+}
+
+// Unwrap returns the marked error.
+func (e *sparedError) Unwrap() error { return e.err }
 
 // refuse builds a refusal of an item.
 //
@@ -65,8 +73,8 @@ func (e *refusalError) Error() string {
 //   - format and args build the refusal's text for a person, the way
 //     fmt.Sprintf builds it.
 //
-// It returns a *refusalError that spares nothing; nothingWrittenTo and
-// nothingDeleted add what the run left untouched.
+// It returns a *refusalError whose message says only what is wrong;
+// nothingWrittenTo and nothingDeleted add what the run left untouched.
 func refuse(reason backupv1alpha1.ItemReason, format string, args ...any) error {
 	return &refusalError{reason: reason, text: fmt.Sprintf(format, args...)}
 }
@@ -78,8 +86,9 @@ func refuse(reason backupv1alpha1.ItemReason, format string, args ...any) error 
 //   - claim names the claim the item restores into.
 //   - err is the error the start check returned. It may be nil.
 //
-// It returns a copy of a *refusalError in err with the claim spared, and any
-// other error, nil included, unchanged.
+// It returns err marked with the claim spared when err holds a
+// *refusalError, and any other error, nil included, unchanged (see
+// withSpared).
 func nothingWrittenTo(claim string, err error) error {
 	return withSpared(err, spared{kind: sparedClaim, claim: claim})
 }
@@ -90,23 +99,33 @@ func nothingWrittenTo(claim string, err error) error {
 // Parameters:
 //   - err is the error the check returned. It may be nil.
 //
-// It returns a copy of a *refusalError in err with the Cluster spared, and
-// any other error, nil included, unchanged.
+// It returns err marked with the Cluster spared when err holds a
+// *refusalError, and any other error, nil included, unchanged (see
+// withSpared).
 func nothingDeleted(err error) error {
 	return withSpared(err, spared{kind: sparedCluster})
 }
 
-// withSpared returns a copy of the *refusalError in err with what it spared
-// set, and any other error unchanged. It is the shared part of
-// nothingWrittenTo and nothingDeleted.
+// withSpared marks a refusal with what the run left untouched. It is the
+// shared part of nothingWrittenTo and nothingDeleted.
+//
+// Parameters:
+//   - err is the error a check returned: a *refusalError, an error that
+//     wraps one, any other error, or nil.
+//   - what names the object the run left untouched.
+//
+// It returns a *sparedError that holds err whole, wrapper included, when
+// errors.As finds a *refusalError in err, so the message is err's own text
+// followed by the sentence on what was spared. It returns any other error,
+// nil included, unchanged, and an error already marked unchanged too, so
+// the sentence never appears twice.
 func withSpared(err error, what spared) error {
 	var refused *refusalError
-	if !errors.As(err, &refused) {
+	var marked *sparedError
+	if !errors.As(err, &refused) || errors.As(err, &marked) {
 		return err
 	}
-	marked := *refused
-	marked.spared = what
-	return &marked
+	return &sparedError{err: err, spared: what}
 }
 
 // invalidSpecError is a refusal of the run as a whole: its spec names
@@ -122,9 +141,16 @@ type invalidSpecError struct {
 // wrong with it.
 func (e *invalidSpecError) Error() string { return e.text }
 
-// invalidSpec builds a refusal of the run as a whole, with a text built from
-// format and args the way fmt.Sprintf builds it. Only a function that only
-// run-level sites call returns one.
+// invalidSpec builds a refusal of the run as a whole.
+//
+// Parameters:
+//   - format and args build the refusal's text for a person, the way
+//     fmt.Sprintf builds it. The text names the field of the spec and what
+//     is wrong with it.
+//
+// It returns an *invalidSpecError, which ends the run with reason Invalid
+// and fails no item. Only a function that only run-level sites call returns
+// one, because asItemFailure does not take it.
 func invalidSpec(format string, args ...any) error {
 	return &invalidSpecError{text: fmt.Sprintf(format, args...)}
 }
@@ -132,7 +158,11 @@ func invalidSpec(format string, args ...any) error {
 // itemFailure is how an item ends when an error fails it: the reason it
 // records and the message a person reads.
 type itemFailure struct {
-	reason  backupv1alpha1.ItemReason
+	// reason is the ItemReason the item records, always a constant of the
+	// API package.
+	reason backupv1alpha1.ItemReason
+	// message is the error's text, which the item records for a person.
+	// No decision reads it.
 	message string
 }
 

@@ -46,8 +46,9 @@ func TestAnErrorFailsAnItemOnlyWhenItIsOnTheList(t *testing.T) {
 }
 
 // A refusal marked as sparing the claim or the Cluster says so after its
-// text, keeps its reason, and leaves the unmarked refusal as it was; any
-// other error, and nil, passes through unchanged.
+// text, keeps its reason, and leaves the unmarked refusal as it was. A
+// wrapped refusal keeps its wrapper's text, and a refusal marked twice says
+// it once. Any other error, and nil, passes through unchanged.
 func TestASparedRefusalSaysWhatTheRunLeftAlone(t *testing.T) {
 	refused := refuse(backupv1alpha1.ItemReasonClaimDeleting, "claim %s is being deleted", claimN)
 
@@ -63,6 +64,17 @@ func TestASparedRefusalSaysWhatTheRunLeftAlone(t *testing.T) {
 	}
 	if refused.Error() != "claim "+claimN+" is being deleted" {
 		t.Errorf("the unmarked refusal became %q", refused.Error())
+	}
+
+	wrapped := nothingWrittenTo(claimN, fmt.Errorf("start: %w", refused))
+	if want := "start: claim " + claimN + " is being deleted" + nothingWritten(claimN); wrapped.Error() != want {
+		t.Errorf("nothingWrittenTo of a wrapped refusal = %q, want %q", wrapped.Error(), want)
+	}
+	if failure, _ := asItemFailure(wrapped); failure.reason != backupv1alpha1.ItemReasonClaimDeleting {
+		t.Errorf("reason of the wrapped refusal = %q, want ClaimDeleting", failure.reason)
+	}
+	if twice := nothingWrittenTo(claimN, written); twice.Error() != written.Error() {
+		t.Errorf("a refusal marked twice = %q, want %q", twice.Error(), written.Error())
 	}
 
 	plain := errors.New("the API server timed out")
