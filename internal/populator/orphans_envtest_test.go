@@ -157,6 +157,9 @@ func TestEnvtestAClaimWhoseVolumeRestoreIsGoneIsReleased(t *testing.T) {
 		Reader:    manager.GetAPIReader(),
 		Recorder:  manager.GetEventRecorder("backup-controller"),
 		Namespace: orphanControllerNS,
+		// The destination is looked for only a MoverPoll after its delete;
+		// a short one keeps the test inside its budget.
+		MoverPoll: 500 * time.Millisecond,
 	}
 	if err := orphans.SetupWithManager(manager); err != nil {
 		t.Fatalf("register OrphanReconciler: %v", err)

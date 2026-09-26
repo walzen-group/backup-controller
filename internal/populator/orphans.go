@@ -54,6 +54,14 @@ type OrphanReconciler struct {
 	// MoverPoll is how long to wait before looking again for a mover pod
 	// that is still there. Zero means 30 seconds.
 	MoverPoll time.Duration
+	// Now returns the current time. Nil means time.Now. Tests replace it so
+	// they can move time forward without sleeping.
+	Now func() time.Time
+
+	// stops records when the reconciler deleted each claim's
+	// ReplicationDestination, so the mover counts gone only once MoverPoll
+	// has passed since the delete.
+	stops internalvolsync.Stops
 }
 
 // SetupWithManager registers the reconciler with mgr. It watches claims, and
@@ -136,7 +144,12 @@ func (r *OrphanReconciler) orphaned(claim *corev1.PersistentVolumeClaim) bool {
 //     naming the destination and requeues after MoverPoll, and goes no
 //     further: VolSync may be in the middle of a reconcile of that
 //     destination and create its mover Job after any look this pass could
-//     take. Only a pass whose delete finds the destination gone goes on;
+//     take. Only a pass whose delete finds the destination gone goes on,
+//     and only once MoverPoll has passed since the delete, because that
+//     event or a watch event can start the next pass at once. The time of
+//     the delete is kept in memory (see internalvolsync.Stops); a
+//     destination found gone with no record, after a restart, counts from
+//     that pass. Until then the pass requeues after MoverPoll;
 //  2. lists the pods of that destination's mover Job, and reads the Job
 //     itself once no pod is left, and while a pod or the Job is still there
 //     records a Normal WaitingForMover event and requeues after MoverPoll,
@@ -173,19 +186,29 @@ func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if poll <= 0 {
 		poll = defaultMoverPoll
 	}
+	now := time.Now
+	if r.Now != nil {
+		now = r.Now
+	}
 	// A destination this pass deletes may be in the middle of a VolSync
 	// reconcile that creates its mover Job after any look this pass could
-	// take, so only the next pass looks for the mover.
+	// take, and an event can start the next pass at once. So the mover is
+	// looked for only once poll has passed since the delete.
+	stopKey := r.Namespace + "/" + destination
 	rd := &volsyncv1alpha1.ReplicationDestination{ObjectMeta: metav1.ObjectMeta{Name: destination, Namespace: r.Namespace}}
 	err = r.Client.Delete(ctx, rd)
 	switch {
 	case err == nil:
+		r.stops.Deleted(stopKey, now())
 		r.Recorder.Eventf(claim, nil, corev1.EventTypeNormal, "WaitingForMover", "Cleanup",
-			"VolumeRestore %s is gone; deleted ReplicationDestination %s, and the next pass looks for its mover before the cleanup goes on",
-			vrKey.Name, destination)
+			"VolumeRestore %s is gone; deleted ReplicationDestination %s, and looks for its mover once %s have passed before the cleanup goes on",
+			vrKey.Name, destination, poll)
 		return ctrl.Result{RequeueAfter: poll}, nil
 	case !apierrors.IsNotFound(err):
 		return ctrl.Result{}, fmt.Errorf("delete ReplicationDestination %s/%s: %w", r.Namespace, destination, err)
+	}
+	if !r.stops.Gone(stopKey, now(), poll) {
+		return ctrl.Result{RequeueAfter: poll}, nil
 	}
 
 	pods := &corev1.PodList{}

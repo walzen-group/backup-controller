@@ -114,6 +114,12 @@ func TestAFailedPrimeDeleteAfterCleanupIsCompletedByTheOrphanReconciler(t *testi
 	}
 
 	r, recorder := newOrphanReconciler(c, c)
+	// Cleanup deleted the destination at a time the reconciler does not
+	// know, so its first pass waits a mover poll before it looks.
+	if res, err := reconcileClaim(t, r); err != nil || res.RequeueAfter <= 0 {
+		t.Fatalf("first Reconcile = %v, %v; want a requeue", res, err)
+	}
+	advancePoll(r)
 	if _, err := reconcileClaim(t, r); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}

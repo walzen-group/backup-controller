@@ -644,3 +644,91 @@ func TestARestoreDoesNotGiveTheAppBackWhileAFinishedItemsMoverIsThere(t *testing
 			readyMessage(waiting.Status.Conditions), backupv1alpha1.ReasonShutdown, pod.Name)
 	}
 }
+
+// advance moves the reconciler's clock forward by d from wherever it is now.
+func advance(r *RestoreRunReconciler, d time.Duration) {
+	now := r.Now
+	r.Now = func() time.Time { return now().Add(d) }
+}
+
+// The status write of the pass that deletes a stopped mover's
+// ReplicationDestination starts another reconcile at once. That pass comes
+// milliseconds after the delete, while VolSync may still be in the middle of
+// a reconcile of the destination that creates the mover's Job. So the run
+// counts the mover gone only once pollInterval has passed since the delete:
+// until then a finished item keeps its Lease and the app stays down, even
+// when no Job and no pod are there. A Job VolSync creates late is found by
+// the pass after that time, and holds the run until it is gone.
+func TestAStoppedMoverCountsGoneOnlyAPollIntervalAfterTheDelete(t *testing.T) {
+	run, destination := quiescedRestoreDone()
+	lease := heldClaimLease(run, claimN)
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination, lease)
+
+	restoreStepAtOnce(t, r) // deletes the destination
+	restoreStepAtOnce(t, r) // the pass the status write starts, at the same instant
+
+	if got := replicasOf(t, c); got != 0 {
+		t.Errorf("replicas = %d on the pass right after the delete, want the app still down", got)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, &coordinationv1.Lease{}); err != nil {
+		t.Errorf("get the claim Lease = %v on the pass right after the delete, want it held", err)
+	}
+	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonShutdown {
+		t.Errorf("reason = %q on the pass right after the delete, want %s", reason, backupv1alpha1.ReasonShutdown)
+	}
+
+	// VolSync's reconcile that was under way creates the mover's Job late.
+	job := moverJob(destination.Name)
+	if err := c.Create(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	advance(r, pollInterval)
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 0 {
+		t.Errorf("replicas = %d with the late mover Job there, want the app still down", got)
+	}
+	if message := readyMessage(readRestoreRun(t, c).Status.Conditions); !strings.Contains(message, job.Name) {
+		t.Errorf("ready message = %q, want it to name Job %s", message, job.Name)
+	}
+
+	if err := c.Delete(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d once the mover Job was gone, want the 2 the app had", got)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, &coordinationv1.Lease{}); !apierrors.IsNotFound(err) {
+		t.Errorf("get the claim Lease = %v, want it released once the mover was gone", err)
+	}
+}
+
+// The same holds when the run ends: finish counts a mover it stopped gone
+// only once pollInterval has passed since it deleted the destination.
+func TestAnEndingRunCountsItsStoppedMoverGoneOnlyAPollIntervalAfterTheDelete(t *testing.T) {
+	run, destination := quiescedMidRestore()
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), destination)
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+
+	restoreStepAtOnce(t, r)
+	restoreStepAtOnce(t, r)
+
+	if got := replicasOf(t, c); got != 0 {
+		t.Errorf("replicas = %d on the pass right after the delete, want the app still down", got)
+	}
+	if readRestoreRun(t, c).Status.Phase.Finished() {
+		t.Error("the run finished on the pass right after the delete, want it waiting")
+	}
+
+	advance(r, pollInterval)
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d a poll interval after the delete, want the 2 the app had", got)
+	}
+}

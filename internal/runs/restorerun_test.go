@@ -62,7 +62,24 @@ func restoreReconciler(t *testing.T, backups prober, objects ...client.Object) (
 
 // restoreStep reconciles the RestoreRun back-to-monday once and returns the
 // result. An error from the reconcile fails the test.
+//
+// It then moves the reconciler's clock forward by the result's RequeueAfter,
+// the time the controller waits before the next pass when no event comes
+// sooner. restoreStepAtOnce leaves the clock where it is, for a pass that an
+// event, such as the run's own status write, starts at once.
 func restoreStep(t *testing.T, r *RestoreRunReconciler) ctrl.Result {
+	t.Helper()
+	result := restoreStepAtOnce(t, r)
+	if result.RequeueAfter > 0 {
+		advance(r, result.RequeueAfter)
+	}
+	return result
+}
+
+// restoreStepAtOnce reconciles the RestoreRun back-to-monday once, with the
+// clock where it is, and returns the result. An error from the reconcile
+// fails the test.
+func restoreStepAtOnce(t *testing.T, r *RestoreRunReconciler) ctrl.Result {
 	t.Helper()
 	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
 	if err != nil {
@@ -1207,6 +1224,10 @@ func TestAnIntoRestoreTimesOutWhileItsClaimIsRefused(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err != nil {
 		t.Fatalf("reconcile past the timeout returned %v, want the run ended", err)
 	}
+	// The run named its destination at the checks, so it looks for that
+	// destination's mover a poll interval later before it ends.
+	advance(r, pollInterval)
+	restoreStep(t, r)
 	run := readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
 		t.Fatalf("phase = %q, reason = %q; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))

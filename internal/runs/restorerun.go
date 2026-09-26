@@ -73,6 +73,11 @@ type RestoreRunReconciler struct {
 	// schemas caches the check that the installed CRD of the run's kind
 	// declares every field the controller writes (see crdOutdated).
 	schemas schemaCache
+
+	// stops records when the run deleted each ReplicationDestination it
+	// stopped, so its mover counts gone only once pollInterval has passed
+	// since the delete (see removeDestinations).
+	stops internalvolsync.Stops
 }
 
 // SetupWithManager registers the reconciler with mgr so it runs for every
@@ -2077,12 +2082,17 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 // only when the run owns it (see ownsDestination); one with another trigger
 // is left alone. The delete carries the UID it read as a precondition, so a
 // destination created under the name since the read is never deleted. A
-// destination that is already gone is not an error. A mover the run deleted
-// the destination of in this pass counts as not gone, whatever the run can
-// see of it: VolSync may be in the middle of a reconcile of that destination
-// and create the Job after the look, so only the next pass looks (see
-// moverRemains). An item keeps the destination's name until its mover is
-// gone, so every pass can look the mover up again.
+// destination that is already gone is not an error.
+//
+// A mover counts as gone only once pollInterval has passed since the run
+// deleted its destination, and a look after that finds no Job and no pod of
+// it (see moverRemains). VolSync may be in the middle of a reconcile of the
+// destination and create the Job after a look taken right after the delete,
+// and the status write of the deleting pass starts the next pass at once.
+// The time of the delete is kept in the reconciler's memory (see
+// internalvolsync.Stops); a destination found gone with no record, after a
+// restart, counts from that pass. An item keeps the destination's name until
+// its mover is gone, so every pass can look the mover up again.
 func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) (moverList, error) {
 	var left moverList
 	for i := range run.Status.Items {
@@ -2111,6 +2121,7 @@ func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *back
 			if err := r.Delete(ctx, destination, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
 				return nil, destinationReleaseError(item.Destination, fmt.Errorf("delete ReplicationDestination %s: %w", item.Destination, err))
 			}
+			r.stops.Deleted(stopKey(run, item.Destination), r.Now())
 			left = append(left, moverLeft{item: item.Name, destination: item.Destination})
 			continue
 		}
@@ -2122,9 +2133,20 @@ func (r *RestoreRunReconciler) removeDestinations(ctx context.Context, run *back
 			left = append(left, moverLeft{item: item.Name, destination: item.Destination, what: what})
 			continue
 		}
+		if !r.stops.Gone(stopKey(run, item.Destination), r.Now(), pollInterval) {
+			left = append(left, moverLeft{item: item.Name, destination: item.Destination})
+			continue
+		}
 		item.Destination = ""
 	}
 	return left, nil
+}
+
+// stopKey returns the key under which the reconciler's stops record the
+// ReplicationDestination named destination: the run's namespace and that
+// name, as namespace/name.
+func stopKey(run *backupv1alpha1.RestoreRun, destination string) string {
+	return run.Namespace + "/" + destination
 }
 
 // moverLeft is a restore mover the run has stopped that is not gone yet.
@@ -2138,8 +2160,9 @@ type moverLeft struct {
 
 	// what names the part of the mover that is still there, such as "pod
 	// volsync-dst-restore-9b7d4e21-0-abcde" or "Job
-	// volsync-dst-restore-9b7d4e21-0". It is empty when the run deleted the
-	// destination in this pass and has not looked for the mover yet.
+	// volsync-dst-restore-9b7d4e21-0". It is empty when the run saw no Job
+	// and no pod of the mover, or did not look, and pollInterval has not
+	// passed since it deleted the destination.
 	what string
 }
 
@@ -2158,7 +2181,9 @@ type moverList []moverLeft
 //
 // It returns the chosen movers that are still there, in the order of
 // status.items. An item counts once it names a ReplicationDestination,
-// because the run has deleted that destination or is about to. An error is a
+// because the run has deleted that destination or is about to, until a look
+// finds no Job and no pod of its mover and pollInterval has passed since the
+// run deleted the destination (see removeDestinations). An error is a
 // *releaseError from a failed look at a mover (see moverRemains), and the
 // caller then releases nothing, which is the choice that changes nothing
 // while the state is unknown.
@@ -2172,7 +2197,7 @@ func (r *RestoreRunReconciler) stoppedMovers(ctx context.Context, run *backupv1a
 		if err != nil {
 			return nil, destinationReleaseError(item.Destination, err)
 		}
-		if what != "" {
+		if what != "" || !r.stops.Settled(stopKey(run, item.Destination), r.Now(), pollInterval) {
 			left = append(left, moverLeft{item: item.Name, destination: item.Destination, what: what})
 		}
 	}
@@ -2198,7 +2223,7 @@ func (l moverList) message() string {
 		return ""
 	}
 	m := l[0]
-	still := "the run deleted the destination in this pass and looks for the mover's Job and pods on the next"
+	still := fmt.Sprintf("the run deleted the destination, and looks for the mover's Job and pods once %s have passed since the delete", pollInterval)
 	if m.what != "" {
 		still = "its " + m.what + " is still there"
 	}

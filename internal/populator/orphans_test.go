@@ -102,9 +102,21 @@ func moverPod(phase corev1.PodPhase) *corev1.Pod {
 
 func newOrphanReconciler(c client.Client, reader client.Reader) (*OrphanReconciler, *events.FakeRecorder) {
 	recorder := events.NewFakeRecorder(20)
-	return &OrphanReconciler{Client: c, Reader: reader, Recorder: recorder, Namespace: orphanControllerNS}, recorder
+	now := time.Date(2026, 9, 26, 7, 0, 0, 0, time.UTC)
+	return &OrphanReconciler{Client: c, Reader: reader, Recorder: recorder, Namespace: orphanControllerNS,
+		Now: func() time.Time { return now }}, recorder
 }
 
+// advancePoll moves the reconciler's clock forward by its mover poll, the
+// time a pass after the destination's delete waits before it looks for the
+// mover.
+func advancePoll(r *OrphanReconciler) {
+	now, poll := r.Now, r.MoverPoll
+	if poll <= 0 {
+		poll = defaultMoverPoll
+	}
+	r.Now = func() time.Time { return now().Add(poll) }
+}
 func reconcileClaim(t *testing.T, r *OrphanReconciler) (ctrl.Result, error) {
 	t.Helper()
 	return r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: orphanNamespace, Name: "data"}})
@@ -143,7 +155,8 @@ func drain(recorder *events.FakeRecorder) []string {
 // deleteDestinationPass runs the pass that deletes the ReplicationDestination
 // of stuckClaim, and checks that it requeues and goes no further. It drops
 // the events that pass recorded, so a test reads only those of the passes
-// after it.
+// after it, and moves the clock forward by the mover poll the pass asked
+// to be requeued after, so the next pass may look for the mover.
 func deleteDestinationPass(t *testing.T, r *OrphanReconciler, recorder *events.FakeRecorder) {
 	t.Helper()
 	res, err := reconcileClaim(t, r)
@@ -154,6 +167,7 @@ func deleteDestinationPass(t *testing.T, r *OrphanReconciler, recorder *events.F
 		t.Fatalf("result of the pass that deletes the destination = %+v, want a requeue", res)
 	}
 	drain(recorder)
+	advancePoll(r)
 }
 
 func assertLeftovers(t *testing.T, c client.Reader, want bool) {
@@ -198,6 +212,12 @@ func TestTheLastFinalizerRemovedDeletesTheClaim(t *testing.T) {
 	c := newOrphanClient(t, claim)
 	r, _ := newOrphanReconciler(c, c)
 
+	// The destination is gone at the first look, deleted at a time the
+	// reconciler does not know, so it waits a mover poll from that look.
+	if res, err := reconcileClaim(t, r); err != nil || res.RequeueAfter <= 0 {
+		t.Fatalf("first reconcile = %v, %v; want a requeue", res, err)
+	}
+	advancePoll(r)
 	if _, err := reconcileClaim(t, r); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -384,6 +404,7 @@ func TestThePassThatDeletesTheDestinationFinishesNothing(t *testing.T) {
 		t.Errorf("events = %q, want one Normal WaitingForMover naming the deleted destination", got)
 	}
 
+	advancePoll(r)
 	if _, err := reconcileClaim(t, r); err != nil {
 		t.Fatalf("second reconcile: %v", err)
 	}
@@ -544,5 +565,45 @@ func TestADeletedVolumeRestoreEnqueuesTheClaimsNamingIt(t *testing.T) {
 	want := []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: orphanNamespace, Name: "data"}}}
 	if !slices.Equal(got, want) {
 		t.Errorf("requests = %v, want %v", got, want)
+	}
+}
+
+// X2: the pass right after the one that deleted the destination, which the
+// WaitingForMover event or another watch event can start at once, finishes
+// nothing either, even when it sees no mover pod and no mover Job. VolSync may
+// still be in the middle of a reconcile of that destination and create the
+// Job after that look. The cleanup goes on only once MoverPoll has passed
+// since the delete.
+func TestThePassRightAfterTheDeleteFinishesNothing(t *testing.T) {
+	c := newOrphanClient(t, append(leftovers(), stuckClaim())...)
+	r, recorder := newOrphanReconciler(c, c)
+
+	if _, err := reconcileClaim(t, r); err != nil {
+		t.Fatalf("reconcile that deletes the destination: %v", err)
+	}
+	drain(recorder)
+	res, err := reconcileClaim(t, r)
+	if err != nil {
+		t.Fatalf("reconcile right after the delete: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("result = %+v, want a requeue", res)
+	}
+	for _, obj := range leftovers()[1:] {
+		if !present(t, c, obj) {
+			t.Errorf("%T %s deleted on the pass right after the destination's delete", obj, obj.GetName())
+		}
+	}
+	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
+		t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
+	}
+
+	advancePoll(r)
+	if _, err := reconcileClaim(t, r); err != nil {
+		t.Fatalf("reconcile a mover poll after the delete: %v", err)
+	}
+	assertLeftovers(t, c, false)
+	if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
+		t.Errorf("claim finalizers = %v, want %s removed a mover poll after the delete", got, ClaimFinalizer)
 	}
 }

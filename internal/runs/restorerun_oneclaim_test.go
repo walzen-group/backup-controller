@@ -93,6 +93,7 @@ func TestTwoInPlaceRestoresOfOneClaimRunOneAtATime(t *testing.T) {
 	if err := c.Delete(context.Background(), pod); err != nil {
 		t.Fatal(err)
 	}
+	advance(r, pollInterval)
 	stepRestore(t, r, "back-to-monday")
 	stepRestore(t, r, "second")
 

@@ -144,6 +144,7 @@ func TestARestoreWhoseSnapshotWasPrunedFailsBeforeWriting(t *testing.T) {
 
 			repo.forget(t, newestTimed)
 			restoreStep(t, r)
+			restoreStep(t, r) // an into restore looks for the mover of the destination it named a poll interval later
 
 			expectItemFailed(t, c, "snapshot "+newestTimed+" (2026-09-25T21:21:02Z), which the checks selected, is no longer in the repository",
 				"restic forget", "Create a new RestoreRun")
@@ -169,6 +170,7 @@ func TestARestoreWhoseSnapshotWasRetimedFailsBeforeWriting(t *testing.T) {
 				t.Fatal(err)
 			}
 			restoreStep(t, r)
+			restoreStep(t, r) // an into restore looks for the mover of the destination it named a poll interval later
 
 			expectItemFailed(t, c, "snapshot "+newestTimed+", which the checks selected, was rewritten as "+rewritten.ShortID()+
 				" at 2026-09-25T21:21:40Z by a quiesced backup after the checks", "Create a new RestoreRun")
@@ -189,6 +191,7 @@ func TestARestoreWhoseSnapshotWasShadowedFailsBeforeWriting(t *testing.T) {
 			later := moverSnapshot("7a11ce00", monday.Time.Add(500*time.Millisecond))
 			r.Snapshots = snapshots{sunday, monday, later}
 			restoreStep(t, r)
+			restoreStep(t, r) // an into restore looks for the mover of the destination it named a poll interval later
 
 			expectItemFailed(t, c, "the repository changed after the checks",
 				"snapshot 6e473100 (2026-09-21T05:00:02Z) shares its second with snapshot 7a11ce00", "so it would restore 7a11ce00",
