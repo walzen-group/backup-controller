@@ -14,6 +14,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -973,9 +974,10 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 //
 // A Running item fails with the mover's logs when the mover failed. Once the
 // destination has completed the run's trigger, the item succeeds only when
-// the mover's log names the snapshot the checks recorded, and fails
-// otherwise (see unconfirmedRestore). It also fails when its destination is
-// gone. restoreVolume leaves the destination in place, and work deletes it
+// the mover's log names the snapshot the checks recorded (see
+// unconfirmedRestore) and the claim is still there, not being deleted, and
+// the one the mover wrote into (see inPlaceClaimLost), and fails otherwise.
+// It also fails when its destination is gone. restoreVolume leaves the destination in place, and work deletes it
 // once the item's end is in the status.
 //
 // A claim that is gone, or whose VolumeRestore or repository Secret is
@@ -1114,14 +1116,77 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, reason
 		} else if destination.Status != nil && destination.Status.LastManualSync == string(run.UID) {
 			// A completed trigger says only that the mover exited 0; its
-			// log says which snapshot, if any, it restored.
+			// log says which snapshot, if any, it restored, and the claim
+			// must still be the one it wrote into.
+			lost, err := r.inPlaceClaimLost(ctx, run, item.Name)
+			if err != nil {
+				return "", "", err
+			}
 			item.Phase = backupv1alpha1.ItemSucceeded
 			if why := unconfirmedRestore(destination, item.Snapshot, item.Name, false); why != "" {
 				item.Phase, item.Message = backupv1alpha1.ItemFailed, why
+			} else if lost != "" {
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, lost
 			}
 		}
 	}
 	return "", "", nil
+}
+
+// inPlaceClaimLost returns a message when the claim an in-place item
+// restored is gone, is being deleted, or is not the claim the mover wrote
+// into, and "" while that claim is there.
+//
+// Parameters:
+//   - run is the RestoreRun. Its claim Leases are the ones labelled with its
+//     UID.
+//   - claimName names the claim, which is also the item's name.
+//
+// The claim the mover wrote into is the one the run took its claim Lease on
+// right before it created the item's ReplicationDestination: the Lease is
+// named after that claim's UID (see claimLeaseName) and lists the item. A
+// claim whose UID is not among the run's claim Leases for the item was
+// created after that create, so it replaced the claim the mover wrote into.
+// A run that holds no claim Lease for the item can't tell which claim the
+// mover wrote into, and gets a message too, since the item must not succeed
+// without that evidence. A failed read of the claim or the Leases comes back
+// as an error, and the caller leaves the item as it was.
+//
+// A claim deleted while its mover's pod mounts it stays, Terminating, until
+// the pod is gone (pvc-protection), so the mover can complete into a claim
+// that is about to go.
+func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (string, error) {
+	leases := &coordinationv1.LeaseList{}
+	if err := r.Reader.List(ctx, leases, client.InNamespace(run.Namespace), client.MatchingLabels{labelLeaseHolderUID: string(run.UID)}); err != nil {
+		return "", fmt.Errorf("list the Leases of RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
+	}
+	prefix := claimLeaseName("")
+	var leased []string
+	for _, lease := range leases.Items {
+		if strings.HasPrefix(lease.Name, prefix) && slices.Contains(leaseItems(&lease), claimName) {
+			leased = append(leased, strings.TrimPrefix(lease.Name, prefix))
+		}
+	}
+	if len(leased) == 0 {
+		return fmt.Sprintf("the run holds no claim Lease for claim %s, so it can't tell whether the mover wrote into the claim that is there now. "+
+			"Check the claim's data, and create a new RestoreRun to restore it", claimName), nil
+	}
+
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Sprintf("claim %s was deleted while the mover wrote into it, and the restored data went with it", claimName), nil
+		}
+		return "", fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
+	}
+	if claim.DeletionTimestamp != nil {
+		return fmt.Sprintf("claim %s was deleted while the mover wrote into it, and the restored data goes with it once the claim is released", claimName), nil
+	}
+	if !slices.Contains(leased, string(claim.UID)) {
+		return fmt.Sprintf("claim %s was replaced while the mover wrote into it: the claim there now (UID %s) is not the one the mover wrote into (UID %s), "+
+			"and nothing was restored into it", claimName, claim.UID, strings.Join(leased, ", ")), nil
+	}
+	return "", nil
 }
 
 // claimWriter returns the name of a ReplicationDestination, other than the
