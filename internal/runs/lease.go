@@ -28,22 +28,14 @@ const (
 	// annotationLeaseItems lists, separated by commas, the names of the
 	// holder run's items the Lease is held for.
 	annotationLeaseItems = "backup.wlz.li/lease-items"
-	// annotationLeaseHolderNamespace names the namespace of the run that
-	// holds a Lease. A quiesce Lease of a Kustomization lives in the
-	// Kustomization's namespace, which is usually not the holder's.
-	annotationLeaseHolderNamespace = "backup.wlz.li/lease-holder-namespace"
-	// labelLeaseScope marks a Lease that guards a namespace's quiesce or a
-	// Kustomization a run suspends (see scopeQuiesce). Claim and repository
-	// Leases carry no scope label.
+	// labelLeaseScope marks a Lease that guards a namespace's quiesce (see
+	// scopeQuiesce). Claim and repository Leases carry no scope label.
 	labelLeaseScope = "backup.wlz.li/lease-scope"
 	// scopeQuiesce is the value of labelLeaseScope on a quiesce Lease.
 	scopeQuiesce = "quiesce"
 	// quiesceLeaseName is the Lease one run at a time takes in a namespace
 	// before it stops that namespace's workloads.
 	quiesceLeaseName = "backup-controller-quiesce"
-	// kustomizationLeasePrefix starts the name of the Lease that guards a
-	// Kustomization a run suspends (see kustomizationLeaseName).
-	kustomizationLeasePrefix = "backup-controller-kustomization-"
 )
 
 // leaseHolder is a run's item that takes the Leases of a claim and its
@@ -56,9 +48,8 @@ type leaseHolder struct {
 	// item is the name of the item in the run's status the Leases are held
 	// for.
 	item string
-	// scope is scopeQuiesce for a Lease that guards a namespace's quiesce or
-	// a Kustomization (see acquireQuiesceLease), and "" for a claim or
-	// repository Lease.
+	// scope is scopeQuiesce for the Lease that guards a namespace's quiesce
+	// (see acquireQuiesceLease), and "" for a claim or repository Lease.
 	scope string
 }
 
@@ -70,11 +61,6 @@ func claimLeaseName(uid types.UID) string { return "backup-controller-claim-" + 
 // repository whose Secret has the given UID.
 func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-" + string(uid) }
 
-// kustomizationLeaseName returns the name of the Lease that guards the
-// Kustomization with the given UID.
-func kustomizationLeaseName(uid types.UID) string {
-	return kustomizationLeasePrefix + string(uid)
-}
 
 // acquireLeases takes the Leases that let one run at a time start a mover
 // on a claim and on its restic repository. A backup and a restore of the
@@ -120,7 +106,7 @@ func acquireLeases(ctx context.Context, c client.Client, reader client.Reader, h
 		return "", err
 	}
 	for _, name := range names {
-		busy, err := acquireLease(ctx, c, reader, holder, namespace, name, nil)
+		busy, err := acquireLease(ctx, c, reader, holder, namespace, name)
 		if err != nil || busy != "" {
 			return busy, err
 		}
@@ -169,13 +155,8 @@ func leaseNamesFor(ctx context.Context, reader client.Reader, namespace, claim, 
 
 // acquireLease takes one Lease for holder, as acquireLeases describes. It
 // returns "" when holder holds it, a message naming the holder when another
-// live run does, and an error for a failed API call.
-//
-// describe renders that message from the Lease as it was read. A caller with
-// more to say than leaseBusyMessage does, such as the Kustomization a Lease
-// guards and the workload that needs it, passes its own; nil uses
-// leaseBusyMessage.
-func acquireLease(ctx context.Context, c client.Client, reader client.Reader, holder leaseHolder, namespace, name string, describe func(*coordinationv1.Lease) string) (string, error) {
+// live run does (see leaseBusyMessage), and an error for a failed API call.
+func acquireLease(ctx context.Context, c client.Client, reader client.Reader, holder leaseHolder, namespace, name string) (string, error) {
 	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
 	stamp(lease, holder, []string{holder.item})
 	err := c.Create(ctx, lease)
@@ -214,9 +195,6 @@ func acquireLease(ctx context.Context, c client.Client, reader client.Reader, ho
 		return "", err
 	}
 	if live {
-		if describe != nil {
-			return describe(held), nil
-		}
 		return leaseBusyMessage(held), nil
 	}
 	stamp(held, holder, []string{holder.item})
@@ -266,7 +244,6 @@ func stamp(lease *coordinationv1.Lease, holder leaseHolder, items []string) {
 		lease.Annotations = map[string]string{}
 	}
 	lease.Annotations[annotationLeaseHolderName] = holder.run.GetName()
-	lease.Annotations[annotationLeaseHolderNamespace] = holder.run.GetNamespace()
 	lease.Annotations[annotationLeaseItems] = strings.Join(items, ",")
 	if holder.scope != "" {
 		lease.Labels[labelLeaseScope] = holder.scope
@@ -315,15 +292,9 @@ const (
 //
 // Parameters:
 //   - reader reads the holder run, uncached.
-//   - lease is the Lease as stored. The holder's namespace comes from the
-//     annotation stamp writes; a Lease from an older controller lives in the
-//     holder's namespace.
+//   - lease is the Lease as stored. It lives in its holder's namespace.
 func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1.Lease) (bool, error) {
-	namespace := lease.Namespace
-	if holder := lease.Annotations[annotationLeaseHolderNamespace]; holder != "" {
-		namespace = holder
-	}
-	key := types.NamespacedName{Namespace: namespace, Name: lease.Annotations[annotationLeaseHolderName]}
+	key := types.NamespacedName{Namespace: lease.Namespace, Name: lease.Annotations[annotationLeaseHolderName]}
 	items := leaseItems(lease)
 	quiesce := lease.Labels[labelLeaseScope] == scopeQuiesce
 	switch lease.Labels[labelLeaseHolderKind] {
@@ -420,10 +391,9 @@ func leaseReleaseError(run metav1.Object, err error) error {
 	}
 }
 
-// releaseQuiesceLeases deletes every quiesce Lease the run holds, in any
-// namespace: the namespace's Lease and the Kustomization Leases Q5 took. It
-// is called once the run's stored status shows the workloads back, so another
-// run may take the Leases over.
+// releaseQuiesceLeases deletes the quiesce Lease the run holds in its
+// namespace. It is called once the run's stored status shows the workloads
+// back, so another run may take the Lease over.
 //
 // The delete carries the UID and the resourceVersion of the Lease as read, so
 // a Lease another run has taken over since is left alone. A Lease that is
@@ -433,7 +403,7 @@ func leaseReleaseError(run metav1.Object, err error) error {
 // rule and is taken over by the next run.
 func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object) error {
 	leases := &coordinationv1.LeaseList{}
-	if err := reader.List(ctx, leases, client.MatchingLabels{
+	if err := reader.List(ctx, leases, client.InNamespace(run.GetNamespace()), client.MatchingLabels{
 		labelLeaseHolderUID: string(run.GetUID()),
 		labelLeaseScope:     scopeQuiesce,
 	}); err != nil {

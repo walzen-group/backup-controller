@@ -128,10 +128,9 @@ rules:
     verbs: ["get", "list", "watch", "create", "delete"]
   # The Leases the runs take (internal/runs/lease.go): one on a claim and on
   # its repository Secret right before a mover starts, so a backup and a
-  # restore of either never run at once; one per namespace before a run stops
-  # that namespace's workloads, so two runs never stop the same workload; and
-  # one per Flux Kustomization a run suspends, which may live in another
-  # namespace. Runs live in every namespace, so the rule is cluster-wide. get
+  # restore of either never run at once; and one per namespace before a run
+  # stops that namespace's workloads, so two runs never stop the same
+  # workload. Runs live in every namespace, so the rule is cluster-wide. get
   # and list go through the uncached reader, so no watch; update takes over the
   # Lease of a run that has finished or given its workloads back.
   - apiGroups: ["coordination.k8s.io"]
