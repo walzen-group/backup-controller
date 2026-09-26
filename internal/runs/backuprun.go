@@ -443,6 +443,13 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		// a field the write may have dropped.
 		restart = true
 	}
+	if !restart && run.Status.RestartPending {
+		// The flag came from the informer cache, which may lag behind a
+		// pass that has since done the restart; see readStop.
+		if err := readStop(ctx, r.Reader, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if restart || run.Status.RestartPending {
 		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 			// The run says why the app is still down at once, rather than
@@ -1141,7 +1148,10 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 // A run with status.restartPending set has chosen its restart moment and may
 // not have started the workloads yet. release starts them and keeps that
 // moment. A run whose status shows the restart done starts nothing again, so
-// it never scales up a workload another run has stopped since.
+// it never scales up a workload another run has stopped since. release
+// decides this on the run as stored: it reads the run again through the
+// uncached Reader first (see readStop), since the informer cache can lag
+// behind the pass that did the restart.
 //
 // The Leases are released even when the restart fails: the run's items are
 // done, and otherMover still keeps another run's mover off a claim whose
@@ -1153,9 +1163,13 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 // a *restartError from restartWorkloads, which names the workload or
 // Kustomization; a failed Lease release or Workload delete as a
 // *releaseError that names what it could not delete. When both the restart
-// and the Lease release fail, it returns both, joined with errors.Join.
+// and the Lease release fail, it returns both, joined with errors.Join. A
+// failed read of the stored run comes back as it is, with nothing started.
 // Every step is safe to repeat.
 func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.BackupRun) error {
+	if err := readStop(ctx, r.Reader, run); err != nil {
+		return err
+	}
 	var restartErr error
 	holding := (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil
 	if holding || run.Status.RestartPending {

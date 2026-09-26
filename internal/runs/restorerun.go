@@ -2111,7 +2111,23 @@ func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *bac
 // restart gives the stopped workloads their replicas back, resumes the
 // Kustomizations the run suspended, and records status.restartedAt. The
 // caller writes the status.
+//
+// Parameters:
+//   - run is the RestoreRun whose status shows it holds the app stopped (see
+//     stopped).
+//
+// The run's copy may come from an informer cache that lags behind the run's
+// own last writes, so restart first reads the stored run again (see
+// readStop). When the stored run shows the restart done, restart starts
+// nothing and returns nil: another run may have stopped the app since. A
+// failed read, and a failed restart, come back as the error.
 func (r *RestoreRunReconciler) restart(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+	if err := readStop(ctx, r.Reader, run); err != nil {
+		return err
+	}
+	if !stopped(run) {
+		return nil
+	}
 	if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 		return err
 	}

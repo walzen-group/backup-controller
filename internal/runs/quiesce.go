@@ -187,6 +187,63 @@ func durablyRestarted(run client.Object) bool {
 	return false
 }
 
+// readStop reads a run again straight from the API server and puts the
+// stored record of its stop and restart on the copy the caller holds. A
+// caller that is about to start the workloads again calls it first, so that
+// it decides on what the API server holds.
+//
+// Parameters:
+//   - reader is the uncached Reader. The reconcilers read their run through
+//     the informer cache, which can lag behind the run's own last writes: a
+//     pass that reads a copy from before the restart was stored would start
+//     the workloads again, under the stop of a run that took the namespace's
+//     quiesce Lease since.
+//   - run is the BackupRun or RestoreRun as the pass read it. Its
+//     status.quiescedAt, status.quiesced, status.suspendedKustomizations,
+//     status.restartedAt and, on a BackupRun, status.restartPending are
+//     replaced with the stored ones when the stored run is newer.
+//
+// It returns an error, and changes nothing, when the read fails, when the
+// run is gone, or when the stored run with that name is another object (a
+// different UID). The caller then starts nothing and the pass runs again.
+// A copy whose resourceVersion matches the stored one is left as it is. A
+// newer stored run changes only the fields above, so the caller's later
+// status write still carries the old resourceVersion and fails with a
+// conflict, and the next pass works from the stored run.
+func readStop(ctx context.Context, reader client.Reader, run client.Object) error {
+	var stored client.Object
+	kind := ""
+	switch run.(type) {
+	case *backupv1alpha1.BackupRun:
+		stored, kind = &backupv1alpha1.BackupRun{}, "BackupRun"
+	case *backupv1alpha1.RestoreRun:
+		stored, kind = &backupv1alpha1.RestoreRun{}, "RestoreRun"
+	default:
+		return fmt.Errorf("read the stop of %T: not a run", run)
+	}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(run), stored); err != nil {
+		return fmt.Errorf("read %s %s/%s again before starting its workloads: %w", kind, run.GetNamespace(), run.GetName(), err)
+	}
+	if stored.GetUID() != run.GetUID() {
+		return fmt.Errorf("%s %s/%s is now another object (UID %s, was %s); nothing is started for the old one",
+			kind, run.GetNamespace(), run.GetName(), stored.GetUID(), run.GetUID())
+	}
+	if stored.GetResourceVersion() == run.GetResourceVersion() {
+		return nil
+	}
+	switch r := run.(type) {
+	case *backupv1alpha1.BackupRun:
+		s := stored.(*backupv1alpha1.BackupRun)
+		r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
+		r.Status.RestartedAt, r.Status.RestartPending = s.Status.RestartedAt, s.Status.RestartPending
+	case *backupv1alpha1.RestoreRun:
+		s := stored.(*backupv1alpha1.RestoreRun)
+		r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
+		r.Status.RestartedAt = s.Status.RestartedAt
+	}
+	return nil
+}
+
 // waitingOn returns a message naming another run in the run's namespace that
 // this run must wait for before it stops the namespace's workloads, or ""
 // when there is none. A run calls it before it takes the namespace's quiesce
