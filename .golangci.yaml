@@ -141,7 +141,7 @@ linters:
         linters: [revive]
         text: '^max-control-nesting:'
         source: '^\s*if !strings\.Contains\(logs, alreadyLocked\) \{$'
-      - path: '^internal/runs/(backuprun|clusterwebhook|cnpg|exclusive|kueue|lease|objects|quiesce|restorerun|sources)\.go$'
+      - path: '^internal/runs/(backuprun|clusterwebhook|cnpg|exclusive|lease|objects|quiesce|restorerun|sources)\.go$'
         linters: [goconst]
       - path: '^internal/runs/(backuprun|quiesce|restorerun|sources)\.go$'
         linters: [revive]
