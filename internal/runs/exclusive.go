@@ -54,7 +54,7 @@ const (
 // covers a quiesced run after its mover and before its retime, when VolSync
 // has already completed the tag. A source VolSync is still syncing (see
 // inUse) holds it too, whatever wrote its tag, because a mover may be
-// running.
+// running; the message then says how that sync ends (see syncingMessage).
 //
 // For restoreMover it looks at every ReplicationDestination in the namespace
 // whose destinationPVC is claim or whose repository is secret. One whose
@@ -99,11 +99,43 @@ func backupInProgress(ctx context.Context, reader client.Reader, namespace, clai
 				run, source.Spec.SourcePVC, repository, source.Name), nil
 		}
 		if inUse(source) {
-			return fmt.Sprintf("ReplicationSource %s is still syncing claim %s to repository %s; this run starts once VolSync has finished that sync",
-				source.Name, source.Spec.SourcePVC, repository), nil
+			return syncingMessage(source, repository), nil
 		}
 	}
 	return "", nil
+}
+
+// syncingMessage returns the Ready message of a restore that waits for a
+// sync no live BackupRun waits for, and says how that wait ends.
+//
+// Parameters:
+//   - source is the ReplicationSource VolSync syncs (see inUse), as stored.
+//     Its labels say whether the controller wrote it, and its status says
+//     when the sync started and how the last mover ended.
+//   - repository is the name of the source's restic repository Secret, which
+//     the message names next to the claim.
+//
+// A sync of a finished or deleted BackupRun keeps going while VolSync
+// retries a failing mover, and the restore would wait for as long as that
+// lasts. The message gives the last mover result VolSync recorded. For a
+// source the controller wrote, it says how to give the sync up: delete the
+// source while no pod of its mover Job runs, since deleting it under a
+// running mover kills restic and leaves a lock; the next backup of the claim
+// writes the source again and unlocks the repository first. A source the
+// controller did not write belongs to someone else, and the message leaves
+// that decision to them.
+func syncingMessage(source *volsyncv1alpha1.ReplicationSource, repository string) string {
+	started, mover := syncState(source)
+	way := fmt.Sprintf("ReplicationSource %s was not written by backup-controller, so whoever manages it decides how that sync ends.",
+		source.Name)
+	if source.Labels[backupv1alpha1.LabelManagedBy] == backupv1alpha1.ManagedByValue {
+		way = fmt.Sprintf("If the mover keeps failing, fix what it reports and VolSync finishes on its own. "+
+			"To give that sync up, delete the ReplicationSource %[1]s while no pod of Job volsync-src-%[1]s is running; "+
+			"the next backup of the claim writes it again and unlocks the repository first.", source.Name)
+	}
+	return fmt.Sprintf("ReplicationSource %s is still syncing claim %s to repository %s; this run starts once VolSync has finished that sync. "+
+		"%s.%s %s",
+		source.Name, source.Spec.SourcePVC, repository, started, mover, way)
 }
 
 // liveBackup returns the name of the BackupRun that still waits for the

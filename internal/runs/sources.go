@@ -332,22 +332,38 @@ func abandonedMessage(source *volsyncv1alpha1.ReplicationSource, owner string) s
 	if owner != "" {
 		of = "BackupRun " + owner
 	}
-	started := "VolSync has not started that sync yet"
-	if source.Status != nil && source.Status.LastSyncStartTime != nil {
-		started = fmt.Sprintf("VolSync started it at %s and retries it with the clone it cut then until a mover succeeds",
-			source.Status.LastSyncStartTime.UTC().Format(time.RFC3339))
-	}
-	mover := ""
-	if source.Status != nil && source.Status.LatestMoverStatus != nil {
-		mover = fmt.Sprintf(" The last mover result VolSync recorded is %s: %s.",
-			source.Status.LatestMoverStatus.Result, lastLines(source.Status.LatestMoverStatus.Logs, 5))
-	}
+	started, mover := syncState(source)
 	return fmt.Sprintf("ReplicationSource %[1]s is still retrying the backup of %[2]s, which no run waits for any more. "+
 		"%[3]s; a new trigger would be completed by that older backup, so this run leaves the source alone.%[4]s "+
 		"Fix what the mover reports and VolSync finishes on its own. "+
 		"To give that backup up, delete the ReplicationSource %[1]s while no pod of Job volsync-src-%[1]s is running; "+
 		"the next backup unlocks the repository first.",
 		source.Name, of, started, mover)
+}
+
+// syncState describes the sync VolSync runs or retries on a source, for a
+// message that tells a person why a run waits or fails.
+//
+// Parameters:
+//   - source is the ReplicationSource as stored. Its status says when VolSync
+//     started the sync and how the last mover ended.
+//
+// It returns two parts of a message. The first says when VolSync started
+// the sync, or that it has not started it yet, and has no final full stop.
+// The second gives the last mover result and the last five lines of its log
+// as a sentence that starts with a space, or is empty when VolSync has
+// recorded no mover result.
+func syncState(source *volsyncv1alpha1.ReplicationSource) (started, mover string) {
+	started = "VolSync has not started that sync yet"
+	if source.Status != nil && source.Status.LastSyncStartTime != nil {
+		started = fmt.Sprintf("VolSync started it at %s and retries it with the clone it cut then until a mover succeeds",
+			source.Status.LastSyncStartTime.UTC().Format(time.RFC3339))
+	}
+	if source.Status != nil && source.Status.LatestMoverStatus != nil {
+		mover = fmt.Sprintf(" The last mover result VolSync recorded is %s: %s.",
+			source.Status.LatestMoverStatus.Result, lastLines(source.Status.LatestMoverStatus.Logs, 5))
+	}
+	return started, mover
 }
 
 // lastLines returns the last n non-empty lines of logs, joined by " / ".

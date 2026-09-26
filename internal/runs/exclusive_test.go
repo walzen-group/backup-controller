@@ -378,3 +378,60 @@ func TestAFinishedRestoreItemsDestinationDoesNotHoldABackup(t *testing.T) {
 		})
 	}
 }
+
+// A BackupRun that has finished can leave its trigger open on the claim's
+// ReplicationSource while VolSync retries the sync it started
+// (status.lastSyncStartTime set): a mover pod may be writing the repository.
+// A restore of the claim waits with reason SourceBusy, creates no
+// ReplicationDestination, and its message says how the retrying sync ends
+// and when the source may be deleted.
+func TestARestoreWaitsWhileVolSyncRetriesTheSyncOfAFinishedBackup(t *testing.T) {
+	r, c := restoreReconciler(t, nil,
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
+		claim(), volumeRestore(), repository())
+	restoreStep(t, r) // plan
+
+	ctx := context.Background()
+	startOtherBackup(t, c)
+	failed := &backupv1alpha1.BackupRun{}
+	get(t, c, ns, "manual-notes", failed)
+	failed.Status.Phase = backupv1alpha1.RunPhaseFailed
+	failed.Status.Items[0].Phase = backupv1alpha1.ItemFailed
+	if err := c.Status().Update(ctx, failed); err != nil {
+		t.Fatal(err)
+	}
+	retrying := &volsyncv1alpha1.ReplicationSource{}
+	get(t, c, ns, claimN, retrying)
+	started := metav1.NewTime(frozen.Add(-time.Hour))
+	retrying.Status.LastSyncStartTime = &started
+	if err := c.Status().Update(ctx, retrying); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
+		t.Fatalf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	if names := destinations(t, c); len(names) != 0 {
+		t.Errorf("destinations = %v, want none while VolSync retries the sync", names)
+	}
+	msg := readyMessage(run.Status.Conditions)
+	for _, want := range []string{"ReplicationSource " + claimN + " is still syncing", "delete the ReplicationSource " + claimN,
+		"no pod of Job volsync-src-" + claimN + " is running"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, want it to contain %q", msg, want)
+		}
+	}
+}
+
+// The wait message of a restore held by a ReplicationSource the controller
+// did not write gives no advice to delete it: the source is someone else's.
+func TestTheSyncingMessageLeavesAnotherOwnersSourceToThem(t *testing.T) {
+	source := backingUp()
+	source.Labels = nil
+	msg := syncingMessage(source, repoN)
+	if strings.Contains(msg, "delete") || !strings.Contains(msg, "whoever manages it") {
+		t.Errorf("message = %q, want no delete advice and the owner named as the one who decides", msg)
+	}
+}
