@@ -262,18 +262,12 @@ func TestAnEmptyVolumeSucceedsWithoutASnapshot(t *testing.T) {
 }
 
 // A run waits with reason SourceBusy while the claim's source is still
-// completing another run's tag, and leaves that tag in place. Writing a
-// second tag would leave the first run waiting for a backup that is never
-// taken.
+// completing the tag of another run that waits for it, and leaves that tag in
+// place. The message names that run. Writing a second tag would leave the
+// first run waiting for a backup that is never taken.
 func TestABusySourceMakesTheRunWait(t *testing.T) {
-	busySource := &volsyncv1alpha1.ReplicationSource{
-		ObjectMeta: metav1.ObjectMeta{Name: claimN, Namespace: ns,
-			Labels: map[string]string{backupv1alpha1.LabelManagedBy: backupv1alpha1.ManagedByValue}},
-		Spec:   volsyncv1alpha1.ReplicationSourceSpec{Trigger: &volsyncv1alpha1.ReplicationSourceTriggerSpec{Manual: "backuprun-other"}},
-		Status: &volsyncv1alpha1.ReplicationSourceStatus{LastManualSync: "backuprun-older"},
-	}
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-		claim(), volume(), volumeRestore(), repository(), busySource)
+		claim(), volume(), volumeRestore(), repository(), busySource(TriggerFor(otherRunUID)), otherRun())
 	step(t, r)
 	step(t, r)
 	step(t, r)
@@ -282,10 +276,133 @@ func TestABusySourceMakesTheRunWait(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
 		t.Fatalf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
+	if msg := readyMessage(run.Status.Conditions); !strings.Contains(msg, "manual-notes") {
+		t.Errorf("message = %q, want it to name the BackupRun manual-notes", msg)
+	}
 	source := &volsyncv1alpha1.ReplicationSource{}
 	get(t, c, ns, claimN, source)
-	if manualTag(source) != "backuprun-other" {
+	if manualTag(source) != TriggerFor(otherRunUID) {
 		t.Errorf("the other run's tag was overwritten with %q", manualTag(source))
+	}
+}
+
+// busySource returns the claim's ReplicationSource with the manual tag open
+// and VolSync retrying its sync after a failed mover.
+func busySource(tag string) *volsyncv1alpha1.ReplicationSource {
+	source := idleSource()
+	source.Spec.Trigger.Manual = tag
+	at := metav1.NewTime(frozen.Add(-time.Hour))
+	source.Status.LastSyncStartTime = &at
+	source.Status.LatestMoverStatus = &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed,
+		Logs: "Fatal: unable to open config file: Stat: The Access Key Id you provided does not exist in our records."}
+	return source
+}
+
+// deadTag is a source's open tag that belongs to no run waiting for it, with
+// the objects that make it so and the name the item's message must give.
+type deadTag struct {
+	tag     string
+	objects []client.Object
+	names   string
+}
+
+// deadTags are the ways a source's open tag can belong to no run that waits
+// for it: a finished run, a run that no longer exists (as for a tag written
+// by v0.7.x or v0.8.x whose run is gone), a run being deleted, and an
+// unfinished run whose own item for the claim already failed.
+func deadTags() map[string]deadTag {
+	finished := otherRun()
+	finished.Status.Phase = backupv1alpha1.RunPhaseFailed
+	deleting := otherRun()
+	deleting.DeletionTimestamp = &metav1.Time{Time: frozen}
+	deleting.Finalizers = []string{Finalizer}
+	itemFailed := otherRun()
+	itemFailed.Status.Items[0].Phase = backupv1alpha1.ItemFailed
+	gone := TriggerFor("0d1e2f3a-0000-4000-8000-000000000009")
+	return map[string]deadTag{
+		"a finished run":                      {TriggerFor(otherRunUID), []client.Object{finished}, "manual-notes"},
+		"no run":                              {gone, nil, gone},
+		"a run being deleted":                 {TriggerFor(otherRunUID), []client.Object{deleting}, "manual-notes"},
+		"a running run whose item has failed": {TriggerFor(otherRunUID), []client.Object{itemFailed}, "manual-notes"},
+	}
+}
+
+// A source whose open tag no run waits for fails the run's item at once,
+// with a message that names the tag's run and says what a person can do. The
+// source is left alone: VolSync is still retrying that sync with the clone it
+// cut for it, and a new tag would be completed by that older backup.
+func TestADeadTriggerFailsTheItemAtOnce(t *testing.T) {
+	for name, tc := range deadTags() {
+		t.Run(name, func(t *testing.T) {
+			objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+				claim(), volume(), volumeRestore(), repository(), busySource(tc.tag)}, tc.objects...)
+			r, c := backupReconciler(t, objects...)
+			r.Client = neverWriteSyncing(t, c)
+			step(t, r) // plan
+			step(t, r) // admit, no queue
+			step(t, r) // start
+
+			run := readBackupRun(t, c)
+			item := run.Status.Items[0]
+			if item.Phase != backupv1alpha1.ItemFailed {
+				t.Fatalf("item = %+v, run reason %q; want the item Failed", item, readyReason(run.Status.Conditions))
+			}
+			for _, want := range []string{tc.names, "no run waits for", "Access Key Id", "delete the ReplicationSource " + claimN, "volsync-src-" + claimN} {
+				if !strings.Contains(item.Message, want) {
+					t.Errorf("item message %q does not say %q", item.Message, want)
+				}
+			}
+			if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+				t.Errorf("phase = %q, want the run Failed with its only item", run.Status.Phase)
+			}
+			source := &volsyncv1alpha1.ReplicationSource{}
+			get(t, c, ns, claimN, source)
+			if manualTag(source) != tc.tag {
+				t.Errorf("source trigger = %q, want %q left in place", manualTag(source), tc.tag)
+			}
+		})
+	}
+}
+
+// In a namespace run, a source busy with a tag no run waits for fails its
+// item before the workloads stop, and the rest of the namespace is backed up.
+// Waiting would keep every item of the namespace from being backed up until
+// the run's timeout.
+func TestADeadTriggerFailsOnlyItsItem(t *testing.T) {
+	for name, tc := range deadTags() {
+		t.Run(name, func(t *testing.T) {
+			objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+				claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), busySource(tc.tag)}, tc.objects...)
+			r, c := backupReconciler(t, objects...)
+			r.Client = neverWriteSyncing(t, c)
+			step(t, r) // plan
+			step(t, r) // admit, no queue
+
+			step(t, r) // quiesce
+			run := readBackupRun(t, c)
+			if run.Status.QuiescedAt == nil {
+				t.Fatalf("the run did not quiesce: phase %q, reason %q: %s", run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
+			}
+			for _, item := range run.Status.Items {
+				if item.Kind == "ReplicationSource" && (item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, tc.names)) {
+					t.Fatalf("volume item = %+v, want it Failed naming %q before the workloads stop", item, tc.names)
+				}
+			}
+
+			step(t, r) // start: the base backup is requested, the app starts again
+			step(t, r)
+			run = readBackupRun(t, c)
+			for _, item := range run.Status.Items {
+				if item.Kind == "Cluster" && item.Phase != backupv1alpha1.ItemRunning {
+					t.Errorf("database item = %+v, want it Running", item)
+				}
+			}
+			d := &appsv1.Deployment{}
+			get(t, c, ns, appN, d)
+			if *d.Spec.Replicas != 2 {
+				t.Errorf("replicas = %d, want the app back at 2", *d.Spec.Replicas)
+			}
+		})
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -21,8 +23,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// errSourceBusy is the error ensureSource returns when the claim's
-// ReplicationSource is in use (see inUse) with a tag other than the run's.
+// errSourceBusy is the error ensureSource returns, wrapped in a sourceHeld,
+// when the claim's ReplicationSource is in use (see inUse) with a tag other
+// than the run's that a live run waits for (see holder).
 // The run waits and tries again later. If it wrote its own tag at that point,
 // VolSync's running sync would complete the new tag with a clone cut for the
 // older one, and a change to the mover's spec would make VolSync replace the
@@ -241,6 +244,125 @@ func inUse(source *volsyncv1alpha1.ReplicationSource) bool {
 	return busy(source) || (source.Status != nil && source.Status.LastSyncStartTime != nil)
 }
 
+// errSourceAbandoned is the error ensureSource returns, wrapped in a
+// sourceHeld, when the claim's ReplicationSource is busy with a tag that no
+// run waits for any more. The item fails at once: waiting would not end, and
+// writing a new tag would have VolSync complete it with the older sync.
+var errSourceAbandoned = errors.New("the ReplicationSource is still retrying a backup no run waits for")
+
+// sourceHeld is the error that says why a run may not write the claim's
+// ReplicationSource: another run waits for its tag (it matches errSourceBusy),
+// or no run does (it matches errSourceAbandoned). Its message is written for
+// the run's Ready condition or the item's message.
+type sourceHeld struct {
+	abandoned bool
+	message   string
+}
+
+// Error returns the message, which names the source and the run or tag that
+// holds it.
+func (e *sourceHeld) Error() string { return e.message }
+
+// Is makes errors.Is match errSourceBusy for a source a live run holds, and
+// errSourceAbandoned for one no run waits for.
+func (e *sourceHeld) Is(target error) bool {
+	if e.abandoned {
+		return target == errSourceAbandoned
+	}
+	return target == errSourceBusy
+}
+
+// holder returns why the run with the trigger tag may not write the
+// ReplicationSource source, which is in use (see inUse) with another tag or
+// with none.
+//
+// Parameters:
+//   - reader lists the BackupRuns in the source's namespace. The caller
+//     passes the uncached Reader: a run is created before it tags a source,
+//     and a cache could lag behind that.
+//   - source is the source as stored.
+//
+// A source whose open tag (see busy) belongs to a live run, and a source
+// VolSync syncs with no open tag, give a sourceHeld that matches
+// errSourceBusy; the run waits. A source whose open tag no live run holds
+// gives one that matches errSourceAbandoned; the item fails. A tag is live
+// when the namespace holds a BackupRun whose UID is the tag without its
+// "backuprun-" prefix, which is not being deleted and not finished, and whose
+// item for the claim is Pending or Running. Pending counts, because a run
+// that wrote its tag and then lost its status write still has the item
+// Pending. The tag's format is the same since v0.7.x, so tags written by
+// those versions are judged the same way. A failed list comes back as a plain
+// error, and the caller retries; no decision is made on it.
+func holder(ctx context.Context, reader client.Reader, source *volsyncv1alpha1.ReplicationSource) error {
+	if !busy(source) {
+		return &sourceHeld{message: fmt.Sprintf("ReplicationSource %s is still syncing; VolSync has not recorded the end of its last sync", source.Name)}
+	}
+	open := manualTag(source)
+	runs := &backupv1alpha1.BackupRunList{}
+	if err := reader.List(ctx, runs, client.InNamespace(source.Namespace)); err != nil {
+		return fmt.Errorf("list BackupRuns in %s: %w", source.Namespace, err)
+	}
+	owner := ""
+	for i := range runs.Items {
+		run := &runs.Items[i]
+		if TriggerFor(run.UID) != open {
+			continue
+		}
+		owner = run.Name
+		if run.DeletionTimestamp != nil || run.Status.Phase.Finished() {
+			break
+		}
+		for _, item := range run.Status.Items {
+			if item.Kind == "ReplicationSource" && item.Name == source.Name &&
+				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
+				return &sourceHeld{message: fmt.Sprintf("ReplicationSource %s is still completing the backup of BackupRun %s", source.Name, run.Name)}
+			}
+		}
+		break
+	}
+	return &sourceHeld{abandoned: true, message: abandonedMessage(source, owner)}
+}
+
+// abandonedMessage returns the item's message for a source busy with a tag
+// no run waits for. It says what is going on and what a person can do. owner
+// is the name of the BackupRun the tag belongs to, or empty when no such run
+// exists; the message then names the tag.
+func abandonedMessage(source *volsyncv1alpha1.ReplicationSource, owner string) string {
+	of := "the trigger " + manualTag(source)
+	if owner != "" {
+		of = "BackupRun " + owner
+	}
+	started := "VolSync has not started that sync yet"
+	if source.Status != nil && source.Status.LastSyncStartTime != nil {
+		started = fmt.Sprintf("VolSync started it at %s and retries it with the clone it cut then until a mover succeeds",
+			source.Status.LastSyncStartTime.UTC().Format(time.RFC3339))
+	}
+	mover := ""
+	if source.Status != nil && source.Status.LatestMoverStatus != nil {
+		mover = fmt.Sprintf(" The last mover result VolSync recorded is %s: %s.",
+			source.Status.LatestMoverStatus.Result, lastLines(source.Status.LatestMoverStatus.Logs, 5))
+	}
+	return fmt.Sprintf("ReplicationSource %[1]s is still retrying the backup of %[2]s, which no run waits for any more. "+
+		"%[3]s; a new trigger would be completed by that older backup, so this run leaves the source alone.%[4]s "+
+		"Fix what the mover reports and VolSync finishes on its own. "+
+		"To give that backup up, delete the ReplicationSource %[1]s while no pod of Job volsync-src-%[1]s is running.",
+		source.Name, of, started, mover)
+}
+
+// lastLines returns the last n non-empty lines of logs, joined by " / ".
+func lastLines(logs string, n int) string {
+	var lines []string
+	for _, line := range strings.Split(logs, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, " / ")
+}
+
 // ensureSource creates or updates the ReplicationSource that backs up a claim,
 // with the run's tag as its manual trigger. Setting the tag is what starts
 // VolSync's backup.
@@ -248,7 +370,7 @@ func inUse(source *volsyncv1alpha1.ReplicationSource) bool {
 // Parameters:
 //   - c reads any ReplicationSource that already exists and writes it.
 //   - reader reads the claim's VolumeRestore and PersistentVolume and the
-//     Namespace.
+//     Namespace, and lists the BackupRuns when the source is in use.
 //   - claim is the claim to back up. The ReplicationSource takes its name.
 //   - tag is the run's manual trigger, from TriggerFor. VolSync starts a
 //     backup when spec.trigger.manual holds a value it hasn't completed yet.
@@ -258,7 +380,9 @@ func inUse(source *volsyncv1alpha1.ReplicationSource) bool {
 //   - The source already carries tag, whether VolSync is still syncing it or
 //     has completed it. A lost status write after the first write gets here.
 //   - The source is in use (see inUse) with another tag, or with none. It
-//     then also returns errSourceBusy.
+//     then also returns the sourceHeld from holder: one that matches
+//     errSourceBusy while a live run waits for that tag, or one that matches
+//     errSourceAbandoned when no run does.
 //
 // It returns a refusal, and writes nothing, when a ReplicationSource of the
 // same name exists without the label app.kubernetes.io/managed-by:
@@ -320,7 +444,7 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 				// Unchanged, so CreateOrUpdate writes nothing.
 				return nil
 			case inUse(source):
-				return errSourceBusy
+				return holder(ctx, reader, source)
 			}
 		}
 		if source.Labels == nil {
@@ -358,8 +482,8 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 		return nil
 	})
 	switch {
-	case errors.Is(err, errSourceBusy):
-		return source, errSourceBusy
+	case errors.Is(err, errSourceBusy), errors.Is(err, errSourceAbandoned):
+		return source, err
 	case isRefusal(err):
 		return nil, err
 	case apierrors.IsInvalid(err):

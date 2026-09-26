@@ -373,16 +373,30 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 	if len(run.Status.Quiesced) == 0 {
 		// A volume still busy with another run's backup would keep the
 		// stopped workloads down for as long as that backup takes. The run
-		// waits with the workloads still running.
-		for _, item := range run.Status.Items {
-			if item.Kind != "ReplicationSource" {
+		// waits with the workloads still running. A volume busy with a
+		// backup no run waits for fails its item here, before anything is
+		// stopped, and the rest of the namespace goes on; the status write
+		// below records it. A source the controller didn't write is left
+		// to startItem, which refuses it.
+		for i := range run.Status.Items {
+			item := &run.Status.Items[i]
+			if item.Kind != "ReplicationSource" || item.Phase != backupv1alpha1.ItemPending {
 				continue
 			}
 			source := &volsyncv1alpha1.ReplicationSource{}
 			err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
-			if err == nil && inUse(source) && manualTag(source) != TriggerFor(run.UID) {
-				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy,
-					fmt.Sprintf("ReplicationSource %s is still completing another run's backup", item.Name)))
+			if err != nil || !inUse(source) || manualTag(source) == TriggerFor(run.UID) ||
+				source.Labels[backupv1alpha1.LabelManagedBy] != backupv1alpha1.ManagedByValue {
+				continue
+			}
+			held := holder(ctx, r.Reader, source)
+			switch {
+			case errors.Is(held, errSourceAbandoned):
+				item.Phase, item.Message = backupv1alpha1.ItemFailed, held.Error()
+			case errors.Is(held, errSourceBusy):
+				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, held.Error()))
+			default:
+				return ctrl.Result{}, held
 			}
 		}
 
@@ -430,7 +444,10 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 //
 // It returns a message for the run's Ready condition when the item has to
 // wait, which happens when the volume's ReplicationSource is still completing
-// another run's backup. The item then stays Pending. Otherwise it returns an
+// the backup of another run that waits for it. The message names that run,
+// and the item stays Pending. When the source is busy with a backup no run
+// waits for (see holder), the item fails at once with a message that says
+// what a person can do, and the source is left alone. Otherwise it returns an
 // empty string. Any other failed read or write, such as a timeout from the
 // API server, comes back as an error with the item left Pending, and the
 // caller returns it so the reconcile runs again.
@@ -448,7 +465,11 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 		tag := TriggerFor(run.UID)
 		_, err := ensureSource(ctx, r.Client, r.Reader, claim, tag)
 		if errors.Is(err, errSourceBusy) {
-			return fmt.Sprintf("ReplicationSource %s is still completing another run's backup", item.Name), nil
+			return err.Error(), nil
+		}
+		if errors.Is(err, errSourceAbandoned) {
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
+			return "", nil
 		}
 		if err != nil {
 			if !isRefusal(err) {
