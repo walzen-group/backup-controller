@@ -202,7 +202,7 @@ doing it.
 | Retrying | an item could not start with an error a retry may fix, such as a Backup a CloudNativePG webhook refuses; the message names every such item and its error |
 | RestartFailed | the run could not give a stopped workload its replicas back or resume a Kustomization it suspended, so the app is still down; when the Lease release or the Workload delete failed as well, the reason stays RestartFailed and the message names both |
 | ReleaseFailed | the app is back, and the run cannot finish because it could not release its Leases or delete its Kueue Workload |
-| CRDOutdated | the run ended before it changed anything, because the installed CRD of its kind lacks a field the controller writes |
+| CRDOutdated | the run ended before it changed anything, because the CRD of its kind lacks a field the controller writes, is not installed, or may not be read by the controller; the message names the field or the permission |
 | Invalid | the spec names something no retry can fix, such as a claim that is not marked `backup.wlz.li/enabled`, or workloads to stop whose Flux Kustomization also applies workloads in another namespace |
 | Succeeded | the run finished with every item done |
 | Failed | the run finished with a failed item, or past its timeout; a run that passed its deadline while waiting for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |
@@ -289,7 +289,7 @@ message says what to do instead.
 | WaitingForRecreate | the run deleted a Cluster and waits for its owner to create it again: `recreate <cluster> to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it` |
 | RestartFailed | the run could not give a workload it stopped its replicas back, could not resume a Kustomization it suspended, or could not stop a restore mover while the app is down; the message names what failed and what to scale, resume or delete by hand |
 | ReleaseFailed | the app is back, and the run cannot finish because it could not release its Leases or stop a restore mover; the message says what to delete by hand |
-| CRDOutdated | the run ended before it changed anything, because the installed CRD of its kind lacks a field the controller writes, or the controller may not read that CRD |
+| CRDOutdated | the same as on a [BackupRun](#ready-reasons): the CRD of its kind lacks a field the controller writes, is not installed, or may not be read by the controller |
 | Invalid | the spec names something no retry can fix, such as an `into` claim that already exists, a Cluster carrying `backup.wlz.li/bootstrap: initdb` named in `database`, or a Cluster another unfinished RestoreRun is restoring |
 | NoBackupInReach | the run ended before it deleted or wrote anything, because an item has no backup at or before `restoreAsOf`, or its selected snapshot is one VolSync's mover would not restore; also a run that restored nothing because every item was Skipped |
 | TimedOut | the run had not finished by its `timeout`, had not passed its checks by then (`the run had not passed its checks by <deadline>: <message>`), or its `into` claim had not been restored by then (`claim <into> had not been restored by <deadline>`); a run that was waiting for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |

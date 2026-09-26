@@ -103,8 +103,8 @@ permissions.
 
 ### Step 4: Apply the CRDs, the RBAC and the image together
 
-The ClusterRole gains four rules, and the first of them refuses work until it
-is applied:
+The ClusterRole gains four rules. Until the first of them is applied, the
+webhook refuses every Cluster create while any other Cluster archives:
 
 - `list` on `objectstores.barmancloud.cnpg.io`, which the webhook's
   shared-archive check uses to read every ObjectStore in one call;
@@ -128,9 +128,9 @@ before.
 caller.
 
 Apply deploy/rbac.yaml, or upgrade the chart, in the same change that moves the
-image. A v0.9.0 image running under the v0.8.x ClusterRole refuses every
-Cluster create with an HTTP 500 while any other Cluster archives, until the
-`list` rule is there.
+image. Under the v0.8.x ClusterRole, a v0.9.0 webhook answers each of those
+Cluster creates with an HTTP 500, and a v0.9.0 run ends with reason
+CRDOutdated because it may not read its CRD.
 
 The CRDs go with the image as well. A run reads the installed CRD of its kind
 before it changes anything and ends with reason CRDOutdated when the schema
@@ -151,8 +151,9 @@ Succeeded:
   could stop the same workload. The second run recorded the zero replicas the
   first had stopped it at, and whichever run restarted last decided whether the
   app came back.
-- Under the v0.7.2 BackupRun CRD, whose schema has no `status.restartPending`,
-  a status write dropped that field, and a run whose restart failed could
+- On a cluster where v0.8.0 or v0.8.1 ran under the v0.7.2 BackupRun CRD,
+  whose schema has no `status.restartPending`, a status write dropped that
+  field, and a run whose restart failed could
   finish while the app was still at zero replicas.
 
 v0.9.0 gives back only what its own runs record as stopped, so it does not
