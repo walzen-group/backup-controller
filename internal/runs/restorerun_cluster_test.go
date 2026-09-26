@@ -2,12 +2,14 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -465,6 +467,47 @@ func TestATimedOutRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
 	}
 	if !strings.Contains(readyMessage(run.Status.Conditions), endedBeforeRecreate) {
 		t.Errorf("ready message = %q, want it to say %q", readyMessage(run.Status.Conditions), endedBeforeRecreate)
+	}
+	if item := run.Status.Items[0]; !item.ClusterLeftDeleted || item.Reason != backupv1alpha1.ItemReasonTimedOut {
+		t.Errorf("clusterLeftDeleted = %t, reason = %q; want true and TimedOut", item.ClusterLeftDeleted, item.Reason)
+	}
+}
+
+// A Cluster the run left deleted is a field of its item, and the run's
+// ending says so: the pass that times out records both and fails to list
+// its Leases, the item's message is edited in between, and the next pass
+// still ends the run with the note in its Ready message.
+func TestAClusterLeftDeletedIsAField(t *testing.T) {
+	c := newClient(t, restoreRun(deletedDatabaseRun), objectStore(), storeSecret())
+	failList := true
+	reader := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*coordinationv1.LeaseList); ok && failList {
+				return apierrors.NewInternalError(errors.New("the API server cannot list the Leases"))
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+	r := &RestoreRunReconciler{Client: c, Reader: reader, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday},
+		Now: func() time.Time { return frozen.Add(5 * time.Hour) }}
+
+	if err := tryRestoreStep(r); err == nil {
+		t.Fatal("the pass whose release failed returned no error")
+	}
+	stored := readRestoreRun(t, c)
+	if item := stored.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !item.ClusterLeftDeleted {
+		t.Fatalf("item = %+v after the failed release, want it Failed with clusterLeftDeleted", item)
+	}
+	stored.Status.Items[0].Message = "edited between the passes"
+	if err := c.Status().Update(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	failList = false
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(readyMessage(run.Status.Conditions), endedBeforeRecreate) {
+		t.Errorf("phase = %q, message = %q; want Failed saying %q", run.Status.Phase, readyMessage(run.Status.Conditions), endedBeforeRecreate)
 	}
 }
 

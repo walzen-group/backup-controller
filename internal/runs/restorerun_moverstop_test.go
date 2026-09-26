@@ -416,7 +416,8 @@ func TestAnIntoRestoreWhoseClaimIsLostWaitsForItsStoppedMoversPod(t *testing.T) 
 // An into restore past its timeout stops its mover and waits for that mover's
 // pod. The pass that finds the pod gone ends the run with reason TimedOut,
 // the reason the timeout gave it, and not with the Failed of an item that
-// failed on its own.
+// failed on its own. It goes by the ending the timeout recorded, so an item
+// message edited during the wait changes nothing.
 func TestATimedOutIntoRestoreEndsTimedOutAfterItsMoverWait(t *testing.T) {
 	run, destination := intoRestoring()
 	started := metav1.NewTime(frozen)
@@ -430,6 +431,13 @@ func TestATimedOutIntoRestoreEndsTimedOutAfterItsMoverWait(t *testing.T) {
 	waiting := readRestoreRun(t, c)
 	if waiting.Status.Phase.Finished() {
 		t.Fatalf("phase = %q with the mover pod still there, want the run unfinished", waiting.Status.Phase)
+	}
+	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonTimedOut {
+		t.Errorf("item = %+v, want it Failed with reason TimedOut", item)
+	}
+	waiting.Status.Items[0].Message = "edited between the passes"
+	if err := c.Status().Update(context.Background(), waiting); err != nil {
+		t.Fatal(err)
 	}
 
 	if err := c.Delete(context.Background(), pod); err != nil {
@@ -735,8 +743,10 @@ func TestAnEndingRunCountsItsStoppedMoverGoneOnlyAPollIntervalAfterTheDelete(t *
 
 // A run that times out while it waits for another run, and then waits for
 // its own stopped mover, ends with the wait it timed out on in its Ready
-// message, as its items carry it. The mover wait replaced the SourceBusy
-// condition in between, and the final message used to lose the wait.
+// message. The pass that times out records that message in status.ending,
+// in the write that fails the item with reason TimedOut. The mover wait
+// replaces the SourceBusy condition and the item's message is edited before
+// the last pass, and the run still ends with the ending as recorded.
 func TestATimedOutRunKeepsTheWaitItTimedOutOn(t *testing.T) {
 	run, destination := quiescedMidRestore()
 	wait := "BackupRun manual-notes holds Lease backup-controller-repo-secret-uid for notes-data; this run starts once that run has finished with it"
@@ -747,8 +757,20 @@ func TestATimedOutRunKeepsTheWaitItTimedOutOn(t *testing.T) {
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
 
 	restoreStep(t, r)
-	if readRestoreRun(t, c).Status.Phase.Finished() {
+	want := "the run had not finished by " + frozen.Add(4*time.Hour).Format(time.RFC3339) + "; it was waiting: " + wait
+	waiting := readRestoreRun(t, c)
+	if waiting.Status.Phase.Finished() {
 		t.Fatal("the run finished with its mover pod still there, want it waiting")
+	}
+	if got := waiting.Status.Ending; got == nil || *got != (backupv1alpha1.RunEnding{Reason: backupv1alpha1.ReasonTimedOut, Message: want}) {
+		t.Fatalf("ending = %+v during the mover wait, want reason TimedOut and %q", got, want)
+	}
+	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonTimedOut || item.Message != want {
+		t.Errorf("item = %+v, want it Failed with reason TimedOut and %q", item, want)
+	}
+	waiting.Status.Items[0].Message = "edited between the passes"
+	if err := c.Status().Update(context.Background(), waiting); err != nil {
+		t.Fatal(err)
 	}
 	if err := c.Delete(context.Background(), pod); err != nil {
 		t.Fatal(err)
@@ -756,11 +778,9 @@ func TestATimedOutRunKeepsTheWaitItTimedOutOn(t *testing.T) {
 	restoreStep(t, r)
 
 	done := readRestoreRun(t, c)
-	if readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut || !strings.Contains(readyMessage(done.Status.Conditions), "it was waiting: "+wait) {
-		t.Errorf("reason = %q, message = %q; want %s keeping the wait %q", readyReason(done.Status.Conditions), readyMessage(done.Status.Conditions),
-			backupv1alpha1.ReasonTimedOut, wait)
-	}
-	if item := done.Status.Items[0]; !strings.Contains(item.Message, "it was waiting: "+wait) {
-		t.Errorf("item message = %q, want it to keep the wait", item.Message)
+	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut ||
+		readyMessage(done.Status.Conditions) != want {
+		t.Errorf("phase = %q, reason = %q, message = %q; want Failed, %s, %q", done.Status.Phase, readyReason(done.Status.Conditions),
+			readyMessage(done.Status.Conditions), backupv1alpha1.ReasonTimedOut, want)
 	}
 }

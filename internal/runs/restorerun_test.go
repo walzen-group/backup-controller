@@ -12,6 +12,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -1044,6 +1045,56 @@ func TestARestoreOfAnOptedOutDatabaseIsInvalid(t *testing.T) {
 	}
 	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
 		t.Error("the opted-out Cluster was deleted")
+	}
+}
+
+// A restore refused at its checks whose release fails keeps its refusal:
+// the pass that refused it records the ending Invalid and fails to list its
+// Leases, the Cluster opts back in between, and the next pass ends the run
+// Invalid with the refusal's message. It never plans the run again.
+func TestARefusedRestoreWhoseReleaseFailedEndsInvalid(t *testing.T) {
+	c := newClient(t, restoreRun(func(r *backupv1alpha1.RestoreRun) {
+		r.Spec.Database = pgN
+		r.Finalizers = []string{Finalizer}
+	}), cluster(optedOut), objectStore(), storeSecret())
+	failList := true
+	reader := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*coordinationv1.LeaseList); ok && failList {
+				return apierrors.NewInternalError(errors.New("the API server cannot list the Leases"))
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+	r := &RestoreRunReconciler{Client: c, Reader: reader, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday},
+		Now: func() time.Time { return frozen }}
+
+	if err := tryRestoreStep(r); err == nil {
+		t.Fatal("the pass whose release failed returned no error")
+	}
+	refusal := ""
+	if ending := readRestoreRun(t, c).Status.Ending; ending != nil {
+		refusal = ending.Message
+	}
+
+	back, _ := getUnstructured(t, c, ClusterGVK, ns, pgN)
+	annotations := back.GetAnnotations()
+	delete(annotations, bootstrap.OptOutAnnotation)
+	back.SetAnnotations(annotations)
+	if err := c.Update(context.Background(), back); err != nil {
+		t.Fatal(err)
+	}
+	failList = false
+	restoreStep(t, r)
+
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
+		!strings.Contains(readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation) {
+		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, the refusal naming %s", run.Status.Phase,
+			readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation)
+	}
+	if got := readyMessage(run.Status.Conditions); got != refusal {
+		t.Errorf("message = %q, want the ending the failed pass recorded, %q", got, refusal)
 	}
 }
 

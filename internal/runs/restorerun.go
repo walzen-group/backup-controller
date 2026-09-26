@@ -120,6 +120,10 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // changes nothing on that error, and an app it has already stopped stays
 // stopped until v1alpha1 is served again. VolSync is upgraded after the controller, so a supported
 // cluster never gets there.
+//
+// A run that recorded status.ending has decided to end, and every later pass
+// only finishes it with that reason and message (see finish), also one that
+// waits for a stopped mover or retries a failed restart.
 func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.RestoreRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -139,32 +143,51 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, fmt.Errorf("add the finalizer to RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
 		}
 	}
+	if ending := run.Status.Ending; ending != nil {
+		return r.finish(ctx, run, ending.Reason, ending.Message)
+	}
 
 	if run.Status.Phase == "" {
-		// The check comes first for both plans: the old RestoreRun CRD drops
-		// the items' clusterUID and snapshotTime, which the restore relies on.
-		message, err := r.schemas.crdOutdated(ctx, r.Reader, restoreRunsCRD, "RestoreRun", backupv1alpha1.RestoreRun{},
-			"the run would lose the Cluster UIDs and snapshot times it records to check its own work")
-		if err != nil {
-			return ctrl.Result{}, r.planFailed(ctx, run, err)
-		}
-		if message != "" {
-			return r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, message)
-		}
-		plan := r.plan
-		if run.Spec.Into != "" {
-			plan = r.planIntoNewClaim
-		}
-		result, err := plan(ctx, run)
-		if err != nil {
-			return ctrl.Result{}, r.planFailed(ctx, run, err)
-		}
-		return result, nil
+		return r.start(ctx, run)
 	}
 	if run.Spec.Into != "" {
 		return r.restoreIntoEmptyClaim(ctx, run)
 	}
 	return r.work(ctx, run)
+}
+
+// start makes the first pass over a new run: it checks the installed
+// RestoreRun CRD, then plans the run.
+//
+// Parameters:
+//   - run is the RestoreRun with an empty phase and its finalizer in place.
+//
+// It returns what plan or planIntoNewClaim returns, or what finish returns
+// for a run whose CRD lacks a field the controller writes. An error that
+// either check returns for a retry goes through planFailed.
+//
+// The CRD check comes first for both plans: the old RestoreRun CRD drops the
+// items' clusterUID and snapshotTime, which the restore relies on. A run
+// with spec.into set is planned by planIntoNewClaim, and any other run by
+// plan.
+func (r *RestoreRunReconciler) start(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
+	message, err := r.schemas.crdOutdated(ctx, r.Reader, restoreRunsCRD, "RestoreRun", backupv1alpha1.RestoreRun{},
+		"the run would lose the Cluster UIDs and snapshot times it records to check its own work")
+	if err != nil {
+		return ctrl.Result{}, r.planFailed(ctx, run, err)
+	}
+	if message != "" {
+		return r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, message)
+	}
+	plan := r.plan
+	if run.Spec.Into != "" {
+		plan = r.planIntoNewClaim
+	}
+	result, err := plan(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, r.planFailed(ctx, run, err)
+	}
+	return result, nil
 }
 
 // planFailed handles an error that plan or planIntoNewClaim returned for a
@@ -835,16 +858,16 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // empty result once the run has ended (see finish). A failed read, write or
 // delete comes back as an error, and controller-runtime retries the pass.
 //
-// A run past spec.timeout is aborted with reason TimedOut (see abort and
-// restoreTimedOut). With spec.quiesce set, the first passes call quiesce to
-// stop the listed workloads, and later passes restore nothing until every
-// pod of those workloads is gone. work then moves each volume item a step
-// further (see restoreVolume), and deletes the ReplicationDestination of each
-// item that has finished once its end is in the status (see
-// removeDestinations). The databases wait until every volume item is done;
-// when a volume restore failed, the databases still Pending are skipped and
-// left running, and otherwise each is moved a step further (see
-// restoreDatabase).
+// A run past spec.timeout ends with reason TimedOut (see timeOut), and a
+// message that names the SourceBusy wait it was in. With spec.quiesce set,
+// the first passes call quiesce to stop the listed workloads, and later
+// passes restore nothing until every pod of those workloads is gone. work
+// then moves each volume item a step further (see restoreVolume), and
+// deletes the ReplicationDestination of each item that has finished once
+// its end is in the status (see removeDestinations). The databases wait
+// until every volume item is done; when a volume restore failed, the
+// databases still Pending are skipped and left running, and otherwise each
+// is moved a step further (see restoreDatabase).
 //
 // While a mover the run stopped is not gone yet, the run waits with reason
 // WaitingForShutdown and gives nothing back (rule X2). After a Cluster is
@@ -866,7 +889,7 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // reason and the message from recreateMessage.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if deadline, over := r.overdue(run); over {
-		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, restoreTimedOut(run, deadline))
+		return r.timeOut(ctx, run, timedOutMessage(deadline, run.Status.Conditions))
 	}
 	// The Leases of an item that finished in an earlier pass go now, so a
 	// backup of that claim need not wait for the rest of the run. An item
@@ -1039,32 +1062,6 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "restoring")
 	return after(pollInterval, r.writeStatus(ctx, run))
-}
-
-// restoreTimedOut returns the Ready message of a run that work aborts
-// because its deadline passed.
-//
-// Parameters:
-//   - run is the RestoreRun. Its items and its Ready condition are read.
-//   - deadline is the run's deadline as overdue returns it.
-//
-// The first pass past the deadline builds the message with timedOutMessage,
-// which adds the SourceBusy wait the run was in, and abort puts it on every
-// unfinished item. When the run then waits for a mover it stopped, its Ready
-// condition says WaitingForShutdown, and a later pass would build the message
-// without that wait. So when an item already failed with a message for this
-// deadline, restoreTimedOut returns that message, without the note
-// clusterLeftDeleted adds to a Cluster item, and the run ends with the same
-// message its items carry.
-func restoreTimedOut(run *backupv1alpha1.RestoreRun, deadline time.Time) string {
-	base := timedOutMessage(deadline, nil)
-	for _, item := range run.Status.Items {
-		if item.Phase != backupv1alpha1.ItemFailed || !strings.HasPrefix(item.Message, base) {
-			continue
-		}
-		return strings.TrimSuffix(item.Message, ". "+clusterLeftDeleted(item.Name))
-	}
-	return timedOutMessage(deadline, run.Status.Conditions)
 }
 
 // restoreVolume moves one in-place volume restore a step further.
@@ -1721,8 +1718,8 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 // (see unconfirmedRestore). It records the item's end in the status before
 // finish deletes the destination, for the reason work gives, and a pass that
 // finds the item's end recorded only finishes the run. A restore not finished
-// by spec.timeout is aborted with reason TimedOut and the message from
-// intoTimedOut.
+// by spec.timeout ends with reason TimedOut and the message from
+// intoTimedOut (see timeOut).
 func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	item := &run.Status.Items[0]
 	done := fmt.Sprintf("claim %s holds the restored data", run.Spec.Into)
@@ -1730,14 +1727,11 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	case backupv1alpha1.ItemSucceeded:
 		return r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, done)
 	case backupv1alpha1.ItemFailed:
-		// An earlier pass recorded the end, and finish either lost its write
-		// or waited for the stopped mover. Without this, a pass that
-		// finds no destination would create one again. An item the timeout
-		// failed carries the timeout's message, and the run then ends with
-		// the reason the timeout gave it.
-		if deadline, over := r.overdue(run); over && item.Message == intoTimedOut(run.Spec.Into, deadline) {
-			return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, item.Message)
-		}
+		// An earlier pass wrote the item's end, and the write that would
+		// have carried the run's ending was lost. Without this, a pass that
+		// finds no destination would create one again. A run that recorded
+		// status.ending, such as one the timeout ended, never gets here:
+		// Reconcile finishes it with that ending.
 		return r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
 	default:
 		// An item in any other phase has not ended, so the restore goes on
@@ -1793,7 +1787,7 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 		}
 	}
 	if deadline, over := r.overdue(run); over {
-		return r.abort(ctx, run, backupv1alpha1.ReasonTimedOut, intoTimedOut(run.Spec.Into, deadline))
+		return r.timeOut(ctx, run, intoTimedOut(run.Spec.Into, deadline))
 	}
 	switch {
 	case readErr == nil:
@@ -1867,10 +1861,8 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 //   - deadline is the run's deadline as overdue returns it, which the
 //     message gives.
 //
-// abort puts the message on the run and on its item. A later pass compares
-// the item's message with it to tell an item the timeout failed from one
-// that failed on its own, so the text depends on nothing but these two
-// values.
+// timeOut puts the message on the run and on its item, and records it in
+// status.ending, which a later pass ends the run with.
 func intoTimedOut(into string, deadline time.Time) string {
 	return fmt.Sprintf("claim %s had not been restored by %s", into, deadline.Format(time.RFC3339))
 }
@@ -2002,44 +1994,100 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 	return "", nil
 }
 
-// abort ends a run early as Failed. It marks every item that has not finished
-// as Failed with the given message, then calls finish, which stops the run's
-// movers and gives the app back.
+// abort ends a run early as Failed. It fails every item that has not
+// finished with the given message (see failUnfinished), then calls finish,
+// which records the ending, stops the run's movers and gives the app back.
 //
 // Parameters:
-//   - reason is the Ready reason the run ends with: ReasonTimedOut when the
-//     run ran past spec.timeout, ReasonInvalid when it refuses a
-//     Kustomization it would have to suspend, and ReasonFailed when it hit
-//     an error it cannot get past, such as a workload it could not stop or
-//     one that was deleted.
-//   - message is the Ready message, and each unfinished item's message.
+//   - reason is the Ready reason the run ends with: ReasonInvalid when it
+//     refuses a Kustomization it would have to suspend, and ReasonFailed
+//     when it hit an error it cannot get past, such as a workload it could
+//     not stop or one that was deleted.
+//   - message is the Ready message, and the start of each unfinished item's
+//     message.
 //
 // It returns what finish returns: an empty result once the run has ended, or
 // the wait for a stopped mover, which finish reports (rule X2).
 //
-// A Cluster item in phase Deleted gets the note from clusterLeftDeleted after
-// the message, and so does the Ready message: the run deleted that Cluster,
-// and the webhook recovers its next creation without the run. A later pass
-// that aborts again finds the note on the Failed item and keeps it in the
-// Ready message, so the message stays the same from pass to pass.
+// The items it fails record no reason; the run's ending says why. The Ready
+// message also carries the note of each Cluster the run left deleted (see
+// leftDeletedNotes). A run past its deadline ends through timeOut instead.
 func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
-	ready := message
+	failUnfinished(run, message, func(item *backupv1alpha1.RestoreItem, text string) {
+		item.Phase, item.Message = backupv1alpha1.ItemFailed, text
+	})
+	return r.finish(ctx, run, reason, leftDeletedNotes(run.Status.Items, message))
+}
+
+// timeOut ends a run whose deadline has passed, with reason TimedOut.
+//
+// Parameters:
+//   - run is the RestoreRun past its deadline, with no ending recorded yet.
+//   - message is the Ready message: timedOutMessage's for an in-place run,
+//     which names the SourceBusy wait the run was in, and intoTimedOut's for
+//     an into restore.
+//
+// It returns what finish returns: an empty result once the run has ended,
+// the wait for a stopped mover, or the error of a release that failed, for
+// a retry.
+//
+// Every unfinished item fails with reason TimedOut (see failUnfinished), and
+// finish records the Ready message, with the note of each Cluster the run
+// left deleted, in status.ending. Every status write from then on carries
+// the ending, and a later pass, such as one after the wait for a stopped
+// mover replaced the SourceBusy condition, ends with it as recorded.
+func (r *RestoreRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
+	failUnfinished(run, message, func(item *backupv1alpha1.RestoreItem, text string) {
+		failRestoreItem(item, refuse(backupv1alpha1.ItemReasonTimedOut, "%s", text))
+	})
+	return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, leftDeletedNotes(run.Status.Items, message))
+}
+
+// failUnfinished fails every item of a run that ends early and has not
+// finished, each with a message that starts with the run's.
+//
+// Parameters:
+//   - run is the RestoreRun that ends. Its items are changed in place, and
+//     the caller writes the status.
+//   - message is the run's Ready message.
+//   - fail sets an item Failed with its message; the caller decides which
+//     reason the item records.
+//
+// A Pending, Running or Recovering item gets the message as it is. A
+// Cluster item in phase Deleted records status.items[].clusterLeftDeleted,
+// and its message adds the note from clusterLeftDeleted: the run deleted
+// that Cluster, and the webhook recovers its next creation without the run.
+// An item in any other phase has already ended and keeps how it ended.
+func failUnfinished(run *backupv1alpha1.RestoreRun, message string, fail func(item *backupv1alpha1.RestoreItem, text string)) {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		switch item.Phase {
 		case backupv1alpha1.ItemDeleted:
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, message+". "+clusterLeftDeleted(item.Name)
+			item.ClusterLeftDeleted = true
+			fail(item, message+". "+clusterLeftDeleted(item.Name))
 		case backupv1alpha1.ItemPending, backupv1alpha1.ItemRunning, backupv1alpha1.ItemRecovering:
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+			fail(item, message)
 		default:
 			// An item in any other phase has already ended, and keeps its
 			// phase and message.
 		}
-		if item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemFailed && strings.HasSuffix(item.Message, clusterLeftDeleted(item.Name)) {
-			ready += ". " + clusterLeftDeleted(item.Name)
+	}
+}
+
+// leftDeletedNotes returns the Ready message of a run that ends early: the
+// given message, then the note from clusterLeftDeleted for each item that
+// records status.items[].clusterLeftDeleted.
+//
+// Parameters:
+//   - items are the run's items, after failUnfinished.
+//   - message is the message the run ends with.
+func leftDeletedNotes(items []backupv1alpha1.RestoreItem, message string) string {
+	for _, item := range items {
+		if item.ClusterLeftDeleted {
+			message += ". " + clusterLeftDeleted(item.Name)
 		}
 	}
-	return r.finish(ctx, run, reason, ready)
+	return message
 }
 
 // clusterLeftDeleted returns the note for a Cluster the run deleted and
@@ -2305,10 +2353,20 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 //     Succeeded, and any other reason ends it Failed.
 //   - message is the Ready message the run ends with.
 //
+// A run that already recorded status.ending ends with that one, and reason
+// and message are not used.
+//
 // It returns an empty result once the run has ended. While a stopped mover
 // is not gone yet, it returns the wait from waitForStopped, and the run stays
 // unfinished. A step that fails is reported through releaseFailed, whose
 // error it returns for a retry; a failed status write comes back as it is.
+//
+// finish first records reason and message in status.ending, so every status
+// write from then on carries them, and the items the caller failed go in
+// the same write. The wait for a stopped mover and a failed release each
+// write the status, ending included. The next pass finds status.ending and
+// calls finish with it (see Reconcile), so the run ends as it decided to,
+// whatever it waited for when it decided.
 //
 // The steps run in this order, and each one runs only once the one before it
 // went through:
@@ -2326,9 +2384,14 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 //  6. It removes the run's finalizer.
 //
 // A run never reaches finish with a Cluster item still in phase Deleted:
-// such an item is not finished, so work ends the run only through abort,
-// which fails the item with the note from clusterLeftDeleted first.
+// such an item is not finished, so work ends the run only through abort or
+// timeOut, which fail the item with the note from clusterLeftDeleted first
+// (see failUnfinished).
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
+	if run.Status.Ending == nil {
+		run.Status.Ending = &backupv1alpha1.RunEnding{Reason: reason, Message: message}
+	}
+	ending := *run.Status.Ending
 	left, err := r.removeDestinations(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err)
@@ -2349,11 +2412,11 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
-	if reason != backupv1alpha1.ReasonSucceeded {
+	if ending.Reason != backupv1alpha1.ReasonSucceeded {
 		run.Status.Phase = backupv1alpha1.RunPhaseFailed
 	}
 	run.Status.CompletedAt = &now
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, reason, message)
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, ending.Reason, ending.Message)
 	if err := r.writeStatus(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}

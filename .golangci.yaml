@@ -175,14 +175,14 @@ linters:
         source: '^func releaseFailure\('
       - path: '^internal/runs/restorerun\.go$'
         linters: [funlen, gocognit]
-        source: '^func \(r \*RestoreRunReconciler\) (Reconcile|plan|items|clustersRestoredElsewhere|selectSnapshot|work|restoreVolume|restoreDatabase|restoreIntoEmptyClaim|quiesce|finalize|removeDestinations)\('
+        source: '^func \(r \*RestoreRunReconciler\) (plan|items|clustersRestoredElsewhere|selectSnapshot|work|restoreVolume|restoreDatabase|restoreIntoEmptyClaim|quiesce|finalize|removeDestinations)\('
       - path: '^internal/runs/restorerun\.go$'
         linters: [revive]
         text: '^confusing-results:'
         source: '^func \(r \*RestoreRunReconciler\) (checkDatabase|restoreVolume)\('
       - path: '^internal/runs/restorerun\.go$'
         linters: [nestif]
-        source: '^\s*if (run\.Status\.Phase == "" |stopped\(run\) && anyRestorePending\(run\.Status\.Items\) |volumesDone |reason, failed := failedMover\(destination\); failed |readErr == nil |len\(run\.Status\.Quiesced\) == 0 )\{$'
+        source: '^\s*if (stopped\(run\) && anyRestorePending\(run\.Status\.Items\) |volumesDone |reason, failed := failedMover\(destination\); failed |readErr == nil |len\(run\.Status\.Quiesced\) == 0 )\{$'
       - path: '^internal/runs/restorerun\.go$'
         linters: [revive]
         text: '^max-control-nesting:'
