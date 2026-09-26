@@ -422,21 +422,23 @@ spec:
   timeout: 10m
 `, ns.Name))
 
-	// The backup waits with the app down. Until the restore has finished,
-	// the second BackupRun never holds the quiesce Lease: a poll that finds
-	// it the holder fails the test (the design asks for this check to be
-	// sampled).
+	// The backup waits with the app down. Until the restore has given the app
+	// back, the second BackupRun never holds the quiesce Lease: a poll that
+	// finds it the holder fails the test (the design asks for this check to
+	// be sampled). The restore releases the Lease once its stored status
+	// records status.restartedAt, which can come before the restore
+	// finishes, so a backup that holds the Lease after that is in order.
 	// The Lease is read before the restore, so a poll fails only when the
-	// restore was still unfinished after the backup held the Lease.
+	// restore had not recorded the restart after the backup held the Lease.
 	backupHoldsEarly := func() error {
 		if quiesceLeaseHolder(t, ns.Name) != "BackupRun second" {
 			return nil
 		}
 		restore, err := readRestoreRun(t, ns.Name, "restore")
-		if err != nil || restore == nil || restore.Status.Phase.Finished() {
+		if err != nil || restore == nil || restore.Status.RestartedAt != nil {
 			return nil
 		}
-		return fmt.Errorf("the second BackupRun holds the quiesce Lease while the restore is unfinished (phase %s)", restore.Status.Phase)
+		return fmt.Errorf("the second BackupRun holds the quiesce Lease while the restore has not given the app back (phase %s)", restore.Status.Phase)
 	}
 	waited := false
 	waitFor(t, "the second BackupRun to report the restore's wait", 3*time.Minute, 2*time.Second, func() (bool, string, error) {
