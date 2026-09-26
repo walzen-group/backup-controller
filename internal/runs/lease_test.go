@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -223,8 +224,10 @@ func TestAStaleLeaseIsTakenOverAndALiveOneIsNot(t *testing.T) {
 		"live run":      {holder: []client.Object{liveRestore}, live: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			objects := append(tc.holder, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-				claim(), volume(), volumeRestore(), repository())
+			objects := slices.Concat(tc.holder, []client.Object{
+				backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
+				claim(), volume(), volumeRestore(), repository(),
+			})
 			r, c := backupReconciler(t, objects...)
 			claimLease, _ := leaseNames(t, c)
 			held := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: claimLease, Namespace: ns}}

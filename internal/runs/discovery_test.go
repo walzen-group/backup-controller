@@ -402,7 +402,7 @@ func fluxServedAt(c client.Client, d *fluxDiscovery, mapper meta.RESTMapper) cli
 			return call("delete", obj.GetName(), obj, func() error { return cl.Delete(ctx, obj, opts...) })
 		},
 	})
-	return withMapper{WithWatch: intercepted.(client.WithWatch), mapper: mapper}
+	return withMapper{WithWatch: intercepted, mapper: mapper}
 }
 
 // withMapper is a client whose RESTMapper is mapper.

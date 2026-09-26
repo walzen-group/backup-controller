@@ -189,7 +189,7 @@ func recordTranscript(ctx context.Context, endpoint, bucket, prefix, server stri
 	}
 	rec.at("prober-survey")
 	if _, err := (bootstrap.S3Prober{}).Survey(ctx, at, nil); err != nil {
-		return nil, fmt.Errorf("Survey: %w", err)
+		return nil, fmt.Errorf("prober survey: %w", err)
 	}
 	rec.at("prober-base-backups")
 	if _, err := (bootstrap.S3Prober{}).BaseBackups(ctx, at); err != nil {

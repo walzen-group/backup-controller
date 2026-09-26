@@ -287,7 +287,7 @@ func TestALostWriteAtTheLimitKeepsTheRestartAfterTheMoment(t *testing.T) {
 		t.Fatalf("replicas = %d on the pass after the lost write, want 2 back", replicas)
 	}
 	run := readBackupRun(t, c)
-	if run.Status.RestartedAt == nil || run.Status.RestartedAt.Time.After(scaledUp) {
+	if run.Status.RestartedAt == nil || run.Status.RestartedAt.After(scaledUp) {
 		t.Errorf("restartedAt = %v, want a moment no later than the scale-up at %s", run.Status.RestartedAt, scaledUp)
 	}
 	if run.Status.RestartPending {

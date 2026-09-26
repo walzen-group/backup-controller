@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -222,7 +223,7 @@ func elementOrder(t *testing.T, body []byte) []string {
 	d := xml.NewDecoder(bytes.NewReader(body))
 	for {
 		tok, err := d.Token()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return order
 		}
 		if err != nil {

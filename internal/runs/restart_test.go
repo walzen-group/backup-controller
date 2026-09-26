@@ -591,8 +591,8 @@ func TestARefusedRestartStillReleasesTheLeases(t *testing.T) {
 // are cut, and for the restart when the run ends at its timeout.
 func TestAnAppGivenBackByHandLetsTheRunGoOn(t *testing.T) {
 	for name, fail := range map[string]func(t *testing.T, r *BackupRunReconciler, c client.Client){
-		"after the clones are cut": func(t *testing.T, r *BackupRunReconciler, c client.Client) { cutClone(t, c) },
-		"at the timeout": func(t *testing.T, r *BackupRunReconciler, c client.Client) {
+		"after the clones are cut": func(t *testing.T, _ *BackupRunReconciler, c client.Client) { cutClone(t, c) },
+		"at the timeout": func(_ *testing.T, r *BackupRunReconciler, _ client.Client) {
 			r.Now = func() time.Time { return frozen.Add(2 * time.Hour) }
 		},
 	} {

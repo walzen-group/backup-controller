@@ -136,14 +136,14 @@ func TestSecretCopyPreservesDataAndType(t *testing.T) {
 		Type:       corev1.SecretTypeOpaque,
 		Data:       map[string][]byte{"repository": []byte("s3://bucket"), "password": []byte("secret")},
 	}
-	copy := SecretCopy(repo, types.UID("claim-123"), "backup-system")
-	if copy.Name != "claim-123" || copy.Namespace != "backup-system" {
-		t.Fatalf("secret identity = %s/%s, want backup-system/claim-123", copy.Namespace, copy.Name)
+	copied := SecretCopy(repo, types.UID("claim-123"), "backup-system")
+	if copied.Name != "claim-123" || copied.Namespace != "backup-system" {
+		t.Fatalf("secret identity = %s/%s, want backup-system/claim-123", copied.Namespace, copied.Name)
 	}
-	if copy.Type != repo.Type || !reflect.DeepEqual(copy.Data, repo.Data) {
-		t.Fatalf("secret copy = %#v, want type and data from repository", copy)
+	if copied.Type != repo.Type || !reflect.DeepEqual(copied.Data, repo.Data) {
+		t.Fatalf("secret copy = %#v, want type and data from repository", copied)
 	}
-	copy.Data["password"][0] = 'X'
+	copied.Data["password"][0] = 'X'
 	if string(repo.Data["password"]) != "secret" {
 		t.Fatal("SecretCopy aliases repository data")
 	}

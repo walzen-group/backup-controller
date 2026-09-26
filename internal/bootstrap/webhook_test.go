@@ -362,7 +362,7 @@ func TestTheCollisionCheckReadsNoSecretOfAnotherCluster(t *testing.T) {
 func TestTheCollisionCheckListsTheObjectStoresOnce(t *testing.T) {
 	const holders = 5
 	objects := []runtime.Object{store()}
-	for i := 0; i < holders; i++ {
+	for i := range holders {
 		namespace := fmt.Sprintf("other%d", i)
 		other, otherStore := elsewhere(t, func(configuration map[string]any) {
 			configuration["destinationPath"] = "s3://backups/" + namespace + "/"
@@ -1133,16 +1133,16 @@ func TestADryRunIsAllowedWithoutReadingTheStore(t *testing.T) {
 }
 
 // update sends a Decider an update of the Cluster app/app-pg from the old
-// object to the new one, as a dry run when dryRun is true. The Decider's
+// object to the updated one, as a dry run when dryRun is true. The Decider's
 // client holds nothing and its Prober always fails, so the request fails if
 // the handler reads anything.
-func update(t *testing.T, old, new *unstructured.Unstructured, dryRun bool) admission.Response {
+func update(t *testing.T, old, updated *unstructured.Unstructured, dryRun bool) admission.Response {
 	t.Helper()
 	oldRaw, err := json.Marshal(old)
 	if err != nil {
 		t.Fatalf("marshal the old cluster: %v", err)
 	}
-	newRaw, err := json.Marshal(new)
+	newRaw, err := json.Marshal(updated)
 	if err != nil {
 		t.Fatalf("marshal the new cluster: %v", err)
 	}

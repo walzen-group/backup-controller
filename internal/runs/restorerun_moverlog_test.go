@@ -44,15 +44,15 @@ func restoreLogFor(short string) string {
 	return strings.ReplaceAll(recordedRestoreLog, recordedRestoreID, short)
 }
 
-// truncatedLog returns the last max bytes of logs, the way VolSync's
+// truncatedLog returns the last limit bytes of logs, the way VolSync's
 // TruncateString (internal/controller/utils/podlogs.go:219-227 at v0.16.0)
 // keeps the filtered log within MOVER_LOG_MAX_BYTES.
-func truncatedLog(logs string, max int) string {
-	if max <= 0 {
+func truncatedLog(logs string, limit int) string {
+	if limit <= 0 {
 		return ""
 	}
-	if len(logs) > max {
-		return logs[len(logs)-max:]
+	if len(logs) > limit {
+		return logs[len(logs)-limit:]
 	}
 	return logs
 }

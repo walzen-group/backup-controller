@@ -26,7 +26,7 @@ type rustfsWriter struct {
 // PutObject uploads body, or size zero bytes when body is nil. RustFS sets
 // the ETag and the time itself, so modified is not used.
 func (w rustfsWriter) PutObject(bucket, key string, body []byte, size int64, _ time.Time) error {
-	var r io.Reader = io.LimitReader(zeros{}, size)
+	r := io.LimitReader(zeros{}, size)
 	if body != nil {
 		r, size = strings.NewReader(string(body)), int64(len(body))
 	}

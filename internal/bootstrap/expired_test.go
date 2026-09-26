@@ -224,7 +224,7 @@ func TestAContextThatEndsAfterTheBaseListingNeverReadsAsAnEmptyPrefix(t *testing
 
 	original := minio.DefaultTransport
 	t.Cleanup(func() { minio.DefaultTransport = original })
-	minio.DefaultTransport = func(secure bool) (*http.Transport, error) {
+	minio.DefaultTransport = func(_ bool) (*http.Transport, error) {
 		transport := &http.Transport{}
 		transport.RegisterProtocol("http", armOnBaseListing{next: http.DefaultTransport, ctx: ctx})
 		return transport, nil

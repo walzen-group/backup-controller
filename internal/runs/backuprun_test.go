@@ -1054,7 +1054,8 @@ func cutClone(t *testing.T, c client.Client) {
 // sets the server clock to created for the create.
 func cloneAt(t *testing.T, c client.Client, created time.Time) *corev1.PersistentVolumeClaim {
 	t.Helper()
-	defer atServerTime(t, c, created)()
+	restoreClock := atServerTime(t, c, created)
+	defer restoreClock()
 	clone := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "volsync-" + claimN + "-src", Namespace: ns,
 			Finalizers: []string{"kubernetes.io/pvc-protection"}},
