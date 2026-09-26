@@ -428,7 +428,8 @@ The controller reads and writes ReplicationDestinations only at
 volsync.backube/v1alpha1 (see [compatibility](compatibility.md)). A RestoreRun
 that meets an API server serving VolSync's kinds at another version fails
 every VolSync request with an error naming the kind and v1alpha1, and retries
-it with the app stopped until v1alpha1 is served again. Upgrade the controller
+it until v1alpha1 is served again. An app the run has already stopped stays
+stopped until then. Upgrade the controller
 before VolSync, and no run meets that error.
 
 ## Databases restore themselves

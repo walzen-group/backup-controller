@@ -117,8 +117,8 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // While VolSync serves its kinds only at a version other than v1alpha1, a
 // pass that reads, creates or deletes a VolSync object gets an error naming
 // the kind and v1alpha1, which it returns for a retry (see serve). The run
-// changes nothing on that error and keeps the app stopped until v1alpha1 is
-// served again. VolSync is upgraded after the controller, so a supported
+// changes nothing on that error, and an app it has already stopped stays
+// stopped until v1alpha1 is served again. VolSync is upgraded after the controller, so a supported
 // cluster never gets there.
 func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.RestoreRun{}

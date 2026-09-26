@@ -153,8 +153,8 @@ const (
 	// Giving the app back needs no VolSync object, so the run ends Failed
 	// with this reason, after it starts the workloads it stopped. Only
 	// BackupRuns use it. A RestoreRun's VolSync requests fail instead, and
-	// the run retries them with the app stopped until v1alpha1 is served
-	// again.
+	// the run retries them until v1alpha1 is served again. An app the run
+	// has already stopped stays stopped until then.
 	ReasonVolSyncUnsupported = "VolSyncUnsupported"
 
 	// ReasonClusterVersionUnsupported reports a RestoreRun that found the API
@@ -163,7 +163,10 @@ const (
 	// name. The API server then creates a Cluster without calling the
 	// webhook, and the Cluster starts as an empty database. The run deletes
 	// no Cluster: a run that has not deleted one ends Failed with this
-	// reason, and a run that already deleted one waits with it. Its message
+	// reason, and a run that already deleted one waits with it. A run that
+	// fails its Cluster item in one pass and ends in a later pass ends with
+	// reason Failed instead, and the item's message names the unserved
+	// version. The ClusterVersionUnsupported message
 	// says that a Cluster created while v1 is not served starts empty and
 	// fails its item, and that a new RestoreRun restores it once v1 is
 	// served again or a controller release registers the new version.

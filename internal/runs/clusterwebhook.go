@@ -83,8 +83,8 @@ func (b webhookBlind) recreateMessage(recreate []string) string {
 	names := strings.Join(recreate, ", ")
 	return fmt.Sprintf("%s. The run has deleted %s and holds nothing back that creates it again. A Cluster created while %s "+
 		"is not served starts as an empty database, and its item then fails; restore it with a new RestoreRun once %s is served "+
-		"again or a backup-controller release that registers the new version is installed. A Cluster created after that is "+
-		"recovered", b.message(), names, webhookClusterKind.GroupVersion(), webhookClusterKind.GroupVersion())
+		"again or a backup-controller release that registers the new version is installed. A Cluster created after that, "+
+		"while this run still waits, is recovered", b.message(), names, webhookClusterKind.GroupVersion(), webhookClusterKind.GroupVersion())
 }
 
 // clusterWebhookBlind looks up whether the API server serves CloudNativePG's
