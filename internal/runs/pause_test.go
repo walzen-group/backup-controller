@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"testing"
+	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -150,5 +151,26 @@ func TestAQueuedBackupRunWithItsWorkloadGoesOnWhilePaused(t *testing.T) {
 	step(t, r)
 	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseRunning {
 		t.Errorf("phase = %q (%s) while paused, want Running", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+}
+
+// The Scheduler creates no BackupRun for a due tick while the controller
+// runs with --pause. Without the flag it creates one run, for the newest
+// tick it missed.
+func TestTheSchedulerCreatesNoRunWhilePaused(t *testing.T) {
+	created := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 9, 24, 5, 30, 0, 0, time.UTC)
+	s, c, _ := scheduler(t, now, scheduledNamespace("0 5 * * *", created), claim())
+	s.Paused = true
+	tick(t, s)
+	if runs := scheduledRuns(t, c); len(runs) != 0 {
+		t.Fatalf("runs = %v while paused, want none", runs)
+	}
+
+	s.Paused = false
+	s.Now = func() time.Time { return now.Add(48 * time.Hour) }
+	tick(t, s)
+	if runs := scheduledRuns(t, c); len(runs) != 1 || runs[0].Name != "scheduled-20260926-0500" {
+		t.Fatalf("runs = %v after the pause, want one for the newest tick", runs)
 	}
 }

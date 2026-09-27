@@ -61,6 +61,11 @@ type Scheduler struct {
 	// nil, no event is recorded.
 	Recorder events.EventRecorder
 
+	// Paused is true when the controller runs with --pause. A due tick then
+	// creates no BackupRun. After the pause, the newest tick that was due
+	// runs once (see dueTick).
+	Paused bool
+
 	// Now returns the current time. Tests set it to move the clock without
 	// sleeping, and SetupWithManager sets it to time.Now when it is nil.
 	Now func() time.Time
@@ -214,7 +219,15 @@ func dueTick(schedule cron.Schedule, baseline, now time.Time) (time.Time, bool) 
 // so a tick can already be due when the schedule arrives. The tick waits
 // until something is marked enabled. A marked claim requeues the namespace
 // at once, and a marked Cluster is seen at the next refresh.
+//
+// While the controller runs with --pause, startTick creates nothing and
+// logs the due tick at level 1. The tick stays due, so the first pass
+// after the pause creates the run.
 func (s *Scheduler) startTick(ctx context.Context, namespace *corev1.Namespace, due time.Time) error {
+	if s.Paused {
+		log.FromContext(ctx).V(1).Info("the controller runs with --pause; the due tick waits", "namespace", namespace.Name, "tick", due.UTC().Format(time.RFC3339))
+		return nil
+	}
 	marked, err := s.anythingEnabled(ctx, namespace.Name)
 	if err != nil {
 		return err
