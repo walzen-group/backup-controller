@@ -1363,3 +1363,61 @@ func TestSplitDestinationRejectsAnotherProvider(t *testing.T) {
 		t.Fatal("an azure:// destination was accepted")
 	}
 }
+
+// TestAnUnrecognisedArchiverEntryRefusesTheCluster checks that a create is
+// refused when the entries of the Barman Cloud plugin in spec.plugins do not
+// have the one shape that Archiver and the plugin read the same way.
+//
+// plugin-barman-cloud v0.15.0 takes barmanObjectName from the last entry with
+// the plugin name, and serverName from the last enabled entry that has the
+// parameter, also when the value is empty
+// (internal/cnpgi/operator/config/config.go:149-161 and :289-301). Archiver
+// takes the first archiver entry and uses the Cluster name for an empty
+// serverName. For each case below the two can disagree about the archive, so
+// the webhook must refuse and name the problem.
+func TestAnUnrecognisedArchiverEntryRefusesTheCluster(t *testing.T) {
+	entry := func(object map[string]any) map[string]any {
+		spec, _ := object["spec"].(map[string]any)
+		plugins, _ := spec["plugins"].([]any)
+		plugin, _ := plugins[0].(map[string]any)
+		return plugin
+	}
+	for name, tc := range map[string]struct {
+		mutate func(map[string]any)
+		want   string
+	}{
+		"two entries": {
+			mutate: func(object map[string]any) {
+				spec, _ := object["spec"].(map[string]any)
+				spec["plugins"] = append(spec["plugins"].([]any), map[string]any{
+					"name": PluginName, "parameters": map[string]any{"barmanObjectName": "other-store"},
+				})
+			},
+			want: "2 entries",
+		},
+		"an empty serverName": {
+			mutate: func(object map[string]any) {
+				entry(object)["parameters"].(map[string]any)["serverName"] = ""
+			},
+			want: "serverName",
+		},
+		"a disabled archiver": {
+			mutate: func(object map[string]any) { entry(object)["enabled"] = false },
+			want:   "enabled",
+		},
+		"an archiver without a store": {
+			mutate: func(object map[string]any) { entry(object)["parameters"] = map[string]any{} },
+			want:   "barmanObjectName",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := decide(t, cluster(t, tc.mutate), stubProber{has: true})
+			if response.Allowed {
+				t.Fatalf("the cluster was allowed with patches %v, want a refusal", response.Patches)
+			}
+			if !strings.Contains(response.Result.Message, tc.want) || !strings.Contains(response.Result.Message, PluginName) {
+				t.Errorf("message %q does not name %q and the plugin", response.Result.Message, tc.want)
+			}
+		})
+	}
+}
