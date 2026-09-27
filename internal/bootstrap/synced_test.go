@@ -97,25 +97,69 @@ func TestTwoQuiescedMomentsRefuseTheCluster(t *testing.T) {
 	}
 }
 
-// TestLiveVolumesKeepTheNewestRecovery checks that a Cluster created while a
-// claim that its VolumeRestore filled is Bound recovers to the end of its
-// archive, as with no quiesced snapshots. Only the Cluster comes back, so a
-// quiesced moment older than the live volume would lose database writes.
-func TestLiveVolumesKeepTheNewestRecovery(t *testing.T) {
-	moment := sunday.Add(24 * time.Hour)
-	lister := snapshotsBySecret{"data-repo": {moverAt("aa", moment, restic.QuiescedTag)}}
-	live := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "app"},
+// restoredClaim returns the Bound claim data in app, created at the time
+// given, whose dataSourceRef names the VolumeRestore data.
+func restoredClaim(created time.Time) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "app", CreationTimestamp: metav1.NewTime(created)},
 		Spec: corev1.PersistentVolumeClaimSpec{DataSourceRef: &corev1.TypedObjectReference{
 			APIGroup: &backupv1alpha1.GroupVersion.Group, Kind: "VolumeRestore", Name: "data",
 		}},
 		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 	}
+}
+
+// TestLiveVolumesKeepTheNewestRecovery checks that a Cluster created beside a
+// claim that existed at the quiesced moment recovers to the end of its
+// archive, as with no quiesced snapshots. Only the Cluster comes back, so a
+// recovery to that moment would lose database writes the live volume holds.
+func TestLiveVolumesKeepTheNewestRecovery(t *testing.T) {
+	moment := sunday.Add(24 * time.Hour)
+	lister := snapshotsBySecret{"data-repo": {moverAt("aa", moment, restic.QuiescedTag)}}
 	original := cluster(t, nil)
 
-	patched := applied(t, original, decideSynced(t, original, lister, append(volumeRestore("data"), live)...))
+	patched := applied(t, original, decideSynced(t, original, lister, append(volumeRestore("data"), restoredClaim(moment.Add(-time.Hour)))...))
 
 	if _, found, _ := unstructured.NestedMap(patched, "spec", "bootstrap", "recovery", "recoveryTarget"); found {
+		t.Error("a Cluster beside a live volume got a recovery target")
+	}
+}
+
+// TestAVolumeRestoredBeforeTheClusterKeepsTheMoment checks that a claim
+// created after the quiesced moment, which its VolumeRestore filled and
+// the library bound before the Cluster was created, does not count as live:
+// the Cluster still recovers to the moment.
+func TestAVolumeRestoredBeforeTheClusterKeepsTheMoment(t *testing.T) {
+	moment := sunday.Add(24 * time.Hour)
+	lister := snapshotsBySecret{"data-repo": {moverAt("aa", moment, restic.QuiescedTag)}}
+	original := cluster(t, nil)
+
+	patched := applied(t, original, decideSynced(t, original, lister, append(volumeRestore("data"), restoredClaim(moment.Add(time.Hour)))...))
+
+	target, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "recoveryTarget", "targetTime")
+	if target != moment.Format(time.RFC3339) {
+		t.Errorf("targetTime = %q, want the quiesced moment %s", target, moment.Format(time.RFC3339))
+	}
+}
+
+// TestTwoMomentsBesideALiveVolumeRecoverTheNewest checks that two quiesced
+// moments do not refuse a Cluster that comes back beside a live volume: it
+// recovers to the end of its archive, as with no quiesced snapshots.
+func TestTwoMomentsBesideALiveVolumeRecoverTheNewest(t *testing.T) {
+	moment := sunday.Add(24 * time.Hour)
+	lister := snapshotsBySecret{
+		"data-repo":  {moverAt("aa", moment, restic.QuiescedTag)},
+		"media-repo": {moverAt("bb", moment.Add(time.Hour), restic.QuiescedTag)},
+	}
+	existing := append(append(volumeRestore("data"), volumeRestore("media")...), restoredClaim(moment.Add(-time.Hour)))
+	original := cluster(t, nil)
+
+	response := decideSynced(t, original, lister, existing...)
+
+	if !response.Allowed {
+		t.Fatalf("the Cluster was refused: %q", response.Result.Message)
+	}
+	if _, found, _ := unstructured.NestedMap(applied(t, original, response), "spec", "bootstrap", "recovery", "recoveryTarget"); found {
 		t.Error("a Cluster beside a live volume got a recovery target")
 	}
 }

@@ -30,9 +30,10 @@ const syncedSource = "the moment of the quiesced snapshots of the namespace's vo
 // restic.SyncedMoment returns for them: the moment and true, false when no
 // repository holds a quiesced snapshot at or before pin, or a
 // *restic.NotSyncedError. A namespace with no VolumeRestore has no moment,
-// and neither has a namespace whose volumes are live (see liveVolume): only
-// the Cluster comes back there, and a moment older than the live volumes
-// would lose database writes.
+// and neither has a namespace with a live volume (see liveVolume), which
+// gets no *restic.NotSyncedError either: only the Cluster comes back there,
+// and a recovery to the moment would lose database writes the live volume
+// holds.
 // It returns another error when a read fails, and when Snapshots is nil and
 // the namespace has a VolumeRestore.
 func (d *Decider) syncedTarget(ctx context.Context, namespace string, pin *time.Time) (time.Time, bool, error) {
@@ -42,10 +43,6 @@ func (d *Decider) syncedTarget(ctx context.Context, namespace string, pin *time.
 	}
 	if len(restores.Items) == 0 {
 		return time.Time{}, false, nil
-	}
-	live, err := d.liveVolume(ctx, namespace)
-	if err != nil || live {
-		return time.Time{}, false, err
 	}
 	if d.Snapshots == nil {
 		return time.Time{}, false, errors.New("the webhook has no lister to read the restic repositories of the VolumeRestores")
@@ -62,7 +59,30 @@ func (d *Decider) syncedTarget(ctx context.Context, namespace string, pin *time.
 	if err != nil {
 		return time.Time{}, false, err
 	}
-	return restic.SyncedMoment(repositories, pin)
+	moment, found, err := restic.SyncedMoment(repositories, pin)
+	var notSynced *restic.NotSyncedError
+	switch {
+	case errors.As(err, &notSynced):
+		// Two moments stop only a restore of the whole app. A claim that
+		// existed at the later one is live, and the Cluster then recovers
+		// as with no quiesced snapshots.
+		moment = latest(notSynced.First.Time, notSynced.Other.Time)
+	case !found:
+		return time.Time{}, false, nil
+	}
+	live, liveErr := d.liveVolume(ctx, namespace, moment)
+	if liveErr != nil || live {
+		return time.Time{}, false, liveErr
+	}
+	return moment, err == nil, err
+}
+
+// latest returns the later of two times.
+func latest(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // automaticTarget gives the target of a recovery that no RestoreRun waits
@@ -97,17 +117,20 @@ func (d *Decider) automaticTarget(ctx context.Context, c creation, pin *time.Tim
 	}
 }
 
-// liveVolume reports whether a namespace holds a live volume that a
-// VolumeRestore filled.
+// liveVolume reports whether a namespace holds a volume that lived on after
+// the synced moment.
 //
 // Parameters:
 //   - namespace is the namespace of the Cluster.
+//   - moment is the synced moment from restic.SyncedMoment.
 //
-// It returns true when a claim whose dataSourceRef names a VolumeRestore is
-// Bound. The populator library binds such a claim only after the restore Job
-// filled it, so a claim that is absent or still Pending comes back with the
-// Cluster. It returns an error when the claims can not be listed.
-func (d *Decider) liveVolume(ctx context.Context, namespace string) (bool, error) {
+// It returns true when a claim whose dataSourceRef names a VolumeRestore was
+// created at or before the moment. That claim existed when the quiesced
+// backup ran, so its data moved on since. A claim created after the moment
+// was filled, or is being filled, from its VolumeRestore, so it comes back
+// with the Cluster, Bound or not. It returns an error when the claims can
+// not be listed.
+func (d *Decider) liveVolume(ctx context.Context, namespace string, moment time.Time) (bool, error) {
 	claims := &corev1.PersistentVolumeClaimList{}
 	if err := d.Client.List(ctx, claims, client.InNamespace(namespace)); err != nil {
 		return false, fmt.Errorf("list the PersistentVolumeClaims: %w", err)
@@ -115,7 +138,7 @@ func (d *Decider) liveVolume(ctx context.Context, namespace string) (bool, error
 	for _, claim := range claims.Items {
 		ref := claim.Spec.DataSourceRef
 		restored := ref != nil && ref.APIGroup != nil && *ref.APIGroup == backupv1alpha1.GroupVersion.Group && ref.Kind == "VolumeRestore"
-		if restored && claim.Status.Phase == corev1.ClaimBound {
+		if restored && !claim.CreationTimestamp.After(moment) {
 			return true, nil
 		}
 	}
