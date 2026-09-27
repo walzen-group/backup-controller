@@ -181,6 +181,11 @@ const (
 	// fails its item, and that a new RestoreRun restores it once v1 is
 	// served again or a controller release registers the new version.
 	ReasonClusterVersionUnsupported = "ClusterVersionUnsupported"
+
+	// ReasonPaused reports a new run that waits because the controller runs
+	// with --pause. The run has started no work. It starts when the
+	// controller runs without the flag again.
+	ReasonPaused = "Paused"
 )
 
 // SetReady sets or replaces the Ready condition in a status's condition list.

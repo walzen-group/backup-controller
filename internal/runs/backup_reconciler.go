@@ -42,6 +42,10 @@ type BackupRunReconciler struct {
 	// Recorder writes an event on the run each time its Ready reason changes.
 	Recorder events.EventRecorder
 
+	// Paused is true when the controller runs with --pause. A new run then
+	// waits with reason Paused and starts no work (see holdNew).
+	Paused bool
+
 	// Now returns the current time. Tests replace it so they can move time
 	// forward without sleeping.
 	Now func() time.Time
@@ -96,6 +100,9 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	before := readyReason(run.Status.Conditions)
 	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Backup") }()
+	if r.Paused && backupRunNew(run) {
+		return ctrl.Result{}, r.holdForPause(ctx, run)
+	}
 	// A run that may touch VolSync objects can't go on while VolSync serves
 	// its kinds only at a version this controller has no Go types for, and
 	// ends. A database-only run needs no VolSync object and goes on.

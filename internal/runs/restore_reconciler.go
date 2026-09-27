@@ -58,6 +58,10 @@ type RestoreRunReconciler struct {
 	// backup.
 	RestoreImage string
 
+	// Paused is true when the controller runs with --pause. A new run then
+	// waits with reason Paused and starts no work (see holdNew).
+	Paused bool
+
 	// Now returns the current time. Tests replace it so they can move time
 	// forward without sleeping.
 	Now func() time.Time
@@ -121,6 +125,9 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	before := readyReason(run.Status.Conditions)
 	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Restore") }()
+	if r.Paused && restoreRunNew(run) {
+		return ctrl.Result{}, r.holdForPause(ctx, run)
+	}
 	if !run.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, run)
 	}
