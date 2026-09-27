@@ -30,16 +30,15 @@ at once.
 pod of yours against the prime claim, or a `ProviderFunctionConfig` of three
 callbacks.
 
-A pod would have to do the restore, which means restic in an image of ours, the
-repository credentials mounted into it, a second implementation of something
-VolSync already does, and a restore that runs outside the cluster's backup
-queue. We would have to maintain each of those for as long as the controller
-exists.
-
-The callbacks let the fill step be "create a ReplicationDestination and wait",
-so VolSync's own mover does every byte with the credentials and the queue it
-already uses. The controller holds no repository credentials, mounts no volume
-and contains no restic code.
+Up to v0.8.x the callbacks created a VolSync ReplicationDestination and
+waited, so VolSync's mover did every byte. From v0.9.0 they create the
+controller's own restore Job
+([Restore through the controller's own Job](#restore-through-the-controllers-own-job)).
+The callbacks still decide: a `PodConfig` pod is built and run by the library,
+while the callbacks let the controller create the same Job a RestoreRun
+creates, from one builder, with its suspend at create, its failure policy, its
+queue label and its stop, and read its result from the Job's conditions. The
+controller's own process still mounts no volume and runs no restic.
 
 ## Define a data source kind of our own
 
@@ -57,10 +56,10 @@ distinguishable by reading either claim.
 
 ## Copy the repository Secret for the length of a restore
 
-VolSync resolves `spec.restic.repository` in the ReplicationDestination's own
-namespace. The prime claim is created in the controller's namespace, so the
-destination is there too, and the app's repository Secret is in the app's
-namespace.
+The restore Job reads the repository Secret through `envFrom`, which names a
+Secret in the Job's own namespace. The prime claim is created in the
+controller's namespace, so the populator's Job is there too, and the app's
+repository Secret is in the app's namespace.
 
 The controller copies that Secret into its namespace, named for the claim's UID,
 and deletes it in `PopulateCleanupFn`. That gives the controller a ClusterRole
@@ -148,26 +147,26 @@ Cluster comes back only when Flux or tofu creates it again, a Kustomization the
 run suspended creates nothing, and resuming it reapplies the workload's
 replicas along with the Cluster.
 
-## Restore a repository into a plain claim through a Direct ReplicationDestination
+## Restore a repository into a plain claim the restore Job fills
 
-From v0.8.0 a RestoreRun with `repository:` and `into:` creates a plain claim
-of `intoSize` with no data source, and a ReplicationDestination with
-`copyMethod: Direct` whose mover writes the selected snapshot into that claim.
-From v0.9.0 every `into` restore goes through that path, from `claim:` and from
-`repository:` alike. Until then a run with `claim:` and `into:` wrote a
-VolumeRestore and a claim naming it in `dataSourceRef`, and the populator filled
-that claim.
+A RestoreRun with `repository:` and `into:` creates a plain claim of
+`intoSize` with no data source, and a restore Job whose pod writes the selected
+snapshot into that claim. Every `into` restore goes through that path, from
+`claim:` and from `repository:` alike. v0.8.0 wrote through a
+ReplicationDestination with `copyMethod: Direct` there, and until v0.8.x a run
+with `claim:` and `into:` wrote a VolumeRestore and a claim naming it in
+`dataSourceRef`, and the populator filled that claim.
 
 The populator path is what v0.7.x ran for both shapes: the run writes a
 VolumeRestore and a claim naming it in `dataSourceRef`. On a
 WaitForFirstConsumer class, the populator library fills a claim only once
-`volume.kubernetes.io/selected-node` is set on it, and only the scheduler sets that annotation, when it places a pod that uses the claim. A run
-with `claim:` copies the source claim's node onto the new claim, which is the
-v0.2.4 fix in the README. A run with `repository:` has no source claim to copy
-from, and no pod uses the new claim until the restore is done, so nothing ever
-writes the annotation. The claim stays Pending, the controller's log says
-nothing, and the run ends TimedOut. Every class on the walzen cluster binds
-WaitForFirstConsumer.
+`volume.kubernetes.io/selected-node` is set on it, and only the scheduler sets
+that annotation, when it places a pod that uses the claim. A run with `claim:`
+copies the source claim's node onto the new claim, which is the v0.2.4 fix in
+the README. A run with `repository:` has no source claim to copy from, and no
+pod uses the new claim until the restore is done, so nothing ever writes the
+annotation. The claim stays Pending, the controller's log says nothing, and the
+run ends TimedOut. Every class on the walzen cluster binds WaitForFirstConsumer.
 
 The controller could pick a node and write the annotation itself. To pick one
 that works, it would have to repeat the scheduler's checks of topology,
@@ -175,16 +174,14 @@ capacity and taints, and keep them in step with the scheduler. A node that
 fails a check the controller skipped gets a volume the provisioner cannot
 create or no pod can reach, and the claim does not say why.
 
-With a Direct destination, the mover pod is the claim's first consumer. The
-scheduler places the mover, and the claim is provisioned on the mover's node,
-the way VolSync places a destination claim it creates itself. An `into` restore
-from a `claim:` has a node to copy as well, and copies it, so the copy lands on
-the pool that holds the original and the scheduler places the mover pod with
-the volume. The claim is Bound while the mover still writes into it, so the
-run's Succeeded phase is what says the data is there, and from v0.9.0 that phase
-also requires the mover's log to name the snapshot the checks selected.
-[restores.md](restores.md#submitting-a-restore)
-shows the run.
+With the restore Job, the Job's pod is the claim's first consumer. The
+scheduler places the pod, and the claim is provisioned on the pod's node. An
+`into` restore from a `claim:` has a node to copy as well, and copies it, so
+the copy lands on the pool that holds the original and the scheduler places
+the pod with the volume. The claim is Bound while the Job still writes into it,
+so the run's Succeeded phase is what says the data is there, and that phase
+requires the Job's condition `Complete=True`.
+[restores.md](restores.md#submitting-a-restore) shows the run.
 
 ## Leave an opted-out Cluster out of a RestoreRun
 
@@ -488,20 +485,151 @@ Clusters and the CRDs, which each run checks before it changes anything.
 [upgrading.md](upgrading.md#step-1-upgrade-only-while-no-run-is-active) has the
 check to run before an upgrade.
 
-## Confirm a restore from the mover's log
+## Restore through the controller's own Job
 
-VolSync completes a restore trigger whatever its mover did: a mover that found
-no snapshot in reach exits 0, and VolSync reports the sync as done. From v0.9.0
-a RestoreRun reads `status.latestMoverStatus` of its ReplicationDestination and
-counts a volume item as restored only when the filtered log names the snapshot
-its checks selected.
+From v0.9.0 every volume restore, a RestoreRun's in place or `into` and the
+populator's fill, runs in a Job the controller builds itself: `restic restore
+<full snapshot ID>` as the container's command, and the Job's conditions as
+the only result ([architecture.md](architecture.md#how-the-restore-job-is-built)).
 
-The alternative is to trust the completed trigger, which is how a restore
-reported success over a volume holding what it held before. VolSync leaves no
-other evidence: it keeps no exit status of a mover that succeeded, and the log
-is all that remains of it. It also keeps only the last `MOVER_LOG_MAX_BYTES`
-bytes of that log, so a VolSync installed with a small value leaves every
-restore unconfirmed, every one fails, and the failure names that setting.
+VolSync's ReplicationDestination, which v0.8.x restored through, accepts only
+`restoreAsOf` and `previous` and no snapshot ID. The controller pinned the
+mover to the selected snapshot's second, and to know what the mover would pick
+it copied the selection logic of VolSync's entry.sh, with its whole-second
+epoch map and its grep for /data. It refused a snapshot that shared its second
+with another, since the mover could restore either. After the mover, VolSync
+reports Successful whatever the mover did: a mover that found no snapshot in
+reach exits 0, and VolSync clears the mover's log and still reports success
+when it cannot read the pod. The run had to read the filtered log, of which
+VolSync keeps 1024 bytes by default, to learn which snapshot was restored, and
+a VolSync installed with `MOVER_LOG_MAX_BYTES` 0 left every restore
+unconfirmed. The populator did not read the log at all and bound whatever the
+mover wrote. The mover's PID 1 is a shell, so a stopped mover's restic died by
+SIGKILL and left its lock.
+
+K8up was the other ready-made restic runner. Its restore reports success for a
+restore that failed, which puts the controller back where it read VolSync's
+log.
+
+The controller's own Job names the snapshot by its full ID, which restic
+resolves to exactly that snapshot file or fails, so two snapshots in one
+second are each restorable. `Complete=True` from the Job controller is
+positive evidence that restic exited 0 for that ID, and no log text decides
+anything. restic is the container's command, so a stop reaches it as SIGTERM,
+and it removes its lock and exits 130. What the Job keeps of VolSync's mover is
+the part a restore needs: the mover's security settings and its
+privileged-movers rule, the cache, and the queue label on the pod. A fix VolSync
+makes to its own restore mover no longer reaches the controller's restores.
+
+## Declare the restore image once, in the installer
+
+The controller's `--restore-image` has no default, and the controller refuses
+to start without it. The walzen infrastructure repository declares one
+`restic_image`, pinned by digest, in its volsync unit, passes it to VolSync's
+chart as `restic.image`, and appends it to the controller's args as
+`--restore-image`, so the restic that writes the backups is the one that
+restores them and a bump of that one input moves both.
+
+A default of VolSync's own mover image in the controller would pin a VolSync
+version inside the controller. A VolSync bump in infra would then run backups
+with one restic and restores with another until someone released the
+controller, and nothing would say so. Reading VolSync's
+`--restic-container-image` from its Deployment at run time would tie the
+controller to another project's Deployment args. The official `restic/restic`
+image is a second image and a different build from the one that writes the
+backups.
+
+The controller checks no repository format. A restic that cannot open the
+repository, such as one older than the repository's format, fails the Job, and
+the item shows restic's exit code and its message; then the image is bumped.
+
+## Create every restore Job suspended
+
+restorejob.Build creates every restore Job with `spec.suspend: true`. Its owner
+records the Job's name and UID, a RestoreRun in the item's status and the
+populator on the prime claim, and a later pass that reads that record back
+from the API server resumes the Job.
+
+A Job created running starts restic as soon as the Job controller sees it. A
+create that the API server answers with an error, such as a 504 on a request
+that outlived its deadline, can still be stored a moment later. By then the run
+may have failed the item, restarted the app or finished, and nothing records
+the Job, so nothing stops it: restic writes into a claim the app mounts again.
+The same holds for a Job whose recording status write was lost.
+
+A suspended Job gets no pod until its owner resumes it, and the owner resumes
+only a Job its stored record names, while that record still goes on with it. A
+Job no record names stays suspended with no pod, until the owner's stop finds
+it by name or the garbage collector deletes it with its owner. Kueue ignores
+the suspended Job, because the queue label is only on the pod template, and
+admits the pod once the Job is resumed. The owner writes one extra patch per
+restore.
+
+## Narrow the Jobs grant with an admission policy
+
+From v0.9.0 the controller's ServiceAccount holds create, patch and delete on
+`jobs` in every namespace, because RestoreRuns run in the app's namespace. The
+release adds the ValidatingAdmissionPolicy `backup-controller-restore-jobs`,
+which lets that ServiceAccount create and change only Jobs of the restore Job's
+shape and delete only Jobs labelled as its own
+([packaging.md](packaging.md#admission-policy-on-the-restore-jobs) lists the
+checks).
+
+RBAC alone cannot say which Jobs: a rule names resources and verbs, and reads
+nothing in the object. With RBAC alone, a bug in the controller or its token in
+other hands could create a privileged pod with a hostPath mount in any
+namespace, which is root on that node. The policy turns the grant into "may
+run a restricted pod that mounts claims": no host namespaces, no node name, no
+ServiceAccount token, only claims, emptyDir and ephemeral claims as volumes,
+and at most the capabilities CHOWN, DAC_OVERRIDE and FOWNER a privileged mover
+gets. Under v0.8.x the same ServiceAccount could reach as much through
+VolSync's ReplicationDestination.
+
+The policy leaves the image and the environment open, and we accept both. It
+does not check the
+image: `--restore-image` is the installer's choice, and pinning it in the
+policy would need a second declaration kept equal to the flag by hand. It does
+not bound the environment either: restic reads `RESTIC_PASSWORD_COMMAND` and
+an rclone program from its environment, which comes from a Secret, and the same
+ServiceAccount can create Secrets for the populator's copy. What the policy
+guarantees holds for any image and any environment. The policy also matches the
+ServiceAccount by its username, so an install that renames the namespace or
+the ServiceAccount without changing the policy runs with RBAC alone; the
+upgrade check in [upgrading.md](upgrading.md#step-5-change-the-infra-units)
+reads the policy back.
+
+## Write replicas through the scale subresource
+
+From v0.9.0 quiesce reads a workload's Scale and writes the replica count back
+through the `scale` subresource of Deployments and StatefulSets, and the
+ClusterRole grants get and list on the workloads and get and update on
+`deployments/scale` and `statefulsets/scale`, with no write verb on the
+workloads themselves.
+
+Up to v0.8.x quiesce sent a merge patch of `spec.replicas` to the workload, so
+the ClusterRole held `patch` on every Deployment and StatefulSet in the
+cluster. That verb lets the ServiceAccount change any workload's image,
+command or volumes. The scale subresource can change nothing but the replica
+count. The update carries no resourceVersion, which both kinds accept as
+unconditional, so a status write by the workload's controller between the
+read and the write does not fail the scale.
+
+## Find a backup's snapshot in the repository
+
+From v0.9.0 a BackupRun finds the snapshot its sync wrote by listing the
+repository: the newest snapshot a VolSync mover wrote in the window from the
+sync's start to its end, as `lastSyncTime` and `lastSyncDuration` record them
+([namespace-backups.md](namespace-backups.md#what-a-run-with-all-set-does)).
+
+Up to v0.8.x the run took the snapshot ID from `snapshot <id> saved` in the
+mover's log and treated `Directory is empty skipping backup` as an empty
+claim. VolSync clears the log and still reports success when it cannot read
+the pod, and keeps only its last 1024 bytes, so a log with neither line left
+the item Running until its timeout, or, without stopped workloads, Succeeded
+with no snapshot. The repository holds the snapshot whatever VolSync kept of
+the log. A window with no snapshot is an empty claim, and because an S3
+listing can lag a write, the run lists twice, a poll interval apart, before it
+records the claim as empty.
 
 ## Give the app back when the quiesce limit runs out
 
