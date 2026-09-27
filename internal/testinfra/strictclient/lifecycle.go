@@ -9,10 +9,13 @@ import (
 	"slices"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/validation"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -20,52 +23,140 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
-// Delete deletes obj after checking a UID precondition the way
+// Delete deletes obj after checking its preconditions the way
 // kube-apiserver 1.36.3 does.
 //
-// The fake client checks a ResourceVersion precondition itself (with a
-// Conflict) but ignores a UID one. On the real server the registry store
-// copies both into storage.Preconditions
-// (k8s.io/apiserver@v0.36.3/pkg/registry/generic/registry/store.go:1154-1158),
-// Preconditions.Check refuses a mismatched UID with an invalid-object storage
-// error, checking UID before ResourceVersion
-// (pkg/storage/interfaces.go:138-163), and InterpretDeleteError turns that
-// into a 409 Conflict (pkg/storage/errors/storage.go:103-104). Delete returns
-// the same Conflict, with the message the real server builds, when the
-// stored uid differs from the precondition. The storage key in the message
-// is namespace/name, where the real server shows its etcd key. Other errors
-// and the deletion itself are the fake client's.
+// The fake client checks a ResourceVersion precondition itself but ignores a
+// UID one. On the real server rest.BeforeDelete checks both against the
+// stored object before anything else, the UID first, and refuses a mismatch
+// with a 409 Conflict on the group and kind
+// (k8s.io/apiserver@v0.36.3/pkg/registry/rest/delete.go:83-91). Delete
+// returns the same Conflict, with the same message, also for a dry run.
+// Other errors and the deletion itself are the fake client's.
 //
 // Every delete that is not a dry run is recorded with the dependents of the
 // object (see Cascades), and with Options.GarbageCollect those dependents are
 // handled the way the garbage collector would; see deleteCascading. A delete
-// that a finalizer holds in place raises the object's generation by one, as
-// the server does; see bumpGenerationOnDelete. A further delete of an object
-// that is already being deleted and still has finalizers stores nothing, so
-// its deletionTimestamp stays; see deleteStored.
+// that a finalizer holds in place raises the object's generation by one and
+// sets deletionGracePeriodSeconds to 0, as the server does; see
+// markAsDeleting. A further delete of an object that is already being
+// deleted and still has finalizers stores nothing, so its deletionTimestamp
+// stays; see deleteStored.
 func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
 	o := &client.DeleteOptions{}
 	o.ApplyOptions(opts)
-	if p := o.Preconditions; p != nil && p.UID != nil {
-		old, err := c.stored(ctx, obj)
-		if err != nil {
-			return c.WithWatch.Delete(ctx, obj, opts...)
-		}
-		if *p.UID != old.GetUID() {
-			return c.uidConflict(obj, *p.UID, old.GetUID())
-		}
-	}
-	if len(o.DryRun) > 0 {
-		return c.WithWatch.Delete(ctx, obj, opts...)
-	}
 	owner, err := c.stored(ctx, obj)
 	if err != nil {
+		return c.WithWatch.Delete(ctx, obj, opts...)
+	}
+	if err := c.checkPreconditions(owner, o.Preconditions); err != nil {
+		return err
+	}
+	if len(o.DryRun) > 0 {
 		return c.WithWatch.Delete(ctx, obj, opts...)
 	}
 	if err := c.deleteCascading(ctx, owner, o, opts); err != nil {
 		return err
 	}
-	return c.bumpGenerationOnDelete(ctx, owner)
+	return c.markAsDeleting(ctx, owner)
+}
+
+// DeleteAllOf deletes every object of obj's kind that the options select, one
+// by one through Delete.
+//
+// Parameters:
+//   - obj gives the kind. Its name and content are not used.
+//   - opts select the objects (namespace, labels, fields) and carry the
+//     delete options for each object.
+//
+// It returns the error of the list or of the first delete that fails with an
+// error other than NotFound. The real server lists the objects and deletes
+// each one through the same Delete as a single delete, and ignores NotFound
+// (k8s.io/apiserver@v0.36.3/pkg/registry/generic/registry/store.go:1331-1389).
+// The fake client instead stamps a new deletionTimestamp on every object that
+// a finalizer holds in place. Through Delete, such an object keeps its first
+// deletionTimestamp and its resourceVersion, as on the server.
+func (c *Client) DeleteAllOf(ctx context.Context, obj client.Object, opts ...client.DeleteAllOfOption) error {
+	o := &client.DeleteAllOfOptions{}
+	o.ApplyOptions(opts)
+	list, err := c.listFor(obj)
+	if err != nil {
+		return err
+	}
+	if err := c.List(ctx, list, &o.ListOptions); err != nil {
+		return err
+	}
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		cur, ok := item.(client.Object)
+		if !ok {
+			return fmt.Errorf("list item %T is not a client.Object", item)
+		}
+		if err := c.Delete(ctx, cur, &o.DeleteOptions); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// listFor returns an empty list of obj's kind, typed when the scheme has a
+// typed list and unstructured otherwise. Its error is the scheme's when the
+// kind of obj is not known.
+func (c *Client) listFor(obj client.Object) (client.ObjectList, error) {
+	gvk, err := apiutil.GVKForObject(obj, c.Scheme())
+	if err != nil {
+		return nil, err
+	}
+	listGVK := gvk.GroupVersion().WithKind(gvk.Kind + "List")
+	if _, unstructuredObj := obj.(*unstructured.Unstructured); !unstructuredObj {
+		if l, err := c.Scheme().New(listGVK); err == nil {
+			if list, ok := l.(client.ObjectList); ok {
+				if u, isU := list.(*unstructured.UnstructuredList); isU {
+					u.SetGroupVersionKind(listGVK)
+				}
+				return list, nil
+			}
+		}
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(listGVK)
+	return list, nil
+}
+
+// checkPreconditions refuses a delete whose preconditions do not match the
+// stored object.
+//
+// Parameters:
+//   - owner is the stored object.
+//   - p are the delete's preconditions. Nil means none.
+//
+// It returns nil when every precondition matches, and otherwise the 409
+// Conflict that rest.BeforeDelete of kube-apiserver 1.36.3 returns, with its
+// message. The resource in that Conflict is the kind of the object and its
+// group (k8s.io/apiserver@v0.36.3/pkg/registry/rest/delete.go:83-91).
+func (c *Client) checkPreconditions(owner client.Object, p *metav1.Preconditions) error {
+	if p == nil {
+		return nil
+	}
+	var cause error
+	switch {
+	case p.UID != nil && *p.UID != owner.GetUID():
+		cause = fmt.Errorf("the UID in the precondition (%s) does not match the UID in record (%s). "+
+			"The object might have been deleted and then recreated", *p.UID, owner.GetUID())
+	case p.ResourceVersion != nil && *p.ResourceVersion != owner.GetResourceVersion():
+		cause = fmt.Errorf("the ResourceVersion in the precondition (%s) does not match the ResourceVersion in record (%s). "+
+			"The object might have been modified", *p.ResourceVersion, owner.GetResourceVersion())
+	default:
+		return nil
+	}
+	gvk, err := apiutil.GVKForObject(owner, c.Scheme())
+	if err != nil {
+		return err
+	}
+	return apierrors.NewConflict(schema.GroupResource{Group: gvk.Group, Resource: gvk.Kind}, owner.GetName(), cause)
 }
 
 // deleteStored deletes owner, the stored object, as kube-apiserver 1.36.3
@@ -73,7 +164,6 @@ func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.D
 //
 // Parameters:
 //   - owner is the stored object, as Delete read it before the delete.
-//   - o are the applied delete options, for the ResourceVersion precondition.
 //   - opts are the caller's delete options, passed to the fake client.
 //
 // It calls the fake client for every delete except one that stores nothing on
@@ -88,60 +178,69 @@ func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.D
 // (deleteObjectLocked, sigs.k8s.io/controller-runtime@v0.24.1/pkg/client/fake/client.go:1198-1200),
 // and its tracker refuses the update that would put the older timestamp back
 // (versioned_tracker.go:296-298), so the wrapper answers without calling it
-// and the first timestamp stays.
-//
-// A ResourceVersion precondition is checked here when the delete stores
-// nothing, with the Conflict the fake client builds for one, so a delete with
-// a stale precondition answers the same whether or not the object was already
-// being deleted. Its other errors are the fake client's.
-func (c *Client) deleteStored(ctx context.Context, owner client.Object, o *client.DeleteOptions, opts []client.DeleteOption) error {
+// and the first timestamp stays. Its errors are the fake client's.
+func (c *Client) deleteStored(ctx context.Context, owner client.Object, opts []client.DeleteOption) error {
 	if owner.GetDeletionTimestamp() == nil || len(owner.GetFinalizers()) == 0 {
 		return c.WithWatch.Delete(ctx, owner, opts...)
-	}
-	if p := o.Preconditions; p != nil && p.ResourceVersion != nil && *p.ResourceVersion != owner.GetResourceVersion() {
-		gvk, err := apiutil.GVKForObject(owner, c.Scheme())
-		if err != nil {
-			return err
-		}
-		gvr, _ := meta.UnsafeGuessKindToResource(gvk)
-		return apierrors.NewConflict(gvr.GroupResource(), owner.GetName(), fmt.Errorf(
-			"the ResourceVersion in the precondition (%s) does not match the ResourceVersion in record (%s). "+
-				"The object might have been modified", *p.ResourceVersion, owner.GetResourceVersion()))
 	}
 	return nil
 }
 
-// bumpGenerationOnDelete raises the generation of an object that the delete
-// left in place with a deletionTimestamp, the way kube-apiserver 1.36.3 does.
+// markAsDeleting gives an object that the delete left in place with a
+// deletionTimestamp the generation and the deletionGracePeriodSeconds that
+// kube-apiserver 1.36.3 gives it.
 //
 // Parameters:
 //   - owner is the stored object as it was before the delete, from Delete.
 //
 // It returns nil when the delete removed the object, when the object was
-// already being deleted, when its generation is 0, and when the follow-up
-// write succeeds. Its error is that write's.
+// already being deleted, when nothing changes, and when the follow-up write
+// succeeds. Its errors are those of the read and of that write.
 //
 // The server raises the generation once, on the delete that sets the
-// deletionTimestamp: markAsDeleting does it for an object whose kind does not
-// support graceful deletion, which is every custom resource, when the
-// generation is above 0
-// (k8s.io/apiserver@v0.36.3/pkg/registry/generic/registry/store.go:1024-1029),
+// deletionTimestamp, when the generation is above 0. markAsDeleting does it
+// for an object whose kind does not support graceful deletion, which is every
+// custom resource
+// (k8s.io/apiserver@v0.36.3/pkg/registry/generic/registry/store.go:1015-1037),
 // and rest.BeforeDelete does it for the other kinds
-// (k8s.io/apiserver@v0.36.3/pkg/registry/rest/delete.go:168-172). The fake
-// client leaves the generation alone, so the wrapper writes the stored object
-// back with one more, as it does for the generation of an update (see
+// (k8s.io/apiserver@v0.36.3/pkg/registry/rest/delete.go:168-172). The same
+// markAsDeleting sets deletionGracePeriodSeconds to 0. A Pod supports
+// graceful deletion and gets another grace period on the server, so the
+// wrapper leaves the grace period of a Pod as the fake client stores it. The
+// fake client changes neither field, so the wrapper writes the stored object
+// back with both, as it does for the generation of an update (see
 // settleGeneration).
-func (c *Client) bumpGenerationOnDelete(ctx context.Context, owner client.Object) error {
+func (c *Client) markAsDeleting(ctx context.Context, owner client.Object) error {
 	if owner.GetDeletionTimestamp() != nil {
 		return nil
 	}
-	// An owner that the fake cannot read has no generation to raise.
+	// The delete removed an owner that the fake cannot find.
 	stored, err := c.stored(ctx, owner)
-	if err == nil && stored.GetDeletionTimestamp() != nil && stored.GetGeneration() != 0 {
-		stored.SetGeneration(stored.GetGeneration() + 1)
-		return c.WithWatch.Update(ctx, stored)
+	if apierrors.IsNotFound(err) {
+		return nil
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	if stored.GetDeletionTimestamp() == nil {
+		return nil
+	}
+	changed := false
+	if g := stored.GetGeneration(); g != 0 {
+		stored.SetGeneration(g + 1)
+		changed = true
+	}
+	if _, pod := stored.(*corev1.Pod); !pod {
+		if p := stored.GetDeletionGracePeriodSeconds(); p == nil || *p != 0 {
+			zero := int64(0)
+			stored.SetDeletionGracePeriodSeconds(&zero)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return c.WithWatch.Update(ctx, stored)
 }
 
 // checkNoNewFinalizers refuses a write that would add a finalizer to an
@@ -432,9 +531,9 @@ func (c *Client) checkUID(obj, old client.Object) error {
 	return c.uidConflict(obj, obj.GetUID(), old.GetUID())
 }
 
-// uidConflict builds the Conflict a failed UID precondition returns. The
-// storage key in the message is namespace/name, where the real server shows
-// its etcd key.
+// uidConflict builds the Conflict that an update or status update with
+// another uid gets from the storage layer. The storage key in the message is
+// namespace/name, where the real server shows its etcd key.
 func (c *Client) uidConflict(obj client.Object, want, stored types.UID) error {
 	gvk, err := apiutil.GVKForObject(obj, c.Scheme())
 	if err != nil {

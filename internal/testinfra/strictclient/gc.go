@@ -128,7 +128,7 @@ func (c *Client) deleteCascading(ctx context.Context, owner client.Object, o *cl
 	c.mu.Unlock()
 
 	if !c.opts.GarbageCollect {
-		return c.deleteStored(ctx, owner, o, opts)
+		return c.deleteStored(ctx, owner, opts)
 	}
 	switch policy {
 	case metav1.DeletePropagationOrphan:
@@ -137,7 +137,7 @@ func (c *Client) deleteCascading(ctx context.Context, owner client.Object, o *cl
 				return err
 			}
 		}
-		return c.deleteStored(ctx, owner, o, opts)
+		return c.deleteStored(ctx, owner, opts)
 	case metav1.DeletePropagationForeground:
 		if !slices.Contains(owner.GetFinalizers(), metav1.FinalizerDeleteDependents) {
 			owner.SetFinalizers(append(owner.GetFinalizers(), metav1.FinalizerDeleteDependents))
@@ -145,7 +145,7 @@ func (c *Client) deleteCascading(ctx context.Context, owner client.Object, o *cl
 				return err
 			}
 		}
-		if err := c.deleteStored(ctx, owner, o, opts); err != nil {
+		if err := c.deleteStored(ctx, owner, opts); err != nil {
 			return err
 		}
 		for _, d := range deps {
@@ -155,7 +155,7 @@ func (c *Client) deleteCascading(ctx context.Context, owner client.Object, o *cl
 		}
 		return c.finishForeground(ctx, owner)
 	default:
-		if err := c.deleteStored(ctx, owner, o, opts); err != nil {
+		if err := c.deleteStored(ctx, owner, opts); err != nil {
 			return err
 		}
 		if _, err := c.stored(ctx, owner); err == nil {

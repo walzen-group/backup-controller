@@ -291,7 +291,7 @@ func TestDeleteChecksUIDAndResourceVersionPreconditions(t *testing.T) {
 	if !apierrors.IsConflict(err) {
 		t.Fatalf("delete with a wrong uid: err = %v, want Conflict", err)
 	}
-	if !strings.Contains(err.Error(), "Precondition failed: UID in precondition: someone-else, UID in object meta: "+string(obj.UID)) {
+	if !strings.Contains(err.Error(), "the UID in the precondition (someone-else) does not match the UID in record ("+string(obj.UID)+")") {
 		t.Errorf("message = %q, want the apiserver's precondition message", err.Error())
 	}
 

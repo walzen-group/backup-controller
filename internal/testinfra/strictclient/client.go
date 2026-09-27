@@ -22,11 +22,14 @@
 //     (k8s.io/apiextensions-apiserver@v0.36.0/pkg/registry/customresource/strategy.go:145-186).
 //     With a status subresource the fake keeps the stored status on a plain
 //     update, so only spec changes count, as on the real server.
-//   - Delete honours a UID precondition with a Conflict (the fake already
-//     honours a ResourceVersion one), raises the generation of an object a
-//     finalizer holds in place, and stores nothing when the object already
-//     has a deletionTimestamp and finalizers, as the server does. See
-//     Client.Delete.
+//   - Delete refuses a UID or ResourceVersion precondition that does not
+//     match with the Conflict and the message of the server. A delete that a
+//     finalizer holds in place raises the generation and sets
+//     deletionGracePeriodSeconds to 0. A delete stores nothing when the object
+//     already has a deletionTimestamp and finalizers. See Client.Delete.
+//   - DeleteAllOf deletes each selected object through Delete, so an object
+//     that a finalizer holds keeps its first deletionTimestamp. See
+//     Client.DeleteAllOf.
 //   - An update or patch cannot add a finalizer to an object that has a
 //     deletionTimestamp; removing the last one deletes the object and the
 //     write still succeeds. See checkNoNewFinalizers.
@@ -80,6 +83,10 @@
 // server-side apply patches, the resourceVersion a patch body may carry, CRD
 // metadata coercion, per-kind default propagation policies other than Job's,
 // and a collector that runs again later (see Client.deleteCascading). The
+// Conflict of an update or status update with another uid shows the storage
+// key as namespace/name, where the real server shows its etcd key. A Pod that
+// a finalizer holds keeps the deletionGracePeriodSeconds of the fake client,
+// because the wrapper does not model graceful deletion. The
 // fake's storage keeps the null status its write path adds to an unstructured
 // object; reads do not show it (see Client.Get). Those are separate
 // behaviours; each one is added as a method or an Options field of Client,

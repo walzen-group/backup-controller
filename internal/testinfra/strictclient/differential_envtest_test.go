@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -206,6 +208,8 @@ func envtestOps(t *testing.T, c client.Client) map[string]string {
 	restoreRunDefaultOps(t, c, o)
 	replicationSourceOps(t, c, o)
 	clusterBeingDeletedOps(t, c, o)
+	heldDeleteOps(t, c, o, &backupv1alpha1.BackupRun{Spec: backupv1alpha1.BackupRunSpec{Source: "data"}}, &backupv1alpha1.BackupRunList{})
+	heldDeleteOps(t, c, o, &corev1.ConfigMap{}, &corev1.ConfigMapList{})
 	scaleOps(t, c, o, &appsv1.Deployment{})
 	scaleOps(t, c, o, &appsv1.StatefulSet{})
 	return o
@@ -318,6 +322,87 @@ func envtestReason(err error) string {
 		return "ok"
 	}
 	return string(apierrors.ReasonForError(err))
+}
+
+// heldDeleteOps deletes an object that a finalizer holds in place with c and
+// adds what it observed to o.
+//
+// Parameters:
+//   - obj is an empty object of the kind to test. The function sets its
+//     name, namespace, label and finalizer.
+//   - list is an empty list of the same kind, for the final cleanup.
+//
+// It records the message of a delete with a stale UID precondition, the
+// deletionGracePeriodSeconds and the generation after the delete, and
+// whether a later DeleteAllOf keeps the first deletionTimestamp and the
+// generation. The DeleteAllOf comes more than one second after the delete,
+// because a deletionTimestamp has a resolution of one second.
+func heldDeleteOps(t *testing.T, c client.Client, o map[string]string, obj client.Object, list client.ObjectList) {
+	t.Helper()
+	ctx := context.Background()
+	kind := fmt.Sprintf("%T", obj)
+	obj.SetNamespace("default")
+	obj.SetName("held")
+	obj.SetLabels(map[string]string{"diff.example.com/held": "yes"})
+	obj.SetFinalizers([]string{"diff.example.com/hold"})
+	if err := c.Create(ctx, obj); err != nil {
+		t.Fatal(err)
+	}
+	read := func() client.Object {
+		cur := obj.DeepCopyObject().(client.Object)
+		if err := c.Get(ctx, client.ObjectKeyFromObject(obj), cur); err != nil {
+			t.Fatal(err)
+		}
+		return cur
+	}
+	other := types.UID("00000000-0000-0000-0000-000000000000")
+	cur := read()
+	// The uid and the resourceVersion differ between the two clients, so
+	// the recorded message shows placeholders for them.
+	staleRV := "1" + cur.GetResourceVersion()
+	placeholders := strings.NewReplacer("("+staleRV+")", "(<stale rv>)", string(cur.GetUID()), "<uid>", "("+cur.GetResourceVersion()+")", "(<rv>)")
+	err := c.Delete(ctx, cur, client.Preconditions{UID: &other})
+	o[kind+" delete with a stale UID precondition: message"] = placeholders.Replace(fmt.Sprint(err))
+	err = c.Delete(ctx, cur, client.Preconditions{ResourceVersion: &staleRV})
+	o[kind+" delete with a stale resourceVersion precondition: message"] = placeholders.Replace(fmt.Sprint(err))
+
+	if err := c.Delete(ctx, read()); err != nil {
+		t.Fatal(err)
+	}
+	first := read()
+	o[kind+" held delete: deletionGracePeriodSeconds"] = fmt.Sprint(ptrValue(first.GetDeletionGracePeriodSeconds()))
+	o[kind+" held delete: generation"] = fmt.Sprint(first.GetGeneration())
+
+	time.Sleep(1100 * time.Millisecond)
+	if err := c.DeleteAllOf(ctx, obj.DeepCopyObject().(client.Object), client.InNamespace("default"),
+		client.MatchingLabels{"diff.example.com/held": "yes"}); err != nil {
+		t.Fatal(err)
+	}
+	again := read()
+	o[kind+" DeleteAllOf: deletionTimestamp kept"] = fmt.Sprint(again.GetDeletionTimestamp().Equal(first.GetDeletionTimestamp()))
+	o[kind+" DeleteAllOf: generation"] = fmt.Sprint(again.GetGeneration())
+	o[kind+" DeleteAllOf: resourceVersion kept"] = fmt.Sprint(again.GetResourceVersion() == first.GetResourceVersion())
+
+	again.SetFinalizers(nil)
+	if err := c.Update(ctx, again); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.List(ctx, list, client.InNamespace("default"), client.MatchingLabels{"diff.example.com/held": "yes"}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o[kind+" after the last finalizer: objects left"] = fmt.Sprint(len(items))
+}
+
+// ptrValue returns the value p points to, or "<nil>".
+func ptrValue[T any](p *T) any {
+	if p == nil {
+		return "<nil>"
+	}
+	return *p
 }
 
 // clusterBeingDeletedOps writes an unstructured CloudNativePG Cluster with c,
