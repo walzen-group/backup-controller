@@ -6,9 +6,12 @@
 #
 # fetch pulls the chart into cache/ and checks its sha256, and pulls the manager
 # image (which is also the restic mover image) into the local Docker engine by
-# digest. install works from those alone. check waits for the manager to be
-# Ready and for the ReplicationSource and ReplicationDestination CRDs to be
-# served. uninstall removes the release, the namespace and the chart's CRDs.
+# digest. install works from those alone, and sets MOVER_LOG_MAX_BYTES=0 on the
+# manager so VolSync stores no mover log in any status: the controller reads
+# nothing from mover logs, and a test that still depends on one fails loudly.
+# check waits for the manager to be Ready with that setting and for the
+# ReplicationSource and ReplicationDestination CRDs to be served. uninstall
+# removes the release, the namespace and the chart's CRDs.
 # Needs helm, kubectl and jq (nix develop -c).
 set -euo pipefail
 
@@ -23,6 +26,9 @@ chart_file="$cache/$(jq -r .volsync.chart.file "$pins")"
 chart_sha="$(jq -r .volsync.chart.sha256 "$pins")"
 image="$(jq -r '.volsync.image | "\(.repository):\(.tag)@\(.digest)"' "$pins")"
 image_by_digest="$(jq -r '.volsync.image | "\(.repository)@\(.digest)"' "$pins")"
+# VolSync caps the mover log it copies into a status at this many bytes; 0
+# stores none (VolSync internal/controller/utils/podlogs.go).
+mover_log_max_bytes=0
 
 verify_chart() {
   echo "$chart_sha  $chart_file" | sha256sum -c --quiet
@@ -56,6 +62,11 @@ install() {
     --set rsync.image="$image" \
     --set rsync-tls.image="$image" \
     --set syncthing.image="$image"
+  # The chart has no value for the manager's environment, so install adds the
+  # setting to the Deployment after the release; set env is idempotent.
+  kubectl --context "$ctx" -n "$ns" set env deploy/volsync -c manager \
+    "MOVER_LOG_MAX_BYTES=$mover_log_max_bytes"
+  kubectl --context "$ctx" -n "$ns" rollout status deploy/volsync --timeout=180s
 }
 
 check() {
@@ -69,13 +80,19 @@ check() {
     echo "manager image is $got, want $image" >&2
     exit 1
   fi
+  got="$(kubectl --context "$ctx" -n "$ns" get deploy volsync \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].env[?(@.name=="MOVER_LOG_MAX_BYTES")].value}')"
+  if [[ "$got" != "$mover_log_max_bytes" ]]; then
+    echo "manager MOVER_LOG_MAX_BYTES is '$got', want $mover_log_max_bytes" >&2
+    exit 1
+  fi
   for crd in replicationsources.volsync.backube replicationdestinations.volsync.backube; do
     kubectl --context "$ctx" wait crd "$crd" --for=condition=Established --timeout=60s
   done
   # Served: a list through the API returns without error.
   kubectl --context "$ctx" get replicationsources.volsync.backube -A >/dev/null
   kubectl --context "$ctx" get replicationdestinations.volsync.backube -A >/dev/null
-  echo "volsync: manager Ready ($got), ReplicationSource and ReplicationDestination served"
+  echo "volsync: manager Ready ($image, MOVER_LOG_MAX_BYTES=$mover_log_max_bytes), ReplicationSource and ReplicationDestination served"
 }
 
 uninstall() {
