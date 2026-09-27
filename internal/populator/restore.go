@@ -250,10 +250,17 @@ func (c *Callbacks) startJob(ctx context.Context, r restore) error {
 // the earlier snapshot would stay behind. On the first Job's new, empty
 // volume the flag removes nothing, and the prime claim is the populator's
 // own, so nothing in it needs keeping.
+//
+// The Job runs privileged when the namespace of the VolumeRestore has the
+// privileged-movers annotation. VolSync 0.16.0 reads the annotation from the
+// namespace of its own object, the namespace of the app
+// (internal/controller/replicationdestination_controller.go:108 and
+// replicationsource_controller.go:114). The annotation of the controller
+// namespace, where the Job runs, has no effect.
 func (c *Callbacks) createJob(ctx context.Context, r restore, snapshot restic.Snapshot) (*batchv1.Job, error) {
-	ns, err := c.operations.GetNamespace(ctx, c.namespace)
+	ns, err := c.operations.GetNamespace(ctx, r.vr.Namespace)
 	if err != nil {
-		return nil, fmt.Errorf("read namespace %s: %w", c.namespace, err)
+		return nil, fmt.Errorf("read namespace %s: %w", r.vr.Namespace, err)
 	}
 	job, err := restorejob.Build(restorejob.Spec{
 		Name:      JobName(r.claim.UID),

@@ -891,3 +891,33 @@ func TestCleanupOfAGoneVolumeRestoreSucceeds(t *testing.T) {
 		t.Errorf("deleted Secrets %v, Job %v; want the copy deleted and the Job gone", ops.deletedSec, ops.job(t, "claim-123"))
 	}
 }
+
+// VolSync 0.16.0 reads the privileged-movers annotation from the namespace
+// of its own object, the namespace of the app
+// (internal/controller/replicationdestination_controller.go:108). The
+// populator reads it from the namespace of the VolumeRestore. Thus a
+// restore into an annotated app namespace runs as root, although the Job
+// runs in the controller namespace, which has no annotation.
+func TestPopulateReadsPrivilegedMoversFromTheVolumeRestoreNamespace(t *testing.T) {
+	ops := populatedOperations(t)
+	ctx := context.Background()
+	ns := &corev1.Namespace{}
+	if err := ops.cluster.Get(ctx, client.ObjectKey{Name: appNS}, ns); err != nil {
+		t.Fatal(err)
+	}
+	ns.Annotations = map[string]string{restorejob.AnnotationPrivilegedMovers: "true"}
+	if err := ops.cluster.Update(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	if err := newCallbacks(ops, monday).Populate(ctx, params()); err != nil {
+		t.Fatalf("Populate() error = %v", err)
+	}
+	job := ops.job(t, "claim-123")
+	if job == nil {
+		t.Fatal("no Job restore-claim-123")
+	}
+	sc := job.Spec.Template.Spec.Containers[0].SecurityContext
+	if sc == nil || ptr.Deref(sc.RunAsUser, -1) != 0 {
+		t.Errorf("security context = %+v, want the privileged mover (runAsUser 0)", sc)
+	}
+}

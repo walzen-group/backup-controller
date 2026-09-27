@@ -111,6 +111,11 @@ func startPolicyEnvtest(ctx context.Context, t *testing.T) client.Client {
 	for _, name := range []string{"namespace.yaml", "serviceaccount.yaml", "rbac.yaml", "admissionpolicy.yaml"} {
 		applyDeployManifest(ctx, t, admin, name)
 	}
+	// The namespace of the VolumeRestore, where the populator reads the
+	// privileged-movers annotation.
+	if err := admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: appNS}}); err != nil {
+		t.Fatal(err)
+	}
 	impersonated := rest.CopyConfig(cfg)
 	impersonated.Impersonate = rest.ImpersonationConfig{
 		UserName: "system:serviceaccount:backup-system:backup-controller",
