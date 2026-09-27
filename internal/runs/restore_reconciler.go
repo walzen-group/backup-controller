@@ -187,13 +187,14 @@ func (r *RestoreRunReconciler) restore(ctx context.Context, run *backupv1alpha1.
 // with spec.into set is planned by planIntoNewClaim, and any other run by
 // plan.
 func (r *RestoreRunReconciler) start(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	message, err := r.schemas.crdOutdated(ctx, r.Reader, restoreRunsCRD, "RestoreRun", backupv1alpha1.RestoreRun{},
+	err := r.schemas.crdOutdated(ctx, r.Reader, restoreRunsCRD, backupv1alpha1.KindRestoreRun, backupv1alpha1.RestoreRun{},
 		"the run would lose the Cluster UIDs and snapshot times it records to check its own work")
+	var outdated *crdOutdatedError
+	if errors.As(err, &outdated) {
+		return r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, outdated.Error())
+	}
 	if err != nil {
 		return ctrl.Result{}, r.planFailed(ctx, run, err)
-	}
-	if message != "" {
-		return r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, message)
 	}
 	plan := r.plan
 	if run.Spec.Into != "" {

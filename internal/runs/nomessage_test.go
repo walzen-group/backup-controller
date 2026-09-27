@@ -55,7 +55,7 @@ type messageRuleEntry struct {
 var textMatcherAllowlist = []messageRuleEntry{
 	{pkg: "runs", decl: "RestoreRunReconciler.inPlaceClaimLost",
 		what: "strings.HasPrefix and TrimPrefix on a Lease name, to find the claim Leases by the prefix the controller gives them"},
-	{pkg: "runs", decl: "walkFields",
+	{pkg: "runs", decl: "fieldName",
 		what: "strings.Cut on a Go struct field's json tag, to get the field name the CRD schema must declare"},
 	{pkg: "runs", decl: "leaseItems",
 		what: "strings.Split on the Lease's items annotation, the comma-separated item names acquireLeases wrote"},

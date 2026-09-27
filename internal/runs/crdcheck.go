@@ -46,9 +46,66 @@ type schemaCacheEntry struct {
 	gaps            []string
 }
 
-// crdOutdated reports the fields the installed CRD crdName lacks and that
-// the controller writes on the kind of sample, as a message for a run's Ready
-// condition.
+// crdProblem says why a run can't trust the installed CRD of its kind.
+type crdProblem int
+
+const (
+	// crdForbidden is a CRD the controller may not read.
+	crdForbidden crdProblem = iota
+	// crdMissing is a CRD that is not installed.
+	crdMissing
+	// crdUncheckable is a CRD whose schema the check can't walk.
+	crdUncheckable
+	// crdGaps is a CRD whose schema does not declare a field the
+	// controller writes.
+	crdGaps
+)
+
+// crdOutdatedError says that the installed CRD of a run's kind can't store
+// every field the controller writes, or that the check can't tell. The run
+// ends with reason CRDOutdated and the error's text. It fails closed: a run
+// that can't be checked does not go on.
+type crdOutdatedError struct {
+	// problem says what is wrong with the CRD.
+	problem crdProblem
+	// crd is the CRD's metadata.name, such as backupruns.backup.wlz.li.
+	crd string
+	// kind is the kind's name as the message shows it, such as BackupRun.
+	kind string
+	// missing are the JSON paths of the fields the schema does not
+	// declare, sorted, for crdGaps.
+	missing []string
+	// harm says what a dropped field would do to the run, for crdGaps.
+	harm string
+	// err is the error of the read, for crdForbidden, or of the walk, for
+	// crdUncheckable.
+	err error
+}
+
+// Error returns the sentence for a person that says what is wrong with the
+// CRD and how to repair it. No decision reads it.
+func (e *crdOutdatedError) Error() string {
+	switch e.problem {
+	case crdForbidden:
+		return fmt.Sprintf("the controller may not read the CustomResourceDefinition %s, so it cannot check that the "+
+			"installed %s CRD stores every field it writes: grant get on customresourcedefinitions.apiextensions.k8s.io "+
+			"named %s (the ClusterRole of this release does): %v", e.crd, e.kind, e.crd, e.err)
+	case crdMissing:
+		return fmt.Sprintf("the CustomResourceDefinition %s is not installed: apply the CRDs of this release", e.crd)
+	case crdUncheckable:
+		return fmt.Sprintf("the installed %s CRD cannot be checked: %v; apply the CRDs of this release", e.kind, e.err)
+	case crdGaps:
+	}
+	return fmt.Sprintf("the installed %s CRD does not declare %s, which this controller writes; the API server would drop it "+
+		"and %s. Apply the CRDs of this release (kubectl apply --server-side -f the release's CRD manifest, or config/crd). "+
+		"Helm does not upgrade CRDs on its own", e.kind, strings.Join(e.missing, ", "), e.harm)
+}
+
+// Unwrap returns the error of the read or of the walk, or nil.
+func (e *crdOutdatedError) Unwrap() error { return e.err }
+
+// crdOutdated checks that the installed CRD crdName declares every field
+// the controller writes on the kind of sample.
 //
 // Parameters:
 //   - reader reads the CRD straight from the API server.
@@ -58,39 +115,35 @@ type schemaCacheEntry struct {
 //     backupv1alpha1.BackupRun{}.
 //   - harm says what a dropped field would do to the run, for the message.
 //
-// It returns an empty message when the schema declares every field. It
-// returns a message and no error when the schema lacks a field, and when the
-// controller may not read the CRD or the CRD does not exist, because a run
-// that cannot be checked must not go on (it fails closed). Any other failed
-// read comes back as an error, for a retry.
-func (c *schemaCache) crdOutdated(ctx context.Context, reader client.Reader, crdName, kind string, sample any, harm string) (string, error) {
+// It returns nil when the schema declares every field. It returns a
+// *crdOutdatedError when the schema lacks a field, and when the controller
+// may not read the CRD or the CRD does not exist, because a run that cannot
+// be checked must not go on (it fails closed). Any other failed read comes
+// back as a plain error, for a retry.
+func (c *schemaCache) crdOutdated(ctx context.Context, reader client.Reader, crdName, kind string, sample any, harm string) error {
 	crd := &unstructured.Unstructured{}
 	crd.SetGroupVersionKind(crdGVK)
 	if err := reader.Get(ctx, types.NamespacedName{Name: crdName}, crd); err != nil {
 		switch {
 		case apierrors.IsForbidden(err):
-			return fmt.Sprintf("the controller may not read the CustomResourceDefinition %s, so it cannot check that the "+
-				"installed %s CRD stores every field it writes: grant get on customresourcedefinitions.apiextensions.k8s.io "+
-				"named %s (the ClusterRole of this release does): %v", crdName, kind, crdName, err), nil
+			return &crdOutdatedError{problem: crdForbidden, crd: crdName, kind: kind, err: err}
 		case apierrors.IsNotFound(err):
-			return fmt.Sprintf("the CustomResourceDefinition %s is not installed: apply the CRDs of this release", crdName), nil
+			return &crdOutdatedError{problem: crdMissing, crd: crdName, kind: kind}
 		}
-		return "", fmt.Errorf("read the CustomResourceDefinition %s: %w", crdName, err)
+		return fmt.Errorf("read the CustomResourceDefinition %s: %w", crdName, err)
 	}
 	gaps, ok := c.lookup(crdName, crd.GetResourceVersion())
 	if !ok {
 		var err error
 		if gaps, err = schemaGaps(crd, sample); err != nil {
-			return fmt.Sprintf("the installed %s CRD cannot be checked: %v; apply the CRDs of this release", kind, err), nil
+			return &crdOutdatedError{problem: crdUncheckable, crd: crdName, kind: kind, err: err}
 		}
 		c.store(crdName, crd.GetResourceVersion(), gaps)
 	}
 	if len(gaps) == 0 {
-		return "", nil
+		return nil
 	}
-	return fmt.Sprintf("the installed %s CRD does not declare %s, which this controller writes; the API server would drop it "+
-		"and %s. Apply the CRDs of this release (kubectl apply --server-side -f the release's CRD manifest, or config/crd). "+
-		"Helm does not upgrade CRDs on its own", kind, strings.Join(gaps, ", "), harm), nil
+	return &crdOutdatedError{problem: crdGaps, crd: crdName, kind: kind, missing: gaps, harm: harm}
 }
 
 // lookup returns the cached gaps of crdName when the cache holds a walk of
@@ -215,26 +268,12 @@ func walkSchema(t reflect.Type, node map[string]any, path string, onPath map[ref
 func walkFields(t reflect.Type, properties map[string]any, path string, onPath map[reflect.Type]bool, gaps *[]string) {
 	for i := range t.NumField() {
 		f := t.Field(i)
-		if !f.IsExported() {
+		name, embedded := fieldName(f)
+		switch {
+		case embedded != nil:
+			walkFields(embedded, properties, path, onPath, gaps)
 			continue
-		}
-		tag := f.Tag.Get("json")
-		name, _, _ := strings.Cut(tag, ",")
-		if name == "-" {
-			continue
-		}
-		if name == "" {
-			ft := f.Type
-			for ft.Kind() == reflect.Pointer {
-				ft = ft.Elem()
-			}
-			if f.Anonymous && ft.Kind() == reflect.Struct {
-				walkFields(ft, properties, path, onPath, gaps)
-				continue
-			}
-			name = f.Name
-		}
-		if path == "" && name == "metadata" {
+		case name == "" || (path == "" && name == "metadata"):
 			continue
 		}
 		fieldPath := name
@@ -248,4 +287,35 @@ func walkFields(t reflect.Type, properties map[string]any, path string, onPath m
 		}
 		walkSchema(f.Type, child, fieldPath, onPath, gaps)
 	}
+}
+
+// fieldName returns the name under which a struct field appears in JSON.
+//
+// Parameters:
+//   - f is a field of a struct type.
+//
+// It returns an empty name for a field that JSON leaves out: an unexported
+// field, or one tagged json:"-". It returns the struct type in embedded,
+// and an empty name, for an embedded struct with an empty json name, whose
+// fields JSON adds to the outer object. Otherwise it returns the name from
+// the json tag, or the field's Go name when the tag gives none.
+func fieldName(f reflect.StructField) (name string, embedded reflect.Type) {
+	if !f.IsExported() {
+		return "", nil
+	}
+	name, _, _ = strings.Cut(f.Tag.Get("json"), ",")
+	switch name {
+	case "-":
+		return "", nil
+	case "":
+		ft := f.Type
+		for ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if f.Anonymous && ft.Kind() == reflect.Struct {
+			return "", ft
+		}
+		return f.Name, nil
+	}
+	return name, nil
 }

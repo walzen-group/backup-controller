@@ -136,9 +136,38 @@ func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 	now := s.Now()
 	s.exportSchedule(namespace, schedule, runs.Items, now)
 
-	baseline := namespace.CreationTimestamp.Time
-	unfinished := false
-	for _, run := range runs.Items {
+	baseline, unfinished := lastTick(namespace.CreationTimestamp.Time, runs.Items)
+	if due, isDue := dueTick(schedule, baseline, now); isDue {
+		// Only one namespace backup runs at a time. A second one would find
+		// every source busy, and it would hold its workloads down while it
+		// waited. The tick runs as soon as the current run finishes, because
+		// the change to that BackupRun requeues the namespace.
+		if unfinished {
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		}
+		if err := s.startTick(ctx, namespace, due); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	wait := min(max(schedule.Next(now).Sub(now), time.Second), refresh)
+	return ctrl.Result{RequeueAfter: wait}, nil
+}
+
+// lastTick finds the last tick a BackupRun of the schedule ran for, and
+// whether a namespace backup is unfinished.
+//
+// Parameters:
+//   - created is the namespace's creation time. A schedule counts its
+//     ticks from it when no BackupRun records a later tick.
+//   - runs are the BackupRuns in the namespace.
+//
+// It returns the latest of created and each tick a run records in its
+// backup.wlz.li/scheduled-for label, and true when a BackupRun with
+// spec.all set has not finished.
+func lastTick(created time.Time, runs []backupv1alpha1.BackupRun) (baseline time.Time, unfinished bool) {
+	baseline = created
+	for _, run := range runs {
 		if tick, err := strconv.ParseInt(run.Labels[backupv1alpha1.LabelScheduledFor], 10, 64); err == nil {
 			if t := time.Unix(tick, 0); t.After(baseline) {
 				baseline = t
@@ -148,41 +177,61 @@ func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 			unfinished = true
 		}
 	}
+	return baseline, unfinished
+}
 
+// dueTick finds the latest tick of the schedule that is due.
+//
+// Parameters:
+//   - schedule is the namespace's parsed schedule.
+//   - baseline is the last tick a run ran for (see lastTick).
+//   - now is the current time.
+//
+// It returns the latest tick after baseline that is not after now, and
+// true, or the zero time and false when no tick after baseline is due.
+// Ticks missed in between are skipped: only the latest one runs.
+func dueTick(schedule cron.Schedule, baseline, now time.Time) (time.Time, bool) {
 	due := schedule.Next(baseline)
-	if !due.After(now) {
-		for next := schedule.Next(due); !next.After(now); next = schedule.Next(next) {
-			due = next
-		}
-		// Only one namespace backup runs at a time. A second one would find
-		// every source busy, and it would hold its workloads down while it
-		// waited. The tick runs as soon as the current run finishes, because
-		// the change to that BackupRun requeues the namespace.
-		if unfinished {
-			return ctrl.Result{RequeueAfter: time.Minute}, nil
-		}
-		// Flux creates a Namespace before the claims in it, so a tick can
-		// already be due when the schedule arrives. The tick waits here until
-		// something is marked enabled. A marked claim requeues the namespace
-		// at once, and a marked Cluster is seen at the next refresh.
-		marked, err := s.anythingEnabled(ctx, req.Name)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if marked {
-			if err := s.create(ctx, req.Name, due); err != nil {
-				return ctrl.Result{}, err
-			}
-			logger.Info("created a scheduled backup", "tick", due.UTC().Format(time.RFC3339))
-		} else if s.Recorder != nil {
-			s.Recorder.Eventf(namespace, nil, corev1.EventTypeWarning, "NothingEnabled", "Schedule",
-				"the tick at %s is due, but nothing in this namespace is marked %s: \"true\"",
-				due.UTC().Format(time.RFC3339), backupv1alpha1.AnnotationEnabled)
-		}
+	if due.After(now) {
+		return time.Time{}, false
 	}
+	for next := schedule.Next(due); !next.After(now); next = schedule.Next(next) {
+		due = next
+	}
+	return due, true
+}
 
-	wait := min(max(schedule.Next(now).Sub(now), time.Second), refresh)
-	return ctrl.Result{RequeueAfter: wait}, nil
+// startTick creates the BackupRun of a due tick, when something in the
+// namespace is marked enabled.
+//
+// Parameters:
+//   - namespace is the namespace of the schedule.
+//   - due is the tick that is due (see dueTick).
+//
+// It returns the error of the check or of the create. When nothing is
+// marked enabled, it creates nothing and records a Warning event with
+// reason NothingEnabled. Flux creates a Namespace before the claims in it,
+// so a tick can already be due when the schedule arrives. The tick waits
+// until something is marked enabled. A marked claim requeues the namespace
+// at once, and a marked Cluster is seen at the next refresh.
+func (s *Scheduler) startTick(ctx context.Context, namespace *corev1.Namespace, due time.Time) error {
+	marked, err := s.anythingEnabled(ctx, namespace.Name)
+	if err != nil {
+		return err
+	}
+	if marked {
+		if err := s.create(ctx, namespace.Name, due); err != nil {
+			return err
+		}
+		log.FromContext(ctx).Info("created a scheduled backup", "namespace", namespace.Name, "tick", due.UTC().Format(time.RFC3339))
+		return nil
+	}
+	if s.Recorder != nil {
+		s.Recorder.Eventf(namespace, nil, corev1.EventTypeWarning, "NothingEnabled", "Schedule",
+			"the tick at %s is due, but nothing in this namespace is marked %s: \"true\"",
+			due.UTC().Format(time.RFC3339), backupv1alpha1.AnnotationEnabled)
+	}
+	return nil
 }
 
 // anythingEnabled reports whether a claim or a Cluster in the namespace

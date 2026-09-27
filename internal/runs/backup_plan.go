@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -50,18 +51,19 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 // be read in a way a retry may fix or when ending the run failed. The check
 // writes nothing else, so it is safe to repeat.
 func (r *BackupRunReconciler) schemaOutdated(ctx context.Context, run *backupv1alpha1.BackupRun) (bool, error) {
-	message, err := r.schemas.crdOutdated(ctx, r.Reader, backupRunsCRD, "BackupRun", backupv1alpha1.BackupRun{},
+	err := r.schemas.crdOutdated(ctx, r.Reader, backupRunsCRD, backupv1alpha1.KindBackupRun, backupv1alpha1.BackupRun{},
 		"the run could leave the workloads it stops at 0 replicas")
-	if err != nil || message == "" {
+	var outdated *crdOutdatedError
+	if !errors.As(err, &outdated) {
 		return false, err
 	}
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		if item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+			item.Phase, item.Message = backupv1alpha1.ItemFailed, outdated.Error()
 		}
 	}
-	return true, r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, message)
+	return true, r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, outdated.Error())
 }
 
 // items returns one Pending item for each thing the run's spec names.

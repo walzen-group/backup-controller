@@ -123,19 +123,10 @@ linters:
         source: '^func Restart\('
       - path: '^internal/runs/release_report\.go$'
         linters: [goconst]
-      - path: '^internal/runs/crdcheck\.go$'
-        linters: [funlen, gocognit]
-        source: '^func walkFields\('
       - path: '^internal/runs/release_report\.go$'
         linters: [revive]
         text: '^confusing-results:'
         source: '^func releaseFailure\('
-      - path: '^internal/runs/schedule\.go$'
-        linters: [funlen, gocognit]
-        source: '^func \(s \*Scheduler\) Reconcile\('
-      - path: '^internal/runs/schedule\.go$'
-        linters: [nestif]
-        source: '^\s*if !due\.After\(now\) \{$'
       # legacy:end
 issues:
   max-issues-per-linter: 0
