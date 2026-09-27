@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -282,6 +283,12 @@ func readRestoreRun(t *testing.T, namespace, name string) (*backupv1alpha1.Resto
 // the Kustomization that applies it belong to the test, and the check that at
 // most one quiesce Lease exists is sampled while the runs work; the run
 // statuses and the final replica count carry the real assertion.
+//
+// The runs stop and start the Deployments through the scale subresource
+// alone: a Warn admission policy on the namespace makes the API server
+// return a warning for every write the controller sends for a Deployment,
+// the controller logs each one, and the test checks each was an update of
+// /scale (see watchDeploymentWrites).
 func TestQuiesceExclusion(t *testing.T) {
 	ns := newTestNamespace(t, "e2e-quiesce")
 	repo := newResticRepo(t, "e2e/"+ns.Name+"/data")
@@ -397,6 +404,11 @@ spec:
 		t.Fatalf("the first BackupRun did not succeed\n%s", evidence())
 	}
 
+	// From here on every write the controller sends for a Deployment in the
+	// namespace is seen, so the test can check the runs stop and start the
+	// Deployments through /scale alone.
+	writes := watchDeploymentWrites(t, ns.Name, "writer")
+
 	// The restore stops the app, and the second backup starts right after it
 	// has: the two must not stop the app together. The restore also stops the
 	// writer, which mounts the claim, since an in-place restore starts only
@@ -491,6 +503,9 @@ spec:
 	if replicas := appReplicas(t, ns.Name, app); replicas != 0 {
 		t.Fatalf("the app stands at %d replicas while the restore holds it, want 0", replicas)
 	}
+	// The restore stopped both Deployments through /scale.
+	checkScaledThroughScale(t, writes, app)
+	checkScaledThroughScale(t, writes, "writer")
 
 	// The restore gives the app back and ends; only then does the backup plan
 	// the replicas the app has.
@@ -552,4 +567,201 @@ spec:
 		}
 		return out == "2", "ready replicas = " + out, nil
 	}, evidence)
+	// Both runs stopped and started the app, and the restore the writer,
+	// through /scale alone.
+	checkScaledThroughScale(t, writes, app)
+	checkScaledThroughScale(t, writes, "writer")
+}
+
+// controllerServiceAccount is the user the controller calls the API server as.
+const controllerServiceAccount = "system:serviceaccount:" + controllerNamespace + ":backup-controller"
+
+// deploymentWrites sees every write the controller makes to a Deployment in
+// namespace, and to its scale subresource, while the test runs.
+type deploymentWrites struct {
+	// namespace is the test namespace whose Deployments are watched.
+	namespace string
+	// since is when the watch started; the controller's log is read from
+	// then on.
+	since time.Time
+}
+
+// watchDeploymentWrites installs a ValidatingAdmissionPolicy with a Warn
+// binding that matches every CREATE, UPDATE and DELETE the controller's
+// ServiceAccount sends for a Deployment in namespace or for its scale
+// subresource, and removes both when the test ends.
+//
+// Parameters:
+//   - namespace is the test namespace; the policy matches it by its
+//     kubernetes.io/metadata.name label, so other tests are never matched.
+//   - probeDeployment names a Deployment in namespace whose Scale the watch
+//     updates in a dry run until the policy warns on it.
+//
+// A merge patch is an UPDATE to admission, so a patch of the Deployment
+// itself matches as well. Each matched request is admitted, with a warning
+// that names the Deployment, the operation and the subresource;
+// controller-runtime's client logs every warning the API server returns, so
+// the controller's log holds one line per write (see writes). The kind
+// cluster keeps no audit log and the test may not reconfigure it, and the
+// Deployment's managedFields cannot show these writes: a Scale with
+// replicas 0 carries no spec.replicas, so the scale to 0 leaves no owner of
+// spec.replicas, and the API server records no manager for an update of a
+// Scale whose managedFields are empty, which the restart then is.
+//
+// The watch waits until the policy warns on a server-side dry run of a
+// scale, impersonating the controller, so no write of the runs is missed.
+func watchDeploymentWrites(t *testing.T, namespace, probeDeployment string) *deploymentWrites {
+	t.Helper()
+	name := "e2e-deployment-writes-" + namespace
+	apply(t, fmt.Sprintf(`apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: %[1]s
+  labels:
+    e2e.backup.wlz.li/test: "true"
+spec:
+  failurePolicy: Ignore
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: %[2]s}
+    resourceRules:
+      - apiGroups: [apps]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [deployments, deployments/scale]
+  matchConditions:
+    - name: controller
+      expression: request.userInfo.username == '%[3]s'
+  validations:
+    - expression: "false"
+      messageExpression: "'e2e-write ' + request.namespace + '/' + request.name + ' ' + request.operation + ' subresource=' + request.subResource + ' dryRun=' + string(request.dryRun)"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: %[1]s
+  labels:
+    e2e.backup.wlz.li/test: "true"
+spec:
+  policyName: %[1]s
+  validationActions: [Warn]
+`, name, namespace, controllerServiceAccount))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		for _, kind := range []string{"validatingadmissionpolicybinding", "validatingadmissionpolicy"} {
+			if _, err := kubectl(ctx, "", "delete", kind, name, "--ignore-not-found"); err != nil {
+				t.Errorf("cleanup: %v", err)
+			}
+		}
+	})
+
+	path := fmt.Sprintf("/apis/apps/v1/namespaces/%s/deployments/%s/scale", namespace, probeDeployment)
+	// The probe's Scale carries no resourceVersion, so a status write to the
+	// Deployment between the read and the dry run is no Conflict.
+	var scaleObject map[string]any
+	if err := json.Unmarshal([]byte(mustKubectl(t, "", "get", "--raw", path)), &scaleObject); err != nil {
+		t.Fatalf("decode the Scale of %s/%s: %v", namespace, probeDeployment, err)
+	}
+	if meta, ok := scaleObject["metadata"].(map[string]any); ok {
+		delete(meta, "resourceVersion")
+	}
+	scaleBody, err := json.Marshal(scaleObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scale := string(scaleBody)
+	waitFor(t, "the write policy to warn on a scale", 2*time.Minute, 2*time.Second, func() (bool, string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "--as", controllerServiceAccount,
+			"replace", "--raw", path+"?dryRun=All", "-f", "-")
+		cmd.Stdin = strings.NewReader(scale)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return false, "", fmt.Errorf("dry-run update of %s's Scale as the controller: %w: %s", probeDeployment, err, out)
+		}
+		warned := strings.Contains(string(out), "e2e-write "+namespace+"/"+probeDeployment)
+		return warned, fmt.Sprintf("warned=%t", warned), nil
+	}, nil)
+	return &deploymentWrites{namespace: namespace, since: time.Now()}
+}
+
+// writes returns the controller's writes to the Deployment named name since
+// the watch started, one "OPERATION subresource=<name>" per request, with
+// "subresource=" empty for a write to the Deployment itself. Dry runs, the
+// watch's own probes, are left out.
+//
+// It reads them from the controller's log, which holds the warning the
+// policy returned for each (see watchDeploymentWrites). A controller
+// container that started after the watch began lost the earlier lines,
+// so the test fails on it rather than miss writes.
+func (w *deploymentWrites) writes(t *testing.T, name string) []string {
+	t.Helper()
+	started := mustKubectl(t, "", "-n", controllerNamespace, "get", "pods", "-l", "app.kubernetes.io/name=backup-controller",
+		"-o", `jsonpath={range .items[*]}{.metadata.name} {.status.containerStatuses[0].state.running.startedAt}{"\n"}{end}`)
+	for _, line := range strings.Split(strings.TrimSpace(started), "\n") {
+		pod, at, _ := strings.Cut(line, " ")
+		if since, err := time.Parse(time.RFC3339, at); err != nil || since.After(w.since) {
+			t.Fatalf("controller pod %s runs since %q, after the write watch began at %s, so its log misses writes",
+				pod, at, w.since.UTC().Format(time.RFC3339))
+		}
+	}
+	log := mustKubectl(t, "", "-n", controllerNamespace, "logs", "deploy/backup-controller",
+		"--since-time="+w.since.UTC().Format(time.RFC3339))
+	marker := "e2e-write " + w.namespace + "/" + name + " "
+	var writes []string
+	for _, line := range strings.Split(log, "\n") {
+		_, rest, ok := strings.Cut(line, marker)
+		if !ok {
+			continue
+		}
+		rest, _, _ = strings.Cut(rest, "\"")
+		write, dryRun, _ := strings.Cut(rest, " dryRun=")
+		if dryRun == "true" {
+			continue
+		}
+		writes = append(writes, write)
+	}
+	return writes
+}
+
+// checkScaledThroughScale fails the test unless the controller wrote a
+// Deployment only through its scale subresource, and did write it.
+//
+// Parameters:
+//   - writes watches the test namespace (see watchDeploymentWrites).
+//   - name is a Deployment a run stopped and started again.
+//
+// Two sources back it: the policy's warnings in the controller's log list
+// every write the controller made, each of which must be an UPDATE of
+// subresource scale; and the Deployment's managedFields must hold no entry
+// of the controller's field manager for the object itself, which any
+// update or patch of the Deployment would leave.
+func checkScaledThroughScale(t *testing.T, writes *deploymentWrites, name string) {
+	t.Helper()
+	seen := writes.writes(t, name)
+	t.Logf("the controller's writes to Deployment %s/%s: %q", writes.namespace, name, seen)
+	if len(seen) == 0 {
+		t.Errorf("the controller's log shows no write to Deployment %s/%s, which a run stopped and started", writes.namespace, name)
+	}
+	for _, write := range seen {
+		if write != "UPDATE subresource=scale" {
+			t.Errorf("the controller sent %s for Deployment %s/%s; it may only update /scale", write, writes.namespace, name)
+		}
+	}
+
+	out := mustKubectl(t, "", "-n", writes.namespace, "get", "deployment", name, "-o", "json", "--show-managed-fields")
+	var deployment struct {
+		Metadata metav1.ObjectMeta `json:"metadata"`
+	}
+	if err := json.Unmarshal([]byte(out), &deployment); err != nil {
+		t.Fatalf("decode Deployment %s/%s: %v", writes.namespace, name, err)
+	}
+	for _, entry := range deployment.Metadata.ManagedFields {
+		if entry.Manager == backupv1alpha1.FieldManager && entry.Subresource != "scale" {
+			t.Errorf("Deployment %s/%s has a managedFields entry of %s (operation %s, subresource %q, fields %s); the controller may only write /scale",
+				writes.namespace, name, entry.Manager, entry.Operation, entry.Subresource, entry.FieldsV1.GetRawString())
+		}
+	}
 }
