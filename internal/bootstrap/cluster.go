@@ -48,43 +48,63 @@ func OwnerBootstrap(cluster *unstructured.Unstructured) string {
 	return method
 }
 
-// Archiver finds where a Cluster archives its WAL. It looks in spec.plugins for
-// the first entry named PluginName with isWALArchiver set to true and a
-// non-empty barmanObjectName parameter.
+// Archiver finds where a Cluster archives its WAL. It reads spec.plugins with
+// the rules of plugin-barman-cloud v0.15.0 and CloudNativePG 1.30.0, so the
+// webhook and the RestoreRun controller look where the plugin writes.
 //
-// It returns that entry's barmanObjectName as the store and its serverName
-// parameter as the server name, with found set to true. When serverName is
-// unset, the server name is the Cluster's own name. It returns found as false
-// when no entry matches. Such a Cluster backs nothing up and has nothing to
-// recover from.
+// It returns the store, the server name and found. The store is the
+// barmanObjectName parameter of the last entry named PluginName, enabled or
+// not (plugin internal/cnpgi/operator/config/config.go:289-301). The server
+// name starts as the Cluster's name. Each enabled entry named PluginName that
+// has a serverName key replaces it, also with an empty value. The last such
+// entry wins (config.go:155-161). An empty server name puts the archive
+// directly under the destinationPath, and storeLocation looks there too.
+//
+// found is false when no enabled entry names PluginName, because
+// CloudNativePG then does not load the plugin in the instance
+// (api/v1/cluster_funcs.go:83-91, internal/cnpi/plugin/client/create.go:50-56).
+// found is also false when the store is empty, because the Archive call of
+// the plugin then cannot read an ObjectStore with no name (plugin
+// internal/cnpgi/common/wal.go:121-129). Such a Cluster backs nothing up and
+// has nothing to recover from.
+//
+// isWALArchiver does not change the result. CloudNativePG gives each WAL
+// segment to every loaded plugin that can archive, with or without that field
+// (pkg/management/postgres/archiver/archiver.go:165-170, 286,
+// internal/cnpi/plugin/client/wal.go:58-80). The plugin does not read it.
 func Archiver(cluster *unstructured.Unstructured) (store, serverName string, found bool) {
-	plugins, ok, err := unstructured.NestedSlice(cluster.Object, "spec", "plugins")
-	if err != nil || !ok {
-		return "", "", false
-	}
+	plugins, _, _ := unstructured.NestedSlice(cluster.Object, "spec", "plugins")
 
-	for _, entry := range plugins {
-		plugin, ok := entry.(map[string]any)
+	serverName = cluster.GetName()
+	loaded := false
+	for _, item := range plugins {
+		entry, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		if name, _, _ := unstructured.NestedString(plugin, "name"); name != PluginName {
+		if name, _, _ := unstructured.NestedString(entry, "name"); name != PluginName {
 			continue
 		}
-		if isArchiver, _, _ := unstructured.NestedBool(plugin, "isWALArchiver"); !isArchiver {
+		parameters, _, _ := unstructured.NestedMap(entry, "parameters")
+		store, _ = parameters["barmanObjectName"].(string)
+		if !pluginEnabled(entry) {
 			continue
 		}
-		store, _, _ = unstructured.NestedString(plugin, "parameters", "barmanObjectName")
-		if store == "" {
-			continue
+		loaded = true
+		if value, set := parameters["serverName"]; set {
+			serverName, _ = value.(string)
 		}
-		serverName, _, _ = unstructured.NestedString(plugin, "parameters", "serverName")
-		if serverName == "" {
-			// Barman defaults the server name to the Cluster's name, so an
-			// unset parameter means the archive sits under that.
-			serverName = cluster.GetName()
-		}
-		return store, serverName, true
 	}
-	return "", "", false
+	if !loaded || store == "" {
+		return "", "", false
+	}
+	return store, serverName, true
+}
+
+// pluginEnabled reports whether a spec.plugins entry is enabled. An entry
+// without the enabled field is enabled, as the IsEnabled function of
+// CloudNativePG says (api/v1/cluster_funcs.go:411-416).
+func pluginEnabled(entry map[string]any) bool {
+	enabled, set, _ := unstructured.NestedBool(entry, "enabled")
+	return !set || enabled
 }
