@@ -33,7 +33,7 @@ backup-controller/
 ├── internal/
 │   ├── api/v1alpha1/           VolumeRestore, BackupRun, RestoreRun and the annotations
 │   ├── populator/              the three provider callbacks
-│   ├── volsync/                building and reading ReplicationDestination
+│   ├── restorejob/             building, reading and stopping the restore Job
 │   ├── runs/                   the BackupRun and RestoreRun reconcilers and the scheduler
 │   ├── bootstrap/              the Cluster webhook and the object store reads
 │   └── restic/                 reading a repository's snapshots over S3
@@ -44,6 +44,7 @@ backup-controller/
 │   ├── kustomization.yaml
 │   ├── namespace.yaml
 │   ├── rbac.yaml
+│   ├── admissionpolicy.yaml    the ValidatingAdmissionPolicy and binding on the restore Jobs
 │   ├── serviceaccount.yaml
 │   ├── deployment.yaml
 │   ├── webhook.yaml            the webhook Service, Issuer, Certificate and MutatingWebhookConfiguration
@@ -97,10 +98,13 @@ groups, so the render has to carry all of them:
 | --- | --- |
 | CustomResourceDefinition | applied first and waited on for `Established`, so a VolumeRestore can be created in the same apply |
 | Namespace | applied before the workload |
-| everything else | ServiceAccount, ClusterRole, ClusterRoleBinding, Deployment, and the webhook's Service, Issuer, Certificate and MutatingWebhookConfiguration |
+| everything else | ServiceAccount, ClusterRole, ClusterRoleBinding, the ValidatingAdmissionPolicy and ValidatingAdmissionPolicyBinding `backup-controller-restore-jobs`, Deployment, and the webhook's Service, Issuer, Certificate and MutatingWebhookConfiguration |
 
 Do not split the install across two assets. One file is the whole install, which
 is what makes the module a single `data "http"` and a single version string.
+
+The Deployment in the render leaves out `--restore-image`, and the installer
+appends it to the `controller` container's args ([Restore image](#restore-image)).
 
 The CRDs are part of every install of a release, the upgrades included. A run
 reads the installed CRD of its kind before it changes anything and ends with
@@ -118,6 +122,81 @@ with `helm upgrade` alone leaves the CRDs at their first version.
 | Base | scratch, with the public CA roots copied in from the build stage for the webhook's object store calls. The binary carries Go's zone database for `CRON_TZ=` schedules, and needs no shell, no restic and no kubectl |
 | User | non-root, no capabilities, read-only root filesystem |
 
+## Restore image
+
+Every restore runs restic in a Job of the controller's own
+([architecture.md](architecture.md#how-the-restore-job-is-built)), and the Job's image is
+the controller's `--restore-image` flag. The flag has no default. Without it
+the controller logs `refusing to start: --restore-image is required: pass the
+image VolSync runs its restic mover in, pinned by digest, so restores run the
+restic that wrote the backups` and exits, so the pod goes into
+CrashLoopBackOff (cmd/backup-controller/flags.go:34).
+
+Pass the image VolSync runs its restic mover in, pinned by digest. VolSync
+0.16.0 runs its mover in its own image, `quay.io/backube/volsync:0.16.0`, which
+carries restic 0.18.1, and its chart replaces that reference with the value
+`restic.image` when set. Declaring the image once and handing it to both
+VolSync and the controller keeps the restic that writes the backups the one
+that restores them. The Job calls `restic` by name, so any image with restic
+0.18.0 or later on its PATH works; the controller holds no restic or VolSync
+version of its own.
+
+| Install path | Where the flag comes from |
+| --- | --- |
+| the rendered manifest | nothing: deploy/deployment.yaml leaves the flag out, and the installer appends `--restore-image=<image>@sha256:<digest>` to the `controller` container's args. The walzen infrastructure repository does that in its backup-controller unit ([upgrading.md](upgrading.md#step-5-change-the-infra-units)) |
+| the Helm chart | the value `restoreImage`, which is required: `helm template` fails while it is empty |
+| the e2e setup | hack/e2e/backup-controller/backup-controller.sh appends the image hack/e2e/volsync/pins.json pins for VolSync |
+
+## Admission policy on the restore Jobs
+
+The ClusterRole grants create, patch and delete on `jobs` in every namespace,
+because RestoreRuns run in the app's namespace. RBAC cannot narrow that grant
+to the controller's own Jobs. The release therefore carries a
+ValidatingAdmissionPolicy and its binding, both named
+`backup-controller-restore-jobs` (deploy/admissionpolicy.yaml). The chart
+renders the same objects as `<fullname>-restore-jobs` from
+chart/templates/admissionpolicy.yaml, behind `admissionPolicy.create`, true by
+default. They need Kubernetes 1.30 or later.
+
+The policy matches only requests whose user is the controller's ServiceAccount:
+`system:serviceaccount:backup-system:backup-controller` in deploy/, and in the
+chart the release namespace and the chart's ServiceAccount. Other users' Jobs,
+the Job controller and the garbage collector are never matched. For that user
+the policy checks every create, update and delete of a batch/v1 Job, and
+refuses with 403 Forbidden and the message of the check that failed:
+
+| Check | Message |
+| --- | --- |
+| the Job carries `app.kubernetes.io/managed-by=backup-controller` and `app.kubernetes.io/component=restore` | `backup-controller may create, change and delete only Jobs labelled app.kubernetes.io/managed-by=backup-controller and app.kubernetes.io/component=restore` |
+| an update changes a Job the controller created | `backup-controller may change only a Job it created` |
+| the pod template carries `app.kubernetes.io/component=restore` | `a restore Job's pods carry app.kubernetes.io/component=restore` |
+| `automountServiceAccountToken: false` | `a restore Job's pod mounts no ServiceAccount token` |
+| no ServiceAccount but the namespace's `default` | `a restore Job's pod runs as its namespace's default ServiceAccount` |
+| no host network, PID or IPC, no `nodeName`, no ephemeral containers, no resource claims | `a restore Job's pod uses no host namespace, names no node, and claims no device` |
+| no `runtimeClassName`, no `priorityClassName` | `a restore Job's pod names no runtime class or priority class` |
+| no `container.apparmor.security.beta.kubernetes.io/` annotation on the pod template | `a restore Job's pod template carries no AppArmor annotation` |
+| volumes are only claims, emptyDir, and ephemeral claims without a data source | `a restore Job's pod mounts only claims, emptyDir and ephemeral claims without a data source` |
+| the pod security context sets no sysctls, no SELinux options, and no Unconfined seccomp or AppArmor profile | `a restore Job's pod security context sets no sysctls, SELinux options or unconfined profile` |
+| every container and init container drops ALL, adds at most CHOWN, DAC_OVERRIDE and FOWNER, is not privileged, forbids privilege escalation, has a read-only root filesystem, sets no SELinux options, no Unconfined profile and no procMount but Default, and uses no volume device and no host port | `a restore Job's containers are unprivileged: drop ALL, add at most CHOWN, DAC_OVERRIDE and FOWNER, no privilege escalation, read-only root, no host port or device` |
+
+The pod security context comes from the VolumeRestore's or the RestoreRun's
+`moverSecurityContext`, so a context that sets sysctls, SELinux options or an
+unconfined profile is refused: a RestoreRun item fails with reason
+RestoreJobRefused and the API server's answer, and a claim the populator fills
+stays Pending with RestoreJobRefused on its VolumeRestore. A context of
+`runAsUser`, `runAsGroup` and `fsGroup` passes.
+
+The policy does not check the image, or the environment the Job reads from the
+repository Secret. [decisions.md](decisions.md#narrow-the-jobs-grant-with-an-admission-policy)
+records why, and what that leaves the ServiceAccount able to do.
+
+The username in the policy's match condition is written for the namespace
+backup-system and the ServiceAccount backup-controller. An install that
+renames either has to change the policy too, or the policy matches no request
+and admits every Job the ServiceAccount creates, the way RBAC alone would.
+The chart builds the username from the release namespace and its
+ServiceAccount value.
+
 ## RBAC the controller needs
 
 `deploy/rbac.yaml` writes it as one ClusterRole, and every rule traces to a
@@ -125,27 +204,27 @@ caller in the controller:
 
 | Resources | Verbs | For |
 | --- | --- | --- |
-| `persistentvolumeclaims` | get, list, watch, create, patch, delete | the app's claim, the prime claim, and an `into:` scratch claim; the orphan reconciler watches claims being deleted, deletes a claim's prime claim, and patches the library's finalizer off a claim whose VolumeRestore is gone |
+| `persistentvolumeclaims` | get, list, watch, create, patch, delete | the app's claim, the prime claim, and an `into:` scratch claim; the populator records its restore Job's UID on the prime claim with a patch; the orphan reconciler watches claims being deleted, deletes a claim's prime claim, and patches the library's finalizer off a claim whose VolumeRestore is gone |
 | `persistentvolumeclaims/finalizers` | update | each ReplicationSource names its claim as owner with `blockOwnerDeletion`, which the OwnerReferencesPermissionEnforcement admission plugin allows only to a writer that may update the owner's finalizers |
 | `persistentvolumes` | get, list, watch, patch | rebinding the volume to the app's claim, and reading a volume's node for its mover |
 | `storageclasses` | get, list, watch | reading the binding mode |
-| `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used, a RestoreRun finding the pod that holds a claim, and the orphan reconciler listing the mover pod it waits for |
+| `pods` | get, list, watch | the library's pod informer, which it builds and waits on whether or not a populator pod is used, a RestoreRun finding the pod that holds a claim, and the stop of a restore Job, which lists the Job's pods by their controller-uid label, and a claim's restore pods by `backup.wlz.li/restore-claim`, and waits while one may still write |
 | `volumerestores` (our group) | get, list, watch, update | reading the data source, adding and removing the `backup.wlz.li/volume-populator` finalizer, and the orphan reconciler's check that a claim's VolumeRestore is gone and its watch for deleted ones |
 | `volumerestores/status` | patch, update | reporting conditions |
 | `backupruns` | get, list, watch, create, update, delete | the runs and their finalizer; create is the scheduler, delete the 30-day TTL |
 | `restoreruns` | get, list, watch, update, delete | the runs and their finalizer |
 | `backupruns/status`, `restoreruns/status` | patch, update | reporting phase, items and conditions |
-| `backupruns/finalizers`, `restoreruns/finalizers` | update | the Workload and scratch claim a run creates name the run as their controller with `blockOwnerDeletion`, which OwnerReferencesPermissionEnforcement allows only with this verb |
+| `backupruns/finalizers`, `restoreruns/finalizers` | update | the Workload, the scratch claim and the restore Job a run creates name the run as their controller with `blockOwnerDeletion`, which OwnerReferencesPermissionEnforcement allows only with this verb |
 | `customresourcedefinitions` (apiextensions.k8s.io), named `backupruns.backup.wlz.li` and `restoreruns.backup.wlz.li` | get | a run reads the installed CRD of its kind before it changes anything, and ends with reason CRDOutdated when the schema lacks a field the controller writes, which the API server would drop |
 | `replicationsources.volsync.backube` | get, list, watch, create, update, patch | writing each enabled claim's source and its manual trigger; v0.8.2 dropped delete, which v0.8.0 and v0.8.1 used after a failed mover |
-| `replicationdestinations.volsync.backube` | get, list, watch, create, delete | one per fill and one per volume restore, in place or with `into:`; the orphan reconciler deletes the destination of a claim whose VolumeRestore is gone |
 | `leases` (coordination.k8s.io) | get, list, create, update, delete | the Lease a BackupRun or RestoreRun acquires on a claim and on its repository Secret right before it starts a mover, so a backup and a restore of either never run at once, and the Lease `backup-controller-quiesce` a run acquires in its namespace before it stops that namespace's workloads (internal/runs/lease.go). Runs live in every namespace, so the rule is cluster-wide, and `update` takes over the Lease of a run that has finished |
-| `jobs` (batch) | get | a RestoreRun and the orphan reconciler reading the Job of a mover they stopped by name, and waiting while it is there, since a Job with no pod can still start one |
+| `jobs` (batch) | get, list, create, patch, delete | the restore Job of a RestoreRun item or a populated claim: created suspended, read by name, resumed and suspended with a merge patch, and deleted with Foreground propagation; a backup lists the restore Jobs by label to wait for one on its claim or repository. Reads go through the uncached reader, so no watch. The [admission policy](#admission-policy-on-the-restore-jobs) narrows this grant to Jobs of the restore Job's shape |
 | `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
 | `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |
 | `clusters.postgresql.cnpg.io` | get, list, delete | the webhook's shared-archive check, a database run, and a database restore deleting its Cluster |
 | `objectstores.barmancloud.cnpg.io` | get, list | the webhook and the restore checks reading where a Cluster archives, and the webhook's shared-archive check listing every ObjectStore once per create. Without list, every Cluster create is refused with an HTTP 500 while any other Cluster archives |
-| `deployments`, `statefulsets` | get, list, patch | quiesce |
+| `deployments`, `statefulsets` | get, list | quiesce reads the workloads it stops; the controller has no write verb on them |
+| `deployments/scale`, `statefulsets/scale` | get, update | quiesce sets the replica count through the scale subresource, which can change nothing else (internal/runs/scale.go) |
 | `kustomizations.kustomize.toolkit.fluxcd.io` | get, patch | suspending and resuming a quiesced workload's Kustomization |
 | `workloads.kueue.x-k8s.io` | get, create, delete | admitting a run as one Workload |
 | `workloads/status` | update | the PodsReady condition the run sets itself |
@@ -162,7 +241,8 @@ in the cluster is the one line in this install worth arguing about, and
 
 | Component | For |
 | --- | --- |
-| VolSync | the movers every volume backup and restore runs through |
+| VolSync | the mover every volume backup runs through; restores run in the controller's own Job |
+| Kubernetes 1.30 or later | ValidatingAdmissionPolicy, which the release applies with the workload |
 | CloudNativePG and the Barman Cloud plugin | the databases the bootstrap webhook acts on |
 | cert-manager | the webhook's serving certificate, issued and renewed with no admin step |
 

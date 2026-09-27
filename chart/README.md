@@ -1,20 +1,26 @@
 # backup-controller
 
 A Helm chart for the backup controller: the Deployment that refills a claim from
-a VolSync restic repository and reports the restore as conditions on the
-VolumeRestore. The plain manifests under `deploy/` are the primary install
-path, and every release attaches them with the image pinned by digest. This
-chart exists for clusters that install with Helm and want the image reference
-templated. Where this chart and `deploy/` disagree, `deploy/` is right.
+its restic repository with a restore Job of its own, runs the namespace backups
+and restores, and reports each restore as conditions on the VolumeRestore. The
+plain manifests under `deploy/` are the primary install path, and every release
+attaches them with the image pinned by digest. This chart exists for clusters
+that install with Helm and want the image reference templated. Where this chart
+and `deploy/` disagree, `deploy/` is right.
 
 ## Requirements
 
-- VolSync, so the `replicationdestinations.volsync.backube` kind the controller
-  creates is servable and a mover writes into the prime claim.
+- VolSync, whose `replicationsources.volsync.backube` kind the controller
+  writes for every backup.
+- A restic image to restore with, pinned by digest, for the required value
+  `restoreImage`: the image VolSync runs its restic mover in, so a restore runs
+  the restic that wrote the backup.
+- Kubernetes 1.30 or later, for the ValidatingAdmissionPolicy the chart
+  installs on the controller's restore Jobs.
 - A restic repository Secret in the namespace of each claim that restores. The
   controller copies that Secret into its own namespace for the length of a
   restore.
-- A cluster-admin for the first install: the chart registers one CRD.
+- A cluster-admin for the first install: the chart registers the CRDs.
 
 ## Install
 
@@ -26,13 +32,15 @@ templated. Where this chart and `deploy/` disagree, `deploy/` is right.
 
    Expected result: `namespace/backup-system created`.
 
-2. Install the release into that namespace.
+2. Install the release into that namespace, with the restic image.
 
    ```
-   helm install backup-controller ./chart -n backup-system
+   helm install backup-controller ./chart -n backup-system --set restoreImage=quay.io/backube/volsync:0.16.0@sha256:<digest>
    ```
 
-   Expected result: `STATUS: deployed`.
+   Expected result: `STATUS: deployed`. Without `restoreImage` the render
+   fails with `restoreImage is required: set it to the image VolSync runs its
+   restic mover in, pinned by digest`.
 
 3. Check the rollout.
 
@@ -44,10 +52,20 @@ templated. Where this chart and `deploy/` disagree, `deploy/` is right.
 
 The chart passes the `namespace` value to the container as `--namespace`, which
 is where the controller creates the prime claim, the repository Secret copy and
-the ReplicationDestination for each restore. The default, `backup-system`,
-matches the install command above. A release installed into a different
-namespace needs `--set namespace=<that namespace>`; a value that names a
-namespace which does not exist fails every restore.
+the restore Job for each claim the populator fills. The default,
+`backup-system`, matches the install command above. A release installed into a
+different namespace needs `--set namespace=<that namespace>`; a value that
+names a namespace which does not exist fails every restore.
+
+The chart passes `restoreImage` as `--restore-image`, the image every restore
+Job runs restic in. The controller refuses to start without it.
+
+With `admissionPolicy.create` true, the chart installs the
+ValidatingAdmissionPolicy and ValidatingAdmissionPolicyBinding
+`<fullname>-restore-jobs`, which let the controller's ServiceAccount create and
+change only Jobs of the restore Job's shape, and delete only its own labelled
+Jobs. The ClusterRole grants create and delete on every Job in the cluster, and
+this policy is what narrows the grant; docs/packaging.md lists its checks.
 
 The controller runs as a non-root user with a read-only root filesystem and no
 capabilities, so a namespace with no pod security labels accepts the pod.
@@ -93,7 +111,9 @@ kubectl delete -f chart/crds/
 | image.digest | "" | `sha256:...` pin; when set it wins over the tag |
 | image.pullPolicy | IfNotPresent | Pull policy for the controller container |
 | nameOverride / fullnameOverride | "" | Name parts used by the object names |
-| namespace | backup-system | Namespace the controller creates its prime claim and destination in, passed as --namespace |
+| namespace | backup-system | Namespace the controller creates its prime claims, Secret copies and the populator's restore Jobs in, passed as --namespace |
+| restoreImage | "" (required) | Image the restore Jobs run restic in, pinned by digest, passed as --restore-image; the render fails without it |
+| admissionPolicy.create | true | Create the ValidatingAdmissionPolicy and binding that narrow the controller's Job grant to restore Jobs of its own shape; needs Kubernetes 1.30 or later |
 | rbac.create | true | Create the ClusterRole and ClusterRoleBinding for the controller |
 | serviceAccount.create | true | Create the ServiceAccount |
 | serviceAccount.name | "" (the fullname) | Use this ServiceAccount name, created or pre-existing |
