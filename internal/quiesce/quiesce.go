@@ -92,33 +92,26 @@ type Workload struct {
 //
 // It returns an error when either list call fails.
 func Targets(ctx context.Context, c client.Reader, namespace string) ([]Workload, error) {
-	marked := func(o metav1.Object) bool { return o.GetAnnotations()[backupv1alpha1.AnnotationQuiesce] == "true" }
-	replicas := func(r *int32) int32 {
-		if r == nil {
-			return 1
-		}
-		return *r
-	}
-
-	var targets []Workload
 	deployments := &appsv1.DeploymentList{}
 	if err := c.List(ctx, deployments, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("list the Deployments in %s: %w", namespace, err)
-	}
-	for i := range deployments.Items {
-		d := &deployments.Items[i]
-		if marked(d) {
-			targets = append(targets, Workload{kind: backupv1alpha1.WorkloadKindDeployment, object: d, replicas: replicas(d.Spec.Replicas), selector: d.Spec.Selector})
-		}
 	}
 	statefulSets := &appsv1.StatefulSetList{}
 	if err := c.List(ctx, statefulSets, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("list the StatefulSets in %s: %w", namespace, err)
 	}
+	var objects []client.Object
+	for i := range deployments.Items {
+		objects = append(objects, &deployments.Items[i])
+	}
 	for i := range statefulSets.Items {
-		s := &statefulSets.Items[i]
-		if marked(s) {
-			targets = append(targets, Workload{kind: backupv1alpha1.WorkloadKindStatefulSet, object: s, replicas: replicas(s.Spec.Replicas), selector: s.Spec.Selector})
+		objects = append(objects, &statefulSets.Items[i])
+	}
+
+	var targets []Workload
+	for _, object := range objects {
+		if object.GetAnnotations()[backupv1alpha1.AnnotationQuiesce] == "true" {
+			targets = append(targets, workloadOf(object))
 		}
 	}
 	sort.Slice(targets, func(i, j int) bool {
@@ -141,33 +134,41 @@ func Targets(ctx context.Context, c client.Reader, namespace string) ([]Workload
 // before it stops anything, so a mistake in spec.quiesce fails the run with
 // nothing changed.
 func Named(ctx context.Context, c client.Reader, namespace string, refs []backupv1alpha1.WorkloadRef) ([]Workload, error) {
-	replicas := func(r *int32) int32 {
-		if r == nil {
-			return 1
-		}
-		return *r
-	}
 	var targets []Workload
 	for _, ref := range refs {
-		key := types.NamespacedName{Namespace: namespace, Name: ref.Name}
-		switch ref.Kind {
-		case backupv1alpha1.WorkloadKindDeployment:
-			d := &appsv1.Deployment{}
-			if err := c.Get(ctx, key, d); err != nil {
-				return nil, missingWorkload(ref, err)
-			}
-			targets = append(targets, Workload{kind: ref.Kind, object: d, replicas: replicas(d.Spec.Replicas), selector: d.Spec.Selector})
-		case backupv1alpha1.WorkloadKindStatefulSet:
-			s := &appsv1.StatefulSet{}
-			if err := c.Get(ctx, key, s); err != nil {
-				return nil, missingWorkload(ref, err)
-			}
-			targets = append(targets, Workload{kind: ref.Kind, object: s, replicas: replicas(s.Spec.Replicas), selector: s.Spec.Selector})
-		default:
+		object := workloadObject(namespace, backupv1alpha1.QuiescedWorkload{Kind: ref.Kind, Name: ref.Name})
+		if object == nil {
 			return nil, &SpecError{Ref: ref, problem: specKindUnsupported}
 		}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(object), object); err != nil {
+			return nil, missingWorkload(ref, err)
+		}
+		targets = append(targets, workloadOf(object))
 	}
 	return targets, nil
+}
+
+// workloadOf returns the Workload of a Deployment or a StatefulSet that was
+// read from the API server. An unset spec.replicas counts as 1, which is the
+// Kubernetes default.
+func workloadOf(object client.Object) Workload {
+	w := Workload{object: object}
+	var replicas *int32
+	switch o := object.(type) {
+	case *appsv1.Deployment:
+		w.kind = backupv1alpha1.WorkloadKindDeployment
+		replicas = o.Spec.Replicas
+		w.selector = o.Spec.Selector
+	case *appsv1.StatefulSet:
+		w.kind = backupv1alpha1.WorkloadKindStatefulSet
+		replicas = o.Spec.Replicas
+		w.selector = o.Spec.Selector
+	}
+	w.replicas = 1
+	if replicas != nil {
+		w.replicas = *replicas
+	}
+	return w
 }
 
 // NamedAndMarked reads the workloads that a RestoreRun in place stops: the

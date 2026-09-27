@@ -78,7 +78,7 @@ func Applied(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, 
 		case err != nil:
 			stopped = append(stopped, w)
 		default:
-			if replicas := specReplicas(object); replicas != nil && *replicas == 0 {
+			if workloadOf(object).replicas == 0 {
 				stopped = append(stopped, w)
 			}
 		}
@@ -98,18 +98,6 @@ func Applied(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, 
 		}
 	}
 	return stopped, suspended
-}
-
-// specReplicas returns the spec.replicas of a Deployment or StatefulSet, or
-// nil for any other object.
-func specReplicas(object client.Object) *int32 {
-	switch o := object.(type) {
-	case *appsv1.Deployment:
-		return o.Spec.Replicas
-	case *appsv1.StatefulSet:
-		return o.Spec.Replicas
-	}
-	return nil
 }
 
 // workloadObject returns an empty Deployment or StatefulSet that carries the
