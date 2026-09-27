@@ -869,26 +869,39 @@ func TestATimedOutIntoRestoreEndsTimedOutAfterItsMoverWait(t *testing.T) {
 	}
 }
 
-// An into restore whose Job failed before the timeout keeps reason Failed
-// when the Job's pod outlives the deadline: the item failed on its own.
-func TestAnIntoRestoreWhoseMoverFailedKeepsFailedPastTheTimeout(t *testing.T) {
+// An into restore whose item failed on its own before the timeout keeps
+// reason Failed when the Job's pod outlives the deadline. Here the claim is
+// deleted while the Job's pod runs: the item fails with reason ClaimLost,
+// the run suspends the Job and waits for the pod past the deadline, and
+// ends Failed once the pod has ended. A Job with Failed=True has no pod
+// left that runs (Kubernetes 1.31 and later add a terminal condition only
+// after every pod has ended), so a failed Job never waits here.
+func TestAnIntoRestoreWhoseItemFailedKeepsFailedPastTheTimeout(t *testing.T) {
 	run, job := intoOnJob(t)
-	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"}}
+	claim := intoClaim(run)
 	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
-	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), job, pod)
+	r, c := restoreReconciler(t, nil, run, claim, sourceOnNode(), volumeRestore(), repository(), job, pod)
+	if err := c.Delete(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
 
 	restoreStep(t, r)
-	if readRestoreRun(t, c).Status.Phase.Finished() {
+	markSuspended(t, c, job)
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	restoreStep(t, r)
+	if waiting := readRestoreRun(t, c); waiting.Status.Phase.Finished() {
 		t.Fatal("the run finished with the Job's pod still running, want it waiting")
 	}
 
-	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
 	setPodPhase(t, c, pod, corev1.PodFailed)
 	restoreStep(t, r)
 
 	done := readRestoreRun(t, c)
 	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonFailed {
 		t.Errorf("phase = %q, reason = %q; want Failed, %s", done.Status.Phase, readyReason(done.Status.Conditions), backupv1alpha1.ReasonFailed)
+	}
+	if item := done.Status.Items[0]; item.Reason != backupv1alpha1.ItemReasonClaimLost {
+		t.Errorf("item = %+v, want reason ClaimLost", item)
 	}
 }
 
