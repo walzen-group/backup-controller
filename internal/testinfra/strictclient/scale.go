@@ -22,16 +22,23 @@ const scaleSubresource = "scale"
 // Parameters:
 //   - name is the subresource, such as "scale" or "status".
 //
-// For "scale" it returns a client that serves Get and Update of the Scale of
+// For "scale", it returns a client that serves Get and Update of the Scale of
 // a Deployment or StatefulSet the way kube-apiserver 1.36.3 does (see
-// scaleClient). Every other subresource, and Create and Patch of the Scale,
-// go to the fake client unchanged.
+// scaleClient). For "status", it returns the client that Status describes.
+// An interceptor client from sigs.k8s.io/controller-runtime/pkg/client/interceptor
+// sends its Status writes through this method, so the strict rules apply
+// also to a wrapped client. Every other subresource, and Create and Patch of
+// the Scale, go to the fake client unchanged.
 func (c *Client) SubResource(name string) client.SubResourceClient {
 	inner := c.WithWatch.SubResource(name)
-	if name != scaleSubresource {
+	switch name {
+	case scaleSubresource:
+		return &scaleClient{SubResourceClient: inner, c: c}
+	case statusSubresource:
+		return &statusWriter{SubResourceClient: inner, c: c}
+	default:
 		return inner
 	}
-	return &scaleClient{SubResourceClient: inner, c: c}
 }
 
 // scaleClient serves the scale subresource of Deployments and StatefulSets.

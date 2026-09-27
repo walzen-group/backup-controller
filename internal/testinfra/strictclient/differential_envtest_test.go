@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -67,17 +68,25 @@ func TestDifferentialAgainstEnvtest(t *testing.T) {
 			}
 			files = append(files, replicationSourceCRD, cnpgClusterCRD)
 			strict := strictclient.Build(fake.NewClientBuilder(), scheme, strictclient.Options{Clock: time.Now, CRDs: files})
+			// An interceptor client sends status writes through
+			// SubResource("status"), so this copy checks that path.
+			wrapped := interceptor.NewClient(
+				strictclient.Build(fake.NewClientBuilder(), scheme, strictclient.Options{Clock: time.Now, CRDs: files}),
+				interceptor.Funcs{})
 
-			want := envtestOps(t, strict)
+			strictObserved := envtestOps(t, strict)
+			wrappedObserved := envtestOps(t, wrapped)
 			got := envtestOps(t, server)
-			for k, w := range want {
-				if got[k] != w {
-					t.Errorf("%s: strict client %q, envtest %q", k, w, got[k])
+			for name, want := range map[string]map[string]string{"strict client": strictObserved, "wrapped strict client": wrappedObserved} {
+				for k, w := range want {
+					if got[k] != w {
+						t.Errorf("%s: %s %q, envtest %q", k, name, w, got[k])
+					}
 				}
-			}
-			for k := range got {
-				if _, ok := want[k]; !ok {
-					t.Errorf("%s: only envtest observed %q", k, got[k])
+				for k := range got {
+					if _, ok := want[k]; !ok {
+						t.Errorf("%s: only envtest observed %q, not the %s", k, got[k], name)
+					}
 				}
 			}
 		})

@@ -2,6 +2,7 @@ package strictclient_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
@@ -46,20 +48,28 @@ func newCRDClient(t *testing.T, crds []string) *strictclient.Client {
 }
 
 // TestStatusWriteIsPrunedByTheInstalledCRD reproduces a v0.8.1 controller
-// writing status.restartPending while the cluster still has the v0.7.2 CRD:
-// the field is dropped on the way in and the read-back lacks it. Against the
-// v0.8.1 CRD it is kept.
+// that writes status.restartPending while the cluster still has the v0.7.2
+// CRD. The strict client drops the field, and the read-back does not have it.
+// With the v0.8.1 CRD, the strict client keeps the field. The same rules
+// apply when an interceptor client wraps the strict client, because the
+// interceptor sends status writes through SubResource("status").
 func TestStatusWriteIsPrunedByTheInstalledCRD(t *testing.T) {
 	for _, tc := range []struct {
-		crds string
-		want bool
+		crds    string
+		want    bool
+		wrapped bool
 	}{
 		{crds: "v0.7.2", want: false},
 		{crds: "v0.8.1", want: true},
+		{crds: "v0.7.2", want: false, wrapped: true},
+		{crds: "v0.8.1", want: true, wrapped: true},
 	} {
-		t.Run(tc.crds, func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/wrapped=%t", tc.crds, tc.wrapped), func(t *testing.T) {
 			ctx := context.Background()
-			c := newCRDClient(t, crdFiles(t, tc.crds))
+			var c client.Client = newCRDClient(t, crdFiles(t, tc.crds))
+			if tc.wrapped {
+				c = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{})
+			}
 			obj := run("r")
 			if err := c.Create(ctx, obj); err != nil {
 				t.Fatal(err)

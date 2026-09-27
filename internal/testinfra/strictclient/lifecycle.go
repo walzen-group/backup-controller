@@ -263,13 +263,19 @@ func goneAfterLastFinalizer(err error, old, written client.Object) bool {
 // client does the same for kinds registered with WithStatusSubresource; this
 // writer checks the stored copy after each write and restores those three
 // fields if the write changed them. A kind without a status subresource gets
-// NotFound, from the fake, as on a real server.
+// NotFound, from the fake, as on a real server. Status returns the same
+// client as SubResource("status").
 func (c *Client) Status() client.SubResourceWriter {
-	return &statusWriter{SubResourceWriter: c.WithWatch.Status(), c: c}
+	return c.SubResource(statusSubresource)
 }
 
+// statusSubresource is the name of the status subresource.
+const statusSubresource = "status"
+
+// statusWriter serves the status subresource with the rules of Status. Get
+// and Create go to the fake client unchanged.
 type statusWriter struct {
-	client.SubResourceWriter
+	client.SubResourceClient
 
 	c *Client
 }
@@ -281,7 +287,7 @@ type statusWriter struct {
 func (w *statusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 	old, err := w.c.stored(ctx, obj)
 	if err != nil {
-		return w.SubResourceWriter.Update(ctx, obj, opts...)
+		return w.SubResourceClient.Update(ctx, obj, opts...)
 	}
 	if err := w.c.checkUID(obj, old); err != nil {
 		return err
@@ -292,7 +298,7 @@ func (w *statusWriter) Update(ctx context.Context, obj client.Object, opts ...cl
 	if err := w.c.coerce(obj, false); err != nil {
 		return err
 	}
-	if err := w.SubResourceWriter.Update(ctx, obj, opts...); err != nil {
+	if err := w.SubResourceClient.Update(ctx, obj, opts...); err != nil {
 		return err
 	}
 	o := &client.SubResourceUpdateOptions{}
@@ -307,7 +313,7 @@ func (w *statusWriter) Update(ctx context.Context, obj client.Object, opts ...cl
 func (w *statusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 	old, err := w.c.stored(ctx, obj)
 	if err != nil {
-		return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+		return w.SubResourceClient.Patch(ctx, obj, patch, opts...)
 	}
 	result, err := w.c.patchedObject(obj, old, patch)
 	if err != nil {
@@ -318,7 +324,7 @@ func (w *statusWriter) Patch(ctx context.Context, obj client.Object, patch clien
 			return err
 		}
 	}
-	if err := w.SubResourceWriter.Patch(ctx, obj, patch, opts...); err != nil {
+	if err := w.SubResourceClient.Patch(ctx, obj, patch, opts...); err != nil {
 		return err
 	}
 	o := &client.SubResourcePatchOptions{}
