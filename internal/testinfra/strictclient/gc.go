@@ -109,10 +109,7 @@ func (c *Client) deleteCascading(ctx context.Context, owner client.Object, o *cl
 		return err
 	}
 	policy := propagation(owner, ownerRef.GroupKind(), o.PropagationPolicy)
-	deps, err := c.dependents(ctx, owner)
-	if err != nil {
-		return err
-	}
+	deps := c.dependents(ctx, owner)
 	cascade := Cascade{Owner: ownerRef, Propagation: policy}
 	for _, d := range deps {
 		r, err := c.ref(d)
@@ -234,10 +231,7 @@ func (c *Client) finishForeground(ctx context.Context, owner client.Object) erro
 	if err != nil {
 		return err
 	}
-	deps, err := c.dependents(ctx, cur)
-	if err != nil {
-		return err
-	}
+	deps := c.dependents(ctx, cur)
 	for _, d := range deps {
 		for _, r := range d.GetOwnerReferences() {
 			if r.UID == cur.GetUID() && r.BlockOwnerDeletion != nil && *r.BlockOwnerDeletion {
@@ -311,7 +305,7 @@ func (c *Client) dropOwnerRefs(ctx context.Context, dep client.Object, drop func
 // a list kind, whose ownerReferences name owner's uid. A namespaced owner
 // only has dependents in its own namespace, since the collector does not
 // follow references across namespaces.
-func (c *Client) dependents(ctx context.Context, owner client.Object) ([]client.Object, error) { //nolint:unparam // a list failure is skipped today, so the error is always nil; T4
+func (c *Client) dependents(ctx context.Context, owner client.Object) []client.Object {
 	var out []client.Object
 	seen := map[types.UID]bool{}
 	for _, gvk := range c.listableKinds() {
@@ -341,7 +335,7 @@ func (c *Client) dependents(ctx context.Context, owner client.Object) ([]client.
 		kb := b.GetObjectKind().GroupVersionKind().String() + "/" + b.GetNamespace() + "/" + b.GetName()
 		return strings.Compare(ka, kb)
 	})
-	return out, nil
+	return out
 }
 
 // listableKinds returns the kinds of the scheme that have a matching list

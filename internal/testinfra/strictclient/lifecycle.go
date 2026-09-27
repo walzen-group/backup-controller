@@ -135,15 +135,13 @@ func (c *Client) bumpGenerationOnDelete(ctx context.Context, owner client.Object
 	if owner.GetDeletionTimestamp() != nil {
 		return nil
 	}
+	// An owner that the fake cannot read has no generation to raise.
 	stored, err := c.stored(ctx, owner)
-	if err != nil {
-		return nil //nolint:nilerr // an owner the fake cannot read has no generation to raise; T4
+	if err == nil && stored.GetDeletionTimestamp() != nil && stored.GetGeneration() != 0 {
+		stored.SetGeneration(stored.GetGeneration() + 1)
+		return c.WithWatch.Update(ctx, stored)
 	}
-	if stored.GetDeletionTimestamp() == nil || stored.GetGeneration() == 0 {
-		return nil
-	}
-	stored.SetGeneration(stored.GetGeneration() + 1)
-	return c.WithWatch.Update(ctx, stored)
+	return nil
 }
 
 // checkNoNewFinalizers refuses a write that would add a finalizer to an

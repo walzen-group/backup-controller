@@ -64,7 +64,10 @@ type crdCacheEntry struct {
 // It is safe for concurrent use.
 func cachedCRDs(paths []string) (*crdSet, error) {
 	e, _ := crdCache.LoadOrStore(crdCacheKey(paths), &crdCacheEntry{})
-	entry := e.(*crdCacheEntry) //nolint:forcetypeassert // the cache stores only *crdCacheEntry; T4
+	entry, ok := e.(*crdCacheEntry)
+	if !ok {
+		panic(fmt.Sprintf("strictclient: the CRD cache holds a %T", e))
+	}
 	entry.once.Do(func() {
 		entry.set, entry.err = loadCRDs(paths)
 	})
@@ -197,7 +200,11 @@ func Build(b *fake.ClientBuilder, scheme *runtime.Scheme, opts Options) *Client 
 			if err != nil {
 				panic(err)
 			}
-			obj = o.(client.Object) //nolint:forcetypeassert // a registered kind is a client.Object; T4
+			co, ok := o.(client.Object)
+			if !ok {
+				panic(fmt.Sprintf("strictclient: the scheme makes %s as a %T, which is not a client.Object", gvk, o))
+			}
+			obj = co
 			// A kind registered as unstructured comes back without its
 			// kind, which the fake builder needs.
 			if u, ok := obj.(*unstructured.Unstructured); ok {
@@ -470,20 +477,13 @@ func isNonNullableNull(x any, s *structuralschema.Structural) bool {
 // object cannot be coerced.
 func (c *Client) seed(b *fake.ClientBuilder) {
 	v := reflect.ValueOf(b).Elem()
-	field := func(name string) any {
-		f := v.FieldByName(name)
-		if !f.IsValid() {
-			panic(fmt.Sprintf("strictclient: fake.ClientBuilder has no field %s; update seed for this controller-runtime version", name))
-		}
-		return reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface()
-	}
-	for _, o := range field("initObject").([]client.Object) { //nolint:forcetypeassert // the fake builder's field has this type; T4
+	for _, o := range builderField[[]client.Object](v, "initObject") {
 		c.seedObject(o)
 	}
-	for _, o := range field("initRuntimeObjects").([]runtime.Object) { //nolint:forcetypeassert // the fake builder's field has this type; T4
+	for _, o := range builderField[[]runtime.Object](v, "initRuntimeObjects") {
 		c.seedObject(o)
 	}
-	for _, l := range field("initLists").([]client.ObjectList) { //nolint:forcetypeassert // the fake builder's field has this type; T4
+	for _, l := range builderField[[]client.ObjectList](v, "initLists") {
 		if err := apimeta.EachListItem(l, func(o runtime.Object) error {
 			c.seedObject(o)
 			return nil
@@ -491,6 +491,28 @@ func (c *Client) seed(b *fake.ClientBuilder) {
 			panic(fmt.Errorf("strictclient: seeded list %T: %w", l, err))
 		}
 	}
+}
+
+// builderField reads an unexported field of the fake client builder.
+//
+// Parameters:
+//   - v is the builder struct, from reflect.ValueOf(b).Elem().
+//   - name is the name of the field that seed reads.
+//
+// It returns the value of the field as a T. It panics when the builder has
+// no field with that name, or when the field is not a T. Both mean that
+// controller-runtime's fake changed and seed needs updating.
+func builderField[T any](v reflect.Value, name string) T {
+	f := v.FieldByName(name)
+	if !f.IsValid() {
+		panic(fmt.Sprintf("strictclient: fake.ClientBuilder has no field %s; update seed for this controller-runtime version", name))
+	}
+	value := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface()
+	typed, ok := value.(T)
+	if !ok {
+		panic(fmt.Sprintf("strictclient: fake.ClientBuilder field %s is a %T; update seed for this controller-runtime version", name, value))
+	}
+	return typed
 }
 
 // seedObject is seed for one object. An object without object metadata is
