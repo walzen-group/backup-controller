@@ -968,6 +968,59 @@ func TestAQuiescedRunWaitsForTheRepositoryLock(t *testing.T) {
 	}
 }
 
+// In a namespace run with two claims, a claim whose sync completes while
+// the other claim's clone is not cut yet waits for the restart. Its snapshot
+// is then moved to the restart moment and tagged quiesced like the other's,
+// so a synced restore finds both volumes at one moment.
+func TestAVolumeDoneBeforeTheRestartIsStillMovedToIt(t *testing.T) {
+	objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment()}, cacheClaim()...)
+	r, c := backupReconciler(t, objects...)
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // start
+	complete(t, c)
+	step(t, r) // find the first claim's snapshot; the cache's clone is not cut
+
+	run := readBackupRun(t, c)
+	if run.Status.RestartedAt != nil {
+		t.Fatal("the app was restarted before the cache's clone was cut")
+	}
+	for _, item := range run.Status.Items {
+		if item.Name == claimN && item.Phase != backupv1alpha1.ItemRunning {
+			t.Fatalf("item = %+v before the restart, want it Running until its snapshot is moved to the restart moment", item)
+		}
+	}
+
+	source := &volsyncv1alpha1.ReplicationSource{}
+	get(t, c, ns, cacheN, source)
+	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{
+		LastManualSync:    manualTag(source),
+		LastSyncTime:      &metav1.Time{Time: monday.Time.Add(2 * time.Second)},
+		LastSyncDuration:  &metav1.Duration{Duration: 3 * time.Second},
+		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultSuccessful},
+	}
+	if err := c.Status().Update(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	step(t, r) // restart, move the first snapshot, find the cache's
+	step(t, r) // move the cache's snapshot, and finish
+
+	run = readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.RestartedAt == nil {
+		t.Fatalf("phase = %q (%s), want Succeeded with a restart moment", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	for _, item := range run.Status.Items {
+		if item.SnapshotTime == nil || !item.SnapshotTime.Equal(run.Status.RestartedAt) {
+			t.Errorf("item %s = %+v, want its snapshot moved to restartedAt %s", item.Name, item, run.Status.RestartedAt)
+		}
+	}
+	if calls := r.Retimer.(*retimer).calls; len(calls) != 2 {
+		t.Errorf("retime calls = %+v, want both snapshots moved and tagged quiesced", calls)
+	}
+}
+
 // A Kustomization someone else suspended is left out of the run's
 // suspendedKustomizations, so the run does not resume it afterwards.
 func TestAKustomizationAlreadySuspendedIsNotResumed(t *testing.T) {

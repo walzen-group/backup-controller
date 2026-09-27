@@ -1120,10 +1120,10 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 // no decision reads the logs.
 //
 // A completed sync gets its snapshot from the repository (see
-// identifySnapshot). On a quiesced run the item then stays Running until the
-// status holding the snapshot's full ID is written, and a later pass moves
-// that snapshot to status.restartedAt and tags it quiesced (see
-// retimeRecorded). A failed read of the source leaves the item as it was,
+// identifySnapshot). On a run that stopped its workloads the item then stays
+// Running until the status holding the snapshot's full ID is written, and a
+// later pass, once status.restartedAt is set, moves that snapshot to it and
+// tags it quiesced (see retimeRecorded). A failed read of the source leaves the item as it was,
 // for the next pass.
 func (r *BackupRunReconciler) collectVolume(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) {
 	source := &volsyncv1alpha1.ReplicationSource{}
@@ -1177,7 +1177,8 @@ func (r *BackupRunReconciler) failedSync(ctx context.Context, run *backupv1alpha
 // repository, and succeeds the item when the run need not move it.
 //
 // Parameters:
-//   - run is the BackupRun, for its namespace and whether it quiesced.
+//   - run is the BackupRun, for its namespace and whether it stopped its
+//     workloads.
 //   - item is the Running volume item whose sync completed. It is changed
 //     in place.
 //   - source is the item's ReplicationSource, whose status records when the
@@ -1193,8 +1194,9 @@ func (r *BackupRunReconciler) failedSync(ctx context.Context, run *backupv1alpha
 // with Empty set. A failed listing leaves the item Running with the error in
 // its message, and the next pass tries again until the run's timeout.
 //
-// A quiesced run's item stays Running with the snapshot recorded, so the
-// status holds the original's full ID before any rewrite. A crash after the
+// The item of a run that stopped its workloads stays Running with the
+// snapshot recorded, so the status holds the original's full ID before any
+// rewrite. A crash after the
 // rewrite then finds the rewritten copy through that ID, where a new search
 // would find no snapshot and take the claim for empty.
 func (r *BackupRunReconciler) identifySnapshot(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem, source *volsyncv1alpha1.ReplicationSource) {
@@ -1216,7 +1218,7 @@ func (r *BackupRunReconciler) identifySnapshot(ctx context.Context, run *backupv
 	s := found.snapshot
 	item.SnapshotID, item.Snapshot, item.SnapshotTime = s.ID, s.ShortID(), newTime(metav1.NewTime(s.Time))
 	item.Message = found.note()
-	if !quiesced(run) {
+	if !stoppedWorkloads(run) {
 		item.Phase = backupv1alpha1.ItemSucceeded
 	}
 }
@@ -1281,24 +1283,35 @@ func (r *BackupRunReconciler) recordedSnapshots(ctx context.Context, run *backup
 	return recorded, nil
 }
 
-// retimeRecorded moves a quiesced run's recorded snapshot to the run's
-// restart moment, tags it quiesced, and succeeds the item.
+// retimeRecorded moves the recorded snapshot of a run that stopped its
+// workloads to the run's restart moment, tags it quiesced, and succeeds the
+// item.
 //
 // Parameters:
-//   - run is the quiesced BackupRun, for its namespace and
-//     status.restartedAt.
+//   - run is the BackupRun, for its namespace, its record of the workloads
+//     it stopped, and status.restartedAt.
 //   - item is the Running volume item, whose snapshotID an earlier pass
 //     recorded. It is changed in place.
 //
-// The item records the rewritten snapshot's IDs and time and succeeds. When
-// the rewrite fails, for example because another process holds a lock on
-// the repository, the item stays Running with the error in its message and
-// the next pass tries again, so the run never reports success for a
-// snapshot a synced restore can't use. A run that turns out not to be
-// quiesced succeeds the item with the snapshot as it was recorded.
+// Every volume item of such a run cut its clone while the workloads were
+// stopped, because the run starts them again only once each clone is cut or
+// its item has failed (see clonesCut and giveUpUncut). The item therefore
+// waits in Running while status.restartedAt is unset, as it is while another
+// item's clone is not cut yet, and is moved once the restart moment is
+// recorded. The item then records the rewritten snapshot's IDs and time and
+// succeeds. When the rewrite fails, for example because another process
+// holds a lock on the repository, the item stays Running with the error in
+// its message and the next pass tries again, so the run never reports
+// success for a snapshot a synced restore can't use. A run that stopped no
+// workload succeeds the item with the snapshot as it was recorded.
 func (r *BackupRunReconciler) retimeRecorded(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) {
-	if !quiesced(run) {
+	if !stoppedWorkloads(run) {
 		item.Phase = backupv1alpha1.ItemSucceeded
+		return
+	}
+	if run.Status.RestartedAt == nil {
+		item.Message = fmt.Sprintf("snapshot %s is saved and waits for the workloads to start again, to be moved to that moment and tagged %s",
+			item.Snapshot, restic.QuiescedTag)
 		return
 	}
 	moved, err := r.retime(ctx, run.Namespace, item.Name, item.SnapshotID, run.Status.RestartedAt.Time)
@@ -1343,11 +1356,12 @@ func (r *BackupRunReconciler) collectDatabase(ctx context.Context, run *backupv1
 	return ""
 }
 
-// quiesced reports whether the run stopped at least one workload and has
-// started the workloads again. Only such a run has a moment when nothing wrote
-// to the volumes or the databases, which is what its snapshots are moved to.
-func quiesced(run *backupv1alpha1.BackupRun) bool {
-	return run.Spec.All && len(run.Status.Quiesced) > 0 && run.Status.RestartedAt != nil
+// stoppedWorkloads reports whether the run stopped at least one workload, as
+// its status.quiesced records. Only such a run has a moment when nothing
+// wrote to the volumes or the databases: its restart moment, which is what
+// its snapshots are moved to.
+func stoppedWorkloads(run *backupv1alpha1.BackupRun) bool {
+	return run.Spec.All && len(run.Status.Quiesced) > 0
 }
 
 // retime moves a snapshot a mover saved to a new time and tags it quiesced,
