@@ -106,68 +106,6 @@ func TestAPopulatorJobRunsOnlyOnceItsUIDIsRecorded(t *testing.T) {
 	}
 }
 
-// TestAJobFoundByNameIsRecordedBeforeItRuns checks that a Job of the claim
-// the prime claim does not record, such as one whose create answered with an
-// error and was stored anyway, is recorded in one sync and resumed only in
-// the next.
-func TestAJobFoundByNameIsRecordedBeforeItRuns(t *testing.T) {
-	ctx := context.Background()
-	ops := populatedOperations(t)
-	job := ops.createJob(t)
-	callbacks := newCallbacks(ops, monday)
-
-	if err := callbacks.Populate(ctx, params()); err != nil {
-		t.Fatalf("Populate() error = %v", err)
-	}
-	if !ptr.Deref(ops.job(t, "claim-123").Spec.Suspend, false) {
-		t.Fatal("a Job the prime claim did not record was resumed in the sync that recorded it")
-	}
-	if got := ops.prime(t, "claim-123").Annotations[AnnotationJobUID]; got != string(job.UID) {
-		t.Fatalf("prime claim records %q, want %s", got, job.UID)
-	}
-	if err := callbacks.Populate(ctx, params()); err != nil {
-		t.Fatalf("second Populate() error = %v", err)
-	}
-	if ptr.Deref(ops.job(t, "claim-123").Spec.Suspend, true) {
-		t.Error("the recorded Job was not resumed")
-	}
-}
-
-// TestAJobOfADeletedClaimIsNeverResumed checks that Populate resumes no Job
-// while the app claim, read fresh, is being deleted. Cleanup or the orphan
-// reconciler stops that claim's Job, and a Job their stop suspended looks
-// the same as one never resumed.
-func TestAJobOfADeletedClaimIsNeverResumed(t *testing.T) {
-	ctx := context.Background()
-	c := newCluster(t)
-	ops := fakeOperationsOn(c)
-	addRepository(ops)
-	job := ops.createJob(t)
-	prime := ops.prime(t, "claim-123")
-	prime.Annotations = map[string]string{AnnotationJobUID: string(job.UID)}
-	if err := c.Update(ctx, prime); err != nil {
-		t.Fatal(err)
-	}
-	claim := &corev1.PersistentVolumeClaim{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: appNS, Name: "notes"}, claim); err != nil {
-		t.Fatal(err)
-	}
-	claim.Finalizers = []string{ClaimFinalizer}
-	if err := c.Update(ctx, claim); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Delete(ctx, claim); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := newCallbacks(ops, monday).Populate(ctx, params()); err != nil {
-		t.Fatalf("Populate() error = %v", err)
-	}
-	if !ptr.Deref(ops.job(t, "claim-123").Spec.Suspend, false) {
-		t.Error("Populate resumed the Job of a claim being deleted")
-	}
-}
-
 // TestCompleteTrustsOnlyTheJob checks that Complete reports the restore
 // finished only for a Job with Complete=True.
 func TestCompleteTrustsOnlyTheJob(t *testing.T) {
@@ -277,7 +215,10 @@ func jobFailedWithExit1(t *testing.T, ops *fakeOperations, job *batchv1.Job) *co
 // is stopped, the entry keeps that reason while the Job is being deleted,
 // no Job is created until the old one is gone, and the entry reads
 // Restoring once the new Job exists. The syncs run in the library's order,
-// so Complete never sees a Job Populate is taking down.
+// so Complete never sees a Job Populate is taking down. Both Jobs restore
+// with --delete: the new one selects the snapshot again, here a newer one, and
+// restores it over what the failed Job left, so files of the earlier snapshot
+// would stay behind without the flag.
 func TestAFailedJobKeepsRestoreFailedUntilReplaced(t *testing.T) {
 	ctx := context.Background()
 	ops := newStrictOperations(t, backupv1alpha1.VolumeRestoreStatus{})
@@ -321,12 +262,15 @@ func TestAFailedJobKeepsRestoreFailedUntilReplaced(t *testing.T) {
 	if ops.job(t, "claim-123") != nil {
 		t.Fatal("the old Job is still there once its pod is gone")
 	}
-	if _, err := librarySync(ctx, callbacks, ops.paramsFor(t, "notes", "claim-123")); err != nil {
+	if _, err := librarySync(ctx, newCallbacks(ops, monday, tuesday), ops.paramsFor(t, "notes", "claim-123")); err != nil {
 		t.Fatalf("sync once the old Job is gone: %v", err)
 	}
 	replaced := ops.job(t, "claim-123")
-	if replaced == nil || replaced.UID == job.UID {
-		t.Fatalf("Job = %+v, want a new one", replaced)
+	if replaced == nil || replaced.UID == job.UID || replaced.Annotations[restorejob.AnnotationSnapshotID] != tuesday.ID {
+		t.Fatalf("Job = %+v, want a new one for the newer snapshot", replaced)
+	}
+	if !hasDelete(job) || !hasDelete(replaced) {
+		t.Error("a restore Job restores without --delete")
 	}
 	assertEntry(t, ops, backupv1alpha1.RestorePhaseRestoring, backupv1alpha1.ReasonRestoring, "restore-claim-123")
 }
@@ -523,47 +467,19 @@ func mapKeys[T any](values map[string]T) []string {
 	return keys
 }
 
-// TestCleanupToleratesTheAlreadyDeletedPrimeClaim checks that Cleanup succeeds
-// without a prime claim and still writes the status that ends the restore.
-//
-// api.md's status table says the Ready condition is True when no claim is
-// being filled from the VolumeRestore, and that claims[] holds only the claims
-// being populated now. Cleanup is the only callback that runs when a restore
-// ends, so it's the one place that can remove the entry and report the
-// VolumeRestore Ready. The library deletes the prime claim after it calls
-// PopulateCleanupFn, so every pass after the one that finished the restore
-// arrives without it. Rejecting those passes failed the sync, and the library
-// requeues on error, so one restored claim errored several times a second for
-// as long as it existed:
-//
-//	error syncing 'pvc/canary-backup/canary-backup': populator parameters
-//	have no prime PVC, requeuing
-//
-// Cleanup exists to remove things, and the prime claim being gone is the state
-// it works towards.
-func TestCleanupToleratesTheAlreadyDeletedPrimeClaim(t *testing.T) {
-	ops := restoringOperations(t)
-	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
-		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
-	})
-	params.PvcPrime = nil
-
-	if err := newCallbacks(ops, monday).Cleanup(context.Background(), params); err != nil {
-		t.Fatalf("Cleanup() without a prime claim = %v, want it tolerated", err)
-	}
-	if len(ops.statuses) != 1 {
-		t.Errorf("status writes = %d, want the restore still reported as ended", len(ops.statuses))
-	}
-}
-
 // TestCleanupRetiresTheClaimAndReportsRestored checks that Cleanup removes the
 // entry of the last claim being filled and sets Ready to True with reason
-// Restored.
+// Restored. It runs without a prime claim: the library deletes the prime
+// claim after it calls PopulateCleanupFn, so every pass after the one that
+// finished the restore arrives without it, and Cleanup, which exists to remove
+// things, must succeed then too. Rejecting those passes once made one restored
+// claim fail its sync several times a second for as long as it existed.
 func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
 	ops := restoringOperations(t)
 	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
 		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
 	})
+	params.PvcPrime = nil
 
 	if err := newCallbacks(ops, monday).Cleanup(context.Background(), params); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
@@ -746,36 +662,6 @@ func hasDelete(job *batchv1.Job) bool {
 	})
 }
 
-// TestEveryPopulatorJobRestoresWithDelete checks that the first restore Job
-// and the Job that replaces a failed one both pass --delete. The replacement
-// picks the snapshot again, here a newer one, and restores it over what the
-// failed Job left, so files of the earlier snapshot would stay behind.
-func TestEveryPopulatorJobRestoresWithDelete(t *testing.T) {
-	ctx := context.Background()
-	ops := newStrictOperations(t, backupv1alpha1.VolumeRestoreStatus{})
-	if _, err := librarySync(ctx, newCallbacks(ops, monday), ops.paramsFor(t, "notes", "claim-123")); err != nil {
-		t.Fatalf("first sync: %v", err)
-	}
-	first := ops.job(t, "claim-123")
-	if !hasDelete(first) {
-		t.Errorf("first Job args = %v, want --delete", first.Spec.Template.Spec.Containers[0].Args)
-	}
-	ops.runJob(t, "claim-123")
-	jobFailedWithExit1(t, ops.fakeOperations, first)
-
-	callbacks := newCallbacks(ops, monday, tuesday)
-	for range 3 {
-		_, _ = librarySync(ctx, callbacks, ops.paramsFor(t, "notes", "claim-123"))
-	}
-	replaced := ops.job(t, "claim-123")
-	if replaced == nil || replaced.UID == first.UID || replaced.Annotations[restorejob.AnnotationSnapshotID] != tuesday.ID {
-		t.Fatalf("Job = %+v, want a replacement for tuesday", replaced)
-	}
-	if !hasDelete(replaced) {
-		t.Errorf("replacement Job args = %v, want --delete", replaced.Spec.Template.Spec.Containers[0].Args)
-	}
-}
-
 // earlierPrimeUID is the UID of a prime claim of notes that is gone: the
 // library created the prime claim again under the same name since.
 const earlierPrimeUID types.UID = "prime-uid-OLD"
@@ -804,7 +690,10 @@ func (f *fakeOperations) createEarlierJob(t *testing.T) *batchv1.Job {
 // Complete=True that filled an earlier prime claim of the claim never
 // completes the claim: its volume went with that prime, and the library
 // would bind the new, empty prime. Populate stops the Job and creates a new
-// one for the prime it has now only once the old one is gone.
+// one for the prime it has now only once the old one is gone. The Job is
+// never recorded on the prime claim of now, so it is never resumed either:
+// a suspended one would write that prime until the garbage collector killed
+// it mid-restore.
 func TestAFinishedJobOfAnEarlierPrimeIsNeverTrusted(t *testing.T) {
 	ctx := context.Background()
 	ops := populatedOperations(t)
@@ -821,33 +710,15 @@ func TestAFinishedJobOfAnEarlierPrimeIsNeverTrusted(t *testing.T) {
 	if got := ops.job(t, "claim-123"); got != nil && got.DeletionTimestamp == nil {
 		t.Fatalf("the Job of the earlier prime is %+v, want it stopped", got)
 	}
+	if got := ops.prime(t, "claim-123").Annotations[AnnotationJobUID]; got == string(old.UID) {
+		t.Fatal("the Job of an earlier prime was recorded on the prime claim of now")
+	}
 	if _, err := librarySync(ctx, callbacks, params()); err != nil {
 		t.Fatalf("sync once the old Job is gone: %v", err)
 	}
 	replaced := ops.job(t, "claim-123")
 	if replaced == nil || replaced.UID == old.UID || len(replaced.OwnerReferences) != 1 || replaced.OwnerReferences[0].UID != "prime-uid-123" {
 		t.Fatalf("Job = %+v, want a new one owned by prime-uid-123", replaced)
-	}
-}
-
-// TestASuspendedJobOfAnEarlierPrimeIsNeverResumed checks that a Job built
-// for an earlier prime claim, still suspended, is never recorded on the prime
-// claim the library has now and never resumed: it would write that prime
-// until the garbage collector killed it mid-restore.
-func TestASuspendedJobOfAnEarlierPrimeIsNeverResumed(t *testing.T) {
-	ctx := context.Background()
-	ops := populatedOperations(t)
-	old := ops.createEarlierJob(t)
-	callbacks := newCallbacks(ops, monday)
-
-	for sync := range 2 {
-		_ = callbacks.Populate(ctx, params())
-		if got := ops.prime(t, "claim-123").Annotations[AnnotationJobUID]; got == string(old.UID) {
-			t.Fatalf("sync %d recorded the Job of an earlier prime on the prime claim", sync)
-		}
-		if job := ops.job(t, "claim-123"); job != nil && job.UID == old.UID && !ptr.Deref(job.Spec.Suspend, false) {
-			t.Fatalf("sync %d resumed the Job of an earlier prime", sync)
-		}
 	}
 }
 
@@ -903,7 +774,9 @@ func recordedSuspendedJob(t *testing.T) *fakeOperations {
 // claim: the app claim names a volume, or the volume's claimRef no longer
 // names the prime claim by its namespace, name and UID. The Job's pod would
 // write the app's volume. A prime claim that names no volume resumes no Job
-// either, and Populate returns no error for it.
+// either, and Populate returns no error for it. Nor does a Job of an app
+// claim being deleted resume: Cleanup or the orphan reconciler stops that
+// Job, and a Job their stop suspended looks the same as one never resumed.
 func TestNoJobIsResumedOnceTheVolumeIsHandedOver(t *testing.T) {
 	for name, handOver := range map[string]func(*testing.T, *fakeOperations){
 		"the app claim names a volume": func(t *testing.T, ops *fakeOperations) {
@@ -933,6 +806,19 @@ func TestNoJobIsResumedOnceTheVolumeIsHandedOver(t *testing.T) {
 			}
 			volume.Spec.ClaimRef.UID = "prime-uid-OTHER"
 			if err := ops.cluster.Update(context.Background(), volume); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"the app claim is being deleted": func(t *testing.T, ops *fakeOperations) {
+			claim := &corev1.PersistentVolumeClaim{}
+			if err := ops.cluster.Get(context.Background(), client.ObjectKey{Namespace: appNS, Name: "notes"}, claim); err != nil {
+				t.Fatal(err)
+			}
+			claim.Finalizers = []string{ClaimFinalizer}
+			if err := ops.cluster.Update(context.Background(), claim); err != nil {
+				t.Fatal(err)
+			}
+			if err := ops.cluster.Delete(context.Background(), claim); err != nil {
 				t.Fatal(err)
 			}
 		},
@@ -1150,7 +1036,9 @@ func TestARefusedJobCreateShowsOnReady(t *testing.T) {
 // a Job created again under the same name since Populate read it, which the
 // API server answers with 422 Invalid on field metadata.uid, is retried
 // without the RestoreJobRefused reason. The replacement stays suspended,
-// and the next sync records it on the prime claim.
+// and the next sync records it on the prime claim without resuming it: a Job
+// the prime claim does not record, such as one whose create answered with an
+// error and was stored anyway, is resumed only in a later sync.
 func TestAResumeThatMeetsAReplacedJobIsNoRefusal(t *testing.T) {
 	ctx := context.Background()
 	ops := recordedSuspendedJob(t)

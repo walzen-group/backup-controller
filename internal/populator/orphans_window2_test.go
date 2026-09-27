@@ -3,6 +3,8 @@ package populator
 import (
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,7 +72,7 @@ func TestAFailedPrimeDeleteAfterCleanupIsCompletedByTheOrphanReconciler(t *testi
 	if err := failing.Delete(ctx, prime); !errors.Is(err, lost) {
 		t.Fatalf("library's prime delete: got %v, want %v", err, lost)
 	}
-	if got := claimFinalizers(t, c); !containsString(got, ClaimFinalizer) {
+	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
 		t.Fatalf("claim finalizers after the failed prime delete = %v, want %s still there", got, ClaimFinalizer)
 	}
 
@@ -81,27 +83,14 @@ func TestAFailedPrimeDeleteAfterCleanupIsCompletedByTheOrphanReconciler(t *testi
 	if present(t, c, prime) {
 		t.Error("the prime is still there after the orphan reconciler ran")
 	}
-	if got := claimFinalizers(t, c); containsString(got, ClaimFinalizer) {
+	if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
 		t.Errorf("claim finalizers = %v, want %s removed", got, ClaimFinalizer)
 	}
 	events := drain(recorder)
-	if len(events) != 1 || !containsPrefix(events[0], "Warning DataSourceGone") {
+	if len(events) != 1 || !strings.HasPrefix(events[0], "Warning DataSourceGone") {
 		t.Errorf("events = %q, want one Warning DataSourceGone", events)
 	}
 	if !apierrors.IsNotFound(c.Get(ctx, client.ObjectKeyFromObject(vr), &backupv1alpha1.VolumeRestore{})) {
 		t.Error("the VolumeRestore came back")
 	}
-}
-
-func containsString(list []string, s string) bool {
-	for _, item := range list {
-		if item == s {
-			return true
-		}
-	}
-	return false
-}
-
-func containsPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
