@@ -234,6 +234,38 @@ func TestASecondEmptyListingMakesTheClaimEmpty(t *testing.T) {
 	}
 }
 
+// The status keeps the first listing's time in whole seconds, so a first
+// listing half a second past a whole second is stored half a second early.
+// A pass pollInterval after that listing is then less than pollInterval
+// after it in truth, and it decides nothing. Only a pass relistAfter after
+// the stored time, which is at least pollInterval after the real listing,
+// makes the claim empty.
+func TestAListingTimeInWholeSecondsStillWaitsAPollInterval(t *testing.T) {
+	r, c := volumeRunOver(t, snapshots{sunday, monday})
+	completeSync(t, c, frozen.Add(time.Minute), 20*time.Second)
+	firstListing := frozen.Add(500 * time.Millisecond)
+	r.Now = func() time.Time { return firstListing }
+	step(t, r)
+
+	first := readBackupRun(t, c).Status.Items[0]
+	if first.Phase != backupv1alpha1.ItemRunning || first.NoSnapshotListedAt == nil || !first.NoSnapshotListedAt.Time.Equal(frozen) {
+		t.Fatalf("item = %+v after the first listing, want it Running with the listing's time stored as %s", first, frozen)
+	}
+
+	r.Now = func() time.Time { return firstListing.Add(pollInterval) }
+	step(t, r)
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Empty {
+		t.Fatalf("item = %+v a pass pollInterval after a listing at %s, want it Running: the stored time is half a second early",
+			item, firstListing)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(relistAfter) }
+	step(t, r)
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemSucceeded || !item.Empty {
+		t.Fatalf("item = %+v, want Succeeded and Empty relistAfter after the stored listing time", item)
+	}
+}
+
 // Snapshots in the window that another host wrote, or that hold other
 // paths than /data, are no mover's: a sync with only those in its window
 // took no snapshot.
