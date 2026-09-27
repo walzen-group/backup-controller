@@ -52,7 +52,7 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 	item := &run.Status.Items[0]
 	switch {
 	case finished(*item):
-		return r.finishInto(ctx, run)
+		return r.endInto(ctx, run, nil)
 	case item.JobUID == "":
 		return r.startIntoJob(ctx, run, item)
 	}
@@ -240,26 +240,16 @@ func (r *RestoreRunReconciler) followIntoJob(ctx context.Context, run *backupv1a
 //   - err is the error of the step that ended it, from settled. When it is
 //     not nil the item has not ended, and endInto returns it for a retry.
 //
-// It returns what finishInto returns. finish writes the item's end with the
-// run's ending before it stops the Job, so a lost write leaves the item as
-// it was with its Job recorded: the retry reads the same Job and ends the
-// item again, instead of taking the stopped Job for one that was deleted
-// before it finished.
+// It returns what finish returns: Succeeded when the item succeeded, and
+// Failed with the item's message otherwise. finish writes the item's end
+// with the run's ending before it stops the Job, so a lost write leaves the
+// item as it was with its Job recorded: the retry reads the same Job and
+// ends the item again, instead of taking the stopped Job for one that was
+// deleted before it finished.
 func (r *RestoreRunReconciler) endInto(ctx context.Context, run *backupv1alpha1.RestoreRun, err error) (ctrl.Result, error) {
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.finishInto(ctx, run)
-}
-
-// finishInto ends an into restore whose item has ended: Succeeded when the
-// item succeeded, and Failed with the item's message otherwise.
-//
-// Parameters:
-//   - run is the RestoreRun, whose item has ended.
-//
-// It returns what finish returns.
-func (r *RestoreRunReconciler) finishInto(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if run.Status.Items[0].Phase == backupv1alpha1.ItemSucceeded {
 		return r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, fmt.Sprintf("claim %s holds the restored data", run.Spec.Into))
 	}
@@ -320,13 +310,10 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 	if err == nil && run.Spec.Claim != "" {
 		err = r.intoTaken(ctx, run, &backupv1alpha1.VolumeRestore{}, kindVolumeRestore)
 	}
-	if asRunRefusal(err) {
-		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+	var settings restoreSettings
+	if err == nil {
+		settings, err = repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	}
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if asRunRefusal(err) {
 		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
