@@ -38,24 +38,22 @@ var grants = []grant{
 	{"storage.k8s.io", "storageclasses", []string{"get", "list", "watch"}, "the library's storage class informer, which reads the binding mode"},
 	{"backup.wlz.li", "volumerestores", []string{"get", "list", "watch"}, "the library's informer over the data source kind"},
 
-	{"", "persistentvolumeclaims", []string{"create", "patch", "delete"}, "the prime claim, and a RestoreRun's scratch claim"},
+	{"", "persistentvolumeclaims", []string{"create", "patch", "delete"}, "the prime claim, the restore Job UID recorded on it, and a RestoreRun's scratch claim"},
 	{"", "persistentvolumes", []string{"patch"}, "rebinding the volume to the app's claim"},
 	{"", "secrets", []string{"get", "create", "delete"}, "the repository Secret copied for the length of a restore"},
 	{"", "events", []string{"create", "patch"}, "the recorder the library hands to the callbacks"},
 	{"backup.wlz.li", "volumerestores", []string{"update"}, "the populator's backup.wlz.li/volume-populator finalizer on a VolumeRestore"},
 	{"backup.wlz.li", "volumerestores/status", []string{"patch", "update"}, "the conditions reported on a VolumeRestore"},
-	{"volsync.backube", "replicationdestinations", []string{"get", "list", "watch", "create", "delete"}, "one destination per restore"},
 
 	// populator.OrphanReconciler, in the run manager, for a claim being
 	// deleted whose VolumeRestore is gone. It watches claims and
-	// VolumeRestores through the manager's cache, reads both and lists the
-	// mover's pods through the API reader, and deletes the claim's objects in
+	// VolumeRestores through the manager's cache, reads both, stops the claim's
+	// restore Jobs through the API reader, and deletes the claim's objects in
 	// the controller namespace before it patches the library's finalizer off.
 	{"", "persistentvolumeclaims", []string{"get", "list", "watch", "patch", "delete"}, "the orphan reconciler: claims being deleted, their prime claim, and the library's finalizer"},
 	{"backup.wlz.li", "volumerestores", []string{"get", "list", "watch"}, "the orphan reconciler: the live check that the VolumeRestore is gone, and its delete events"},
-	{"", "pods", []string{"list"}, "the orphan reconciler: the mover pod it waits for"},
+	{"", "pods", []string{"list"}, "the populator and the orphan reconciler: the pods of every restore Job of a claim, by its restore-claim label, which they wait for"},
 	{"", "secrets", []string{"delete"}, "the orphan reconciler: the Secret copy of a claim whose VolumeRestore is gone"},
-	{"volsync.backube", "replicationdestinations", []string{"delete"}, "the orphan reconciler: the destination of a claim whose VolumeRestore is gone"},
 	{"events.k8s.io", "events", []string{"create", "patch"}, "the orphan reconciler's WaitingForMover and DataSourceGone events"},
 
 	{"volsync.backube", "replicationsources", []string{"get", "list", "watch", "create", "update", "patch"}, "each enabled claim's source, which the controller writes and triggers"},
@@ -65,8 +63,6 @@ var grants = []grant{
 	{"backup.wlz.li", "backupruns/status", []string{"patch", "update"}, "a BackupRun's phase and conditions"},
 	{"backup.wlz.li", "restoreruns/status", []string{"patch", "update"}, "a RestoreRun's phase and conditions"},
 	{"events.k8s.io", "events", []string{"create", "patch"}, "an event on a run each time its Ready reason changes"},
-	{"", "pods", []string{"list"}, "a RestoreRun: the pods of a mover it stopped, which it waits for before it gives the app back"},
-	{"batch", "jobs", []string{"get"}, "a RestoreRun and the orphan reconciler: the Job of a mover they stopped, which they wait for"},
 	// The restore Job (internal/restorejob): the controller creates it
 	// suspended, reads it by name through the uncached reader, resumes and
 	// suspends it with a merge patch and deletes it with Foreground
@@ -77,6 +73,7 @@ var grants = []grant{
 	{"", "pods", []string{"list"}, "restorejob.Stop: the pods of a restore Job, listed by controller-uid, which it waits for"},
 
 	{"", "namespaces", []string{"get", "list", "watch"}, "the scheduler reads each namespace's backup.wlz.li/schedule"},
+	{"", "namespaces", []string{"get"}, "a restore Job follows the privileged-movers annotation of its namespace"},
 	{"postgresql.cnpg.io", "clusters", []string{"get", "list", "delete"}, "a database run reads its Cluster, and a restore deletes it"},
 	{"barmancloud.cnpg.io", "objectstores", []string{"get", "list"}, "the webhook reads the admitted Cluster's ObjectStore, and lists them all once for the collision check"},
 	{"postgresql.cnpg.io", "backups", []string{"get", "create"}, "a base backup on demand"},
@@ -162,6 +159,24 @@ func TestNoRuleWritesAWorkloadItself(t *testing.T) {
 				if allows(role, "apps", resource, verb) || allows(role, "*", resource, verb) || allows(role, "apps", "*", verb) {
 					t.Errorf("%s allows %s on %s; quiesce needs only the scale subresource", source, verb, resourceName("apps", resource))
 				}
+			}
+		}
+	}
+}
+
+// TestNoRuleReachesAReplicationDestination checks that neither ClusterRole,
+// in deploy/ or in the chart, grants any verb on VolSync's
+// ReplicationDestinations. Every restore, a RestoreRun's and the populator's,
+// runs in the controller's own restore Job, and no part of the controller
+// reads, creates or deletes a destination, so a grant would be one nothing
+// uses.
+func TestNoRuleReachesAReplicationDestination(t *testing.T) {
+	deploy := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
+	chart := &rbacv1.ClusterRole{Rules: readChartRules(t, filepath.Join("..", "..", "chart", "templates", "rbac.yaml"))}
+	for source, role := range map[string]*rbacv1.ClusterRole{"deploy/": deploy, "the chart": chart} {
+		for _, verb := range []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"} {
+			if allows(role, "volsync.backube", "replicationdestinations", verb) {
+				t.Errorf("%s allows %s on %s; no restore uses a ReplicationDestination", source, verb, resourceName("volsync.backube", "replicationdestinations"))
 			}
 		}
 	}
