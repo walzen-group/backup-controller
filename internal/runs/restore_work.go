@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -54,12 +53,13 @@ import (
 // an item that still names a restore Job has one Stop has not reported
 // stopped (see restoreItemDone).
 //
-// While clusterWebhookBlind reports that the bootstrap webhook would not see
-// a Cluster created again, work deletes no Cluster: it fails every Pending
-// Cluster item (see failBlindClusters), a run that ends in the pass that
-// failed such an item ends with reason ClusterVersionUnsupported (see
-// failedReason), and a run that waits for a deleted Cluster waits with that
-// reason and the message from recreateMessage.
+// While clusterWebhookUnserved reports that the bootstrap webhook would not
+// see a Cluster created again, work deletes no Cluster: it fails every
+// Pending Cluster item with reason ClusterVersionUnsupported (see
+// failBlindClusters). A run with such a Failed item ends with reason
+// ClusterVersionUnsupported in whichever pass it ends (see endReason). A run
+// that waits for a deleted Cluster waits with that reason and the message
+// from recreateMessage.
 func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if done, result, err := r.endIfOverdue(ctx, run); done {
 		return result, err
@@ -113,10 +113,8 @@ type volumePass struct {
 // databasePass is what restoreDatabases found over the Cluster items in one
 // pass.
 type databasePass struct {
-	// blind is what clusterWebhookBlind found in this pass.
-	blind webhookBlind
-	// blindFailed are the items failBlindClusters failed in this pass.
-	blindFailed []string
+	// unserved is what clusterWebhookUnserved found in this pass, or nil.
+	unserved *UnservedError
 	// recreate names each deleted Cluster whose old instance pods and PVCs
 	// are gone, so its owner can create it again.
 	recreate []string
@@ -296,17 +294,16 @@ func (r *RestoreRunReconciler) stopFinishedJobs(ctx context.Context, run *backup
 // step fails for a reason a retry may fix.
 //
 // A Cluster the webhook would not see created again comes back empty, so
-// no Cluster is deleted while that holds (see clusterWebhookBlind): each
+// no Cluster is deleted while that holds (see clusterWebhookUnserved): each
 // Pending Cluster item fails first (see failBlindClusters). When a volume
 // restore failed, each Cluster item still Pending is Skipped with reason
 // OtherItemFailed and left running. Otherwise each moves a step further
 // (see restoreDatabase), and a deleted one waits until its old instance
 // pods and PVCs are gone (see cnpg.InstanceLeft).
 func (r *RestoreRunReconciler) restoreDatabases(ctx context.Context, run *backupv1alpha1.RestoreRun, volumes volumePass) (databasePass, error) {
-	pass := databasePass{blind: clusterWebhookBlind(r.RESTMapper())}
-	pass.blindFailed = failBlindClusters(run.Status.Items, pass.blind)
-	if len(pass.blindFailed) > 0 {
-		log.FromContext(ctx).Error(errors.New(pass.blind.message()), "deleting no Cluster: the bootstrap webhook would not see it created again",
+	pass := databasePass{unserved: clusterWebhookUnserved(r.RESTMapper())}
+	if failBlindClusters(run.Status.Items, pass.unserved) {
+		log.FromContext(ctx).Error(pass.unserved, "deleting no Cluster: the bootstrap webhook would not see it created again",
 			"namespace", run.Namespace, "name", run.Name)
 	}
 	if !volumes.done {
@@ -388,7 +385,7 @@ func (r *RestoreRunReconciler) giveBackWhenDone(ctx context.Context, run *backup
 //   - volumes and databases are what this pass found.
 //
 // It returns what finish returns for a run that ends: Failed when an item
-// failed (see anyRestoreFailed and failedReason), Failed with reason
+// failed (see anyRestoreFailed and endReason), Failed with reason
 // NoBackupInReach when no item succeeded (see nothingRestored), and
 // Succeeded otherwise. A run that goes on waits, in this order, with reason
 // WaitingForShutdown for a deleted Cluster that is not gone yet, with
@@ -399,7 +396,7 @@ func (r *RestoreRunReconciler) finishOrWait(ctx context.Context, run *backupv1al
 	items := run.Status.Items
 	switch {
 	case restoreDone(items) && anyRestoreFailed(items):
-		return r.finish(ctx, run, failedReason(databases.blindFailed), restoreFailures(items))
+		return r.finish(ctx, run, endReason(items), restoreFailures(items))
 	case restoreDone(items) && !anyRestoreSucceeded(items):
 		return r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, nothingRestored(items))
 	case restoreDone(items):
@@ -407,9 +404,9 @@ func (r *RestoreRunReconciler) finishOrWait(ctx context.Context, run *backupv1al
 	case len(databases.shuttingDown) > 0:
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonShutdown,
 			fmt.Sprintf("waiting for %s of the deleted Cluster to be gone before anything creates it again", strings.Join(databases.shuttingDown, ", "))))
-	case len(databases.recreate) > 0 && databases.blind.blind():
+	case len(databases.recreate) > 0 && databases.unserved != nil:
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonClusterVersionUnsupported,
-			databases.blind.recreateMessage(databases.recreate)))
+			recreateMessage(databases.unserved, databases.recreate)))
 	case len(databases.recreate) > 0:
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonRecreate,
 			fmt.Sprintf("recreate %s to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it", strings.Join(databases.recreate, ", "))))

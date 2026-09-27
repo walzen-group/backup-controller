@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -105,8 +104,8 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 
 	// A Cluster the run would delete comes back empty while the webhook
 	// can't see its creation, so the run ends before it changes anything.
-	if blind := clusterWebhookBlind(r.RESTMapper()); len(failBlindClusters(items, blind)) > 0 {
-		return r.endBlind(ctx, run, items, blind)
+	if unservedErr := clusterWebhookUnserved(r.RESTMapper()); failBlindClusters(items, unservedErr) {
+		return r.endBlind(ctx, run, items, unservedErr)
 	}
 
 	synced, busy, err := r.checkItems(ctx, run, items, at)
@@ -495,21 +494,22 @@ func restoringCluster(other *backupv1alpha1.RestoreRun, clusters []string) (stri
 // Parameters:
 //   - run is the RestoreRun being planned.
 //   - items are the run's items, in which failBlindClusters failed each
-//     Pending Cluster item. endBlind marks every item still Pending Skipped.
-//   - blind is the blindness clusterWebhookBlind found. Its message is the
+//     Pending Cluster item. endBlind marks every item still Pending Skipped,
+//     with reason ClusterVersionUnsupported.
+//   - unservedErr is the error of clusterWebhookUnserved. Its text is the
 //     run's message.
 //
 // It returns what finish returns for reason ClusterVersionUnsupported. It
-// logs the blindness as an error first.
-func (r *RestoreRunReconciler) endBlind(ctx context.Context, run *backupv1alpha1.RestoreRun, items []backupv1alpha1.RestoreItem, blind webhookBlind) (ctrl.Result, error) {
-	log.FromContext(ctx).Error(errors.New(blind.message()), "deleting no Cluster: the bootstrap webhook would not see it created again",
+// logs the error first.
+func (r *RestoreRunReconciler) endBlind(ctx context.Context, run *backupv1alpha1.RestoreRun, items []backupv1alpha1.RestoreItem, unservedErr *UnservedError) (ctrl.Result, error) {
+	log.FromContext(ctx).Error(unservedErr, "deleting no Cluster: the bootstrap webhook would not see it created again",
 		"namespace", run.Namespace, "name", run.Name)
 	for i := range items {
 		if items[i].Phase == backupv1alpha1.ItemPending {
-			items[i].Phase = backupv1alpha1.ItemSkipped
+			items[i].Phase, items[i].Reason = backupv1alpha1.ItemSkipped, backupv1alpha1.ItemReasonClusterVersionUnsupported
 			items[i].Message = "left alone because the run deletes no Cluster the bootstrap webhook would not see created again"
 		}
 	}
 	run.Status.Items = items
-	return r.finish(ctx, run, backupv1alpha1.ReasonClusterVersionUnsupported, blind.message())
+	return r.finish(ctx, run, backupv1alpha1.ReasonClusterVersionUnsupported, unservedErr.Error())
 }

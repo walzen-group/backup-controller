@@ -29,8 +29,8 @@ func crdsWithDestinationAt(t *testing.T, version string) []string {
 func TestAVolSyncThatMovesOnlyReplicationDestinationEndsNoBackup(t *testing.T) {
 	c := newClientWithCRDs(t, crdsWithDestinationAt(t, "v1beta1"), backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment())
-	if message := volsyncUnsupported(c.RESTMapper()); message != "" {
-		t.Fatalf("volsyncUnsupported() = %q, want nothing to report", message)
+	if err := volsyncSourceUnserved(c.RESTMapper()); err != nil {
+		t.Fatalf("volsyncSourceUnserved() = %v, want nothing to report", err)
 	}
 	served := servingOnly(c)
 	r := &BackupRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}

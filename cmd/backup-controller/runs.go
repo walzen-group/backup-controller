@@ -367,18 +367,15 @@ func managerOptions(scheme *runtime.Scheme, metricsAddr, healthAddr string, hook
 //   - mapper is the manager's RESTMapper, which the reconcilers and the
 //     webhook share.
 //
-// It logs the message of runs.VolSyncUnsupported and of
-// runs.ClusterWebhookBlind when either reports, so the log says it before
-// any run does. It then calls bootstrap.Warm, so the webhook's first request
+// It logs the error of runs.CheckServedVersions when a kind is not served
+// at the version the controller uses, so the log says it before any run
+// does. It then calls bootstrap.Warm, so the webhook's first request
 // finds postgresql.cnpg.io and barmancloud.cnpg.io cached, and logs a lookup
 // that failed; the webhook then looks the group up on its first request,
 // within its budget.
 func checkServedVersions(mapper meta.RESTMapper) {
-	if message := runs.VolSyncUnsupported(mapper); message != "" {
-		klog.Errorf("VolSync is not served at the version this controller uses: %s", message)
-	}
-	if message := runs.ClusterWebhookBlind(mapper); message != "" {
-		klog.Errorf("the bootstrap webhook would not see a Cluster created: %s", message)
+	if err := runs.CheckServedVersions(mapper); err != nil {
+		klog.Errorf("a kind this controller uses is not served at the version it uses: %v", err)
 	}
 	if err := bootstrap.Warm(mapper); err != nil {
 		klog.Errorf("could not look up the served versions the bootstrap webhook reads; its first request looks them up again: %v", err)

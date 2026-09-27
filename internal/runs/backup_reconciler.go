@@ -100,8 +100,8 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// its kinds only at a version this controller has no Go types for, and
 	// ends. A database-only run needs no VolSync object and goes on.
 	if !run.Status.Phase.Finished() && run.DeletionTimestamp.IsZero() && run.Spec.Database == "" {
-		if message := volsyncUnsupported(r.RESTMapper()); message != "" {
-			return ctrl.Result{}, r.endForVolSync(ctx, run, message)
+		if unservedErr := volsyncSourceUnserved(r.RESTMapper()); unservedErr != nil {
+			return ctrl.Result{}, r.endForVolSync(ctx, run, unservedErr)
 		}
 	}
 	if !run.DeletionTimestamp.IsZero() {

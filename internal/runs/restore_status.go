@@ -126,3 +126,24 @@ func anyRestoreSucceeded(items []backupv1alpha1.RestoreItem) bool {
 	}
 	return false
 }
+
+// endReason returns the Ready reason of a restore that ends with a Failed
+// item.
+//
+// Parameters:
+//   - items are the run's items, all finished.
+//
+// It returns ReasonClusterVersionUnsupported when a Failed item records
+// reason ClusterVersionUnsupported (see failBlindClusters), and
+// ReasonFailed otherwise. It is the one decision that reads an item's
+// reason: the reason is a typed field, and the run ends with it in
+// whichever pass the run ends, also a pass after the one that failed the
+// item.
+func endReason(items []backupv1alpha1.RestoreItem) string {
+	for _, item := range items {
+		if item.Phase == backupv1alpha1.ItemFailed && item.Reason == backupv1alpha1.ItemReasonClusterVersionUnsupported {
+			return backupv1alpha1.ReasonClusterVersionUnsupported
+		}
+	}
+	return backupv1alpha1.ReasonFailed
+}

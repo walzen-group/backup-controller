@@ -121,7 +121,7 @@ linters:
       - path: '^internal/quiesce/restart\.go$'
         linters: [funlen, gocognit]
         source: '^func Restart\('
-      - path: '^internal/runs/(clusterwebhook|release_report)\.go$'
+      - path: '^internal/runs/release_report\.go$'
         linters: [goconst]
       - path: '^internal/runs/crdcheck\.go$'
         linters: [funlen, gocognit]

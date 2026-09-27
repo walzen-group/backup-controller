@@ -3,6 +3,7 @@
 package runs
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,7 +54,7 @@ func TestEnvtestTheVolSyncCheckNamesReplicationSourceOnAFreshMapper(t *testing.T
 	}
 
 	for _, pass := range []string{"first", "second"} {
-		message := volsyncUnsupported(mapper)
+		message := fmt.Sprint(volsyncSourceUnserved(mapper))
 		if !strings.Contains(message, "ReplicationSource") {
 			t.Errorf("%s check: message %q does not name ReplicationSource", pass, message)
 		}

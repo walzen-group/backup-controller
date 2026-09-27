@@ -238,3 +238,36 @@ func TestAPlannedNamespaceRestoreStopsNothingWhileTheWebhookCannotSee(t *testing
 		}
 	}
 }
+
+// A restore whose Cluster item fails while CloudNativePG no longer serves
+// Cluster at v1, and whose volume item still runs then, ends a pass later
+// with reason ClusterVersionUnsupported. The failed Cluster item records
+// the reason ClusterVersionUnsupported, which the run's end reason comes
+// from. Before, the run ended with reason Failed, because only the pass
+// that failed the item counted.
+func TestABlindClusterFailedEarlierStillEndsClusterVersionUnsupported(t *testing.T) {
+	run, job := restoringOnJob(t)
+	run.Spec.Claim, run.Spec.All = "", true
+	run.Status.Items = append(run.Status.Items,
+		backupv1alpha1.RestoreItem{Kind: backupv1alpha1.ItemKindCluster, Name: pgN, Phase: backupv1alpha1.ItemPending, BaseBackup: saturday.ID})
+	c := newClientWithCRDs(t, crdsServedAtNext(t), run, job, claim(), volumeRestore(), repository(),
+		atNext(cluster()), atNext(objectStore()), storeSecret())
+	served := servingOnly(c)
+	r := &RestoreRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday},
+		RestoreImage: testImage, Now: frozenNow}
+
+	restoreStep(t, r) // the Cluster item fails, the volume item runs on
+	if items := readRestoreRun(t, c).Status.Items; items[1].Phase != backupv1alpha1.ItemFailed || items[0].Phase != backupv1alpha1.ItemRunning {
+		t.Fatalf("items = %+v, want the Cluster item Failed and the volume item Running", items)
+	}
+	completeJob(t, c)
+	done := stepUntilFinished(t, r, c, 3)
+
+	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonClusterVersionUnsupported {
+		t.Errorf("phase = %q, reason = %q (%s); want Failed with %s", done.Status.Phase, readyReason(done.Status.Conditions),
+			readyMessage(done.Status.Conditions), backupv1alpha1.ReasonClusterVersionUnsupported)
+	}
+	if item := done.Status.Items[1]; item.Reason != backupv1alpha1.ItemReasonClusterVersionUnsupported {
+		t.Errorf("Cluster item = %+v, want reason %s", item, backupv1alpha1.ItemReasonClusterVersionUnsupported)
+	}
+}

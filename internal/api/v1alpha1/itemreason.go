@@ -169,4 +169,12 @@ const (
 	// came back without the run's recovery, or whose recovered Cluster was
 	// deleted or replaced. The run leaves that Cluster alone.
 	ItemReasonClusterNotRecovered ItemReason = "ClusterNotRecovered"
+
+	// ItemReasonClusterVersionUnsupported is a database restore that the
+	// run did not start, because the API server serves CloudNativePG's
+	// Cluster at another version and no longer at postgresql.cnpg.io/v1,
+	// the version the bootstrap webhook's rules name. It is also an item
+	// that the run skipped beside such a Cluster item at plan. The run
+	// deleted nothing.
+	ItemReasonClusterVersionUnsupported ItemReason = "ClusterVersionUnsupported"
 )
