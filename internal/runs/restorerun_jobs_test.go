@@ -149,12 +149,11 @@ func setPodPhase(t *testing.T, c client.Client, pod *corev1.Pod, phase corev1.Po
 	}
 }
 
-// movers returns the names of the restore movers in the test namespace: the
-// restore Jobs a run creates, and any ReplicationDestination, which no run
-// creates any more, so a test that wants no mover sees one of either kind.
+// movers returns the names of the restore Jobs in the test namespace, the
+// movers a RestoreRun creates.
 func movers(t *testing.T, c client.Client) []string {
 	t.Helper()
-	names := destinations(t, c)
+	var names []string
 	for _, job := range restoreJobs(t, c) {
 		names = append(names, job.Name)
 	}

@@ -100,17 +100,14 @@ func TestAnIntoRestoreCreatesAJobForTheFullSnapshotID(t *testing.T) {
 			}
 			job := jobs[0]
 			item := run.Status.Items[0]
-			if item.SnapshotID != monday.ID || item.Job != job.Name || item.JobUID != job.UID || item.Job != jobName(restoreUID, 0) || item.Destination != "" {
-				t.Fatalf("item = %+v, Job %s (UID %s); want it naming the Job and its UID, with monday's full ID and no destination", item, job.Name, job.UID)
+			if item.SnapshotID != monday.ID || item.Job != job.Name || item.JobUID != job.UID || item.Job != jobName(restoreUID, 0) {
+				t.Fatalf("item = %+v, Job %s (UID %s); want it naming the Job and its UID, with monday's full ID", item, job.Name, job.UID)
 			}
 			restore := job.Spec.Template.Spec.Containers[0]
 			if !metav1.IsControlledBy(&job, run) || job.Annotations[restorejob.AnnotationSnapshotID] != monday.ID ||
 				!slices.Contains(restore.Args, monday.ID) || !slices.Contains(restore.Args, "--delete") || jobClaim(&job) != shape.into {
 				t.Errorf("Job owners = %v, annotations = %v, args = %v, claim %q; want the run's Job restoring %s into %s with --delete",
 					job.OwnerReferences, job.Annotations, restore.Args, jobClaim(&job), monday.ID, shape.into)
-			}
-			if names := destinations(t, c); len(names) != 0 {
-				t.Errorf("destinations = %v, want none", names)
 			}
 			if shape.into != "notes-data-monday" {
 				return

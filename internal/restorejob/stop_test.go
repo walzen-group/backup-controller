@@ -400,3 +400,61 @@ func TestReadsGoThroughTheReader(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// MayStillWrite holds a Job the Job controller may still start a pod for,
+// and a Job with a pod that may still run restic, and passes a Job that is
+// finished, suspended in one read or being deleted once each of its own
+// pods has ended or was never scheduled and is being deleted.
+func TestMayStillWrite(t *testing.T) {
+	deleting := metav1.NewTime(podTime)
+	pod := func(phase corev1.PodPhase, node string, deleted bool, uid types.UID) corev1.Pod {
+		p := jobPod("restore-3a7c-0-x7k2p", uid, 0)
+		p.Spec.NodeName, p.Status.Phase = node, phase
+		if deleted {
+			p.DeletionTimestamp = &deleting
+		}
+		return p
+	}
+	for _, tc := range []struct {
+		name  string
+		job   func(job *batchv1.Job)
+		pods  []corev1.Pod
+		holds bool
+	}{
+		{name: "running, no pod yet", holds: true},
+		{name: "suspend asked, condition not yet set", job: func(j *batchv1.Job) { j.Spec.Suspend = ptr.To(true) }, holds: true},
+		{name: "suspended", job: suspendedJob},
+		{name: "suspended, pod running", job: suspendedJob, pods: []corev1.Pod{pod(corev1.PodRunning, "worker-1", true, "job-uid")}, holds: true},
+		{name: "suspended, unscheduled pod being deleted", job: suspendedJob, pods: []corev1.Pod{pod(corev1.PodPending, "", true, "job-uid")}},
+		{name: "suspended, unscheduled pod not deleted", job: suspendedJob, pods: []corev1.Pod{pod(corev1.PodPending, "", false, "job-uid")}, holds: true},
+		{name: "complete, pod succeeded", job: completeJob, pods: []corev1.Pod{pod(corev1.PodSucceeded, "worker-1", false, "job-uid")}},
+		{name: "failed, pod failed", job: func(j *batchv1.Job) { withCondition(j, batchv1.JobFailed, "BackoffLimitExceeded", "") },
+			pods: []corev1.Pod{pod(corev1.PodFailed, "worker-1", false, "job-uid")}},
+		{name: "complete, another Job's pod running", job: completeJob, pods: []corev1.Pod{pod(corev1.PodRunning, "worker-1", false, "other-uid")}},
+		{name: "being deleted, pods gone", job: func(j *batchv1.Job) { j.DeletionTimestamp = &deleting }},
+		{name: "being deleted, pod running", job: func(j *batchv1.Job) { j.DeletionTimestamp = &deleting },
+			pods: []corev1.Pod{pod(corev1.PodRunning, "worker-1", false, "job-uid")}, holds: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := readJob(t)
+			if tc.job != nil {
+				tc.job(job)
+			}
+			if got := restorejob.MayStillWrite(job, tc.pods); got != tc.holds {
+				t.Errorf("MayStillWrite = %t, want %t", got, tc.holds)
+			}
+		})
+	}
+}
+
+// suspendedJob marks a Job suspended in one read: spec.suspend true and
+// Suspended=True.
+func suspendedJob(job *batchv1.Job) {
+	job.Spec.Suspend = ptr.To(true)
+	withCondition(job, batchv1.JobSuspended, "JobSuspended", "Job suspended")
+}
+
+// completeJob marks a Job Complete.
+func completeJob(job *batchv1.Job) {
+	withCondition(job, batchv1.JobComplete, "CompletionsReached", "")
+}

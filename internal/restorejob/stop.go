@@ -245,3 +245,32 @@ func mayWrite(p *corev1.Pod) bool {
 	}
 	return p.Spec.NodeName != "" || p.DeletionTimestamp == nil
 }
+
+// MayStillWrite reports whether a restore Job may still write its claim or
+// hold its repository, so that a backup of either has to wait for it.
+//
+// Parameters:
+//   - job is the Job as the caller just read it from the API server.
+//   - pods are the pods the caller listed by the Job's UID in the
+//     batch.kubernetes.io/controller-uid label, read fresh as well. Pods of
+//     another Job in the list are ignored.
+//
+// It returns true while the Job controller may still start a pod for the
+// Job, or while one of its pods may still run restic. The Job controller
+// may start a pod for a Job that is neither Complete nor Failed, not being
+// deleted, and not shown suspended by both spec.suspend and Suspended=True
+// in the same read, the rule the stop gate follows (see suspend). A pod may
+// run restic until it has ended, unless it was never scheduled and is being
+// deleted (see Stop).
+func MayStillWrite(job *batchv1.Job, pods []corev1.Pod) bool {
+	suspended := ptr.Deref(job.Spec.Suspend, false) && conditionTrue(job, batchv1.JobSuspended)
+	if !finished(job) && job.DeletionTimestamp == nil && !suspended {
+		return true
+	}
+	for i := range pods {
+		if pods[i].Labels[batchv1.ControllerUidLabel] == string(job.UID) && mayWrite(&pods[i]) {
+			return true
+		}
+	}
+	return false
+}

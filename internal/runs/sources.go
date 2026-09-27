@@ -523,10 +523,10 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 			return &sourceHeldError{message: busy}
 		}
 		// A restore of the claim or its repository that already has its
-		// ReplicationDestination goes first, as one started before the
-		// controller took Leases does. The check runs here, right before
-		// the write, so a restore that created its destination after an
-		// earlier check is still seen.
+		// restore Job goes first, and so does a Job whose pods may still
+		// write after its run has ended. The check runs here, right before
+		// the write, so a restore that created its Job after an earlier
+		// check is still seen.
 		restoring, err := otherMover(ctx, reader, claim.Namespace, claim.Name, vr.Spec.Repository, restoreMover)
 		if err != nil {
 			return err

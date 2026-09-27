@@ -6,11 +6,14 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/restorejob"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // moverKind names the kind of mover otherMover looks for: the backup movers
-// of ReplicationSources, or the restore movers of ReplicationDestinations.
+// of ReplicationSources, or the controller's restore Jobs.
 type moverKind int
 
 const (
@@ -56,12 +59,12 @@ const (
 // inUse) holds it too, whatever wrote its tag, because a mover may be
 // running; the message then says how that sync ends (see syncingMessage).
 //
-// For restoreMover it looks at every ReplicationDestination in the namespace
-// whose destinationPVC is claim or whose repository is secret. One whose
-// manual tag is the UID of a RestoreRun that is not finished and not being
-// deleted holds the claim, unless the run's item that names the destination
-// has finished. A destination of a run that finished or no longer exists
-// does not; the finished run deletes it.
+// For restoreMover it looks at every restore Job of the controller in the
+// namespace, selected by restorejob.ManagedLabels, whose
+// restorejob.AnnotationClaim annotation is claim or whose
+// restorejob.AnnotationRepository annotation is secret. Such a Job holds the
+// claim while its RestoreRun still restores with it, and after that for as
+// long as it or its pods may still write (see restoreJobHolds).
 //
 // A failed list comes back as an error, and the caller retries; nothing is
 // decided on it.
@@ -163,54 +166,98 @@ func liveBackup(runs *backupv1alpha1.BackupRunList, source *volsyncv1alpha1.Repl
 
 // restoreInProgress is otherMover for restoreMover.
 func restoreInProgress(ctx context.Context, reader client.Reader, namespace, claim, secret string) (string, error) {
-	runs := &backupv1alpha1.RestoreRunList{}
-	if err := reader.List(ctx, runs, client.InNamespace(namespace)); err != nil {
-		return "", fmt.Errorf("list RestoreRuns in %s: %w", namespace, err)
+	jobs := &batchv1.JobList{}
+	if err := reader.List(ctx, jobs, client.InNamespace(namespace), client.MatchingLabels(restorejob.ManagedLabels())); err != nil {
+		return "", fmt.Errorf("list restore Jobs in %s: %w", namespace, err)
 	}
-	var live []*backupv1alpha1.RestoreRun
-	for i := range runs.Items {
-		run := &runs.Items[i]
-		if run.DeletionTimestamp == nil && !run.Status.Phase.Finished() {
-			live = append(live, run)
-		}
-	}
-	if len(live) == 0 {
-		return "", nil
-	}
-
-	list := &volsyncv1alpha1.ReplicationDestinationList{}
-	if err := reader.List(ctx, list, client.InNamespace(namespace)); err != nil {
-		return "", fmt.Errorf("list ReplicationDestinations in %s: %w", namespace, err)
-	}
-	for i := range list.Items {
-		destination := &list.Items[i]
-		if destination.Spec.Restic == nil || destination.Spec.Trigger == nil || destination.Spec.Trigger.Manual == "" {
+	var runs *backupv1alpha1.RestoreRunList
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if !matches(job.Annotations[restorejob.AnnotationClaim], claim) && !matches(job.Annotations[restorejob.AnnotationRepository], secret) {
 			continue
 		}
-		target := ""
-		if destination.Spec.Restic.DestinationPVC != nil {
-			target = *destination.Spec.Restic.DestinationPVC
-		}
-		if !matches(target, claim) && !matches(destination.Spec.Restic.Repository, secret) {
-			continue
-		}
-		for _, run := range live {
-			if string(run.UID) != destination.Spec.Trigger.Manual || itemFinished(run, destination.Name) {
-				continue
+		if runs == nil {
+			runs = &backupv1alpha1.RestoreRunList{}
+			if err := reader.List(ctx, runs, client.InNamespace(namespace)); err != nil {
+				return "", fmt.Errorf("list RestoreRuns in %s: %w", namespace, err)
 			}
-			return fmt.Sprintf("RestoreRun %s is restoring claim %s from repository %s with ReplicationDestination %s; this run starts once that restore has finished",
-				run.Name, target, destination.Spec.Restic.Repository, destination.Name), nil
+		}
+		held, err := restoreJobHolds(ctx, reader, runs, job)
+		if err != nil || held != "" {
+			return held, err
 		}
 	}
 	return "", nil
 }
 
-// itemFinished reports whether the run's item that names the destination
-// has finished. An item that names no destination yet, as after a lost
-// status write, has not.
-func itemFinished(run *backupv1alpha1.RestoreRun, destination string) bool {
+// restoreJobHolds returns a message for the Ready condition when a restore
+// Job holds the claim and the repository it names, or "" when it does not.
+//
+// Parameters:
+//   - ctx bounds the pod list.
+//   - reader lists the Job's pods. Callers pass the uncached Reader, which
+//     restoreInProgress read the Job through.
+//   - runs are the RestoreRuns of the Job's namespace, which say whose Job it
+//     is and whether that run still restores with it.
+//   - job is a restore Job that writes the asking run's claim or reads its
+//     repository.
+//
+// It returns an error from a failed pod list, and the caller retries.
+//
+// The Job holds them while the run named by its LabelRestoreRun label is not
+// finished and not being deleted and the run's item that names the Job has
+// not finished (see itemFinished). Past that, and for a Job of the volume
+// populator or of a run that is gone, it holds them for as long as the Job
+// controller may start a pod for it or one of its pods may still run restic
+// (see restorejob.MayStillWrite): a run records its item's end before it
+// stops the Job, and a stop takes until every pod has ended.
+func restoreJobHolds(ctx context.Context, reader client.Reader, runs *backupv1alpha1.RestoreRunList, job *batchv1.Job) (string, error) {
+	claim, repository := job.Annotations[restorejob.AnnotationClaim], job.Annotations[restorejob.AnnotationRepository]
+	run := jobRun(runs, job)
+	if run != nil && run.DeletionTimestamp == nil && !run.Status.Phase.Finished() && !itemFinished(run, job.Name) {
+		return fmt.Sprintf("RestoreRun %s is restoring claim %s from repository %s with restore Job %s; this run starts once that restore has finished",
+			run.Name, claim, repository, job.Name), nil
+	}
+	pods := &corev1.PodList{}
+	if err := reader.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{batchv1.ControllerUidLabel: string(job.UID)}); err != nil {
+		return "", fmt.Errorf("list the pods of restore Job %s: %w", job.Name, err)
+	}
+	if !restorejob.MayStillWrite(job, pods.Items) {
+		return "", nil
+	}
+	owner := "a RestoreRun that no longer exists"
+	switch {
+	case run != nil:
+		owner = "RestoreRun " + run.Name
+	case job.Labels[restorejob.LabelRestoreClaim] != "":
+		owner = "the VolumeRestore populator"
+	}
+	return fmt.Sprintf("restore Job %s of %s may still write claim %s from repository %s; this run starts once the Job is stopped and its pods have ended",
+		job.Name, owner, claim, repository), nil
+}
+
+// jobRun returns the RestoreRun whose UID the restore Job's LabelRestoreRun
+// label holds, or nil when no run in the list has it.
+func jobRun(runs *backupv1alpha1.RestoreRunList, job *batchv1.Job) *backupv1alpha1.RestoreRun {
+	uid := job.Labels[restorejob.LabelRestoreRun]
+	for i := range runs.Items {
+		if uid != "" && string(runs.Items[i].UID) == uid {
+			return &runs.Items[i]
+		}
+	}
+	return nil
+}
+
+// itemFinished reports whether the run's item that names the restore Job
+// has finished. An item that names no Job yet, as after a lost status
+// write, has not.
+//
+// Parameters:
+//   - run is the RestoreRun the Job restores for.
+//   - job is the Job's name, which the item records in its job field.
+func itemFinished(run *backupv1alpha1.RestoreRun, job string) bool {
 	for _, item := range run.Status.Items {
-		if item.Destination == destination {
+		if item.Job == job {
 			return finished(item)
 		}
 	}

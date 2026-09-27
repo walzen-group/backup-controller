@@ -9,42 +9,43 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// restoringDestination is the name of the ReplicationDestination of
-// restoring's item: restore-, the first eight characters of the run's UID, a
-// dash and the item's position, as runs named their destinations before
-// they restored through their own Jobs. restoreInProgress matches such a
-// destination until restic-jobs step 7c moves it to Jobs.
-const restoringDestination = "restore-9b7d4e21-0"
-
 // restoring returns the RestoreRun back-to-monday in the middle of an
-// in-place restore of the claim, and the ReplicationDestination its mover
-// writes the claim from.
-func restoring() (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.ReplicationDestination) {
+// in-place restore of the claim, and the restore Job its item names, which
+// writes the claim from the repository. The Job has no conditions yet, so
+// the Job controller may start a pod for it at any time.
+func restoring(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job) {
+	t.Helper()
+	return restoringInto(t, claimN)
+}
+
+// restoringInto returns the RestoreRun back-to-monday in the middle of an
+// in-place restore, and the restore Job its item names.
+//
+// Parameters:
+//   - t fails the test when the Job cannot be built.
+//   - claimName is the claim the run restores and its Job writes. A test
+//     that wants the Job to share only the repository with a backup of
+//     claimN passes another claim.
+//
+// The Job restores monday from the repository repoN and has the UID jobUID,
+// which the run's item records beside the Job's name.
+func restoringInto(t *testing.T, claimName string) (*backupv1alpha1.RestoreRun, *batchv1.Job) {
+	t.Helper()
 	run := restoreRun(func(r *backupv1alpha1.RestoreRun) {
-		r.Spec.Claim = claimN
+		r.Spec.Claim = claimName
 		r.Status.Phase = backupv1alpha1.RunPhaseRunning
-		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN,
-			Phase: backupv1alpha1.ItemRunning, Destination: restoringDestination}}
 	})
-	claimName := claimN
-	destination := &volsyncv1alpha1.ReplicationDestination{
-		ObjectMeta: metav1.ObjectMeta{Name: restoringDestination, Namespace: ns},
-		Spec: volsyncv1alpha1.ReplicationDestinationSpec{
-			Trigger: &volsyncv1alpha1.ReplicationDestinationTriggerSpec{Manual: string(restoreUID)},
-			Restic: &volsyncv1alpha1.ReplicationDestinationResticSpec{
-				ReplicationDestinationVolumeOptions: volsyncv1alpha1.ReplicationDestinationVolumeOptions{
-					CopyMethod: volsyncv1alpha1.CopyMethodDirect, DestinationPVC: &claimName,
-				},
-				Repository: repoN,
-			},
-		},
-	}
-	return run, destination
+	job := restoreJobFor(t, run, claimName, monday.ID)
+	run.Status.Items = []backupv1alpha1.RestoreItem{{Kind: backupv1alpha1.ItemKindClaim, Name: claimName,
+		Phase: backupv1alpha1.ItemRunning, SnapshotID: monday.ID, Job: job.Name, JobUID: job.UID}}
+	return run, job
 }
 
 // backingUp returns the claim's ReplicationSource with the open trigger of
@@ -72,28 +73,37 @@ func ownSourceTag(t *testing.T, c client.Client) string {
 	return ""
 }
 
-// destinations returns the names of the ReplicationDestinations in the
-// namespace.
-func destinations(t *testing.T, c client.Client) []string {
-	t.Helper()
-	list := &volsyncv1alpha1.ReplicationDestinationList{}
-	if err := c.List(context.Background(), list, client.InNamespace(ns)); err != nil {
-		t.Fatal(err)
-	}
-	var names []string
-	for _, d := range list.Items {
-		names = append(names, d.Name)
-	}
-	return names
-}
-
 // A backup started while a restore writes the claim waits with reason
 // SourceBusy, names the restore, and writes no trigger: its clone would cut
 // a half-restored volume, and its forget would fail on the restore's lock.
 func TestABackupWaitsWhileARestoreOfTheClaimRuns(t *testing.T) {
-	restore, destination := restoring()
+	restore, job := restoring(t)
+	expectBackupWaitsForRestore(t, restore, job)
+}
+
+// A backup started while a restore of another claim writes from the same
+// repository waits with reason SourceBusy, names the restore, and writes no
+// trigger: its forget needs the exclusive lock, which fails while the
+// restore holds its read lock.
+func TestABackupWaitsWhileARestoreFromItsRepositoryRuns(t *testing.T) {
+	restore, job := restoringInto(t, "other-data")
+	expectBackupWaitsForRestore(t, restore, job)
+}
+
+// expectBackupWaitsForRestore runs the BackupRun before-upgrade of claimN
+// beside a RestoreRun whose restore Job writes the claim or reads its
+// repository, and checks that the backup waits with reason SourceBusy,
+// names the RestoreRun, and writes no trigger.
+//
+// Parameters:
+//   - t reports the failures.
+//   - restore is the RestoreRun, stored as given with no Lease of its own,
+//     as a run that started before the controller took Leases.
+//   - job is the restore Job the run's item names, stored as given.
+func expectBackupWaitsForRestore(t *testing.T, restore *backupv1alpha1.RestoreRun, job *batchv1.Job) {
+	t.Helper()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-		claim(), volume(), volumeRestore(), repository(), restore, destination)
+		claim(), volume(), volumeRestore(), repository(), restore, job)
 	step(t, r)
 	step(t, r)
 	step(t, r)
@@ -102,8 +112,8 @@ func TestABackupWaitsWhileARestoreOfTheClaimRuns(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
 		t.Fatalf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
-	if msg := readyMessage(run.Status.Conditions); !strings.Contains(msg, "RestoreRun back-to-monday") {
-		t.Errorf("message = %q, want it to name the RestoreRun back-to-monday", msg)
+	if msg := readyMessage(run.Status.Conditions); !strings.Contains(msg, "RestoreRun back-to-monday") || !strings.Contains(msg, job.Name) {
+		t.Errorf("message = %q, want it to name the RestoreRun back-to-monday and its restore Job %s", msg, job.Name)
 	}
 	if tag := ownSourceTag(t, c); tag == TriggerFor(runUID) {
 		t.Errorf("the backup wrote its trigger while the restore ran")
@@ -139,7 +149,7 @@ func startOtherBackup(t *testing.T, c client.Client) {
 
 // A restore past its checks whose claim's repository a backup started on
 // since waits with reason SourceBusy, names the backup, and creates no
-// ReplicationDestination. (A backup already running at the checks holds the
+// restore Job. (A backup already running at the checks holds the
 // checks themselves; see
 // TestARestoreSelectsItsSnapshotOnlyOnceABackupOfItsRepositoryHasFinished.)
 func TestARestoreWaitsWhileABackupRuns(t *testing.T) {
@@ -158,7 +168,7 @@ func TestARestoreWaitsWhileABackupRuns(t *testing.T) {
 		t.Errorf("message = %q, want it to name the BackupRun manual-notes", msg)
 	}
 	if names := movers(t, c); len(names) != 0 {
-		t.Errorf("destinations = %v, want none while the backup runs", names)
+		t.Errorf("restore Jobs = %v, want none while the backup runs", names)
 	}
 }
 
@@ -214,16 +224,17 @@ func TestABackupAndARestoreStartedTogetherNeverDeadlock(t *testing.T) {
 	}
 }
 
-// A destination left by a RestoreRun that finished or no longer exists does
-// not hold a backup, and a source whose trigger a finished or deleted
-// BackupRun completed does not hold a restore.
+// A Complete restore Job with no pod left, of a RestoreRun that finished or
+// no longer exists, does not hold a backup, and a source whose trigger a
+// finished or deleted BackupRun completed does not hold a restore.
 func TestAFinishedOrDeletedRunDoesNotBlock(t *testing.T) {
-	finishedRestore, destination := restoring()
+	finishedRestore, job := restoring(t)
 	finishedRestore.Status.Phase = backupv1alpha1.RunPhaseSucceeded
 	finishedRestore.Status.Items[0].Phase = backupv1alpha1.ItemSucceeded
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	for name, objects := range map[string][]client.Object{
-		"finished restore": {finishedRestore, destination},
-		"deleted restore":  {destination},
+		"finished restore": {finishedRestore, job.DeepCopy()},
+		"deleted restore":  {job.DeepCopy()},
 	} {
 		t.Run(name, func(t *testing.T) {
 			objects = append(objects, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
@@ -308,10 +319,10 @@ func TestAnIntoRestoreWaitsWhileItsRepositoryIsBackedUp(t *testing.T) {
 // A namespace run waits before it stops anything while a restore writes one
 // of its claims, so the app is not held down for the length of the restore.
 func TestANamespaceRunWaitsForARestoreBeforeItQuiesces(t *testing.T) {
-	restore, destination := restoring()
+	restore, job := restoring(t)
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false), localQueueObject(),
-		restore, destination)
+		restore, job)
 	step(t, r) // plan
 	step(t, r) // admit
 	admitAll(t, c)
@@ -356,29 +367,60 @@ func TestABackupWaitsWhileAnIntoRestoreFromTheClaimRuns(t *testing.T) {
 	}
 }
 
-// A restore whose item has finished no longer holds the claim or the
-// repository against a backup, even while its ReplicationDestination is still
-// there: the run records the item's end before it deletes the destination, so
-// the destination outlives the restore for a pass or more. A restore whose
-// item is still Running holds them.
-func TestAFinishedRestoreItemsDestinationDoesNotHoldABackup(t *testing.T) {
-	for _, tc := range []struct {
-		phase backupv1alpha1.ItemPhase
-		holds bool
-	}{
-		{backupv1alpha1.ItemRunning, true},
-		{backupv1alpha1.ItemSucceeded, false},
-		{backupv1alpha1.ItemFailed, false},
-	} {
-		t.Run(string(tc.phase), func(t *testing.T) {
-			run, destination := restoring()
-			run.Status.Items[0].Phase = tc.phase
-			c := newClient(t, run, destination)
+// restoreJobCase is a state of a restore Job and its RestoreRun, for the
+// test of which restore Jobs hold a claim and its repository.
+type restoreJobCase struct {
+	// name names the subtest.
+	name string
+	// item is the phase of the run's item that names the Job.
+	item backupv1alpha1.ItemPhase
+	// noRun leaves the RestoreRun out, as after it was deleted.
+	noRun bool
+	// job changes the Job before the test stores it.
+	job func(job *batchv1.Job)
+	// pod is the phase of the Job's one pod, or "" for a Job whose pods are
+	// gone.
+	pod corev1.PodPhase
+	// holds is whether a backup of the claim must wait.
+	holds bool
+}
 
-			busy, err := restoreInProgress(context.Background(), c, ns, claimN, repoN)
-			if err != nil {
-				t.Fatal(err)
-			}
+// completeCondition marks a Job Complete, as the Job controller does once
+// restic exited 0.
+func completeCondition(job *batchv1.Job) {
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+}
+
+// suspendedCondition marks a Job suspended, as a run's stop leaves it once
+// the Job controller took its pods down.
+func suspendedCondition(job *batchv1.Job) {
+	job.Spec.Suspend = ptr.To(true)
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobSuspended, Status: corev1.ConditionTrue}}
+}
+
+// A restore Job holds the claim and the repository while its run's item has
+// not finished, and while it or its pods may still write: the Job controller
+// may start a pod for a Job that is neither finished nor suspended, and a pod
+// that has not ended may run restic. A Job whose item has finished and whose
+// pods have all ended, or are gone, holds nothing, even while it is still
+// there: a run records the item's end before it stops and deletes the Job.
+func TestWhichRestoreJobsHoldABackup(t *testing.T) {
+	for _, tc := range []restoreJobCase{
+		{name: "running", item: backupv1alpha1.ItemRunning, pod: corev1.PodRunning, holds: true},
+		{name: "not started", item: backupv1alpha1.ItemRunning, holds: true},
+		{name: "complete, item not yet written", item: backupv1alpha1.ItemRunning, job: completeCondition, holds: true},
+		{name: "complete, pods gone", item: backupv1alpha1.ItemSucceeded, job: completeCondition},
+		{name: "complete, pod succeeded", item: backupv1alpha1.ItemSucceeded, job: completeCondition, pod: corev1.PodSucceeded},
+		{name: "failed item, Job not yet suspended", item: backupv1alpha1.ItemFailed, pod: corev1.PodRunning, holds: true},
+		{name: "suspended, pod still running", item: backupv1alpha1.ItemFailed, job: suspendedCondition, pod: corev1.PodRunning, holds: true},
+		{name: "suspended, pod failed", item: backupv1alpha1.ItemFailed, job: suspendedCondition, pod: corev1.PodFailed},
+		{name: "suspended, pods gone", item: backupv1alpha1.ItemFailed, job: suspendedCondition},
+		{name: "run deleted, Job not finished", noRun: true, holds: true},
+		{name: "run deleted, pod still running", noRun: true, job: suspendedCondition, pod: corev1.PodRunning, holds: true},
+		{name: "run deleted, Job complete, pods gone", noRun: true, job: completeCondition},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			busy := restoreJobHold(t, tc)
 			if held := busy != ""; held != tc.holds {
 				t.Errorf("restoreInProgress = %q, want held = %t", busy, tc.holds)
 			}
@@ -386,11 +428,64 @@ func TestAFinishedRestoreItemsDestinationDoesNotHoldABackup(t *testing.T) {
 	}
 }
 
+// restoreJobHold stores the state a restoreJobCase describes and returns
+// what restoreInProgress says about a backup of claimN to repoN.
+func restoreJobHold(t *testing.T, tc restoreJobCase) string {
+	t.Helper()
+	run, job := restoring(t)
+	run.Status.Items[0].Phase = tc.item
+	if tc.job != nil {
+		tc.job(job)
+	}
+	objects := []client.Object{job}
+	if !tc.noRun {
+		objects = append(objects, run)
+	}
+	c := newClient(t, objects...)
+	if tc.pod != "" {
+		createPod(t, c, jobPodOf(job, job.Name+"-x7k2p", tc.pod))
+	}
+	busy, err := restoreInProgress(context.Background(), c, ns, claimN, repoN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return busy
+}
+
+// A restore Job holds only the claim it writes and the repository it reads,
+// and only a Job the controller labelled as its own restore Job counts.
+func TestARestoreJobHoldsOnlyItsClaimAndRepository(t *testing.T) {
+	run, job := restoring(t)
+	c := newClient(t, run, job)
+	for _, tc := range []struct {
+		claim, repository string
+		holds             bool
+	}{
+		{claimN, "", true},
+		{"", repoN, true},
+		{"other-data", "other-restic-data", false},
+		{"", "", false},
+	} {
+		busy, err := restoreInProgress(context.Background(), c, ns, tc.claim, tc.repository)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if held := busy != ""; held != tc.holds {
+			t.Errorf("claim %q, repository %q: restoreInProgress = %q, want held = %t", tc.claim, tc.repository, busy, tc.holds)
+		}
+	}
+	job.Labels = nil
+	c = newClient(t, run, job)
+	if busy, err := restoreInProgress(context.Background(), c, ns, claimN, repoN); err != nil || busy != "" {
+		t.Errorf("restoreInProgress = %q, %v; want a Job without the controller's labels to hold nothing", busy, err)
+	}
+}
+
 // A BackupRun that has finished can leave its trigger open on the claim's
 // ReplicationSource while VolSync retries the sync it started
 // (status.lastSyncStartTime set): a mover pod may be writing the repository.
 // A restore of the claim waits with reason SourceBusy, creates no
-// ReplicationDestination, and its message says how the retrying sync ends
+// restore Job, and its message says how the retrying sync ends
 // and when the source may be deleted.
 func TestARestoreWaitsWhileVolSyncRetriesTheSyncOfAFinishedBackup(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
@@ -421,7 +516,7 @@ func TestARestoreWaitsWhileVolSyncRetriesTheSyncOfAFinishedBackup(t *testing.T) 
 		t.Fatalf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
 	if names := movers(t, c); len(names) != 0 {
-		t.Errorf("destinations = %v, want none while VolSync retries the sync", names)
+		t.Errorf("restore Jobs = %v, want none while VolSync retries the sync", names)
 	}
 	msg := readyMessage(run.Status.Conditions)
 	for _, want := range []string{"ReplicationSource " + claimN + " is still syncing", "delete the ReplicationSource " + claimN,

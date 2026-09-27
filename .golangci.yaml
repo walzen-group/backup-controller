@@ -151,7 +151,7 @@ linters:
         source: '^func walkFields\('
       - path: '^internal/runs/exclusive\.go$'
         linters: [funlen, gocognit]
-        source: '^func (backupInProgress|restoreInProgress)\('
+        source: '^func backupInProgress\('
       - path: '^internal/runs/lease\.go$'
         linters: [funlen, gocognit]
         source: '^func holderLive\('

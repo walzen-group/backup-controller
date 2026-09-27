@@ -8,6 +8,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,7 +20,7 @@ import (
 )
 
 // blindToMovers wraps c so that its lists of ReplicationSources and
-// ReplicationDestinations come back empty. A reconciler reading through it
+// Jobs come back empty. A reconciler reading through it
 // stands for a run whose otherMover check ran in the same instant as the
 // other run's: neither sees the other's mover object, and only the Leases,
 // which go through c, can keep them apart.
@@ -27,7 +28,7 @@ func blindToMovers(c client.Client) client.Client {
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 			switch list.(type) {
-			case *volsyncv1alpha1.ReplicationSourceList, *volsyncv1alpha1.ReplicationDestinationList:
+			case *volsyncv1alpha1.ReplicationSourceList, *batchv1.JobList:
 				return nil
 			}
 			return cl.List(ctx, list, opts...)
@@ -112,7 +113,7 @@ func TestTwoRunsWhoseChecksPassTogetherStartOneMover(t *testing.T) {
 }
 
 // blindToQuiesce wraps c so that its lists of ReplicationSources,
-// ReplicationDestinations, BackupRuns and RestoreRuns come back empty. A
+// Jobs, BackupRuns and RestoreRuns come back empty. A
 // reconciler reading through it stands in for a pass whose pre-checks,
 // waitingOn among them, ran in the same instant as the other run's: neither
 // sees the other's runs or mover objects, and only the quiesce Lease, which
@@ -123,7 +124,7 @@ func blindToQuiesce(c client.Client) client.Client {
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 			switch list.(type) {
-			case *volsyncv1alpha1.ReplicationSourceList, *volsyncv1alpha1.ReplicationDestinationList,
+			case *volsyncv1alpha1.ReplicationSourceList, *batchv1.JobList,
 				*backupv1alpha1.BackupRunList, *backupv1alpha1.RestoreRunList:
 				return nil
 			}
