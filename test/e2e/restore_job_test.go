@@ -557,7 +557,7 @@ spec:
       defaultRequest: {cpu: 10m}
 `, f.ns.Name, stopTestCPU))
 
-	pods := watchObjects[corev1.Pod](t, f.ns.Name, "pods", "-l", "app.kubernetes.io/component=restore")
+	pods := watchObjects[corev1.Pod](t, f.ns.Name, "pods", "app.kubernetes.io/component=restore")
 	f.applyRestore(t, "stopped", "")
 
 	var restorePod string
@@ -672,14 +672,29 @@ func (w *objectWatch[T]) history(name string) []T {
 }
 
 // watchObjects starts kubectl get --watch for objects of a kind in namespace
-// that the selector arguments pick, and records every state it reports until
-// the test ends.
+// that match selector, and records every state it reports until the test
+// ends.
 //
 // Parameters:
 //   - kind: the resource, such as pods or jobs
-//   - selectArgs: kubectl's selector flags, such as -l with a label selector
-//     or --field-selector with metadata.name=<name>
-func watchObjects[T any](t *testing.T, namespace, kind string, selectArgs ...string) *objectWatch[T] {
+//   - selector: a label selector
+func watchObjects[T any](t *testing.T, namespace, kind, selector string) *objectWatch[T] {
+	t.Helper()
+	return watchSelected[T](t, namespace, kind, "-l", selector)
+}
+
+// watchObject starts kubectl get --watch for the one object of a kind named
+// name in namespace, which need not exist yet, and records every state it
+// reports until the test ends.
+func watchObject[T any](t *testing.T, namespace, kind, name string) *objectWatch[T] {
+	t.Helper()
+	return watchSelected[T](t, namespace, kind, "--field-selector", "metadata.name="+name)
+}
+
+// watchSelected starts kubectl get --watch for objects of a kind in
+// namespace that the selector flags pick, such as -l with a label selector,
+// and records every state it reports until the test ends.
+func watchSelected[T any](t *testing.T, namespace, kind string, selectArgs ...string) *objectWatch[T] {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	args := append([]string{"--context", kubeContext, "-n", namespace, "get", kind}, selectArgs...)

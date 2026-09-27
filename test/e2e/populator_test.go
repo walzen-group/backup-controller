@@ -330,8 +330,8 @@ func TestThePopulatorFillsAClaimFromTheRepository(t *testing.T) {
 	}
 	uid := claim.UID
 	jobName, primeName, copyName := "restore-"+string(uid), "prime-"+string(uid), string(uid)
-	jobs := watchObjects[batchv1.Job](t, controllerNamespace, "jobs", "-l", restoreClaimLabel+"="+string(uid))
-	primes := watchObjects[corev1.PersistentVolumeClaim](t, controllerNamespace, "pvc", "--field-selector", "metadata.name="+primeName)
+	jobs := watchObjects[batchv1.Job](t, controllerNamespace, "jobs", restoreClaimLabel+"="+string(uid))
+	primes := watchObject[corev1.PersistentVolumeClaim](t, controllerNamespace, "pvc", primeName)
 	// The watches list what exists when they start; give them a moment
 	// before the app places the claim and the populator starts.
 	time.Sleep(2 * time.Second)
@@ -462,7 +462,7 @@ func TestAFirstDeployBindsEmpty(t *testing.T) {
 		}
 		claims[v.claim] = claim.UID
 	}
-	jobs := watchObjects[batchv1.Job](t, controllerNamespace, "jobs", "-l", "app.kubernetes.io/component=restore")
+	jobs := watchObjects[batchv1.Job](t, controllerNamespace, "jobs", "app.kubernetes.io/component=restore")
 	time.Sleep(2 * time.Second)
 	apply(t, appManifest(ns.Name, "app", image, "exec sleep infinity", missing.claim, empty.claim))
 
@@ -531,7 +531,7 @@ func TestSnapshotsOfAnotherLayoutKeepAClaimPending(t *testing.T) {
 		t.Fatalf("claim %s is gone right after its apply", v.claim)
 	}
 	uid := claim.UID
-	jobs := watchObjects[batchv1.Job](t, controllerNamespace, "jobs", "-l", restoreClaimLabel+"="+string(uid))
+	jobs := watchObjects[batchv1.Job](t, controllerNamespace, "jobs", restoreClaimLabel+"="+string(uid))
 	time.Sleep(2 * time.Second)
 	apply(t, appManifest(ns.Name, "app", image, "exec sleep infinity", v.claim))
 
