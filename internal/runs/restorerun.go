@@ -825,14 +825,20 @@ func (r *RestoreRunReconciler) repositorySnapshots(ctx context.Context, run *bac
 	return snapshots, nil
 }
 
-// listRepository returns every snapshot in the restic repository whose
-// Secret, in the run's namespace, is named secretName, oldest first, for
-// the checks that still take a reason as a string (see
-// repositorySnapshots).
+// listRepository lists every snapshot in a run's restic repository, oldest
+// first, for the checks that still take a reason as a string.
 //
-// It returns a reason, and no error, when the Secret doesn't exist. It
-// returns an error when the Secret can't be read for another reason and when
-// listing the repository fails.
+// Parameters:
+//   - run is the RestoreRun; the Secret is read in its namespace.
+//   - secretName names the repository Secret.
+//
+// It returns the snapshots. It returns the refusal's text as the reason,
+// and no error, when the Secret doesn't exist. It returns an error when the
+// Secret can't be read for another reason and when listing the repository
+// fails.
+//
+// It turns the typed refusal of repositorySnapshots back into a string,
+// which selectSnapshot and recheckSnapshot still return as their reason.
 func (r *RestoreRunReconciler) listRepository(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string) ([]restic.Snapshot, string, error) {
 	snapshots, err := r.repositorySnapshots(ctx, run, secretName)
 	var refused *refusalError
@@ -1719,19 +1725,18 @@ func replacedDestination(name string) string { //nolint:unused // deleted in res
 // claim that is no longer the run's. inPlaceClaimLost does the same for an
 // in-place item.
 func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
-	lost := refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted (or replaced) while the mover wrote into it", run.Spec.Into)
 	claim := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
-	if err := r.Reader.Get(ctx, key, claim); err != nil {
-		if apierrors.IsNotFound(err) {
-			return lost
-		}
+	err := r.Reader.Get(ctx, key, claim)
+	switch {
+	case apierrors.IsNotFound(err):
+		// A claim that is gone is lost.
+	case err != nil:
 		return fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
+	case claim.DeletionTimestamp == nil && metav1.IsControlledBy(claim, run):
+		return nil
 	}
-	if claim.DeletionTimestamp != nil || !metav1.IsControlledBy(claim, run) {
-		return lost
-	}
-	return nil
+	return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted (or replaced) while the mover wrote into it", run.Spec.Into)
 }
 
 // abort ends a run early as Failed. It fails every item that has not
