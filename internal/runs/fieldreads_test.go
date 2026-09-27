@@ -10,6 +10,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
+	"github.com/walzen-group/backup-controller/internal/kueue"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
@@ -146,10 +147,10 @@ func TestAQueuedRunThatKueueNeverAdmitsFails(t *testing.T) {
 
 	run := readBackupRun(t, c)
 	message := readyMessage(run.Status.Conditions)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(message, "Kueue") || !strings.Contains(message, workloadName(runUID)) {
-		t.Fatalf("phase = %q, Ready = %q; want Failed naming Kueue and the Workload %s", run.Status.Phase, message, workloadName(runUID))
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(message, "Kueue") || !strings.Contains(message, kueue.WorkloadName(runUID)) {
+		t.Fatalf("phase = %q, Ready = %q; want Failed naming Kueue and the Workload %s", run.Status.Phase, message, kueue.WorkloadName(runUID))
 	}
-	if _, ok := getUnstructured(t, c, WorkloadGVK, ns, workloadName(runUID)); ok {
+	if _, ok := getUnstructured(t, c, kueue.WorkloadGVK, ns, kueue.WorkloadName(runUID)); ok {
 		t.Error("the Workload outlived the failed run")
 	}
 }

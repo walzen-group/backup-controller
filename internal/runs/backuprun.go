@@ -10,6 +10,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
+	"github.com/walzen-group/backup-controller/internal/kueue"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -269,12 +270,12 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 // waits, admit requeues after pollInterval, and a run Kueue does not admit
 // within its timeout from its creation fails (see awaitAdmission).
 func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
-	queue, err := localQueue(ctx, r.Reader, r.RESTMapper(), run.Namespace)
+	queue, err := kueue.LocalQueue(ctx, r.Reader, r.RESTMapper(), run.Namespace)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if queue != "" {
-		workload, err := ensureWorkload(ctx, r.Client, run, backupRunKind, queue)
+		workload, err := kueue.EnsureWorkload(ctx, r.Client, run, backupRunKind, queue)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -284,10 +285,10 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 				return ctrl.Result{}, err
 			}
 		}
-		if !admitted(workload) {
+		if !kueue.Admitted(workload) {
 			return r.awaitAdmission(ctx, run, workload, queue)
 		}
-		if err := markPodsReady(ctx, r.Client, workload, metav1.NewTime(r.Now())); err != nil {
+		if err := kueue.MarkPodsReady(ctx, r.Client, workload, metav1.NewTime(r.Now())); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -326,7 +327,7 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 //
 // Parameters:
 //   - run is the Queued BackupRun.
-//   - workload is the run's Workload, as ensureWorkload read or created it.
+//   - workload is the run's Workload, as kueue.EnsureWorkload read or created it.
 //   - queue is the LocalQueue the Workload waits in.
 //
 // A run with no status.startedAt is never overdue (see overdue), and a
@@ -1646,9 +1647,9 @@ func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.B
 	if restartErr != nil {
 		return restartErr
 	}
-	if err := deleteWorkload(ctx, r.Client, run.Namespace, run.UID); err != nil {
+	if err := kueue.DeleteWorkload(ctx, r.Client, run.Namespace, run.UID); err != nil {
 		return &releaseError{
-			action: "delete its Kueue Workload " + workloadName(run.UID) + ", which holds the run's place in the queue",
+			action: "delete its Kueue Workload " + kueue.WorkloadName(run.UID) + ", which holds the run's place in the queue",
 			advice: "Fix the cause, or delete the Workload yourself; either way the run then finishes by itself.",
 			err:    err,
 		}

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/kueue"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -66,7 +67,7 @@ func TestARunIsAdmittedAtTheVersionKueueServes(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseQueued || run.Status.StartedAt != nil {
 		t.Fatalf("phase = %q, startedAt = %v; want the run queued for admission", run.Status.Phase, run.Status.StartedAt)
 	}
-	workload, ok := getUnstructured(t, c, schema.GroupVersionKind{Group: kueueGroup, Version: "v1beta1", Kind: "Workload"}, ns, workloadName(runUID))
+	workload, ok := getUnstructured(t, c, schema.GroupVersionKind{Group: kueueGroup, Version: "v1beta1", Kind: "Workload"}, ns, kueue.WorkloadName(runUID))
 	if !ok {
 		t.Fatal("the run created no Workload at v1beta1")
 	}

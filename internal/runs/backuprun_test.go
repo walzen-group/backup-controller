@@ -12,6 +12,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
+	"github.com/walzen-group/backup-controller/internal/kueue"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -808,7 +809,7 @@ func TestAHibernatedDatabaseIsSkipped(t *testing.T) {
 // condition on the run's Workload.
 func admitAll(t *testing.T, c client.Client) {
 	t.Helper()
-	workload, ok := getUnstructured(t, c, WorkloadGVK, ns, workloadName(runUID))
+	workload, ok := getUnstructured(t, c, kueue.WorkloadGVK, ns, kueue.WorkloadName(runUID))
 	if !ok {
 		t.Fatal("the run created no Workload")
 	}
@@ -841,8 +842,8 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 
 	admitAll(t, c)
 	step(t, r) // admitted: PodsReady, Running
-	workload, _ := getUnstructured(t, c, WorkloadGVK, ns, workloadName(runUID))
-	if !conditionTrue(workload, "PodsReady") {
+	workload, _ := getUnstructured(t, c, kueue.WorkloadGVK, ns, kueue.WorkloadName(runUID))
+	if !kueue.ConditionTrue(workload, "PodsReady") {
 		t.Error("the Workload was not marked PodsReady, and waitForPodsReady would evict it")
 	}
 
@@ -886,7 +887,7 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q (%s), want Succeeded", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
-	if _, ok := getUnstructured(t, c, WorkloadGVK, ns, workloadName(runUID)); ok {
+	if _, ok := getUnstructured(t, c, kueue.WorkloadGVK, ns, kueue.WorkloadName(runUID)); ok {
 		t.Error("the Workload outlived the run and holds its queue slot")
 	}
 }

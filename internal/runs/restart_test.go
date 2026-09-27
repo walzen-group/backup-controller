@@ -8,6 +8,7 @@ import (
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/kueue"
 	"github.com/walzen-group/backup-controller/internal/served"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	appsv1 "k8s.io/api/apps/v1"
@@ -301,8 +302,8 @@ func TestOnlyAKindNoVersionOfWhichIsServedIsGone(t *testing.T) {
 				t.Fatalf("served.Kind error = %v, want gone = %t", err, tc.gone)
 			}
 			c := servingOnly(strictclient.Build(fake.NewClientBuilder().WithRESTMapper(failingMapper{err: tc.err}), runtime.NewScheme(), strictclient.Options{Clock: func() time.Time { return frozen }}))
-			if err := deleteWorkload(context.Background(), c, ns, runUID); (err == nil) != tc.gone {
-				t.Errorf("deleteWorkload error = %v, want an error only when the lookup failed", err)
+			if err := kueue.DeleteWorkload(context.Background(), c, ns, runUID); (err == nil) != tc.gone {
+				t.Errorf("kueue.DeleteWorkload error = %v, want an error only when the lookup failed", err)
 			}
 		})
 	}
@@ -327,9 +328,9 @@ func TestAReleaseFailureNamesWhatFailed(t *testing.T) {
 		"Workload": {
 			refuse: func(obj client.Object) bool {
 				u, ok := obj.(*unstructured.Unstructured)
-				return ok && u.GroupVersionKind().GroupKind() == WorkloadGVK.GroupKind()
+				return ok && u.GroupVersionKind().GroupKind() == kueue.WorkloadGVK.GroupKind()
 			},
-			names: []string{"Workload " + workloadName(runUID)},
+			names: []string{"Workload " + kueue.WorkloadName(runUID)},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
