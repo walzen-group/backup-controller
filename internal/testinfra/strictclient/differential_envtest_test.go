@@ -1,11 +1,12 @@
 //go:build envtest
 
 // The envtest differential suite runs the custom resource rules of the strict
-// client against envtest's kube-apiserver 1.36.3, with this repository's
-// BackupRun CRD at v0.7.2 and at v0.8.1 from internal/testinfra/crds,
-// VolSync's ReplicationSource CRD and CloudNativePG's Cluster CRD from the
-// same folder (written as an unstructured object), and compares what a client
-// observes, the RestoreRun defaults included. Each version gets its own
+// client, and the scale subresource of Deployments and StatefulSets, against
+// envtest's kube-apiserver 1.36.3, with this repository's BackupRun CRD at
+// v0.7.2 and at v0.8.1 from internal/testinfra/crds, VolSync's
+// ReplicationSource CRD and CloudNativePG's Cluster CRD from the same folder
+// (written as an unstructured object), and compares what a client observes,
+// the RestoreRun defaults included. Each version gets its own
 // control plane, which is stopped at the end, so the CRDs go with it.
 //
 //	nix develop .#envtest -c go test -tags envtest ./internal/testinfra/strictclient/
@@ -19,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,7 +48,7 @@ func TestDifferentialAgainstEnvtest(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = env.Stop() })
 			scheme := runtime.NewScheme()
-			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, backupv1alpha1.AddToScheme} {
+			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, backupv1alpha1.AddToScheme} {
 				if err := add(scheme); err != nil {
 					t.Fatal(err)
 				}
@@ -194,6 +197,8 @@ func envtestOps(t *testing.T, c client.Client) map[string]string {
 	restoreRunDefaultOps(t, c, o)
 	replicationSourceOps(t, c, o)
 	clusterBeingDeletedOps(t, c, o)
+	scaleOps(t, c, o, &appsv1.Deployment{})
+	scaleOps(t, c, o, &appsv1.StatefulSet{})
 	return o
 }
 
@@ -405,4 +410,97 @@ func clusterBeingDeletedOps(t *testing.T, c client.Client, o map[string]string) 
 	gone := &unstructured.Unstructured{}
 	gone.SetGroupVersionKind(clusterGVK)
 	o["Cluster after the last finalizer: gone"] = fmt.Sprint(apierrors.IsNotFound(c.Get(ctx, client.ObjectKeyFromObject(u), gone)))
+}
+
+// scaleOps writes the replica count of a Deployment or a StatefulSet through
+// its scale subresource with c and adds to o what it observed.
+//
+// Parameters:
+//   - t fails the test when a step that must succeed does not.
+//   - c is the strict client or the envtest client.
+//   - o collects the observations, keyed by the workload's kind.
+//   - kind is an empty Deployment or StatefulSet; it picks the kind.
+//
+// It records the Scale a read returns, what an update through an object
+// that carries only a name leaves in the stored object (the replica count,
+// the generation and the pod template), the Scale the update hands back,
+// and the outcome of an update with a stale resourceVersion, with another
+// uid, with a negative count, and of a read and an update of a workload
+// that does not exist.
+func scaleOps(t *testing.T, c client.Client, o map[string]string, kind client.Object) {
+	t.Helper()
+	ctx := context.Background()
+	replicas := int32(2)
+	labels := map[string]string{"app": "scaled"}
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{Labels: labels},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx:1.27"}}},
+	}
+	meta := metav1.ObjectMeta{Name: "scaled", Namespace: "default"}
+	var created client.Object
+	switch kind.(type) {
+	case *appsv1.Deployment:
+		created = &appsv1.Deployment{ObjectMeta: meta, Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: labels}, Template: template}}
+	default:
+		created = &appsv1.StatefulSet{ObjectMeta: meta, Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: labels}, Template: template, ServiceName: "scaled"}}
+	}
+	if err := c.Create(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+	k := fmt.Sprintf("%T scale: ", kind)
+	named := func() client.Object {
+		obj, _ := kind.DeepCopyObject().(client.Object)
+		obj.SetNamespace("default")
+		obj.SetName("scaled")
+		return obj
+	}
+
+	scale := &autoscalingv1.Scale{}
+	if err := c.SubResource("scale").Get(ctx, named(), scale); err != nil {
+		t.Fatal(err)
+	}
+	o[k+"read"] = fmt.Sprintf("%d replicas, selector %s, resourceVersion of the object %t",
+		scale.Spec.Replicas, scale.Status.Selector, scale.ResourceVersion == created.GetResourceVersion())
+	stale := scale.DeepCopy()
+
+	scale.Spec.Replicas = 0
+	if err := c.SubResource("scale").Update(ctx, named(), client.WithSubResourceBody(scale)); err != nil {
+		t.Fatal(err)
+	}
+	stored := named()
+	if err := c.Get(ctx, client.ObjectKeyFromObject(stored), stored); err != nil {
+		t.Fatal(err)
+	}
+	var storedReplicas *int32
+	var containers []corev1.Container
+	switch s := stored.(type) {
+	case *appsv1.Deployment:
+		storedReplicas, containers = s.Spec.Replicas, s.Spec.Template.Spec.Containers
+	case *appsv1.StatefulSet:
+		storedReplicas, containers = s.Spec.Replicas, s.Spec.Template.Spec.Containers
+	}
+	var images []string
+	for _, container := range containers {
+		images = append(images, container.Image)
+	}
+	o[k+"stored after update"] = fmt.Sprintf("%d replicas, generation %d, images %v", *storedReplicas, stored.GetGeneration(), images)
+	o[k+"returned by update"] = fmt.Sprintf("%d replicas, resourceVersion of the object %t",
+		scale.Spec.Replicas, scale.ResourceVersion == stored.GetResourceVersion())
+
+	stale.Spec.Replicas = 1
+	o[k+"update with a stale resourceVersion"] = envtestReason(c.SubResource("scale").Update(ctx, named(), client.WithSubResourceBody(stale)))
+	otherUID := scale.DeepCopy()
+	otherUID.UID = "00000000-0000-0000-0000-000000000000"
+	o[k+"update with another uid"] = envtestReason(c.SubResource("scale").Update(ctx, named(), client.WithSubResourceBody(otherUID)))
+	negative := scale.DeepCopy()
+	negative.Spec.Replicas = -1
+	o[k+"update to -1"] = envtestReason(c.SubResource("scale").Update(ctx, named(), client.WithSubResourceBody(negative)))
+
+	missing := named()
+	missing.SetName("missing")
+	o[k+"read of a missing workload"] = envtestReason(c.SubResource("scale").Get(ctx, missing, &autoscalingv1.Scale{}))
+	body := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 1}}
+	o[k+"update of a missing workload"] = envtestReason(c.SubResource("scale").Update(ctx, missing, client.WithSubResourceBody(body)))
 }

@@ -55,6 +55,10 @@
 //   - apps Deployment and StatefulSet and batch Job get generation 1 on create
 //     and one more on every write that changes their spec (and, for a
 //     Deployment, its annotations). See Client.generationRule.
+//   - The scale subresource of a Deployment or StatefulSet reads the stored
+//     object and writes only its spec.replicas, raising the generation,
+//     refusing a stale resourceVersion or another uid with a Conflict and a
+//     negative count as Invalid. See Client.SubResource.
 //   - Every delete records the deleted object's dependents (Client.Cascades),
 //     and with Options.GarbageCollect they are orphaned, deleted in the
 //     background or deleted in the foreground as the garbage collector of
@@ -63,11 +67,11 @@
 //
 // The built-in rules (generation, Job's default propagation, UID
 // preconditions, finalizers, garbage collection) are checked against a real
-// cluster by differential_e2e_test.go, and the CRD rules against envtest's
-// kube-apiserver by differential_envtest_test.go. The envtest suite runs in
-// CI. The e2e suite runs only by hand, with make e2e against the
-// docker-desktop cluster, so the built-in rules are checked when someone runs
-// it and not in CI.
+// cluster by differential_e2e_test.go, and the CRD rules and the scale
+// subresource against envtest's kube-apiserver by
+// differential_envtest_test.go. The envtest suite runs in CI. The e2e suite
+// runs only by hand, with make e2e against the docker-desktop cluster, so the
+// built-in rules are checked when someone runs it and not in CI.
 //
 // It leaves out: generation for built-in kinds other than those above (the
 // wrapper keeps the stored value; a PersistentVolumeClaim's stays 0 on a real
