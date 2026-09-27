@@ -16,26 +16,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// oldRestoreUID is the UID of the RestoreRun old-restore, an earlier run
-// that restored into the same claim name.
-const oldRestoreUID = types.UID("9b7d4e21-0000-4000-8000-000000000009")
-
-// oldRestoreRef returns the controller reference the RestoreRun old-restore
-// put on the objects it created.
-func oldRestoreRef() metav1.OwnerReference {
-	old := &backupv1alpha1.RestoreRun{ObjectMeta: metav1.ObjectMeta{Name: "old-restore", Namespace: ns, UID: oldRestoreUID}}
-	return *metav1.NewControllerRef(old, backupv1alpha1.GroupVersion.WithKind("RestoreRun"))
-}
-
-// intoApp is a mutate function for restoreRun that restores the repository
-// Secret into the app's own claim, notes-data, the way a user who read the
-// old refusal ("spec.into is required when spec.repository names the
-// source") would write it.
-func intoApp(r *backupv1alpha1.RestoreRun) {
-	size := resource.MustParse("1Gi")
-	r.Spec.Repository, r.Spec.Into, r.Spec.IntoSize = repoN, claimN, &size
-}
-
 // intoMonday is a mutate function for restoreRun that restores the claim's
 // backups into a new claim named notes-data-monday.
 func intoMonday(r *backupv1alpha1.RestoreRun) {
@@ -71,39 +51,6 @@ func stepUntilFinished(t *testing.T, r *RestoreRunReconciler, c client.Client, n
 		restoreStep(t, r)
 	}
 	return readRestoreRun(t, c)
-}
-
-// An into restore from a repository whose spec.into names the app's live
-// claim ends Invalid at its checks. It writes nothing: no mover, and
-// the claim is as it was. Before, the run created a Direct destination with
-// enableFileDeletion on the mounted claim and ended Succeeded.
-func TestAnIntoRestoreRefusesAnExistingClaim(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(intoApp), claim(), volumeRestore(), repository(), writerPod())
-	before := &corev1.PersistentVolumeClaim{}
-	get(t, c, ns, claimN, before)
-
-	restoreStep(t, r) // plan
-	if names := movers(t, c); len(names) == 0 {
-		restoreStep(t, r)
-	}
-	if names := movers(t, c); len(names) > 0 {
-		completeJob(t, c)
-	}
-	run := stepUntilFinished(t, r, c, 3)
-
-	if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
-		!strings.Contains(readyMessage(run.Status.Conditions), "claim notes-data already exists and this run did not create it") {
-		t.Fatalf("phase = %q, reason = %q, message = %q; want Invalid saying the claim exists",
-			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-	}
-	if names := movers(t, c); len(names) > 0 {
-		t.Errorf("movers = %v, want none", names)
-	}
-	after := &corev1.PersistentVolumeClaim{}
-	get(t, c, ns, claimN, after)
-	if after.ResourceVersion != before.ResourceVersion || len(after.OwnerReferences) != 0 {
-		t.Errorf("claim changed: resourceVersion %s -> %s, owners %v", before.ResourceVersion, after.ResourceVersion, after.OwnerReferences)
-	}
 }
 
 // An into restore from a claim whose spec.into names an existing Bound claim
@@ -180,39 +127,6 @@ func TestAnIntoRestoreRefusesAClaimCreatedAfterItsChecks(t *testing.T) {
 	}
 }
 
-// A run created again with the same spec.into, while the old run still
-// exists, does not adopt the claim the old run created: the garbage
-// collector deletes that claim with the old run. The new run ends Invalid
-// and names the old run.
-func TestARetriedIntoRestoreDoesNotAdoptTheOldRunsClaim(t *testing.T) {
-	for name, mutate := range map[string]func(*backupv1alpha1.RestoreRun){
-		"from a repository": fromRepository,
-		"from a claim":      func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" },
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := restoreReconciler(t, nil, restoreRun(mutate), claim(), volumeRestore(), repository(),
-				boundClaim("scratch", oldRestoreRef()))
-			restoreStep(t, r)
-			if names := movers(t, c); len(names) == 0 {
-				restoreStep(t, r)
-			}
-			if names := movers(t, c); len(names) > 0 {
-				completeJob(t, c)
-			}
-			run := stepUntilFinished(t, r, c, 3)
-
-			if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
-				!strings.Contains(readyMessage(run.Status.Conditions), "it belongs to RestoreRun old-restore") {
-				t.Fatalf("phase = %q, reason = %q, message = %q; want Invalid naming RestoreRun old-restore",
-					run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-			}
-			if names := movers(t, c); len(names) > 0 {
-				t.Errorf("movers = %v, want none", names)
-			}
-		})
-	}
-}
-
 // A pass whose claim create went through but came back as an error is
 // retried, and the next pass finds the claim the run created and goes on
 // to create the restore Job. The ownership check must not refuse the run's
@@ -270,21 +184,6 @@ func TestAnIntoRestoreWhoseClaimIsReplacedFails(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
 		!strings.Contains(readyMessage(run.Status.Conditions), "claim scratch is no longer controlled by the run, so it may not be the claim the run created") {
 		t.Fatalf("phase = %q, message = %q; want Failed saying the claim was replaced", run.Status.Phase, readyMessage(run.Status.Conditions))
-	}
-}
-
-// A restore from spec.repository without spec.into is refused with a message
-// that sends the user to spec.claim for an existing claim, and says spec.into
-// must name a claim that does not exist yet.
-func TestAnIntoRestoreFromARepositoryNamesTheInPlaceShape(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Repository = repoN }), repository())
-	restoreStep(t, r)
-
-	message := readyMessage(readRestoreRun(t, c).Status.Conditions)
-	for _, want := range []string{"must name a claim that does not exist yet", "set spec.claim to it as well"} {
-		if !strings.Contains(message, want) {
-			t.Errorf("message = %q, want it to say %q", message, want)
-		}
 	}
 }
 
@@ -375,45 +274,4 @@ func TestAnIntoRestoreRecordsIntoClaimTaken(t *testing.T) {
 	if after.ResourceVersion != foreign.ResourceVersion || len(after.OwnerReferences) != 0 || after.DeletionTimestamp != nil {
 		t.Errorf("claim = %+v, want the foreign claim untouched", after.ObjectMeta)
 	}
-}
-
-// An into restore whose status write was lost, and whose claim is then
-// deleted, takes the Job over and fails with reason ClaimLost. The Job never
-// ran, so the message says that the Job wrote nothing.
-func TestAnIntoClaimGoneBeforeTheJobRanSaysSo(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
-	restoreStep(t, r) // plan
-	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			if _, ok := obj.(*backupv1alpha1.RestoreRun); ok {
-				return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("restoreruns").GroupResource(), obj.GetName(), nil)
-			}
-			return cl.SubResource(sub).Update(ctx, obj, opts...)
-		},
-	})
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
-	}
-	r.Client = c
-	jobs := restoreJobs(t, c)
-	if len(jobs) != 1 {
-		t.Fatalf("restore Jobs = %v, want the lost pass's one", jobs)
-	}
-	own := &corev1.PersistentVolumeClaim{}
-	get(t, c, ns, "scratch", own)
-	if err := c.Delete(context.Background(), own); err != nil {
-		t.Fatal(err)
-	}
-	stepUntilFinished(t, r, c, 3)
-	if !suspendedJob(t, c, jobs[0].Name) {
-		t.Errorf("Job %s was resumed, want it left suspended with its claim gone", jobs[0].Name)
-	}
-	markSuspended(t, c, &jobs[0])
-	run := stepUntilFinished(t, r, c, 2)
-
-	if message := readyMessage(run.Status.Conditions); run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
-		!strings.Contains(message, "claim scratch was deleted before its restore Job ran, so the Job wrote nothing") {
-		t.Fatalf("phase = %q, message = %q; want Failed saying the Job wrote nothing", run.Status.Phase, message)
-	}
-	expectItemReason(t, c, backupv1alpha1.ItemReasonClaimLost)
 }

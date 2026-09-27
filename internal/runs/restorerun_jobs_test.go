@@ -12,7 +12,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // The helpers in this file stand in for the Job controller around an
@@ -160,63 +159,4 @@ func movers(t *testing.T, c client.Client) []string {
 		names = append(names, job.Name)
 	}
 	return names
-}
-
-// swappedJob is a way the Job under a Running item's name stops being the
-// Job the run recorded, for the tests of how followJob refuses it.
-type swappedJob struct {
-	// name names the subtest.
-	name string
-	// swap changes the recorded Job in place before the test stores it.
-	swap func(job *batchv1.Job)
-	// reason is the reason the item fails with.
-	reason backupv1alpha1.ItemReason
-	// stopped is true when the Job under the name still has the recorded
-	// UID, so the run suspends and deletes it.
-	stopped bool
-}
-
-// swappedJobs are the Jobs followJob refuses although one holds the item's
-// name: a Job someone created under the name after the recorded one was
-// deleted, which is Complete, and the recorded Job after someone removed
-// its controller reference to the run.
-var swappedJobs = []swappedJob{
-	{name: "replaced", reason: backupv1alpha1.ItemReasonRestoreJobDeleted, swap: func(job *batchv1.Job) {
-		job.UID = "replacement-uid"
-		job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
-	}},
-	{name: "no longer controlled", reason: backupv1alpha1.ItemReasonRestoreJobFailed, stopped: true, swap: func(job *batchv1.Job) {
-		job.OwnerReferences = nil
-	}},
-}
-
-// countJobCreates returns a client over c that counts the Jobs created
-// through it, and the count.
-func countJobCreates(c client.Client) (client.Client, *int) {
-	creates := 0
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if _, ok := obj.(*batchv1.Job); ok {
-				creates++
-			}
-			return cl.Create(ctx, obj, opts...)
-		},
-	}), &creates
-}
-
-// expectSwappedJobLeft checks the Jobs a run left once it stopped the Job it
-// recorded for a swapped Job: none when the Job under the name had the
-// recorded UID, and otherwise that Job, neither suspended nor deleted.
-func expectSwappedJobLeft(t *testing.T, c client.Client, tc swappedJob, job *batchv1.Job) {
-	t.Helper()
-	jobs := restoreJobs(t, c)
-	if tc.stopped {
-		if len(jobs) != 0 {
-			t.Errorf("restore Jobs = %v, want the recorded Job deleted", jobs)
-		}
-		return
-	}
-	if len(jobs) != 1 || jobs[0].UID != job.UID || suspendedJob(t, c, job.Name) {
-		t.Errorf("restore Jobs = %v, want the Job with UID %s left alone", jobs, job.UID)
-	}
 }

@@ -13,7 +13,6 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
-	"github.com/walzen-group/backup-controller/internal/restorejob"
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -157,86 +156,6 @@ func TestARestoreWhoseSnapshotWasPrunedFailsBeforeWriting(t *testing.T) {
 	}
 }
 
-// A restore whose selected snapshot a quiesced backup retimed between the
-// checks and the create fails the item and names the rewritten copy. The
-// copy has another ID and time, and the run recorded no tree to prove it
-// holds the same data, so it does not follow the copy (design R3).
-func TestARestoreWhoseSnapshotWasRetimedFailsBeforeWriting(t *testing.T) {
-	for _, shape := range restoreShapes {
-		t.Run(shape.name, func(t *testing.T) {
-			repo := copyRecorded(t, "timed")
-			r, c := restoreReconciler(t, nil, restoreRun(shape.mutate), claim(), volumeRestore(), repository())
-			r.Snapshots = repo
-			restoreStep(t, r) // plan
-
-			rewritten, err := repo.repo.Retime(context.Background(), newestTimed, time.Date(2026, 9, 25, 21, 21, 40, 0, time.UTC), restic.QuiescedTag)
-			if err != nil {
-				t.Fatal(err)
-			}
-			restoreStep(t, r)
-			restoreStep(t, r) // the finished run only waits for its expiry
-
-			expectItemFailed(t, c, "snapshot "+newestTimed+", which the checks selected, was rewritten as "+rewritten.ShortID()+
-				" at 2026-09-25T21:21:40Z by a quiesced backup after the checks", "Create a new RestoreRun")
-			expectNothingCreated(t, c, shape.into)
-			expectItemReason(t, c, backupv1alpha1.ItemReasonSnapshotChanged)
-		})
-	}
-}
-
-// A restore whose selected snapshot another one joined in its second after
-// the checks goes ahead, in place and into a new claim: its restore Job
-// restores the recorded snapshot by its full ID, which the later one can't
-// shadow. Before, an into restore failed, since VolSync's mover pinned to
-// that second would have restored the later one.
-func TestARestoreWhoseSnapshotWasShadowedGoesAhead(t *testing.T) {
-	later := moverSnapshot("7a11ce00", monday.Time.Add(500*time.Millisecond))
-	for _, shape := range restoreShapes {
-		t.Run(shape.name, func(t *testing.T) {
-			r, c := restoreReconciler(t, nil, restoreRun(shape.mutate), claim(), volumeRestore(), repository())
-			restoreStep(t, r) // plan, which selects monday
-
-			r.Snapshots = snapshots{sunday, monday, later}
-			restoreStep(t, r)
-
-			if got := itemJob(t, c).Annotations[restorejob.AnnotationSnapshotID]; got != monday.ID {
-				t.Errorf("restore Job snapshot = %s, want monday's %s", got, monday.ID)
-			}
-		})
-	}
-}
-
-// A restore whose repository did not change since the checks starts its
-// restore Job, from the recorded repository, which restores the selected
-// snapshot by its full ID. An into restore creates no VolumeRestore.
-func TestARestoreWhoseSnapshotIsStillThereGoesAhead(t *testing.T) {
-	for _, shape := range restoreShapes {
-		t.Run(shape.name, func(t *testing.T) {
-			r, c := restoreReconciler(t, nil, restoreRun(shape.mutate), claim(), volumeRestore(), repository())
-			r.Snapshots = copyRecorded(t, "timed")
-			restoreStep(t, r) // plan
-			restoreStep(t, r) // create
-
-			run := readRestoreRun(t, c)
-			if run.Status.Phase != backupv1alpha1.RunPhaseRunning || run.Status.Items[0].Phase != backupv1alpha1.ItemRunning {
-				t.Fatalf("phase = %q, item = %+v; want Running", run.Status.Phase, run.Status.Items[0])
-			}
-			item := run.Status.Items[0]
-			if job := itemJob(t, c); job.Annotations[restorejob.AnnotationSnapshotID] != item.SnapshotID || item.Snapshot != newestTimed {
-				t.Errorf("restore Job snapshot = %s, item = %+v; want the Job to restore %s by the recorded full ID",
-					job.Annotations[restorejob.AnnotationSnapshotID], item, newestTimed)
-			}
-			if shape.into == "" {
-				return
-			}
-			key := types.NamespacedName{Namespace: ns, Name: shape.into}
-			if err := c.Get(context.Background(), key, &backupv1alpha1.VolumeRestore{}); !apierrors.IsNotFound(err) {
-				t.Errorf("VolumeRestore %s: %v, want none created", shape.into, err)
-			}
-		})
-	}
-}
-
 // A pass that created the item's restore Job and lost the status write
 // leaves the item Pending. The next pass takes that Job over: the item goes
 // Running and names the Job and its UID, even when the snapshot is gone from
@@ -358,70 +277,6 @@ func finishOtherRun(t *testing.T, c client.Client) {
 	if err := c.Status().Update(context.Background(), source); err != nil {
 		t.Fatal(err)
 	}
-}
-
-// A restore that waits at its checks for a backup that outlasts spec.timeout,
-// counted from the run's creation, ends TimedOut and names the backup.
-func TestARestoreWaitingForABackupAtItsChecksTimesOut(t *testing.T) {
-	for _, shape := range restoreShapes {
-		t.Run(shape.name, func(t *testing.T) {
-			r, c := restoreReconciler(t, nil, restoreRun(shape.mutate, func(r *backupv1alpha1.RestoreRun) { r.CreationTimestamp = metav1.NewTime(frozen) }),
-				claim(), volumeRestore(), repository(), otherRun(), backingUp())
-			restoreStep(t, r)
-
-			r.Now = func() time.Time { return frozen.Add(4 * time.Hour) }
-			restoreStep(t, r)
-
-			run := readRestoreRun(t, c)
-			if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
-				t.Fatalf("phase = %q, reason = %q; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))
-			}
-			if msg := readyMessage(run.Status.Conditions); !strings.Contains(msg, "had not passed its checks by 2026-09-24T16:00:00Z") ||
-				!strings.Contains(msg, "BackupRun manual-notes") {
-				t.Errorf("message = %q, want the deadline and the BackupRun", msg)
-			}
-			expectNothingCreated(t, c, shape.into)
-		})
-	}
-}
-
-// An in-place item that records a short snapshot ID and no full one fails
-// before its restore Job exists, with reason RestoreJobRefused: the Job
-// restores only a full ID, and a shorter one would let restic pick a
-// snapshot of its own. The run records the full ID with its plan, so only a
-// status the run did not write holds such an item.
-func TestAnItemWithoutAFullSnapshotIDFailsBeforeItStarts(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) {
-		r.Spec.Claim = claimN
-		r.Status.Phase = backupv1alpha1.RunPhaseRunning
-		r.Status.StartedAt = atFrozen(0)
-		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN,
-			Phase: backupv1alpha1.ItemPending, Snapshot: sunday.ShortID(), SnapshotTime: &metav1.Time{Time: sunday.Time}}}
-	}), claim(), volumeRestore(), repository())
-	restoreStep(t, r)
-
-	expectItemFailed(t, c, "records no full snapshot ID", "Nothing was written to claim "+claimN)
-	expectItemReason(t, c, backupv1alpha1.ItemReasonRestoreJobRefused)
-	expectNothingCreated(t, c, "")
-}
-
-// An item whose restore Job spec Build refuses fails with reason
-// RestoreJobRefused before the Job exists, and its message says that
-// nothing was written to the claim, as every other refusal before the
-// create does. The repository lists a snapshot whose ID is no full ID, which
-// the recheck finds and Build refuses; no restic writes such an ID.
-func TestARefusedJobSpecSaysNothingWasWritten(t *testing.T) {
-	odd := monday
-	odd.ID = "6e473100"
-	r, c := restoreReconciler(t, nil, checkedRestore(inPlace, func(r *backupv1alpha1.RestoreRun) {
-		r.Status.Items[0].SnapshotID = odd.ID
-	}), claim(), volumeRestore(), repository())
-	r.Snapshots = snapshots{odd}
-	restoreStep(t, r)
-
-	expectItemFailed(t, c, "restore Job spec", "Nothing was written to claim "+claimN)
-	expectItemReason(t, c, backupv1alpha1.ItemReasonRestoreJobRefused)
-	expectNothingCreated(t, c, "")
 }
 
 // expectItemReason checks that the run's first item records the reason

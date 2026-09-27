@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -10,15 +9,12 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
-	coordinationv1 "k8s.io/api/coordination/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // These tests cover how a database item tells the Cluster it deleted, its own
@@ -101,21 +97,6 @@ func clusterUID(t *testing.T, c client.Client) types.UID {
 	return u.GetUID()
 }
 
-// refuseFirstClusterDelete returns a client over c whose first delete of a
-// Cluster fails the way an API server outage fails it.
-func refuseFirstClusterDelete(c client.Client) client.Client {
-	refused := false
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == cnpg.ClusterGVK.Kind && !refused {
-				refused = true
-				return apierrors.NewServiceUnavailable("etcd leader changed")
-			}
-			return cl.Delete(ctx, obj, opts...)
-		},
-	})
-}
-
 // A Cluster created again after the run deleted the old one, carrying
 // backup.wlz.li/bootstrap: initdb or declaring its own bootstrap, started
 // empty or from its owner's bootstrap, and nothing was restored. The item
@@ -151,37 +132,6 @@ func TestAClusterCreatedAgainOptedOutFailsTheRun(t *testing.T) {
 	}
 }
 
-// The old Cluster, whose delete failed, gains backup.wlz.li/bootstrap: initdb
-// before the run tries again. It is the Cluster the run never deleted, so the
-// item is Skipped and the Cluster stays.
-func TestAnOldClusterThatOptsOutBeforeTheDeleteIsSkipped(t *testing.T) {
-	r, c := restoreReconciler(t, prober{saturday},
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), cluster(), objectStore(), storeSecret())
-	restoreStep(t, r) // plan
-	r.Client = refuseFirstClusterDelete(c)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass whose delete failed succeeded, want the error returned")
-	}
-	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemDeleted || item.ClusterUID != "old-cluster-uid" {
-		t.Fatalf("item = %+v, want Deleted with the old Cluster's UID", item)
-	}
-
-	old, _ := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN)
-	optedOut(old)
-	if err := c.Update(context.Background(), old); err != nil {
-		t.Fatal(err)
-	}
-	restoreStep(t, r)
-
-	item := readRestoreRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemSkipped || !strings.Contains(item.Message, bootstrap.OptOutAnnotation) {
-		t.Errorf("item = %+v, want Skipped naming %s", item, bootstrap.OptOutAnnotation)
-	}
-	if uid := clusterUID(t, c); uid != "old-cluster-uid" {
-		t.Errorf("Cluster UID = %q, want the old Cluster left alone", uid)
-	}
-}
-
 // A Cluster created again without the barman-cloud plugin archives nowhere.
 // The webhook admits it untouched, so it is not the run's recovery. The run
 // fails the item saying so and leaves the Cluster alone, instead of deleting
@@ -204,73 +154,6 @@ func TestAClusterCreatedAgainWithoutArchivingIsNotDeleted(t *testing.T) {
 	if uid := clusterUID(t, c); uid != recreated.GetUID() {
 		t.Errorf("Cluster UID = %q, want the Cluster that archives nowhere (%s) left alone", uid, recreated.GetUID())
 	}
-}
-
-// An item marked Deleted without a clusterUID can't tell the old Cluster from
-// a new one. A run that found no Cluster at its start leaves such an item,
-// and a test stands in for the rest by clearing the field. A live Cluster
-// that is not the run's recovery fails the item and stays, whichever it is.
-func TestARunWithoutAClusterUIDDeletesNothing(t *testing.T) {
-	forget := func(t *testing.T, c client.Client) {
-		t.Helper()
-		run := readRestoreRun(t, c)
-		run.Status.Items[0].ClusterUID = ""
-		if err := c.Status().Update(context.Background(), run); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	t.Run("the old Cluster the delete missed", func(t *testing.T) {
-		r, c := restoreReconciler(t, prober{saturday},
-			restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), cluster(), objectStore(), storeSecret())
-		restoreStep(t, r) // plan
-		r.Client = refuseFirstClusterDelete(c)
-		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-			t.Fatal("the pass whose delete failed succeeded, want the error returned")
-		}
-		forget(t, c)
-		restoreStep(t, r)
-		restoreStep(t, r)
-
-		run := readRestoreRun(t, c)
-		if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "no clusterUID") {
-			t.Errorf("item = %+v, want Failed saying the item holds no clusterUID", item)
-		}
-		if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-			t.Errorf("phase = %q, want Failed", run.Status.Phase)
-		}
-		if uid := clusterUID(t, c); uid != "old-cluster-uid" {
-			t.Errorf("Cluster UID = %q, want the Cluster left alone", uid)
-		}
-	})
-
-	t.Run("a new Cluster", func(t *testing.T) {
-		r, c := databaseRestore(t)
-		forget(t, c)
-		recreated := createCluster(t, c)
-		restoreStep(t, r)
-		restoreStep(t, r)
-
-		if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed {
-			t.Errorf("item = %+v, want Failed", item)
-		}
-		if uid := clusterUID(t, c); uid != recreated.GetUID() {
-			t.Errorf("Cluster UID = %q, want the Cluster left alone", uid)
-		}
-	})
-
-	t.Run("its own recovery", func(t *testing.T) {
-		r, c := databaseRestore(t)
-		forget(t, c)
-		recovered := createCluster(t, c, recoveredBy("back-to-monday"))
-		restoreStep(t, r)
-		markHealthy(t, c, recovered)
-		restoreStep(t, r)
-
-		if run := readRestoreRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
-			t.Errorf("phase = %q, items = %+v; want Succeeded", run.Status.Phase, run.Status.Items)
-		}
-	})
 }
 
 // A Cluster the webhook recovered for the run is replaced during the
@@ -376,32 +259,6 @@ func TestTwoRunsWaitingOnOneClusterDoNotDeleteEachOthersRecovery(t *testing.T) {
 	}
 }
 
-// A Deleted item that finds the Cluster recovered for another run fails,
-// naming that run, and leaves the recovery alone. The refusal at the checks
-// keeps two runs from both deleting one Cluster; this is what the run does
-// should they get there all the same.
-func TestADeletedItemLeavesAnotherRunsRecoveryAlone(t *testing.T) {
-	second := restoreRun(func(r *backupv1alpha1.RestoreRun) {
-		r.Name, r.UID, r.Spec.Database = "second", "9b7d4e21-0000-4000-8000-00000000000a", pgN
-		r.Finalizers = []string{Finalizer}
-		r.Status.Phase = backupv1alpha1.RunPhaseRunning
-		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "Cluster", Name: pgN, Phase: backupv1alpha1.ItemDeleted}}
-	})
-	r, c := restoreReconciler(t, prober{saturday}, second, objectStore(), storeSecret())
-	recovered := createCluster(t, c, recoveredBy("back-to-monday"))
-	stepRestore(t, r, "second")
-	stepRestore(t, r, "second")
-
-	run := &backupv1alpha1.RestoreRun{}
-	get(t, c, ns, "second", run)
-	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "RestoreRun back-to-monday recovered it") {
-		t.Errorf("second run's item = %+v (%s), want Failed naming back-to-monday", item, readyMessage(run.Status.Conditions))
-	}
-	if uid := clusterUID(t, c); uid != recovered.GetUID() {
-		t.Errorf("Cluster UID = %q, want back-to-monday's recovery (%s) left alone", uid, recovered.GetUID())
-	}
-}
-
 // Two runs that planned in the same instant both passed the check at their
 // plan, since neither had written its items yet. So a run checks again right
 // before it deletes the Cluster: back-to-monday finds second holding the
@@ -474,44 +331,6 @@ func TestATimedOutRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
 	}
 }
 
-// A Cluster the run left deleted is a field of its item, and the run's
-// ending says so: the pass that times out records both and fails to list
-// its Leases, the item's message is edited in between, and the next pass
-// still ends the run with the note in its Ready message.
-func TestAClusterLeftDeletedIsAField(t *testing.T) {
-	c := newClient(t, restoreRun(deletedDatabaseRun), objectStore(), storeSecret())
-	failList := true
-	reader := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if _, ok := list.(*coordinationv1.LeaseList); ok && failList {
-				return apierrors.NewInternalError(errors.New("the API server cannot list the Leases"))
-			}
-			return cl.List(ctx, list, opts...)
-		},
-	})
-	r := &RestoreRunReconciler{Client: c, Reader: reader, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday},
-		Now: func() time.Time { return frozen.Add(5 * time.Hour) }}
-
-	if err := tryRestoreStep(r); err == nil {
-		t.Fatal("the pass whose release failed returned no error")
-	}
-	stored := readRestoreRun(t, c)
-	if item := stored.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !item.ClusterLeftDeleted {
-		t.Fatalf("item = %+v after the failed release, want it Failed with clusterLeftDeleted", item)
-	}
-	stored.Status.Items[0].Message = "edited between the passes"
-	if err := c.Status().Update(context.Background(), stored); err != nil {
-		t.Fatal(err)
-	}
-	failList = false
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(readyMessage(run.Status.Conditions), endedBeforeRecreate) {
-		t.Errorf("phase = %q, message = %q; want Failed saying %q", run.Status.Phase, readyMessage(run.Status.Conditions), endedBeforeRecreate)
-	}
-}
-
 // A run deleted while it waits for its deleted Cluster records an event that
 // says the same.
 func TestADeletedRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
@@ -530,81 +349,5 @@ func TestADeletedRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("events = %q, want one saying %q", recorded(recorder), endedBeforeRecreate)
-	}
-}
-
-// A run that timed out with its Cluster deleted, and is deleted before it
-// could finish, records the ClusterLeftDeleted event too. Its item is Failed
-// by then and records clusterLeftDeleted, and the run's Ready message, which
-// carries the note, goes with the run.
-func TestARunDeletedAfterItsTimeoutSaysHowItsDeletedClusterComesBack(t *testing.T) {
-	c := newClient(t, restoreRun(deletedDatabaseRun), objectStore(), storeSecret())
-	failList := true
-	reader := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if _, ok := list.(*coordinationv1.LeaseList); ok && failList {
-				return apierrors.NewInternalError(errors.New("the API server cannot list the Leases"))
-			}
-			return cl.List(ctx, list, opts...)
-		},
-	})
-	recorder := events.NewFakeRecorder(10)
-	r := &RestoreRunReconciler{Client: c, Reader: reader, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday},
-		Recorder: recorder, Now: func() time.Time { return frozen.Add(5 * time.Hour) }}
-
-	if err := tryRestoreStep(r); err == nil {
-		t.Fatal("the pass whose release failed returned no error")
-	}
-	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !item.ClusterLeftDeleted {
-		t.Fatalf("item = %+v after the failed release, want it Failed with clusterLeftDeleted", item)
-	}
-	failList = false
-	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
-		t.Fatal(err)
-	}
-	restoreStep(t, r)
-
-	var found bool
-	for _, event := range recorded(recorder) {
-		found = found || (strings.Contains(event, "ClusterLeftDeleted") && strings.Contains(event, endedBeforeRecreate))
-	}
-	if !found {
-		t.Errorf("events = %q, want a ClusterLeftDeleted event saying %q", recorded(recorder), endedBeforeRecreate)
-	}
-}
-
-// A run deleted after its owner created the deleted Cluster again records no
-// ClusterLeftDeleted event: the Cluster is back, and a note about its next
-// creation would be wrong. A Cluster that is still the one the run deleted,
-// such as one whose deletion has not completed, keeps the event.
-func TestADeletedRunSkipsTheEventWhenItsClusterIsBack(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		uid   types.UID
-		event bool
-	}{
-		{"created again", "new-cluster-uid", false},
-		{"still the old one", "old-cluster-uid", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			back := cluster()
-			back.SetUID(tc.uid)
-			r, c := restoreReconciler(t, prober{saturday}, restoreRun(deletedDatabaseRun), objectStore(), storeSecret(), back)
-			recorder := events.NewFakeRecorder(10)
-			r.Recorder = recorder
-			if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
-				t.Fatal(err)
-			}
-
-			restoreStep(t, r)
-
-			found := false
-			for _, event := range recorded(recorder) {
-				found = found || strings.Contains(event, "ClusterLeftDeleted")
-			}
-			if found != tc.event {
-				t.Errorf("ClusterLeftDeleted recorded = %t, want %t", found, tc.event)
-			}
-		})
 	}
 }

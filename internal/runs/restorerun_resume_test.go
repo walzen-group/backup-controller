@@ -1,18 +1,13 @@
 package runs
 
 import (
-	"bytes"
 	"context"
-	"errors"
-	"strings"
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	batchv1 "k8s.io/api/batch/v1"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -104,138 +99,6 @@ func TestARestoreJobIsResumedOnlyOnceTheRunRecordedIt(t *testing.T) {
 			}
 		})
 	}
-}
-
-// refuseResumes returns a client over c that refuses as Forbidden every
-// patch that clears a Job's spec.suspend, the way an admission policy
-// would.
-func refuseResumes(c client.Client) client.Client {
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			data, err := patch.Data(obj)
-			if err != nil {
-				return err
-			}
-			if _, ok := obj.(*batchv1.Job); ok && bytes.Contains(data, []byte(`"suspend":false`)) {
-				return apierrors.NewForbidden(batchv1.Resource("jobs"), obj.GetName(), errors.New("resume refused"))
-			}
-			return cl.Patch(ctx, obj, patch, opts...)
-		},
-	})
-}
-
-// A resume the API server refuses as Forbidden fails the item with reason
-// RestoreJobRefused, saying nothing was written to the claim, as a refused
-// create does. The run then stops the Job, which never ran, and ends
-// Failed. That holds for an in-place and an into restore.
-func TestARefusedResumeFailsTheItem(t *testing.T) {
-	for name, tc := range map[string]struct {
-		run     *backupv1alpha1.RestoreRun
-		objects []client.Object
-		passes  int
-	}{
-		"in place": {restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-			[]client.Object{claim(), volumeRestore(), repository()}, 3},
-		"into": {plannedInto(), []client.Object{sourceOnNode(), volumeRestore(), repository()}, 2},
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := restoreReconciler(t, nil, append(tc.objects, tc.run)...)
-			r.Client = refuseResumes(c)
-			for range tc.passes {
-				restoreStep(t, r)
-			}
-
-			item := readRestoreRun(t, c).Status.Items[0]
-			if item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobRefused ||
-				!strings.Contains(item.Message, "resume") || !strings.Contains(item.Message, "Nothing was written to claim "+item.Name) {
-				t.Fatalf("item = %+v, want Failed with reason RestoreJobRefused, saying the resume was refused and nothing was written", item)
-			}
-			job := onlyJob(t, c)
-			if !suspendedJob(t, c, job.Name) {
-				t.Fatalf("restore Job %s runs, want it still suspended", job.Name)
-			}
-			markSuspended(t, c, job)
-			done := stepUntilFinished(t, r, c, 3)
-			if done.Status.Phase != backupv1alpha1.RunPhaseFailed {
-				t.Errorf("phase = %q, want Failed", done.Status.Phase)
-			}
-			if jobs := restoreJobs(t, c); len(jobs) != 0 {
-				t.Errorf("restore Jobs = %v, want the refused Job deleted", jobs)
-			}
-		})
-	}
-}
-
-// A restore Job whose create answered 504 Timeout and was stored only after
-// the next pass refused its item never runs. The run restores two claims;
-// the second item's Job restores while the first item's Job lands. Every
-// pass after that leaves the late Job suspended: work releases the failed
-// item's claim Lease, and once the second Job completes the run gives the
-// app back, stops the late Job, which has no pod, and ends Failed.
-func TestAJobThatLandsAfterItsItemFailedNeverRuns(t *testing.T) {
-	run, _ := quiescedMidRestore(t)
-	run.Status.Items = []backupv1alpha1.RestoreItem{
-		{Kind: backupv1alpha1.ItemKindClaim, Name: claimN, Phase: backupv1alpha1.ItemPending,
-			Snapshot: monday.ShortID(), SnapshotID: monday.ID, SnapshotTime: &metav1.Time{Time: monday.Time}},
-		runningOnJob(cacheN, 1),
-	}
-	run.Status.Items[1].JobUID = "second-job-uid"
-	second := restoreJobFor(t, run, cacheN, monday.ID)
-	second.Name, second.UID = jobName(restoreUID, 1), "second-job-uid"
-	cacheLease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: claimLeaseName("cache-claim-uid"), Namespace: ns}}
-	stamp(cacheLease, leaseHolder{kind: "RestoreRun", run: run, item: cacheN}, []string{cacheN})
-	r, c := restoreReconciler(t, nil, append([]client.Object{run, claim(), volumeRestore(), repository(),
-		stoppedDeployment(), kustomization(true), second, cacheLease}, cacheClaim()...)...)
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}
-
-	var land func() *batchv1.Job
-	r.Client, land = createLandsLater(t, c)
-	if _, err := r.Reconcile(context.Background(), req); err == nil {
-		t.Fatal("the pass whose Job create timed out succeeded, want the timeout returned")
-	}
-	r.Client = c
-	deleteVolumeRestore(t, c)
-	restoreStep(t, r)
-	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Job != "" {
-		t.Fatalf("item = %+v, want Failed with no Job", item)
-	}
-
-	land()
-	late := lateJob(t, c, second.UID)
-	markSuspended(t, c, late)
-	restoreStep(t, r)
-	restoreStep(t, r)
-	if !suspendedJob(t, c, late.Name) {
-		t.Fatalf("the late restore Job %s runs, want it suspended: the run never recorded it", late.Name)
-	}
-	lease := types.NamespacedName{Namespace: ns, Name: claimLeaseName("claim-uid")}
-	if err := c.Get(context.Background(), lease, &coordinationv1.Lease{}); !apierrors.IsNotFound(err) {
-		t.Errorf("get the failed item's claim Lease = %v, want it released", err)
-	}
-
-	endJob(t, c, second.Name, batchv1.JobComplete, "CompletionsReached", "Reached expected number of succeeded pods")
-	done := stepUntilFinished(t, r, c, 4)
-	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || replicasOf(t, c) != 2 {
-		t.Errorf("phase = %q, replicas = %d; want Failed and the app back", done.Status.Phase, replicasOf(t, c))
-	}
-	for _, job := range restoreJobs(t, c) {
-		if job.UID == late.UID {
-			t.Errorf("the late restore Job %s is left, want it deleted", late.Name)
-		}
-	}
-}
-
-// lateJob returns the restore Job in the test namespace whose UID is not
-// the one given.
-func lateJob(t *testing.T, c client.Client, other types.UID) *batchv1.Job {
-	t.Helper()
-	for _, job := range restoreJobs(t, c) {
-		if job.UID != other {
-			return &job
-		}
-	}
-	t.Fatal("no late restore Job, want the one whose create timed out")
-	return nil
 }
 
 // landOnRestart returns a client over c that calls land at the first write

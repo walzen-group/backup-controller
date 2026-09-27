@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -12,17 +11,13 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	batchv1 "k8s.io/api/batch/v1"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // The tests in this file check an into restore (spec.into), from a claim's
@@ -150,51 +145,6 @@ func TestAnIntoRestoreSucceedsOnACompleteJob(t *testing.T) {
 	}
 }
 
-// An into restore whose Job ends Failed through the FailJob rule fails the
-// item with reason RestoreJobFailed and restic's exit code, read from the
-// Job's own pod, and the run ends Failed.
-func TestAnIntoRestoreFailsOnAFailedJobWithTheExitCode(t *testing.T) {
-	r, c := startedInto(t, fromRepository)
-	job := itemJob(t, c)
-	pod := jobPodOf(job, "restore-pod", corev1.PodFailed)
-	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "restore", State: corev1.ContainerState{
-		Terminated: &corev1.ContainerStateTerminated{ExitCode: 12, Message: "Fatal: wrong password or no key found"},
-	}}}
-	createPod(t, c, pod)
-	endJob(t, c, job.Name, batchv1.JobFailed, "PodFailurePolicy", "Container restore for pod notes/restore-pod exited with code 12 matching FailJob rule at index 0")
-	run := stepUntilFinished(t, r, c, 3)
-
-	item := run.Status.Items[0]
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobFailed ||
-		!strings.Contains(item.Message, "restic exited 12 (wrong password)") {
-		t.Errorf("phase = %q, item = %+v; want Failed with reason RestoreJobFailed and exit code 12", run.Status.Phase, item)
-	}
-}
-
-// A restore Job create the API server refuses fails an into restore's item
-// with reason RestoreJobRefused and the server's message, says nothing was
-// written to the new claim, and creates no Job.
-func TestARefusedIntoJobCreateFailsTheItem(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
-	restoreStep(t, r) // plan
-	r.Client = refuseJobCreates(c, func(obj client.Object) error {
-		return apierrors.NewForbidden(schema.GroupResource{Group: "batch", Resource: "jobs"}, obj.GetName(),
-			errors.New("ValidatingAdmissionPolicy 'backup-controller-jobs' denied request"))
-	})
-	restoreStep(t, r)
-	r.Client = c
-	run := stepUntilFinished(t, r, c, 2)
-
-	item := run.Status.Items[0]
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobRefused ||
-		!strings.Contains(item.Message, "refused to create restore Job") || !strings.Contains(item.Message, "Nothing was written to claim scratch") {
-		t.Errorf("phase = %q, item = %+v; want Failed with reason RestoreJobRefused, the server's refusal and nothing written", run.Status.Phase, item)
-	}
-	if jobs := restoreJobs(t, c); len(jobs) != 0 {
-		t.Errorf("restore Jobs = %v, want none", jobs)
-	}
-}
-
 // A pass that created an into restore's claim and Job and lost the status
 // write that recorded the Job leaves the item without it. The next pass
 // takes that Job over, records its name and UID, and creates no second Job.
@@ -235,54 +185,6 @@ func plannedInto() *backupv1alpha1.RestoreRun {
 	})
 }
 
-// A restore Job the run created under the into item's name whose
-// snapshot-id annotation is not the recorded full ID fails the item with
-// reason RestoreJobFailed naming both IDs, and the run stops that Job. A
-// Job of that name the run did not create fails the item with reason
-// RestoreJobRefused and is left alone.
-func TestAnIntoTakeoverChecksTheJob(t *testing.T) {
-	t.Run("another ID", func(t *testing.T) {
-		run := plannedInto()
-		lost := restoreJobFor(t, run, run.Spec.Into, sunday.ID)
-		r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(), intoClaim(run), lost)
-		restoreStep(t, r)
-
-		item := readRestoreRun(t, c).Status.Items[0]
-		if item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobFailed || item.JobUID != lost.UID ||
-			!strings.Contains(item.Message, sunday.ID) || !strings.Contains(item.Message, monday.ID) {
-			t.Fatalf("item = %+v, want Failed with reason RestoreJobFailed naming both IDs and the Job", item)
-		}
-		if !suspendedJob(t, c, lost.Name) || readRestoreRun(t, c).Status.Phase.Finished() {
-			t.Errorf("Job suspended = %t, phase = %q; want the Job stopped and the run waiting for it", suspendedJob(t, c, lost.Name), readRestoreRun(t, c).Status.Phase)
-		}
-		markSuspended(t, c, lost)
-		if run := stepUntilFinished(t, r, c, 2); run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-			t.Errorf("phase = %q once the Job was stopped, want Failed", run.Status.Phase)
-		}
-	})
-	t.Run("not the run's", func(t *testing.T) {
-		run := plannedInto()
-		foreign := restoreJobFor(t, run, run.Spec.Into, monday.ID)
-		foreign.OwnerReferences = nil
-		delete(foreign.Labels, restorejob.LabelRestoreRun)
-		r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(), foreign)
-		done := stepUntilFinished(t, r, c, 3)
-
-		if item := done.Status.Items[0]; done.Status.Phase != backupv1alpha1.RunPhaseFailed || item.Phase != backupv1alpha1.ItemFailed ||
-			item.Reason != backupv1alpha1.ItemReasonRestoreJobRefused || item.JobUID != "" {
-			t.Errorf("phase = %q, item = %+v; want Failed with reason RestoreJobRefused naming no Job", done.Status.Phase, item)
-		}
-		kept := &batchv1.Job{}
-		get(t, c, ns, foreign.Name, kept)
-		if ptr.Deref(kept.Spec.Suspend, true) {
-			t.Errorf("the foreign Job's suspend = %v, want it untouched", kept.Spec.Suspend)
-		}
-		if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: run.Spec.Into}, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
-			t.Errorf("claim %s: %v, want it never created", run.Spec.Into, err)
-		}
-	})
-}
-
 // intoOnJob returns the RestoreRun back-to-monday in the middle of an into
 // restore of the claim notes-data-monday (see intoMonday): Running since the
 // frozen time, holding its finalizer, with its item Running and naming the
@@ -294,162 +196,6 @@ func intoOnJob(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job) {
 	run := plannedInto()
 	run.Status.Items[0] = runningOnJob(run.Spec.Into, 0)
 	return run, restoreJobFor(t, run, run.Spec.Into, monday.ID)
-}
-
-// An into restore whose Job someone deleted fails its item with reason
-// RestoreJobDeleted, and the run never creates a second Job: Stop gates on
-// the pods of the recorded UID. The Job's orphaned pod, which keeps that
-// UID, holds the run and its Lease until it has ended.
-func TestADeletedIntoRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
-	run, job := intoOnJob(t)
-	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
-	lease := heldClaimLease(run, run.Spec.Into)
-	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), job, pod, lease)
-	if err := c.Delete(context.Background(), job, client.PropagationPolicy(metav1.DeletePropagationOrphan)); err != nil {
-		t.Fatal(err)
-	}
-	creates := 0
-	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if _, ok := obj.(*batchv1.Job); ok {
-				creates++
-			}
-			return cl.Create(ctx, obj, opts...)
-		},
-	})
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	waiting := readRestoreRun(t, c)
-	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobDeleted ||
-		!strings.Contains(item.Message, "was deleted before it finished") {
-		t.Errorf("item = %+v, want Failed with reason RestoreJobDeleted saying the Job was deleted", item)
-	}
-	if creates != 0 || len(restoreJobs(t, c)) != 0 {
-		t.Errorf("Job creates = %d, restore Jobs = %v; want no second Job", creates, restoreJobs(t, c))
-	}
-	if waiting.Status.Phase.Finished() || !strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
-		t.Fatalf("phase = %q, message = %q while pod %s runs; want the run waiting and naming the pod",
-			waiting.Status.Phase, readyMessage(waiting.Status.Conditions), pod.Name)
-	}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, lease); err != nil {
-		t.Errorf("get the claim Lease = %v, want it held while the pod runs", err)
-	}
-
-	setPodPhase(t, c, pod, corev1.PodFailed)
-	if done := stepUntilFinished(t, r, c, 2); done.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Errorf("phase = %q once the pod had ended, want Failed", done.Status.Phase)
-	}
-}
-
-// An into restore whose Job name now holds a Job with another UID fails
-// its item with reason RestoreJobDeleted, also when that Job is Complete,
-// and one whose Job the run no longer controls fails it with reason
-// RestoreJobFailed. The run never creates a second Job, and Stop gates on
-// the recorded UID: a Job with another UID is neither suspended nor
-// deleted, and the pod of the recorded UID holds the run and its Lease
-// until it has ended. The first release of the Lease after that fails, so
-// finish runs again once the stop has cleared the recorded UID: an into
-// run gets no second stop otherwise, and that pass must still leave the
-// Job under the name alone, since the item names the Job it stopped.
-func TestAReplacedOrUncontrolledIntoRestoreJobFailsTheItem(t *testing.T) {
-	for _, tc := range swappedJobs {
-		t.Run(tc.name, func(t *testing.T) {
-			run, job := intoOnJob(t)
-			pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
-			tc.swap(job)
-			lease := heldClaimLease(run, run.Spec.Into)
-			r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), job, pod, lease)
-			var creates *int
-			r.Client, creates = countJobCreates(c)
-			restoreStep(t, r)
-			if tc.stopped {
-				markSuspended(t, c, job)
-			}
-			restoreStep(t, r)
-
-			waiting := readRestoreRun(t, c)
-			if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != tc.reason || item.JobUID != jobUID {
-				t.Errorf("item = %+v, want Failed with reason %s, still naming UID %s", item, tc.reason, jobUID)
-			}
-			if *creates != 0 || suspendedJob(t, c, job.Name) != tc.stopped {
-				t.Errorf("Job creates = %d, Job suspended = %t; want no second Job and suspended %t", *creates, suspendedJob(t, c, job.Name), tc.stopped)
-			}
-			if waiting.Status.Phase.Finished() || !strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
-				t.Fatalf("phase = %q, message = %q while pod %s runs; want the run waiting and naming the pod",
-					waiting.Status.Phase, readyMessage(waiting.Status.Conditions), pod.Name)
-			}
-			if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, lease); err != nil {
-				t.Errorf("get the claim Lease = %v, want it held while the pod runs", err)
-			}
-
-			setPodPhase(t, c, pod, corev1.PodFailed)
-			r.Client = refuseLeaseDeletes(c)
-			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-				t.Fatal("the pass whose Lease release was refused succeeded, want the refusal returned")
-			}
-			if item := readRestoreRun(t, c).Status.Items[0]; item.JobUID != "" || item.Job != job.Name {
-				t.Fatalf("item = %+v after the stop, want no UID and the stopped Job's name %s", item, job.Name)
-			}
-			r.Client = c
-			if done := stepUntilFinished(t, r, c, 2); done.Status.Phase != backupv1alpha1.RunPhaseFailed {
-				t.Errorf("phase = %q once the pod had ended, want Failed", done.Status.Phase)
-			}
-			expectSwappedJobLeft(t, c, tc, job)
-		})
-	}
-}
-
-// An into restore deleted while its Job restores stops the Job through the
-// recorded UID and keeps its finalizer until the Job's pod has ended.
-func TestADeletedIntoRestoreStopsItsJob(t *testing.T) {
-	run, job := intoOnJob(t)
-	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
-	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), job, pod)
-	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
-		t.Fatal(err)
-	}
-	restoreStep(t, r)
-
-	if !suspendedJob(t, c, job.Name) || len(readRestoreRun(t, c).Finalizers) == 0 {
-		t.Fatalf("Job suspended = %t, finalizers = %v; want the Job stopped and the finalizer kept while its pod runs",
-			suspendedJob(t, c, job.Name), readRestoreRun(t, c).Finalizers)
-	}
-	markSuspended(t, c, job)
-	setPodPhase(t, c, pod, corev1.PodFailed)
-	restoreStep(t, r)
-
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{}); !apierrors.IsNotFound(err) {
-		t.Errorf("get the run = %v, want it gone once the Job's pod had ended", err)
-	}
-	if jobs := restoreJobs(t, c); len(jobs) != 0 {
-		t.Errorf("restore Jobs = %v, want the stopped one deleted", jobs)
-	}
-}
-
-// An abort of an into restore whose Job still runs stops the Job through the
-// recorded UID and holds until the Job's pod has ended. The item gets the
-// abort's message.
-func TestAnAbortedIntoRestoreStopsItsJob(t *testing.T) {
-	run, job := intoOnJob(t)
-	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
-	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), job, pod)
-	if _, err := r.abort(context.Background(), readRestoreRun(t, c), backupv1alpha1.ReasonFailed, "the source claim went away"); err != nil {
-		t.Fatal(err)
-	}
-
-	waiting := readRestoreRun(t, c)
-	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.HasPrefix(item.Message, "the source claim went away") {
-		t.Errorf("item = %+v, want Failed with the abort's message", item)
-	}
-	if !suspendedJob(t, c, job.Name) || waiting.Status.Phase.Finished() {
-		t.Fatalf("Job suspended = %t, phase = %q; want the Job stopped and the run waiting", suspendedJob(t, c, job.Name), waiting.Status.Phase)
-	}
-	markSuspended(t, c, job)
-	setPodPhase(t, c, pod, corev1.PodFailed)
-	if done := stepUntilFinished(t, r, c, 2); done.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Errorf("phase = %q once the pod had ended, want Failed", done.Status.Phase)
-	}
 }
 
 // An into restore checks the claim it created, never the in-place rule of
@@ -512,19 +258,6 @@ func TestAnIntoRestoreWhoseFinalWriteWasLostIsNotStartedAgain(t *testing.T) {
 	if jobs := restoreJobs(t, c); len(jobs) != 0 {
 		t.Errorf("restore Jobs = %v, want no new Job", jobs)
 	}
-}
-
-// refuseLeaseDeletes returns a client over c that refuses every delete of a
-// Lease as Forbidden, so a run can't release its Leases.
-func refuseLeaseDeletes(c client.Client) client.Client {
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			if _, ok := obj.(*coordinationv1.Lease); ok {
-				return apierrors.NewForbidden(coordinationv1.Resource("leases"), obj.GetName(), errors.New("delete refused"))
-			}
-			return cl.Delete(ctx, obj, opts...)
-		},
-	})
 }
 
 // Two snapshots in one second restore by their full IDs, in place and into

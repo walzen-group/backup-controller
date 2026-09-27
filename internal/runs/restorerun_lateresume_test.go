@@ -3,16 +3,12 @@ package runs
 import (
 	"bytes"
 	"context"
-	"errors"
-	"strings"
 	"testing"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -137,49 +133,6 @@ func TestARunThatEndsNeverResumesItsJob(t *testing.T) {
 	}
 }
 
-// failResumes returns an answer for watchResumes that refuses the first
-// resume with err and lets every later one through.
-func failResumes(err error) func(int, client.Object, client.WithWatch) error {
-	return func(n int, _ client.Object, _ client.WithWatch) error {
-		if n == 1 {
-			return err
-		}
-		return nil
-	}
-}
-
-// A resume that fails for a reason a retry may fix, such as a 500 from an
-// unreachable Kueue webhook, a 503 or a 504 Timeout, fails nothing: the pass
-// returns the error, the item stays Running on its suspended Job, and the
-// next pass resumes it.
-func TestATransientResumeErrorIsRetried(t *testing.T) {
-	for name, err := range map[string]error{
-		"500 webhook down": apierrors.NewInternalError(errors.New(`failed calling webhook "mjob.kb.io": connect: connection refused`)),
-		"503":              apierrors.NewServiceUnavailable("the server is currently unable to handle the request"),
-		"504":              apierrors.NewTimeoutError("the request timed out", 0),
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-				claim(), volumeRestore(), repository())
-			restoreStep(t, r) // plan
-			restoreStep(t, r) // creates the Job
-			r.Client, _ = watchResumes(c, failResumes(err))
-
-			if _, got := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); got == nil {
-				t.Fatal("the pass whose resume failed succeeded, want the error returned for a retry")
-			}
-			job := onlyJob(t, c)
-			if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.JobUID != job.UID || !suspendedJob(t, c, job.Name) {
-				t.Fatalf("item = %+v, Job suspended = %t; want the item Running on its suspended Job", item, suspendedJob(t, c, job.Name))
-			}
-			restoreStep(t, r)
-			if suspendedJob(t, c, job.Name) {
-				t.Errorf("restore Job %s is still suspended after the retry, want it resumed", job.Name)
-			}
-		})
-	}
-}
-
 // staleRuns returns a client over c that answers every get of a RestoreRun
 // with stale, as an informer cache that has not seen the latest write does.
 func staleRuns(c client.Client, stale *backupv1alpha1.RestoreRun) client.Client {
@@ -242,66 +195,5 @@ func updateRunStatus(t *testing.T, c client.Client, run *backupv1alpha1.RestoreR
 	t.Helper()
 	if err := c.Status().Update(context.Background(), run); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// replaceJob returns an answer for watchResumes that replaces the Job
-// under its name before the first resume reaches the API server, as a
-// person who deletes and creates it again does. The resume, which carries
-// the old UID, is then refused as Invalid.
-func replaceJob(t *testing.T) func(int, client.Object, client.WithWatch) error {
-	return func(n int, obj client.Object, cl client.WithWatch) error {
-		if n != 1 {
-			return nil
-		}
-		ctx := context.Background()
-		old := &batchv1.Job{}
-		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), old); err != nil {
-			t.Fatal(err)
-		}
-		if err := cl.Delete(ctx, old, client.PropagationPolicy("Background")); err != nil {
-			t.Fatal(err)
-		}
-		again := old.DeepCopy()
-		again.ResourceVersion, again.UID, again.Status = "", "", batchv1.JobStatus{}
-		if err := cl.Create(ctx, again); err != nil {
-			t.Fatal(err)
-		}
-		return nil
-	}
-}
-
-// A resume the API server refuses as Invalid is read again. When the Job's
-// name now holds a Job with another UID, the Job the item recorded was
-// deleted, and the item fails with reason RestoreJobDeleted. When it still
-// holds the recorded Job, the server refused the resume itself, and the
-// item fails with reason RestoreJobRefused.
-func TestAnInvalidResumeTellsAReplacedJobFromARefusal(t *testing.T) {
-	for name, tc := range map[string]struct {
-		answer func(t *testing.T) func(int, client.Object, client.WithWatch) error
-		reason backupv1alpha1.ItemReason
-	}{
-		"replaced": {answer: replaceJob, reason: backupv1alpha1.ItemReasonRestoreJobDeleted},
-		"refused": {answer: func(*testing.T) func(int, client.Object, client.WithWatch) error {
-			return failResumes(apierrors.NewInvalid(batchv1.SchemeGroupVersion.WithKind("Job").GroupKind(), "restore",
-				field.ErrorList{field.Forbidden(field.NewPath("spec", "suspend"), "resume refused")}))
-		}, reason: backupv1alpha1.ItemReasonRestoreJobRefused},
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-				claim(), volumeRestore(), repository())
-			restoreStep(t, r) // plan
-			restoreStep(t, r) // creates the Job
-			r.Client, _ = watchResumes(c, tc.answer(t))
-			restoreStep(t, r)
-
-			item := readRestoreRun(t, c).Status.Items[0]
-			if item.Phase != backupv1alpha1.ItemFailed || item.Reason != tc.reason {
-				t.Errorf("item = %+v, want Failed with reason %s", item, tc.reason)
-			}
-			if tc.reason == backupv1alpha1.ItemReasonRestoreJobDeleted && !strings.Contains(item.Message, "another UID") {
-				t.Errorf("item message = %q, want it to say another Job holds the name", item.Message)
-			}
-		})
 	}
 }

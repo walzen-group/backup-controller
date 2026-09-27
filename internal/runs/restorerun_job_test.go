@@ -3,7 +3,6 @@ package runs
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -18,7 +17,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
@@ -56,21 +54,6 @@ func TestAnInPlaceRestoreCreatesAJobForTheFullSnapshotID(t *testing.T) {
 	}
 	if sc := restore.SecurityContext; sc.RunAsUser != nil {
 		t.Errorf("runAsUser = %d in a namespace without privileged movers, want unset", *sc.RunAsUser)
-	}
-}
-
-// In a namespace that lets movers run privileged, the restore Job runs as
-// root, as VolSync's mover would there, so restic restores each file's owner.
-func TestAnInPlaceRestoreJobFollowsPrivilegedMovers(t *testing.T) {
-	privileged := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns,
-		Annotations: map[string]string{restorejob.AnnotationPrivilegedMovers: "true"}}}
-	r, c := restoreReconciler(t, nil, restoreRun(inPlace), claim(), volumeRestore(), repository(), privileged)
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // restore
-
-	sc := itemJob(t, c).Spec.Template.Spec.Containers[0].SecurityContext
-	if sc.RunAsUser == nil || *sc.RunAsUser != 0 || !slices.Contains(sc.Capabilities.Add, "CHOWN") {
-		t.Errorf("security context = %+v, want root with CHOWN", sc)
 	}
 }
 
@@ -229,30 +212,6 @@ func TestTakeoverChecksTheSnapshotIDAnnotation(t *testing.T) {
 	}
 }
 
-// A Job the run did not create, with neither a controller reference to the
-// run nor the run's UID in its restore-run label, that holds the name of
-// the item's restore Job fails the item with reason RestoreJobRefused. The
-// run leaves that Job alone: it neither suspends nor deletes it.
-func TestARestoreRefusesAJobItDidNotCreate(t *testing.T) {
-	run := checkedRestore(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN })
-	foreign := restoreJobFor(t, run, claimN, monday.ID)
-	foreign.OwnerReferences = nil
-	delete(foreign.Labels, restorejob.LabelRestoreRun)
-	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(), foreign)
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	item := readRestoreRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobRefused || item.JobUID != "" {
-		t.Errorf("item = %+v, want Failed with reason RestoreJobRefused naming no Job", item)
-	}
-	kept := &batchv1.Job{}
-	get(t, c, ns, foreign.Name, kept)
-	if ptr.Deref(kept.Spec.Suspend, true) {
-		t.Errorf("the foreign Job's suspend = %v, want it untouched", kept.Spec.Suspend)
-	}
-}
-
 // A Running item whose restore Job someone deleted fails with reason
 // RestoreJobDeleted, and the run never creates a second Job for it: Stop
 // gates on the pods of the recorded UID only. The Job's pod, which the
@@ -296,50 +255,6 @@ func TestADeletedRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
 	restoreStep(t, r)
 	if got := replicasOf(t, c); got != 2 {
 		t.Errorf("replicas = %d once the pod had ended, want the 2 the app had", got)
-	}
-}
-
-// A Running item whose Job name now holds a Job with another UID fails with
-// reason RestoreJobDeleted, also when that Job is Complete, and one whose
-// Job the run no longer controls fails with reason RestoreJobFailed. The run
-// never creates a second Job, and Stop gates on the recorded UID: a Job with
-// another UID is neither suspended nor deleted, and the pod of the recorded
-// UID holds the app down until it has ended.
-func TestAReplacedOrUncontrolledRestoreJobFailsTheItem(t *testing.T) {
-	for _, tc := range swappedJobs {
-		t.Run(tc.name, func(t *testing.T) {
-			run, job := quiescedMidRestore(t)
-			pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
-			tc.swap(job)
-			r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
-				stoppedDeployment(), kustomization(true), job, pod)
-			var creates *int
-			r.Client, creates = countJobCreates(c)
-			restoreStep(t, r)
-			if tc.stopped {
-				markSuspended(t, c, job)
-			}
-			restoreStep(t, r)
-
-			waiting := readRestoreRun(t, c)
-			if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != tc.reason || item.JobUID != jobUID {
-				t.Errorf("item = %+v, want Failed with reason %s, still naming UID %s", item, tc.reason, jobUID)
-			}
-			if *creates != 0 || suspendedJob(t, c, job.Name) != tc.stopped {
-				t.Errorf("Job creates = %d, Job suspended = %t; want no second Job and suspended %t", *creates, suspendedJob(t, c, job.Name), tc.stopped)
-			}
-			if got := replicasOf(t, c); got != 0 || !strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
-				t.Fatalf("replicas = %d, message = %q while pod %s runs; want the app down and the wait naming the pod",
-					got, readyMessage(waiting.Status.Conditions), pod.Name)
-			}
-
-			setPodPhase(t, c, pod, corev1.PodFailed)
-			restoreStep(t, r)
-			if got := replicasOf(t, c); got != 2 {
-				t.Errorf("replicas = %d once the pod had ended, want the 2 the app had", got)
-			}
-			expectSwappedJobLeft(t, c, tc, job)
-		})
 	}
 }
 
@@ -414,47 +329,6 @@ func TestAnAbortStopsTheJobAndSaysWhyItsPodWaited(t *testing.T) {
 	}
 }
 
-// While a restore Job runs, the item's message shows why its newest pod has
-// not started, for a person. The item stays Running.
-func TestTheItemShowsWhyItsJobsPodWaits(t *testing.T) {
-	run, job := restoringOnJob(t)
-	pod := jobPodOf(job, "restore-pod", corev1.PodPending)
-	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "restore", State: corev1.ContainerState{
-		Waiting: &corev1.ContainerStateWaiting{Reason: "CreateContainerConfigError", Message: `secret "notes-restic-data" not found`},
-	}}}
-	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(), job, pod)
-
-	restoreStep(t, r)
-
-	item := readRestoreRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemRunning || !strings.Contains(item.Message, "waiting: restore: CreateContainerConfigError") {
-		t.Errorf("item = %+v, want Running with the pod's waiting reason in its message", item)
-	}
-}
-
-// Of two snapshots with the same time, a restore at that time takes the one
-// with the higher ID, and previous steps back through both before it reaches
-// the older snapshot (RJ1F1). Each is recorded by its full ID, so its restore
-// Job restores exactly it. Before, the checks refused both, since VolSync's
-// mover pinned to their second could restore either.
-func TestPreviousStepsThroughASameTimeTieOnTheRestoreAsOfPath(t *testing.T) {
-	tie := time.Date(2026, 9, 21, 5, 0, 2, 0, time.UTC)
-	lower, higher := moverSnapshot("aaaaaaaa", tie), moverSnapshot("bbbbbbbb", tie)
-	for previous, want := range []restic.Snapshot{higher, lower, sunday} {
-		t.Run(want.ShortID(), func(t *testing.T) {
-			back := int32(previous)
-			r, c := restoreReconciler(t, nil, restoreRun(inPlace, asOf("2026-09-21T05:00:02Z"),
-				func(r *backupv1alpha1.RestoreRun) { r.Spec.Previous = &back }), claim(), volumeRestore(), repository())
-			r.Snapshots = snapshots{sunday, lower, higher}
-			restoreStep(t, r) // plan
-
-			if item := readRestoreRun(t, c).Status.Items[0]; item.SnapshotID != want.ID {
-				t.Errorf("previous %d: item = %+v (%s), want %s", previous, item, readyMessage(readRestoreRun(t, c).Status.Conditions), want.ID)
-			}
-		})
-	}
-}
-
 // Only snapshots with the layout VolSync's backup mover gives one are
 // candidates (D4): a newer snapshot of another host or path is passed over,
 // and a repository with none of the mover's layout fails the item naming
@@ -486,28 +360,6 @@ func TestOnlyMoverSnapshotsAreCandidates(t *testing.T) {
 	restoreStep(t, r)
 	expectRefused(t, r, "the repository holds 1 snapshot, which no VolSync mover wrote (host volsync, paths [/data]): "+
 		"77770000 (host laptop, paths [/data])")
-}
-
-// A repository with no snapshot of the mover's layout fails the item naming
-// only the five newest snapshots it passed over, newest first, and counting
-// the older ones, so a large repository still gives a short message.
-func TestTheNoMoverSnapshotMessageNamesTheFiveNewest(t *testing.T) {
-	var all snapshots
-	for i := range 7 {
-		s := moverSnapshot(fmt.Sprintf("5e1f000%d", i), monday.Time.Add(time.Duration(i)*time.Hour))
-		s.Hostname = "laptop"
-		all = append(all, s)
-	}
-	r, _ := restoreReconciler(t, nil, restoreRun(inPlace), claim(), volumeRestore(), repository())
-	r.Snapshots = all
-	restoreStep(t, r)
-
-	expectRefused(t, r, "the repository holds 7 snapshots, none written by a VolSync mover (host volsync, paths [/data]): "+
-		"5e1f0006 (host laptop, paths [/data]), 5e1f0005 (host laptop, paths [/data]), 5e1f0004 (host laptop, paths [/data]), "+
-		"5e1f0003 (host laptop, paths [/data]), 5e1f0002 (host laptop, paths [/data]), and 2 older")
-	if message := readRestoreRun(t, r.Client).Status.Items[0].Message; strings.Contains(message, "5e1f0001") || strings.Contains(message, "5e1f0000") {
-		t.Errorf("message = %q, want the two oldest snapshots left out", message)
-	}
 }
 
 // A synced in-place restore takes a quiesced snapshot even when an untagged

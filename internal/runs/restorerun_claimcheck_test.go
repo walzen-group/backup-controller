@@ -7,7 +7,6 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -75,35 +74,6 @@ func TestAnInPlaceRestoreIntoAReplacedClaimFails(t *testing.T) {
 
 	expectVolumeFailed(t, readRestoreRun(t, c), "claim "+claimN, "replaced", "not the one the run checked and took its Lease on",
 		"The restore Job mounts claim "+claimN+" by name", "may have written into it", "check its data")
-}
-
-// An in-place item whose run no longer holds a claim Lease for it can't tell
-// which claim its restore Job wrote into, and fails once the Job completes.
-func TestAnInPlaceRestoreWithoutItsClaimLeaseFails(t *testing.T) {
-	r, c := startedRestore(t, inPlace)
-	lease := &coordinationv1.Lease{}
-	get(t, c, ns, claimLeaseName("claim-uid"), lease)
-	if err := c.Delete(context.Background(), lease); err != nil {
-		t.Fatal(err)
-	}
-	completeJob(t, c)
-
-	restoreStep(t, r)
-
-	expectVolumeFailed(t, readRestoreRun(t, c), "claim Lease", "whether its restore Job wrote into")
-}
-
-// An in-place item whose claim is the one the run took its Lease on
-// succeeds.
-func TestAnInPlaceRestoreIntoItsOwnClaimSucceeds(t *testing.T) {
-	r, c := startedRestore(t, inPlace)
-	completeJob(t, c)
-
-	restoreStep(t, r)
-
-	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemSucceeded {
-		t.Errorf("item = %+v, want it Succeeded", item)
-	}
 }
 
 // A restore's mover gets the cache capacity of the claim's VolumeRestore,

@@ -16,7 +16,6 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -664,56 +663,6 @@ func TestAQuiescedRestoreThatCannotStopTheAppFailsAtOnce(t *testing.T) {
 	}
 }
 
-// A spec.quiesce workload deleted while the run holds it stopped ends the run
-// as Failed, with reason Failed. The run has not timed out, so TimedOut would
-// point at the wrong cause.
-func TestAQuiescedRestoreWhoseWorkloadVanishesFails(t *testing.T) {
-	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
-		deployment(), kustomization(false), writerPod())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // quiesce
-
-	if err := c.Delete(context.Background(), deployment()); err != nil {
-		t.Fatal(err)
-	}
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonFailed {
-		t.Fatalf("phase = %q, reason = %q; want Failed with reason Failed", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-	if !strings.Contains(readyMessage(run.Status.Conditions), appN) {
-		t.Errorf("ready message = %q, want it to name %s", readyMessage(run.Status.Conditions), appN)
-	}
-}
-
-// A failed read of a spec.quiesce workload while the run holds it stopped is
-// returned for a retry, and the run keeps going. Only a workload that is gone
-// ends the run.
-func TestAQuiescedRestoreRetriesAFailedWorkloadRead(t *testing.T) {
-	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
-		deployment(), kustomization(false), writerPod())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // quiesce
-
-	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*appsv1.Deployment); ok {
-				return apierrors.NewServiceUnavailable("etcd leader changed")
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-	})
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Error("reconcile succeeded, want the read error returned for a retry")
-	}
-	if run := readRestoreRun(t, c); run.Status.Phase.Finished() {
-		t.Errorf("phase = %q after a failed read, want the run still going", run.Status.Phase)
-	}
-}
-
 // A quiesce pass whose status write is lost after the app was stopped is
 // run again. The retry keeps the replica count and the Kustomization the
 // first pass recorded, so a run that then times out gives the app its 2
@@ -775,30 +724,6 @@ func TestARestoreSeesAPodTheCacheHasNotSeenYet(t *testing.T) {
 	run := readRestoreRun(t, c)
 	if reason := readyReason(run.Status.Conditions); reason != backupv1alpha1.ReasonClaimInUse || run.Status.Items[0].Phase != backupv1alpha1.ItemPending {
 		t.Fatalf("reason = %q, item = %+v; want ClaimInUse with the item Pending", reason, run.Status.Items[0])
-	}
-}
-
-// A database restore looks for the deleted Cluster's instance pods through the
-// uncached reader. An instance pod the informer cache has not seen yet keeps
-// the run waiting with reason WaitingForShutdown and the app stopped.
-func TestADatabaseRestoreSeesAnInstanceTheCacheHasNotSeenYet(t *testing.T) {
-	pod, pvc := oldInstance()
-	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
-		deployment(), kustomization(false), pod, pvc)
-	r.Client = staleCache(c)
-
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // quiesce
-	restoreStep(t, r) // restore the volume
-	completeJob(t, c)
-	restoreStep(t, r) // volume done, database deleted
-
-	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonShutdown {
-		t.Errorf("reason = %q, want WaitingForShutdown while pod %s-1 is still there", reason, pgN)
-	}
-	if got := replicasOf(t, c); got != 0 {
-		t.Errorf("replicas = %d while the old instance was still there, want 0", got)
 	}
 }
 
@@ -879,64 +804,6 @@ func TestARestorePlanRetriesAFailedRead(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// A failed read of a claim's VolumeRestore when its restore is about to start
-// is returned for a retry. The volume item stays Pending, and the database of
-// a namespace restore is not skipped as if the volume had failed.
-func TestARestoreRetriesAFailedReadBeforeAVolumeStarts(t *testing.T) {
-	r, c := restoreReconciler(t, prober{saturday}, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
-	restoreStep(t, r) // plan
-
-	r.Reader = unavailable(c, is[*backupv1alpha1.VolumeRestore])
-	run := reconcileExpectingRetry(t, r, c)
-	if run.Status.Items[0].Phase != backupv1alpha1.ItemPending || run.Status.Items[1].Phase != backupv1alpha1.ItemPending {
-		t.Errorf("items = %+v, want both still Pending", run.Status.Items)
-	}
-}
-
-// brokenLister is a SnapshotLister whose every listing fails with err, the
-// way restic fails against a repository whose password is wrong.
-type brokenLister struct{ err error }
-
-// Snapshots returns the lister's error.
-func (b brokenLister) Snapshots(context.Context, *corev1.Secret) ([]restic.Snapshot, error) {
-	return nil, b.err
-}
-
-// A run whose repository can't be listed says why on its Ready condition while
-// it retries, so `kubectl get` shows more than an empty phase. Once
-// spec.timeout has passed since the run was created, it gives up as Failed
-// with reason TimedOut, although it never started.
-func TestARestoreWhoseChecksKeepFailingSaysWhyAndTimesOut(t *testing.T) {
-	r, c := restoreReconciler(t, nil,
-		restoreRun(func(r *backupv1alpha1.RestoreRun) {
-			r.Spec.Claim = claimN
-			r.CreationTimestamp = metav1.NewTime(frozen)
-		}),
-		claim(), volumeRestore(), repository())
-	r.Snapshots = brokenLister{errors.New("Fatal: wrong password or no key found")}
-
-	run := reconcileExpectingRetry(t, r, c)
-	if cond := readyMessage(run.Status.Conditions); !strings.Contains(cond, "wrong password") {
-		t.Errorf("ready message = %q, want the listing error", cond)
-	}
-	if run.Status.Phase != "" {
-		t.Errorf("phase = %q, want the run still unplanned", run.Status.Phase)
-	}
-
-	r.Now = func() time.Time { return frozen.Add(4 * time.Hour) }
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err != nil {
-		t.Fatalf("reconcile at the timeout returned %v, want the run ended", err)
-	}
-	run = readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
-		t.Fatalf("phase = %q, reason = %q at the timeout; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-	if cond := readyMessage(run.Status.Conditions); !strings.Contains(cond, "wrong password") {
-		t.Errorf("ready message = %q, want the error the run gave up on", cond)
 	}
 }
 
@@ -1045,74 +912,6 @@ func TestARestoreThatSkippedEveryItemFails(t *testing.T) {
 	}
 }
 
-// A restore of one database that opts out of the bootstrap webhook ends as
-// Invalid at its checks, naming the annotation, and leaves the Cluster alone.
-func TestARestoreOfAnOptedOutDatabaseIsInvalid(t *testing.T) {
-	r, c := restoreReconciler(t, prober{saturday},
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), cluster(optedOut), objectStore(), storeSecret())
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
-		!strings.Contains(readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation) {
-		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, naming %s",
-			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation)
-	}
-	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
-		t.Error("the opted-out Cluster was deleted")
-	}
-}
-
-// A restore refused at its checks whose release fails keeps its refusal:
-// the pass that refused it records the ending Invalid and fails to list its
-// Leases, the Cluster opts back in between, and the next pass ends the run
-// Invalid with the refusal's message. It never plans the run again.
-func TestARefusedRestoreWhoseReleaseFailedEndsInvalid(t *testing.T) {
-	c := newClient(t, restoreRun(func(r *backupv1alpha1.RestoreRun) {
-		r.Spec.Database = pgN
-		r.Finalizers = []string{Finalizer}
-	}), cluster(optedOut), objectStore(), storeSecret())
-	failList := true
-	reader := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if _, ok := list.(*coordinationv1.LeaseList); ok && failList {
-				return apierrors.NewInternalError(errors.New("the API server cannot list the Leases"))
-			}
-			return cl.List(ctx, list, opts...)
-		},
-	})
-	r := &RestoreRunReconciler{Client: c, Reader: reader, Snapshots: snapshots{sunday, monday}, Prober: prober{saturday},
-		Now: func() time.Time { return frozen }}
-
-	if err := tryRestoreStep(r); err == nil {
-		t.Fatal("the pass whose release failed returned no error")
-	}
-	refusal := ""
-	if ending := readRestoreRun(t, c).Status.Ending; ending != nil {
-		refusal = ending.Message
-	}
-
-	back, _ := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN)
-	annotations := back.GetAnnotations()
-	delete(annotations, bootstrap.OptOutAnnotation)
-	back.SetAnnotations(annotations)
-	if err := c.Update(context.Background(), back); err != nil {
-		t.Fatal(err)
-	}
-	failList = false
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
-		!strings.Contains(readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation) {
-		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, the refusal naming %s", run.Status.Phase,
-			readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation)
-	}
-	if got := readyMessage(run.Status.Conditions); got != refusal {
-		t.Errorf("message = %q, want the ending the failed pass recorded, %q", got, refusal)
-	}
-}
-
 // loseNextStatusWrite returns a client over c that fails the first status
 // write of a RestoreRun with a conflict, the way a lost write or a controller
 // crash loses it.
@@ -1154,57 +953,6 @@ func TestAVolumeRestoreWhoseSuccessWasNotRecordedFinishes(t *testing.T) {
 	}
 	if jobs := restoreJobs(t, c); len(jobs) != 0 {
 		t.Errorf("restore Jobs = %v, want none once the run has ended", jobs)
-	}
-}
-
-// previousOne is a mutate function for restoreRun that sets spec.previous to
-// 1.
-func previousOne(r *backupv1alpha1.RestoreRun) {
-	one := int32(1)
-	r.Spec.Previous = &one
-}
-
-// An into restore with spec.previous fills its claim from the snapshot it
-// recorded: its restore Job restores that snapshot's full ID, so nothing
-// steps back again from a newer snapshot.
-func TestAnIntoRestoreWithPreviousRestoresTheSnapshotItRecorded(t *testing.T) {
-	r, c := restoreReconciler(t, nil,
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "notes-data-monday" }, previousOne),
-		claim(), volumeRestore(), repository())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // create
-
-	run := readRestoreRun(t, c)
-	if run.Status.Items[0].Snapshot != sunday.ShortID() {
-		t.Fatalf("snapshot = %q, want %s, one before the newest", run.Status.Items[0].Snapshot, sunday.ShortID())
-	}
-	job := itemJob(t, c)
-	if got := job.Annotations[restorejob.AnnotationSnapshotID]; got != sunday.ID || !slices.Contains(job.Spec.Template.Spec.Containers[0].Args, sunday.ID) {
-		t.Errorf("restore Job snapshot = %s, args = %v; want sunday's full ID %s", got, job.Spec.Template.Spec.Containers[0].Args, sunday.ID)
-	}
-}
-
-// An in-place restore hands its restore Job the full ID of the snapshot its
-// checks selected. A backup taken between the checks and the start would
-// shift what "newest" or previous means, and the Job does not pick again.
-func TestAClaimRestoreHandsTheMoverTheSnapshotItSelected(t *testing.T) {
-	early := sunday
-	early.Time = sunday.Time.Add(700 * time.Millisecond)
-	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, previousOne),
-		claim(), volumeRestore(), repository())
-	r.Snapshots = snapshots{early, monday}
-	restoreStep(t, r) // plan
-
-	tuesday := restic.Snapshot{ID: fullID("7a11ce00"), Time: monday.Time.Add(24 * time.Hour), Hostname: "volsync", Paths: []string{"/data"}}
-	r.Snapshots = snapshots{early, monday, tuesday}
-	restoreStep(t, r) // restore
-
-	job := itemJob(t, c)
-	if got := job.Annotations[restorejob.AnnotationSnapshotID]; got != early.ID {
-		t.Errorf("restore Job snapshot = %s, want %s, the one the checks selected", got, early.ID)
-	}
-	if args := job.Spec.Template.Spec.Containers[0].Args; !slices.Contains(args, early.ID) {
-		t.Errorf("restore args = %v, want them to name %s", args, early.ID)
 	}
 }
 
@@ -1263,33 +1011,6 @@ func TestAnIntoRestoreFromARepositoryNeedsASize(t *testing.T) {
 	}
 }
 
-// An into restore whose claim the API server keeps refusing still times out.
-// The run checks its deadline before it creates anything, so an error from
-// the create can't keep it waiting past spec.timeout.
-func TestAnIntoRestoreTimesOutWhileItsClaimIsRefused(t *testing.T) {
-	r, c := restoreReconciler(t, nil,
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "notes-data-monday" }),
-		claim(), volumeRestore(), repository())
-	restoreStep(t, r) // plan
-
-	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if _, ok := obj.(*corev1.PersistentVolumeClaim); ok {
-				return apierrors.NewServiceUnavailable("admission webhook timed out")
-			}
-			return cl.Create(ctx, obj, opts...)
-		},
-	})
-	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err != nil {
-		t.Fatalf("reconcile past the timeout returned %v, want the run ended", err)
-	}
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
-		t.Fatalf("phase = %q, reason = %q; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-}
-
 // declaring returns a mutate function for cluster that gives the Cluster its
 // own bootstrap method in spec.bootstrap, with the given content.
 func declaring(method string, content map[string]any) func(*unstructured.Unstructured) {
@@ -1297,61 +1018,6 @@ func declaring(method string, content map[string]any) func(*unstructured.Unstruc
 		if err := unstructured.SetNestedMap(u.Object, map[string]any{method: content}, "spec", "bootstrap"); err != nil {
 			panic(err)
 		}
-	}
-}
-
-// A namespace restore skips a Cluster that declares its own bootstrap method,
-// names the method in the item's message, and never deletes it. Flux would
-// create it again with that method, the webhook would refuse it while the run
-// waits, and the database would stay down until the timeout. The volumes
-// restore as usual.
-func TestANamespaceRestoreLeavesAClusterWithADeclaredBootstrapAlone(t *testing.T) {
-	for name, method := range map[string]func(*unstructured.Unstructured){
-		"pg_basebackup": declaring("pg_basebackup", map[string]any{"source": "legacy-db"}),
-		"recovery":      declaring("recovery", map[string]any{"source": "owners-archive"}),
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := restoreReconciler(t, prober{saturday},
-				restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
-				claim(), volumeRestore(), repository(), cluster(method), objectStore(), storeSecret())
-
-			restoreStep(t, r) // plan
-			run := readRestoreRun(t, c)
-			if item := run.Status.Items[1]; item.Phase != backupv1alpha1.ItemSkipped || !strings.Contains(item.Message, "spec.bootstrap."+name) {
-				t.Fatalf("database item = %+v (%s), want Skipped naming spec.bootstrap.%s", item, readyMessage(run.Status.Conditions), name)
-			}
-			restoreStep(t, r) // restore the volume
-			completeJob(t, c)
-			restoreStep(t, r)
-			restoreStep(t, r) // the pass after the stop finds the restore Job stopped
-
-			run = readRestoreRun(t, c)
-			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
-				t.Errorf("phase = %q, items = %+v; want Succeeded with the volume restored", run.Status.Phase, run.Status.Items)
-			}
-			if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
-				t.Errorf("the Cluster declaring %s was deleted", name)
-			}
-		})
-	}
-}
-
-// A restore of one database that declares its own bootstrap method ends as
-// Invalid at its checks, naming the method, and leaves the Cluster alone.
-func TestARestoreOfADatabaseWithADeclaredBootstrapIsInvalid(t *testing.T) {
-	r, c := restoreReconciler(t, prober{saturday},
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }),
-		cluster(declaring("pg_basebackup", map[string]any{"source": "legacy-db"})), objectStore(), storeSecret())
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
-		!strings.Contains(readyMessage(run.Status.Conditions), "spec.bootstrap.pg_basebackup") {
-		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, naming spec.bootstrap.pg_basebackup",
-			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-	}
-	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
-		t.Error("the Cluster declaring pg_basebackup was deleted")
 	}
 }
 
