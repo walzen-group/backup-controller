@@ -247,11 +247,10 @@ type RestoreItem struct {
 	// write.
 	// +optional
 	JobUID types.UID `json:"jobUID,omitempty"`
-	// SnapshotTime is the time of that snapshot. The run hands it to the mover
-	// as restoreAsOf, in whole seconds and with no previous, so the mover
-	// picks the snapshot the checks selected. Right before the mover starts,
-	// the run lists the repository again, and the item fails when the mover
-	// would pick another snapshot at that time.
+	// SnapshotTime is the time restic recorded on that snapshot, for display.
+	// The restore Job restores by SnapshotID and never by time. When the
+	// snapshot is gone from the repository before the Job starts, the item
+	// fails with SnapshotChanged and its message names this time.
 	// +optional
 	SnapshotTime *metav1.Time `json:"snapshotTime,omitempty"`
 	// BaseBackup is the ID of the barman base backup a database's recovery

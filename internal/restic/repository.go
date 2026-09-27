@@ -287,19 +287,25 @@ func isID(name string) bool {
 	return err == nil && len(name) == 64
 }
 
-// AtOrBefore returns the newest snapshot taken at or before the time t, and
-// false when every snapshot is later. A VolSync restore whose restoreAsOf is t
-// picks the same snapshot, so the controller uses AtOrBefore to check a
-// restore before it starts one.
+// AtOrBefore returns the newest snapshot taken at or before a point in time.
+// The restoreAsOf of a RestoreRun and of a VolumeRestore selects its
+// snapshot with it, and the restore Job then restores that snapshot by its
+// full ID.
 //
-// It compares whole seconds, the way VolSync's restic mover does: the mover
-// drops the fraction from each snapshot's time and from restoreAsOf before it
-// compares them. So a snapshot taken at 06:00:00.7 counts as taken at or before
-// 06:00:00, which is the time a BackupRun reports for it. Among the snapshots
-// in reach, the newest by full time wins, and among snapshots with the same
-// full time, the one with the higher ID wins. That is the order Snapshots
-// sorts by, so AtOrBefore picks the in-reach snapshot that comes last in that
-// order, whatever order the given list is in.
+// Parameters:
+//   - snapshots is the list to choose from, in any order.
+//   - t is the point in time; only its whole seconds count.
+//
+// It returns the chosen snapshot and true, or the zero Snapshot and false
+// when every snapshot is later than t.
+//
+// It compares whole seconds: a snapshot taken at 06:00:00.7 counts as taken
+// at or before 06:00:00, which is the time a BackupRun reports for it, so a
+// restore to that reported time finds the snapshot. Among the snapshots in
+// reach, the newest by full time wins, and among snapshots with the same full
+// time, the one with the higher ID wins. That is the order Snapshots sorts
+// by, so AtOrBefore picks the in-reach snapshot that comes last in that
+// order.
 func AtOrBefore(snapshots []Snapshot, t time.Time) (Snapshot, bool) {
 	var found Snapshot
 	ok := false

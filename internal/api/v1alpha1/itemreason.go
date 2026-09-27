@@ -32,10 +32,12 @@ const (
 	// the Job and waits until no pod of it can still write.
 	ItemReasonRestoreJobDeleted ItemReason = "RestoreJobDeleted"
 
-	// ItemReasonRestoreJobRefused is a volume restore for which the run
-	// created no restore Job: the API server refused the create as
-	// Forbidden or Invalid, the Job's spec could not be built, or a Job the
-	// run did not create holds its name. Nothing was written to the claim.
+	// ItemReasonRestoreJobRefused is a volume restore whose restore Job never
+	// ran. Either the run created no Job, because the API server refused the
+	// create as Forbidden or Invalid, the Job's spec could not be built, or a
+	// Job the run did not create holds its name; or the run created the Job
+	// suspended and the API server refused to resume it as Forbidden or
+	// Invalid. Nothing was written to the claim.
 	ItemReasonRestoreJobRefused ItemReason = "RestoreJobRefused"
 
 	// ItemReasonSnapshotChanged is a volume restore whose selected snapshot
