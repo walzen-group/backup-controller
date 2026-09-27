@@ -428,8 +428,9 @@ func clusterBeingDeletedOps(t *testing.T, c client.Client, o map[string]string) 
 // uid and with a negative count. It then records the outcome of an update
 // from the stale read with its resourceVersion cleared, which both kinds
 // accept as an unconditional update, and the count and generation it
-// stores. Last it records a read and an update of a workload that does not
-// exist.
+// stores, and the outcome of such an update after the workload was deleted
+// and created again (see recreatedOps). Last it records a read and an update
+// of a workload that does not exist.
 func scaleOps(t *testing.T, c client.Client, o map[string]string, kind client.Object) {
 	t.Helper()
 	ctx := context.Background()
@@ -509,12 +510,60 @@ func scaleOps(t *testing.T, c client.Client, o map[string]string, kind client.Ob
 	}
 	o[k+"update of a stale read without a resourceVersion"] = fmt.Sprintf("%s, stored %d replicas at generation %d",
 		outcome, replicasOf(stored), stored.GetGeneration())
+	recreatedOps(t, c, o, k, created, unconditional)
 
 	missing := named()
 	missing.SetName("missing")
 	o[k+"read of a missing workload"] = envtestReason(c.SubResource("scale").Get(ctx, missing, &autoscalingv1.Scale{}))
 	body := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 1}}
 	o[k+"update of a missing workload"] = envtestReason(c.SubResource("scale").Update(ctx, missing, client.WithSubResourceBody(body)))
+}
+
+// recreatedOps deletes the workload scaleOps scales, creates it again, and
+// adds to o the outcome of a scale update from the Scale read before the
+// delete, with its resourceVersion cleared, and the replica count the new
+// workload keeps.
+//
+// Parameters:
+//   - t fails the test when the delete, the create or the read fails.
+//   - c is the strict client or the envtest client.
+//   - o collects the observations.
+//   - k is the key prefix scaleOps uses for the workload's kind.
+//   - created is the workload as scaleOps created it, which is created
+//     again under the same name with its 2 replicas.
+//   - stale is a Scale of the old workload, carrying its uid. The update
+//     sends it without a resourceVersion, as scale does.
+//
+// It checks what internal/runs' scale relies on: a workload deleted and
+// created again between the read and the write keeps its count, because
+// the uid the Scale carries is not the new workload's. The test fails
+// unless the update is a Conflict on the client it runs on, and the
+// differential comparison then holds both clients to the same outcome.
+func recreatedOps(t *testing.T, c client.Client, o map[string]string, k string, created client.Object, stale *autoscalingv1.Scale) {
+	t.Helper()
+	ctx := context.Background()
+	if err := c.Delete(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := created.DeepCopyObject().(client.Object)
+	again.SetResourceVersion("")
+	again.SetUID("")
+	again.SetCreationTimestamp(metav1.Time{})
+	if err := c.Create(ctx, again); err != nil {
+		t.Fatal(err)
+	}
+	body := stale.DeepCopy()
+	body.ResourceVersion = ""
+	body.Spec.Replicas = 0
+	outcome := envtestReason(c.SubResource("scale").Update(ctx, again, client.WithSubResourceBody(body)))
+	if outcome != string(metav1.StatusReasonConflict) {
+		t.Errorf("%T: %supdate after the workload was recreated = %s, want Conflict", c, k, outcome)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(again), again); err != nil {
+		t.Fatal(err)
+	}
+	o[k+"update of a stale read without a resourceVersion after the workload was recreated"] = fmt.Sprintf(
+		"%s, stored %d replicas, uid of the read %t", outcome, replicasOf(again), again.GetUID() == stale.UID)
 }
 
 // replicasOf returns the stored spec.replicas of a Deployment or a
