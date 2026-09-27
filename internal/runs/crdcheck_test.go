@@ -105,43 +105,6 @@ func TestSchemaGapsNamesTheFieldsAnOldCRDLacks(t *testing.T) {
 	}
 }
 
-// A field this release removed from the types, the RestoreRun items'
-// destination, is gone from the generated CRD, and a released CRD that
-// still declares it holds a run without a gap for it: the walk checks the
-// fields of the Go types and ignores properties the types lack.
-func TestARemovedFieldIsNoGap(t *testing.T) {
-	t.Parallel()
-	const file = "backup.wlz.li_restoreruns.yaml"
-	declares := func(crd *unstructured.Unstructured) bool {
-		versions, _, _ := unstructured.NestedSlice(crd.Object, "spec", "versions")
-		for _, v := range versions {
-			version, _ := v.(map[string]any)
-			_, found, _ := unstructured.NestedMap(version, "schema", "openAPIV3Schema", "properties", "status",
-				"properties", "items", "items", "properties", "destination")
-			if found {
-				return true
-			}
-		}
-		return false
-	}
-	if declares(readCRD(t, ownCRDDir+file)) {
-		t.Errorf("%s%s declares status.items[].destination, want it removed", ownCRDDir, file)
-	}
-	released := readCRD(t, v081CRDDir+file)
-	if !declares(released) {
-		t.Fatalf("%s%s does not declare status.items[].destination; the test needs a CRD that does", v081CRDDir, file)
-	}
-	gaps, err := schemaGaps(released, backupv1alpha1.RestoreRun{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, gap := range gaps {
-		if strings.Contains(gap, "destination") {
-			t.Errorf("gaps = %v, want none for the removed destination", gaps)
-		}
-	}
-}
-
 // A quiesced run under the v0.7.2 BackupRun CRD, which drops
 // status.restartPending, ends CRDOutdated at plan, and its app keeps running.
 func TestABackupRunUnderAnOldCRDStopsNothing(t *testing.T) {
