@@ -573,7 +573,8 @@ object store through which the Cluster archives:
 
 | What it finds | What it does |
 | --- | --- |
-| nothing at all under the Cluster's prefix | nothing. The Cluster bootstraps as written, which is `initdb` |
+| nothing at all under the Cluster's prefix, and no completed backup in the ObjectStore status for its server name | nothing. The Cluster bootstraps as written, which is `initdb` |
+| nothing at all under the prefix, and the ObjectStore status records a completed backup for the server name of the Cluster | refuses the Cluster: `The listing of s3://<bucket>/<prefix>/ found nothing. The status of ObjectStore ...` ([When the store status disagrees with the listing](#when-the-store-status-disagrees-with-the-listing) has the full text) |
 | a completed base backup | rewrites the Cluster to recover from it, to the end of the archive |
 | a completed base backup, and a RestoreRun that deleted this Cluster | rewrites it to recover to the run's `restoreAsOf`, and names the run in `backup.wlz.li/restore-run` |
 | a completed base backup, and `backup.wlz.li/restore-as-of` on the Cluster | rewrites it to recover to that moment |
@@ -581,7 +582,7 @@ object store through which the Cluster archives:
 | no completed base backup, and a RestoreRun or the annotation asks for a recovery | refuses the Cluster: `... holds no completed base backup to recover from.` |
 | no base backup finished by the moment a run or the annotation asks for | refuses the Cluster, naming the oldest base backup |
 | the Cluster declares a bootstrap method other than `initdb`, such as `recovery` or `pg_basebackup` | nothing, unless a RestoreRun waits for this Cluster. Then it refuses the Cluster with `declares its own spec.bootstrap.<method>. Remove the declared bootstrap ..., or delete the RestoreRun.`, so two sources cannot race |
-| `backup.wlz.li/bootstrap: initdb`, and nothing under the prefix | nothing. The annotation asks for an empty database on purpose |
+| `backup.wlz.li/bootstrap: initdb`, and nothing under the prefix | nothing. The annotation asks for an empty database on purpose. The ObjectStore status check of the second row applies here too |
 | `backup.wlz.li/bootstrap: initdb`, and anything under the prefix | refuses the Cluster: `The Cluster asks for an empty database (backup.wlz.li/bootstrap: initdb), and s3://<bucket>/<prefix>/ still holds the archive of an earlier one. ...` ([Starting a database empty](#starting-a-database-empty) has the full text) |
 | the store takes longer than the webhook's 10-second budget to answer | refuses the Cluster with what it read so far ([How long the webhook reads](#how-long-the-webhook-reads)) |
 
@@ -662,6 +663,43 @@ The webhook also refuses a prefix that holds only failed base backups and no
 WAL, although the check of barman would pass there.
 [decisions.md](decisions.md#refuse-a-new-database-over-an-archive-it-could-never-archive-into)
 records why.
+
+### When the store status disagrees with the listing
+
+Before the webhook lets a Cluster start empty over an empty prefix, it reads
+the status of the ObjectStore. After each backup, the sidecar of the
+barman-cloud plugin writes `status.serverRecoveryWindow.<serverName>`. The
+field `lastSuccessfulBackupTime` in that entry holds the end of the newest
+completed base backup. If the listing found nothing and the plugin has set
+this field, the webhook refuses the Cluster:
+
+```text
+The listing of s3://backups/app/app-pg/ found nothing. The status of
+ObjectStore app/app-pg-store records a completed backup for serverName
+"app-pg" (status.serverRecoveryWindow, lastSuccessfulBackupTime
+2026-09-20T03:00:01Z). The webhook does not start an empty database while the
+two disagree. Make sure that the destinationPath, endpointURL and credentials
+of the ObjectStore reach the bucket that holds the backups. If you deleted
+that archive on purpose, delete the old entry from the status with this
+command, then create the Cluster again: kubectl -n app patch
+objectstores.barmancloud.cnpg.io app-pg-store --subresource=status
+--type=json -p '[{"op":"remove","path":"/status/serverRecoveryWindow/app-pg"}]'
+```
+
+The check applies to a Cluster with `backup.wlz.li/bootstrap: initdb` too. An
+entry with only `lastFailedBackupTime`, an empty entry, or an entry for another
+server name does not stop the Cluster. The plugin writes an entry without
+`lastSuccessfulBackupTime` when its catalog holds no completed backup.
+
+The listing and the status disagree for one of these causes:
+
+| Cause | Repair |
+| --- | --- |
+| The webhook lists a place that the plugin does not write to, for example because the endpointURL or the credentials of the ObjectStore changed | Repair the ObjectStore, then create the Cluster again. The webhook then finds the base backup and recovers the Cluster. |
+| You deleted the archive on purpose, and the status still holds the entry of the old database | Run the `kubectl patch` command from the message, then create the Cluster again |
+
+The sidecar writes the status only while a Cluster runs. Thus the old entry
+stays after the archive is gone, until you delete it.
 
 ### How long the webhook reads
 
@@ -897,7 +935,10 @@ database.
 An empty database can archive only into an empty prefix, for the reason in
 [A database that could never archive](#a-database-that-could-never-archive).
 Thus the webhook also reads the store for an opted-out Cluster. It admits the
-Cluster unchanged when nothing exists under its prefix. It refuses the Cluster
+Cluster unchanged when nothing exists under its prefix and the ObjectStore
+status records no completed backup for its server name
+([When the store status disagrees with the listing](#when-the-store-status-disagrees-with-the-listing)).
+It refuses the Cluster
 when anything exists there:
 
 ```text
@@ -922,7 +963,7 @@ it. There are two ways:
 
 | The old archive | Do this |
 | --- | --- |
-| is worth nothing | delete everything under `s3://<bucket>/<prefix>/`, with the trailing slash so a sibling such as `<prefix>-old/` stays, then create the Cluster |
+| is worth nothing | delete everything under `s3://<bucket>/<prefix>/`, with the trailing slash so a sibling such as `<prefix>-old/` stays. Delete the entry of the server name from `status.serverRecoveryWindow` of the ObjectStore with the `kubectl patch` command in [When the store status disagrees with the listing](#when-the-store-status-disagrees-with-the-listing). Then create the Cluster |
 | should stay | set a `serverName` in the Cluster's barman-cloud plugin parameters that no archive uses yet, then create the Cluster |
 
 With the AWS CLI, the first way is:

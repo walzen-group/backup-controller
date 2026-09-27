@@ -89,13 +89,17 @@ List every archive with the Clusters that write it:
 jq -r --slurpfile stores <(kubectl get objectstores.barmancloud.cnpg.io -A -o json) '
   ($stores[0].items | map({key: "\(.metadata.namespace)/\(.metadata.name)", value: (.spec.configuration.destinationPath // "")}) | from_entries) as $dest
   | [.items[] as $c
-     | first(($c.spec.plugins // [])[] | select(.name == "barman-cloud.cloudnative-pg.io" and .isWALArchiver == true and (.parameters.barmanObjectName // "") != "")) as $p
-     | ($dest["\($c.metadata.namespace)/\($p.parameters.barmanObjectName)"] // "") as $d
+     | [($c.spec.plugins // [])[] | select(.name == "barman-cloud.cloudnative-pg.io")] as $entries
+     | [$entries[] | select(.enabled != false)] as $enabled
+     | select($enabled | length > 0)
+     | ($entries[-1].parameters.barmanObjectName // "") as $store
+     | select($store != "")
+     | ($dest["\($c.metadata.namespace)/\($store)"] // "") as $d
      | select($d | startswith("s3://"))
      | ($d | ltrimstr("s3://") | split("/")) as $parts
-     | (($p.parameters.serverName // "") | if . == "" then $c.metadata.name else . end) as $server
+     | (reduce ($enabled[] | (.parameters // {}) | select(has("serverName")) | .serverName) as $s ($c.metadata.name; $s)) as $server
      | {archive: (($parts[0] | ascii_downcase) + "/" + ([$parts[1:][], $server] | map(select(. != "")) | join("/"))),
-        cluster: "\($c.metadata.namespace)/\($c.metadata.name) (ObjectStore \($p.parameters.barmanObjectName), \($d))"}]
+        cluster: "\($c.metadata.namespace)/\($c.metadata.name) (ObjectStore \($store), \($d))"}]
   | group_by(.archive)[]
   | "\(length)\t\(.[0].archive)\t\(map(.cluster) | join(", "))"
 ' <(kubectl get clusters.postgresql.cnpg.io -A -o json) | sort -rn
@@ -109,9 +113,11 @@ Each line gives these values:
 
 The query follows the rules of the webhook:
 
-- It uses the first barman-cloud plugin entry with `isWALArchiver: true`.
-- It uses the ObjectStore in the namespace of the Cluster.
-- The server name is the name of the Cluster by default.
+- It skips a Cluster with no enabled barman-cloud plugin entry.
+- It uses the ObjectStore that `barmanObjectName` of the last barman-cloud
+  entry names, in the namespace of the Cluster.
+- The server name is the name of the Cluster by default. A `serverName` in an
+  enabled entry replaces it, also when it is empty, and the last one wins.
 - It compares the bucket without letter case.
 
 Expected result: every line starts with 1.

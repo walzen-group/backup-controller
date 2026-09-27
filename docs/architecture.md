@@ -117,11 +117,20 @@ CloudNativePG's Go module.
 ### Where a database's backups are
 
 Every database operation starts by finding the archive. `bootstrap.Archiver`
-reads the Cluster's `spec.plugins`, picks the `barman-cloud.cloudnative-pg.io`
-entry with `isWALArchiver: true`, and returns its `barmanObjectName` and
-`serverName`. An unset `serverName` means the Cluster's own name, the same
-default barman uses. A Cluster with no such entry archives nowhere, and every
-database operation leaves it alone.
+reads the `barman-cloud.cloudnative-pg.io` entries in the Cluster's
+`spec.plugins` with the rules of plugin-barman-cloud 0.15.0:
+
+| Value | Where Archiver reads it |
+| --- | --- |
+| the store | `barmanObjectName` of the last entry, enabled or not |
+| the server name | the Cluster's name, replaced by `serverName` of each enabled entry that sets it, also by an empty value. The last such entry wins |
+
+A Cluster with no enabled entry, or with an empty store, archives nowhere, and
+every database operation leaves it alone. `isWALArchiver` does not change the
+result, because CloudNativePG gives each WAL segment to every loaded plugin
+that can archive.
+[compatibility.md](compatibility.md#plugin-barman-cloud-0150-and-barman-3200)
+has the source lines.
 
 `bootstrap.ResolveLocation` then turns the store's name into an S3 location:
 
