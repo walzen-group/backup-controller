@@ -140,3 +140,31 @@ func TestTheKeptKeysStayUnderTheCap(t *testing.T) {
 		t.Errorf("after the cap, the keyDeriver keeps %d keys, want only the newest one", len(d.derived))
 	}
 }
+
+// TestAKeptKeyOpensWhileTheGateIsHeld checks that an Open whose key the
+// keyDeriver keeps gets it at once, while another derivation holds the gate.
+func TestAKeptKeyOpensWhileTheGateIsHeld(t *testing.T) {
+	d := newKeyDeriver(func(_, _ []byte, _, _, _, keyLen int) ([]byte, error) {
+		return make([]byte, keyLen), nil
+	})
+	file := keyFile{KDF: "scrypt", N: 2, R: 1, P: 1, Salt: []byte{1}}
+	if _, err := d.derive("backup", file); err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	d.gate <- struct{}{}
+	defer func() { <-d.gate }()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.derive("backup", file)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("derive: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the Open of a kept key waited for the gate")
+	}
+}

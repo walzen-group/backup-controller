@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"golang.org/x/crypto/scrypt"
 )
@@ -28,11 +29,12 @@ type keyDeriver struct {
 	// kdf is the key derivation function, scrypt.Key in the controller.
 	kdf kdf
 	// gate holds a token while a derivation runs. Its capacity of one makes
-	// every other derivation wait for the running one to end, and it guards
-	// derived.
+	// every other derivation wait for the running one to end.
 	gate chan struct{}
+	// mu guards derived.
+	mu sync.Mutex
 	// derived holds the key of each derivation that has run, read and
-	// written only while holding gate.
+	// written only while holding mu.
 	derived map[derivation]key
 }
 
@@ -77,17 +79,21 @@ func deriveKey(password string, file keyFile) (key, error) {
 // takes about 0.5s on the machine that runs `restic init`. The recorded key
 // files have p=8 and p=9, so one derivation takes 0.5s of CPU or more. Three
 // Opens of cold repositories at once wait in the gate one after another.
-// derive looks for a kept key only when it holds the gate. So an Open waits
-// while another derivation runs, also when derive keeps its key.
+// derive looks for a kept key before it takes the gate. Thus the Open of a
+// kept key does not wait for a derivation of another key file. After it takes
+// the gate, derive looks again, because the derivation before it can have
+// kept the same key.
 func (d *keyDeriver) derive(password string, file keyFile) (key, error) {
 	if file.KDF != "scrypt" {
 		return key{}, fmt.Errorf("key file uses kdf %q, and only scrypt is supported", file.KDF)
 	}
+	id := derivationOf(password, file)
+	if k, ok := d.kept(id); ok {
+		return k, nil
+	}
 	d.gate <- struct{}{}
 	defer func() { <-d.gate }()
-
-	id := derivationOf(password, file)
-	if k, ok := d.derived[id]; ok {
+	if k, ok := d.kept(id); ok {
 		return k, nil
 	}
 	raw, err := d.kdf([]byte(password), file.Salt, file.N, file.R, file.P, 64)
@@ -98,11 +104,36 @@ func (d *keyDeriver) derive(password string, file keyFile) (key, error) {
 	copy(k.encrypt[:], raw[:32])
 	copy(k.macK[:], raw[32:48])
 	copy(k.macR[:], raw[48:64])
+	d.keep(id, k)
+	return k, nil
+}
+
+// kept returns the key that the keyDeriver keeps for a derivation.
+//
+// Parameters:
+//   - id is the derivation, from derivationOf.
+//
+// It returns ok false when the keyDeriver keeps no key for id.
+func (d *keyDeriver) kept(id derivation) (k key, ok bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	k, ok = d.derived[id]
+	return k, ok
+}
+
+// keep records the key of a derivation. When the keyDeriver already keeps
+// maxDerivedKeys keys, keep removes all of them first.
+//
+// Parameters:
+//   - id is the derivation, from derivationOf.
+//   - k is the key that the derivation gave.
+func (d *keyDeriver) keep(id derivation, k key) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if len(d.derived) >= maxDerivedKeys {
 		clear(d.derived)
 	}
 	d.derived[id] = k
-	return k, nil
 }
 
 // derivationOf returns the derivation that scrypt runs for a password and a
