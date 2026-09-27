@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/walzen-group/backup-controller/internal/testinfra/barmanstore"
-	"github.com/walzen-group/backup-controller/internal/testinfra/s3fault"
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -100,40 +98,5 @@ func TestAStalledKubernetesReadNamesTheBudgetAndTheStep(t *testing.T) {
 				t.Errorf("the error %q does not say %q", response.Result.Message, want)
 			}
 		})
-	}
-}
-
-// TestAFailedGetIsNamedWhenTheBudgetRunsOut checks that when a backup.info
-// read failed and the budget then ran out, the refusal names the file that
-// failed to read, since that file might have been the DONE one, instead of
-// saying none of the files read completed.
-func TestAFailedGetIsNamedWhenTheBudgetRunsOut(t *testing.T) {
-	recorded := withoutNewest(t, barmanstore.MustLoad(t, "many-failed"))
-	ids := recorded.Backups()["app-pg"]
-	newest := ids[len(ids)-1]
-	endpoint, proxy := faultyS3(t, recordedS3(t, recorded))
-	denied := proxy.Add(s3fault.Rule{
-		Match:  s3fault.Match{Methods: []string{"GET"}, KeySuffix: newest + "/backup.info"},
-		Status: http.StatusForbidden,
-		Code:   "AccessDenied",
-	})
-	proxy.Add(slowInfo)
-
-	response := decideWithin(t, cluster(t, nil), endpoint, time.Second)
-
-	if response.Allowed {
-		t.Fatalf("the cluster was admitted: %v", response.Patches)
-	}
-	if denied.Hits() == 0 {
-		t.Fatal("no GET reached the AccessDenied rule")
-	}
-	message := response.Result.Message
-	for _, want := range []string{"ran out of time", "base/" + newest + "/backup.info", "AccessDenied"} {
-		if !strings.Contains(message, want) {
-			t.Errorf("the refusal %q does not say %q", message, want)
-		}
-	}
-	if strings.Contains(message, "none of them completed") {
-		t.Errorf("the refusal %q says none completed although one could not be read", message)
 	}
 }

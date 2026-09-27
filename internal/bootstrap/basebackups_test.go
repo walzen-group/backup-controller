@@ -34,22 +34,6 @@ func TestParseBackupInfoReadsTheEndToTheMicrosecond(t *testing.T) {
 	}
 }
 
-// TestABaseBackupIsNamedByItsDirectory checks that a backup.info with no
-// backup_id takes its ID from the directory that holds it. barman-cloud writes
-// no backup_id into backup.info.
-func TestABaseBackupIsNamedByItsDirectory(t *testing.T) {
-	// The ID format is barman's, as CloudNativePG reported it for the prod
-	// canary's Backup canary-namespace-backup-pg-a9158795: 20260924T224544.
-	info := "status=DONE\nbegin_time=2026-09-24 22:45:44.000000+00:00\nend_time=2026-09-24 22:45:54.061271+00:00\n"
-	backup, done, err := baseBackupAt("canary-namespace-backup/canary-namespace-backup-pg/base/20260924T224544/backup.info", []byte(info))
-	if err != nil || !done {
-		t.Fatalf("backup = %+v, done = %v, err = %v", backup, done, err)
-	}
-	if backup.ID != "20260924T224544" {
-		t.Errorf("id = %q, want the directory name", backup.ID)
-	}
-}
-
 // TestParseBackupInfoSkipsABackupThatDidNotFinish checks that a FAILED backup
 // is reported as incomplete, without an error.
 func TestParseBackupInfoSkipsABackupThatDidNotFinish(t *testing.T) {

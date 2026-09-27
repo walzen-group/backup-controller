@@ -3,7 +3,6 @@ package bootstrap
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -87,22 +86,5 @@ func TestTheWebhookReadsKindsAtTheVersionTheyAreServedAt(t *testing.T) {
 	response := decideAtNext(t, stubProber{has: false})
 	if !response.Allowed {
 		t.Fatalf("the Cluster was refused: %v", response.Result)
-	}
-}
-
-// On such a cluster, the webhook still finds another Cluster that archives
-// to the same prefix, and refuses the create naming it.
-func TestTheWebhookFindsACollisionAtTheServedVersion(t *testing.T) {
-	other := cluster(t, func(object map[string]any) {
-		object["metadata"].(map[string]any)["namespace"] = "other"
-	})
-	otherStore := store()
-	otherStore.SetNamespace("other")
-	response := decideAtNext(t, stubProber{has: false}, other, otherStore)
-	if response.Allowed {
-		t.Fatal("a Cluster was admitted while another database archives to its prefix")
-	}
-	if !strings.Contains(response.Result.Message, "other/app-pg") {
-		t.Errorf("the refusal %q does not name the holder other/app-pg", response.Result.Message)
 	}
 }

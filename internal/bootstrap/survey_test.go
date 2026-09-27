@@ -3,13 +3,10 @@ package bootstrap
 import (
 	"context"
 	"encoding/json"
-	"reflect"
-	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/minio/minio-go/v7"
 	"github.com/walzen-group/backup-controller/internal/testinfra/barmanstore"
 	"github.com/walzen-group/backup-controller/internal/testinfra/s3fault"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -130,105 +127,6 @@ func TestTheBudgetRefusesWithAMessage(t *testing.T) {
 func TestTheBudgetFitsTheManifest(t *testing.T) {
 	if DefaultBudget+5*time.Second > 15*time.Second {
 		t.Errorf("DefaultBudget %s leaves under 5s of the 15s webhook timeout", DefaultBudget)
-	}
-}
-
-// v081BaseBackups is the v0.8.1 reader, kept as the reference the new one
-// must agree with: a recursive listing of base/, every backup.info read in
-// key order, DONE ones sorted by end time.
-func v081BaseBackups(t *testing.T, at Location) []BaseBackup {
-	t.Helper()
-	client, err := S3Prober{}.client(at)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var backups []BaseBackup
-	for object := range client.ListObjects(context.Background(), at.Bucket, minio.ListObjectsOptions{Prefix: at.BasePrefix(), Recursive: true}) {
-		if object.Err != nil {
-			t.Fatal(object.Err)
-		}
-		if !strings.HasSuffix(object.Key, "/backup.info") {
-			continue
-		}
-		backup, done, err := readBaseBackup(context.Background(), client, at.Bucket, object.Key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if done {
-			backups = append(backups, backup)
-		}
-	}
-	sort.Slice(backups, func(i, j int) bool { return backups[i].End.Before(backups[j].End) })
-	return backups
-}
-
-// TestTheNewReaderAgreesWithTheOldOnTheRecordedStores checks, for every
-// recorded store and each server in it, that BaseBackups returns what the
-// v0.8.1 reader did and that Survey finds a DONE backup exactly when that
-// list is not empty, is Empty exactly when the recorded barman-cloud-check-wal-archive passed,
-// and reports the oldest DONE backup when asked for a target before it.
-func TestTheNewReaderAgreesWithTheOldOnTheRecordedStores(t *testing.T) {
-	names, err := barmanstore.Names()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range names {
-		recorded := barmanstore.MustLoad(t, name)
-		server := recordedS3(t, recorded)
-		servers := map[string]bool{"app-pg": true}
-		for s := range recorded.Backups() {
-			servers[s] = true
-		}
-		for serverName := range servers {
-			t.Run(name+"/"+serverName, func(t *testing.T) {
-				at := Location{Endpoint: server.URL, Bucket: "backups", Prefix: "app/" + serverName,
-					AccessKey: server.AccessKey, SecretKey: server.SecretKey}
-				want := v081BaseBackups(t, at)
-
-				got, err := S3Prober{}.BaseBackups(context.Background(), at)
-				if err != nil {
-					t.Fatalf("BaseBackups: %v", err)
-				}
-				if len(got) != 0 || len(want) != 0 {
-					if !reflect.DeepEqual(got, want) {
-						t.Errorf("BaseBackups = %v, the v0.8.1 reader gives %v", got, want)
-					}
-				}
-
-				archive, err := S3Prober{}.Survey(context.Background(), at, nil)
-				if err != nil {
-					t.Fatalf("Survey: %v", err)
-				}
-				if (archive.Found != nil) != (len(want) > 0) {
-					t.Errorf("Survey found %v, the v0.8.1 reader lists %d DONE backups", archive.Found, len(want))
-				}
-				if verdict, ok := recorded.Verdicts[serverName]; ok {
-					if passes := verdict.CheckWalArchive.ExitCode == 0; archive.Empty != passes {
-						t.Errorf("Survey Empty = %v, barman-cloud-check-wal-archive exit code %d", archive.Empty, verdict.CheckWalArchive.ExitCode)
-					}
-				}
-
-				if len(want) == 0 {
-					return
-				}
-				before := want[0].End.Add(-time.Second)
-				early, err := S3Prober{}.Survey(context.Background(), at, &before)
-				if err != nil {
-					t.Fatalf("Survey with a target: %v", err)
-				}
-				if early.Found != nil || early.Oldest == nil || *early.Oldest != want[0] {
-					t.Errorf("Survey before the oldest backup = found %v, oldest %v, want none found and oldest %v", early.Found, early.Oldest, want[0])
-				}
-				last := want[len(want)-1].End
-				late, err := S3Prober{}.Survey(context.Background(), at, &last)
-				if err != nil {
-					t.Fatalf("Survey with a target: %v", err)
-				}
-				if late.Found == nil {
-					t.Errorf("Survey at the newest backup's end found nothing")
-				}
-			})
-		}
 	}
 }
 

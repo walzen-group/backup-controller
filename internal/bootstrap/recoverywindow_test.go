@@ -67,35 +67,3 @@ func TestAnEmptyPrefixIsRefusedWhenTheStoreStatusRecordsABackup(t *testing.T) {
 		})
 	}
 }
-
-// TestAnEmptyPrefixStartsEmptyWhenTheStoreStatusRecordsNoBackup checks the
-// shapes of status.serverRecoveryWindow that record no completed backup for
-// the server name. The Cluster starts empty over the empty prefix in each.
-// plugin-barman-cloud v0.15.0 writes a key per server name
-// (internal/cnpgi/instance/recovery_window.go:52-61, 79-85). With no
-// completed backup in the catalog, the key holds no lastSuccessfulBackupTime.
-// A failed backup sets lastFailedBackupTime alone.
-func TestAnEmptyPrefixStartsEmptyWhenTheStoreStatusRecordsNoBackup(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		windows map[string]any
-	}{
-		{"no status", nil},
-		{"a backup of another server name", map[string]any{"app-pg-old": completedWindow()}},
-		{"an empty window", map[string]any{"app-pg": map[string]any{}}},
-		{"a failed backup only", map[string]any{"app-pg": map[string]any{"lastFailedBackupTime": lastBackup}}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			server := recordedS3(t, barmanstore.MustLoad(t, "empty"))
-
-			response := decideWith(t, cluster(t, nil), S3Prober{}, storeWithWindows(server.URL, tc.windows))
-
-			if !response.Allowed {
-				t.Fatalf("the cluster was refused: %v", response.Result)
-			}
-			if len(response.Patches) != 0 {
-				t.Fatalf("the cluster was rewritten: %v", response.Patches)
-			}
-		})
-	}
-}

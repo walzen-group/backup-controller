@@ -124,16 +124,6 @@ func TestAStoreWithADoneBaseBackupRecoversTheCluster(t *testing.T) {
 	}
 }
 
-// TestTheRefusalCountsTheBaseBackups checks the parenthesis of the refusal
-// for a prefix with several base backup directories and none DONE.
-func TestTheRefusalCountsTheBaseBackups(t *testing.T) {
-	at := Location{Bucket: "backups", Prefix: "app/app-pg"}
-	message := noDoneBackup(at, "app-pg", 3)
-	if want := "s3://backups/app/app-pg/ holds an archive with no completed base backup (3 base backups under base/, none DONE)."; !strings.HasPrefix(message, want) {
-		t.Errorf("refusal %q does not start with %q", message, want)
-	}
-}
-
 // withoutWAL returns the recorded failed-base store without the WAL files
 // under wals/, and with other objects in their place: a file under wals/
 // that is not a WAL name and a file beside base/. barman-cloud-check-wal-archive

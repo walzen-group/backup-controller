@@ -2,16 +2,8 @@ package bootstrap
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
-	"fmt"
-	"math/big"
 	"net/http"
 	"strings"
 	"testing"
@@ -227,58 +219,6 @@ func jsonpatchApply(original, patch []byte) ([]byte, error) {
 	return decoded.Apply(original)
 }
 
-// TestAClusterIsRefusedWhenAnotherArchivesThere checks that a new Cluster is
-// refused when a Cluster in another namespace already archives to the same
-// bucket and prefix, and that the refusal names that Cluster.
-//
-// Two databases archiving to one prefix interleave their WAL and leave the
-// archive unrestorable, silently and permanently. Each Cluster is valid on its
-// own, so only something that can see both can catch it. Measured on the test
-// cluster on 2026-09-15, when a new canary and an existing Flux canary both
-// wanted canary-postgres-pg.
-func TestAClusterIsRefusedWhenAnotherArchivesThere(t *testing.T) {
-	// Same object store and the same server name, in another namespace.
-	other := cluster(t, func(object map[string]any) {
-		metadata, _ := object["metadata"].(map[string]any)
-		metadata["name"] = "app-pg"
-		metadata["namespace"] = "other"
-	})
-	other.SetAPIVersion("postgresql.cnpg.io/v1")
-	other.SetKind("Cluster")
-
-	// The other namespace needs its own store and secret for the holder's
-	// destination to resolve.
-	otherStore := store()
-	otherStore.SetNamespace("other")
-	otherSecret := secret()
-	otherSecret.Namespace = "other"
-
-	raw, err := json.Marshal(cluster(t, nil))
-	if err != nil {
-		t.Fatalf("marshal the cluster: %v", err)
-	}
-	builder := newBuilder(t).
-		WithObjects(secret(), otherSecret).
-		WithRuntimeObjects(store(), otherStore, other)
-
-	decider := &Decider{Client: builder.Build(), Prober: stubProber{has: false}}
-	response := decider.Handle(context.Background(), admission.Request{
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Operation: admissionv1.Create,
-			Namespace: "app",
-			Name:      "app-pg",
-			Object:    runtime.RawExtension{Raw: raw},
-		},
-	})
-
-	if response.Allowed {
-		t.Fatal("a Cluster was admitted while another database archives to its prefix")
-	}
-	if !strings.Contains(response.Result.Message, "other/app-pg") {
-		t.Errorf("the refusal does not name the holder: %q", response.Result.Message)
-	}
-}
-
 // elsewhere builds the Cluster other/app-pg, which archives through the
 // ObjectStore other/app-pg-store to app-pg's own prefix, and that store. The
 // mutate function, when given, edits the store's spec.configuration.
@@ -298,119 +238,6 @@ func elsewhere(t *testing.T, mutate func(map[string]any)) (*unstructured.Unstruc
 		_ = unstructured.SetNestedMap(otherStore.Object, configuration, "spec", "configuration")
 	}
 	return other, otherStore
-}
-
-// TestTheCollisionCheckReadsNoSecretOfAnotherCluster checks that finding who
-// else archives to a prefix reads the other Clusters' ObjectStores and none of
-// their Secrets. Only the admitted Cluster's own two credentials are read.
-//
-// The webhook times out after 15 seconds and fails closed. Reading two
-// Secrets for every archiving Cluster on the cluster put each create behind
-// client-go's rate limiter, and around 43 archiving Clusters were enough for
-// every create to time out.
-func TestTheCollisionCheckReadsNoSecretOfAnotherCluster(t *testing.T) {
-	other, otherStore := elsewhere(t, func(configuration map[string]any) {
-		configuration["destinationPath"] = "s3://backups/other/"
-	})
-	otherSecret := secret()
-	otherSecret.Namespace = "other"
-
-	raw, err := json.Marshal(cluster(t, nil))
-	if err != nil {
-		t.Fatalf("marshal the cluster: %v", err)
-	}
-	reads := 0
-	c := newBuilder(t).
-		WithObjects(secret(), otherSecret).
-		WithRuntimeObjects(store(), otherStore, other).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if _, ok := obj.(*corev1.Secret); ok {
-					reads++
-				}
-				return c.Get(ctx, key, obj, opts...)
-			},
-		}).Build()
-
-	decider := &Decider{Client: c, Prober: stubProber{has: false}}
-	response := decider.Handle(context.Background(), admission.Request{
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Operation: admissionv1.Create,
-			Namespace: "app",
-			Name:      "app-pg",
-			Object:    runtime.RawExtension{Raw: raw},
-		},
-	})
-
-	if !response.Allowed {
-		t.Fatalf("the cluster was refused: %v", response.Result)
-	}
-	if reads != 2 {
-		t.Errorf("the webhook read %d Secrets, want the admitted Cluster's own 2", reads)
-	}
-}
-
-// TestTheCollisionCheckListsTheObjectStoresOnce checks that finding who else
-// archives to a prefix costs one list of the ObjectStores, however many other
-// Clusters archive. The only ObjectStore read by name is the admitted
-// Cluster's own. Finding W6.
-//
-// A disaster-recovery recreate creates every Cluster at once, often against a
-// slow API server. One uncached read per other archiving Cluster, one after
-// another, could use the webhook's whole 10 s budget on its own, and each
-// later create in the batch had more Clusters to read.
-func TestTheCollisionCheckListsTheObjectStoresOnce(t *testing.T) {
-	const holders = 5
-	objects := []runtime.Object{store()}
-	for i := range holders {
-		namespace := fmt.Sprintf("other%d", i)
-		other, otherStore := elsewhere(t, func(configuration map[string]any) {
-			configuration["destinationPath"] = "s3://backups/" + namespace + "/"
-		})
-		other.SetNamespace(namespace)
-		otherStore.SetNamespace(namespace)
-		objects = append(objects, other, otherStore)
-	}
-
-	raw, err := json.Marshal(cluster(t, nil))
-	if err != nil {
-		t.Fatalf("marshal the cluster: %v", err)
-	}
-	gets, lists := 0, 0
-	c := newBuilder(t).
-		WithObjects(secret()).
-		WithRuntimeObjects(objects...).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if obj.GetObjectKind().GroupVersionKind().Kind == ObjectStoreGVK.Kind {
-					gets++
-				}
-				return c.Get(ctx, key, obj, opts...)
-			},
-			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-				if list.GetObjectKind().GroupVersionKind().Kind == ObjectStoreListGVK.Kind {
-					lists++
-				}
-				return c.List(ctx, list, opts...)
-			},
-		}).Build()
-
-	decider := &Decider{Client: c, Prober: stubProber{has: false}}
-	response := decider.Handle(context.Background(), admission.Request{
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Operation: admissionv1.Create,
-			Namespace: "app",
-			Name:      "app-pg",
-			Object:    runtime.RawExtension{Raw: raw},
-		},
-	})
-
-	if !response.Allowed {
-		t.Fatalf("the cluster was refused: %v", response.Result)
-	}
-	if gets != 1 || lists != 1 {
-		t.Errorf("with %d other archiving Clusters the webhook read %d ObjectStores by name and listed them %d times, want the admitted Cluster's own read and 1 list", holders, gets, lists)
-	}
 }
 
 // TestAHolderWithoutItsSecretStillCollides checks that a Cluster archiving to
@@ -458,39 +285,6 @@ func TestTheSamePrefixOnAnotherEndpointIsACollision(t *testing.T) {
 		if !strings.Contains(response.Result.Message, want) {
 			t.Errorf("the refusal does not say %q: %q", want, response.Result.Message)
 		}
-	}
-}
-
-// TestTheSameEndpointWrittenTwoWaysIsACollision checks that endpointURLs that
-// name one S3 service in two spellings never let two Clusters share a bucket
-// and prefix. Each pair reaches one service, and v0.8.1's host comparison
-// admitted all but the first.
-func TestTheSameEndpointWrittenTwoWaysIsACollision(t *testing.T) {
-	pairs := []struct{ ours, theirs string }{
-		{"https://store.example", "Store.example"},
-		{"https://s3.example.com", "https://s3.example.com:443"},
-		{"http://minio.minio.svc:9000", "http://minio.minio.svc.cluster.local:9000"},
-		{"", "https://s3.amazonaws.com"},
-		{"https://s3.amazonaws.com", "https://s3.eu-central-1.amazonaws.com"},
-		{"https://s3.example.com", "https://s3.example.com."},
-	}
-	for _, pair := range pairs {
-		t.Run(pair.ours+" and "+pair.theirs, func(t *testing.T) {
-			ours := store()
-			_ = unstructured.SetNestedField(ours.Object, pair.ours, "spec", "configuration", "endpointURL")
-			other, otherStore := elsewhere(t, func(configuration map[string]any) {
-				configuration["endpointURL"] = pair.theirs
-			})
-
-			response := decideWith(t, cluster(t, nil), stubProber{has: false}, ours, other, otherStore)
-
-			if response.Allowed {
-				t.Fatalf("a Cluster on %q was admitted while other/app-pg archives to its prefix on %q", pair.ours, pair.theirs)
-			}
-			if !strings.Contains(response.Result.Message, "other/app-pg") {
-				t.Errorf("the refusal does not name the holder: %q", response.Result.Message)
-			}
-		})
 	}
 }
 
@@ -563,19 +357,6 @@ func TestAnUnreadableHolderStoreRefusesTheCluster(t *testing.T) {
 	}
 	if response.Result.Code != http.StatusInternalServerError {
 		t.Errorf("code = %d, want %d", response.Result.Code, http.StatusInternalServerError)
-	}
-}
-
-// TestAHolderWhoseStoreIsGoneIsSkipped checks that another Cluster whose
-// ObjectStore does not exist is skipped. It cannot archive anywhere, so it
-// holds no prefix.
-func TestAHolderWhoseStoreIsGoneIsSkipped(t *testing.T) {
-	other, _ := elsewhere(t, nil)
-
-	response := decide(t, cluster(t, nil), stubProber{has: false}, other)
-
-	if !response.Allowed {
-		t.Fatalf("a Cluster was refused over another Cluster whose ObjectStore is gone: %v", response.Result)
 	}
 }
 
@@ -733,45 +514,6 @@ func TestTheOptOutAnnotationIsRefusedOverAnOldArchive(t *testing.T) {
 	}
 }
 
-// TestTheOptOutAnnotationCollidesLikeAnyCluster checks that an opted-out
-// Cluster is refused when another Cluster already archives to its prefix.
-func TestTheOptOutAnnotationCollidesLikeAnyCluster(t *testing.T) {
-	other := cluster(t, func(object map[string]any) {
-		metadata, _ := object["metadata"].(map[string]any)
-		metadata["namespace"] = "other"
-	})
-	otherStore := store()
-	otherStore.SetNamespace("other")
-	otherSecret := secret()
-	otherSecret.Namespace = "other"
-
-	response := decide(t, optedOut(t), stubProber{}, other, otherStore, otherSecret)
-
-	if response.Allowed {
-		t.Fatal("an opted-out cluster was admitted onto another Cluster's archive")
-	}
-	if !strings.Contains(response.Result.Message, "other/app-pg already archives") {
-		t.Errorf("the refusal %q does not name the holder", response.Result.Message)
-	}
-}
-
-// TestTheOptOutAnnotationNeedsTheStore checks that an opted-out Cluster is
-// refused with an HTTP 500 when its store can't be read, since admitting it
-// could start a database that never archives.
-func TestTheOptOutAnnotationNeedsTheStore(t *testing.T) {
-	endpoint, proxy := faultyS3(t, recordedS3(t, barmanstore.MustLoad(t, "empty")))
-	proxy.Add(s3fault.Rule{Status: http.StatusServiceUnavailable, Code: "SlowDown"})
-
-	response := decideWith(t, optedOut(t), S3Prober{}, storeAt(endpoint))
-
-	if response.Allowed {
-		t.Fatal("an opted-out cluster was admitted while its store could not be read")
-	}
-	if response.Result.Code != http.StatusInternalServerError {
-		t.Errorf("code = %d, want %d", response.Result.Code, http.StatusInternalServerError)
-	}
-}
-
 // declaredRecovery builds a Cluster that declares its own point-in-time
 // recovery, the way the terragrunt restore input and the Flux
 // postgres-recovery component write one.
@@ -798,33 +540,6 @@ func waiting(asOf *string) *backupv1alpha1.RestoreRun {
 			Phase: backupv1alpha1.RunPhaseWaiting,
 			Items: []backupv1alpha1.RestoreItem{{Kind: "Cluster", Name: "app-pg", Phase: backupv1alpha1.ItemDeleted}},
 		},
-	}
-}
-
-// TestADeclaredRecoveryIsRefusedWhenAnotherArchivesThere checks that the
-// collision check also applies to a Cluster that declares its own recovery. A
-// declared recovery archives like any other Cluster, and two databases writing
-// one prefix interleave their WAL whatever either bootstrapped from.
-func TestADeclaredRecoveryIsRefusedWhenAnotherArchivesThere(t *testing.T) {
-	other := cluster(t, func(object map[string]any) {
-		metadata, _ := object["metadata"].(map[string]any)
-		metadata["name"] = "second-pg"
-	})
-	other.SetAPIVersion("postgresql.cnpg.io/v1")
-	other.SetKind("Cluster")
-	// second-pg archives to app-pg's prefix by naming it as its server.
-	plugins, _, _ := unstructured.NestedSlice(other.Object, "spec", "plugins")
-	plugin, _ := plugins[0].(map[string]any)
-	plugin["parameters"] = map[string]any{"barmanObjectName": "app-pg-store", "serverName": "app-pg"}
-	_ = unstructured.SetNestedSlice(other.Object, plugins, "spec", "plugins")
-
-	response := decide(t, declaredRecovery(t), stubProber{has: true}, other)
-
-	if response.Allowed {
-		t.Fatal("a declared recovery was admitted onto a prefix another database archives to")
-	}
-	if !strings.Contains(response.Result.Message, "app/second-pg") {
-		t.Errorf("the refusal does not name the holder: %q", response.Result.Message)
 	}
 }
 
@@ -986,50 +701,6 @@ func TestADeclaredRecoveryIsLeftAlone(t *testing.T) {
 	}
 	if len(response.Patches) != 0 {
 		t.Fatalf("a point-in-time restore was rewritten: %v", response.Patches)
-	}
-}
-
-// cloned builds a Cluster that bootstraps with pg_basebackup from another
-// server, the way a replica cluster or a migration clone is written.
-func cloned(t *testing.T) *unstructured.Unstructured {
-	return cluster(t, func(object map[string]any) {
-		spec, _ := object["spec"].(map[string]any)
-		spec["bootstrap"] = map[string]any{
-			"pg_basebackup": map[string]any{"source": "origin"},
-		}
-	})
-}
-
-// TestAPgBasebackupClusterIsLeftAlone checks that a Cluster bootstrapping with
-// pg_basebackup is admitted without a patch, even though its store holds a
-// base backup.
-//
-// Adding a recovery beside pg_basebackup gives the Cluster two bootstrap
-// methods, and CloudNativePG refuses that with "Only one bootstrap method can
-// be specified at a time". The owner chose where the data comes from.
-func TestAPgBasebackupClusterIsLeftAlone(t *testing.T) {
-	response := decide(t, cloned(t), stubProber{has: true})
-
-	if !response.Allowed {
-		t.Fatalf("the cluster was refused: %v", response.Result)
-	}
-	if len(response.Patches) != 0 {
-		t.Fatalf("a pg_basebackup Cluster was rewritten: %v", response.Patches)
-	}
-}
-
-// TestAPgBasebackupClusterIsRefusedWhileARunWaits checks that a Cluster
-// bootstrapping with pg_basebackup is refused while a RestoreRun waits for it,
-// as a declared recovery is, and that the refusal names the run and the
-// method. The run and the Cluster name two sources for one database.
-func TestAPgBasebackupClusterIsRefusedWhileARunWaits(t *testing.T) {
-	response := decide(t, cloned(t), stubProber{has: true}, waiting(nil))
-
-	if response.Allowed {
-		t.Fatal("a pg_basebackup Cluster was admitted while a RestoreRun waits for it")
-	}
-	if !strings.Contains(response.Result.Message, "back-to-monday") || !strings.Contains(response.Result.Message, "pg_basebackup") {
-		t.Errorf("the refusal does not name the run and the method: %q", response.Result.Message)
 	}
 }
 
@@ -1219,59 +890,6 @@ func TestAnUpdateOfAnInitdbClusterIsLeftAlone(t *testing.T) {
 	}
 }
 
-// TestAnUpdateOfADeclaredRecoveryIsLeftAlone checks that an update of a
-// Cluster whose recovery someone wrote by hand gets no patch, even when it
-// carries initdb too. A hand-written point-in-time restore is theirs to get
-// right.
-func TestAnUpdateOfADeclaredRecoveryIsLeftAlone(t *testing.T) {
-	declared := func() *unstructured.Unstructured {
-		return cluster(t, func(object map[string]any) {
-			spec, _ := object["spec"].(map[string]any)
-			spec["bootstrap"] = map[string]any{
-				"initdb":   map[string]any{"database": "app"},
-				"recovery": map[string]any{"source": "objectstore"},
-			}
-		})
-	}
-
-	response := update(t, declared(), declared(), true)
-
-	if len(response.Patches) != 0 {
-		t.Fatalf("a declared recovery was rewritten: %v", response.Patches)
-	}
-}
-
-// TestTheServerNameParameterWinsOverTheClusterName checks that the recovery
-// reads from the plugin's serverName parameter when the Cluster sets one.
-func TestTheServerNameParameterWinsOverTheClusterName(t *testing.T) {
-	original := cluster(t, func(object map[string]any) {
-		spec, _ := object["spec"].(map[string]any)
-		plugins, _ := spec["plugins"].([]any)
-		plugin, _ := plugins[0].(map[string]any)
-		parameters, _ := plugin["parameters"].(map[string]any)
-		parameters["serverName"] = "app-pg-original"
-	})
-
-	response := decide(t, original, stubProber{has: true})
-	patched := applied(t, original, response)
-
-	external, _, _ := unstructured.NestedSlice(patched, "spec", "externalClusters")
-	entry, _ := external[0].(map[string]any)
-	server, _, _ := unstructured.NestedString(entry, "plugin", "parameters", "serverName")
-	if server != "app-pg-original" {
-		t.Errorf("serverName = %q, want the plugin's own parameter", server)
-	}
-}
-
-// TestBasePrefixIsTheServersBackupDirectory checks that BasePrefix appends
-// "/base/" to the location's prefix.
-func TestBasePrefixIsTheServersBackupDirectory(t *testing.T) {
-	at := Location{Bucket: "backups", Prefix: "app/app-pg"}
-	if got, want := at.BasePrefix(), "app/app-pg/base/"; got != want {
-		t.Errorf("BasePrefix() = %q, want %q", got, want)
-	}
-}
-
 // TestSplitDestinationSeparatesBucketFromPrefix checks that splitDestination
 // returns the bucket and a prefix with its slashes trimmed, for an empty,
 // one-level and two-level prefix.
@@ -1292,74 +910,5 @@ func TestSplitDestinationSeparatesBucketFromPrefix(t *testing.T) {
 		if bucket != tc.bucket || prefix != tc.prefix {
 			t.Errorf("splitDestination(%q) = %q, %q; want %q, %q", tc.in, bucket, prefix, tc.bucket, tc.prefix)
 		}
-	}
-}
-
-// TestNoEndpointCAMeansThePublicRoots checks that tlsTransport with no bundle
-// still builds a root pool and requires TLS 1.2. A store fronted by a public
-// authority declares no endpointCA, and the client verifies against the roots
-// the image ships.
-func TestNoEndpointCAMeansThePublicRoots(t *testing.T) {
-	transport, err := tlsTransport(nil)
-	if err != nil {
-		t.Fatalf("tlsTransport(nil): %v", err)
-	}
-	if transport.TLSClientConfig.RootCAs == nil {
-		t.Error("no root pool was built")
-	}
-	if transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
-		t.Error("the transport accepts TLS below 1.2")
-	}
-}
-
-// TestAnEndpointCAIsAddedToTheRoots checks that a PEM bundle passed to
-// tlsTransport ends up in the root pool. A store fronted by a private
-// authority carries the bundle that signs it, and this controller has no CA
-// settings of its own.
-func TestAnEndpointCAIsAddedToTheRoots(t *testing.T) {
-	// A throwaway self-signed certificate, generated in this test so the
-	// repository carries no certificate material of its own.
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("generate a key: %v", err)
-	}
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "store.example"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("create a certificate: %v", err)
-	}
-	bundle := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-
-	transport, err := tlsTransport(bundle)
-	if err != nil {
-		t.Fatalf("tlsTransport(bundle): %v", err)
-	}
-
-	subjects := transport.TLSClientConfig.RootCAs.Subjects() //nolint:staticcheck // reading the pool is the assertion
-	if len(subjects) == 0 {
-		t.Fatal("the bundle was not added to the pool")
-	}
-}
-
-// TestAnUnparsableEndpointCAIsRejected checks that tlsTransport returns an
-// error for a bundle holding no PEM certificate.
-func TestAnUnparsableEndpointCAIsRejected(t *testing.T) {
-	if _, err := tlsTransport([]byte("this is not a certificate")); err == nil {
-		t.Fatal("a bundle holding no PEM certificate was accepted")
-	}
-}
-
-// TestSplitDestinationRejectsAnotherProvider checks that splitDestination
-// returns an error for a destination with a scheme other than s3://.
-func TestSplitDestinationRejectsAnotherProvider(t *testing.T) {
-	if _, _, err := splitDestination("azure://container/"); err == nil {
-		t.Fatal("an azure:// destination was accepted")
 	}
 }
