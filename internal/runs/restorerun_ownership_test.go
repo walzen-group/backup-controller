@@ -268,7 +268,7 @@ func TestAnIntoRestoreWhoseClaimIsReplacedFails(t *testing.T) {
 	run := stepUntilFinished(t, r, c, 2)
 
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
-		!strings.Contains(readyMessage(run.Status.Conditions), "claim scratch was deleted (or replaced) while the mover wrote into it") {
+		!strings.Contains(readyMessage(run.Status.Conditions), "claim scratch was deleted (or replaced) while its restore Job wrote into it") {
 		t.Fatalf("phase = %q, message = %q; want Failed saying the claim was replaced", run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
 }

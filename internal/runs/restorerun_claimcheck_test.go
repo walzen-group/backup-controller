@@ -32,11 +32,10 @@ func expectVolumeFailed(t *testing.T, run *backupv1alpha1.RestoreRun, want ...st
 	}
 }
 
-// An in-place item whose claim was deleted while the mover wrote fails once
-// the mover completes. The claim is Terminating: pvc-protection keeps it
-// while the mover's pod mounts it, and the mover finishes writing into a
-// claim that is about to go. Before, the item succeeded on the mover's log
-// alone.
+// An in-place item whose claim was deleted while its restore Job wrote fails
+// once the Job completes. The claim is Terminating: pvc-protection keeps it
+// while the Job's pod mounts it, and the Job finishes writing into a claim
+// that is about to go. The message names the restore Job as the writer.
 func TestAnInPlaceRestoreIntoADeletedClaimFails(t *testing.T) {
 	r, c := startedRestore(t, inPlace)
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -52,11 +51,11 @@ func TestAnInPlaceRestoreIntoADeletedClaimFails(t *testing.T) {
 
 	restoreStep(t, r)
 
-	expectVolumeFailed(t, readRestoreRun(t, c), "claim "+claimN, "deleted")
+	expectVolumeFailed(t, readRestoreRun(t, c), "claim "+claimN, "deleted while its restore Job wrote into it")
 }
 
 // An in-place item whose claim was replaced by another of the same name
-// while the mover wrote fails once the mover completes. The mover mounts the
+// while its restore Job wrote fails once the Job completes. The Job mounts the
 // claim by name, so it may have written into the new claim as well; the
 // message says so and asks for the claim's data to be checked.
 func TestAnInPlaceRestoreIntoAReplacedClaimFails(t *testing.T) {
@@ -75,11 +74,11 @@ func TestAnInPlaceRestoreIntoAReplacedClaimFails(t *testing.T) {
 	restoreStep(t, r)
 
 	expectVolumeFailed(t, readRestoreRun(t, c), "claim "+claimN, "replaced", "not the one the run checked and took its Lease on",
-		"may have written into it", "check its data")
+		"The restore Job mounts claim "+claimN+" by name", "may have written into it", "check its data")
 }
 
 // An in-place item whose run no longer holds a claim Lease for it can't tell
-// which claim the mover wrote into, and fails once the mover completes.
+// which claim its restore Job wrote into, and fails once the Job completes.
 func TestAnInPlaceRestoreWithoutItsClaimLeaseFails(t *testing.T) {
 	r, c := startedRestore(t, inPlace)
 	lease := &coordinationv1.Lease{}
@@ -91,7 +90,7 @@ func TestAnInPlaceRestoreWithoutItsClaimLeaseFails(t *testing.T) {
 
 	restoreStep(t, r)
 
-	expectVolumeFailed(t, readRestoreRun(t, c), "claim Lease")
+	expectVolumeFailed(t, readRestoreRun(t, c), "claim Lease", "whether its restore Job wrote into")
 }
 
 // An in-place item whose claim is the one the run took its Lease on

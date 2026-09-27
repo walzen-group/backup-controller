@@ -766,6 +766,9 @@ func noCandidate(all []restic.Snapshot, quiescedOnly bool) string {
 	if slices.ContainsFunc(all, restic.MoverLayout) && quiescedOnly {
 		return fmt.Sprintf("the repository holds no snapshot tagged %s; only a BackupRun that stopped the workloads writes one", restic.QuiescedTag)
 	}
+	if len(all) == 1 {
+		return "the repository holds 1 snapshot, which no VolSync mover wrote (host volsync, paths [/data]): " + passedOver(all)
+	}
 	return fmt.Sprintf("the repository holds %d snapshots, none written by a VolSync mover (host volsync, paths [/data]): %s",
 		len(all), passedOver(all))
 }
@@ -1226,7 +1229,7 @@ func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1al
 // It returns nil while that claim is there, and a *refusalError with reason
 // ClaimLost when the claim is gone, is being deleted, or is another claim.
 // A run that holds no claim Lease for the item can't tell which claim the
-// mover wrote into, and gets that refusal too, since the item must not
+// restore Job wrote into, and gets that refusal too, since the item must not
 // succeed without that evidence. A failed read of the claim or the Leases
 // comes back as a plain error, and the caller leaves the item as it was.
 //
@@ -1239,9 +1242,9 @@ func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1al
 // written into the new claim, and the message asks for that claim's data to
 // be checked.
 //
-// A claim deleted while its mover's pod mounts it stays, Terminating, until
-// the pod is gone (pvc-protection), so the mover can complete into a claim
-// that is about to go.
+// A claim deleted while a pod of its restore Job mounts it stays,
+// Terminating, until the pod is gone (pvc-protection), so the Job can
+// complete into a claim that is about to go.
 func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) error {
 	leases := &coordinationv1.LeaseList{}
 	if err := r.Reader.List(ctx, leases, client.InNamespace(run.Namespace), client.MatchingLabels{labelLeaseHolderUID: string(run.UID)}); err != nil {
@@ -1255,23 +1258,23 @@ func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backup
 		}
 	}
 	if len(leased) == 0 {
-		return refuse(backupv1alpha1.ItemReasonClaimLost, "the run holds no claim Lease for claim %s, so it can't tell whether the mover wrote into the claim that is there now. "+
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "the run holds no claim Lease for claim %s, so it can't tell whether its restore Job wrote into the claim that is there now. "+
 			"Check the claim's data, and create a new RestoreRun to restore it", claimName)
 	}
 
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
 		if apierrors.IsNotFound(err) {
-			return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted while the mover wrote into it, and the restored data went with it", claimName)
+			return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted while its restore Job wrote into it, and the restored data went with it", claimName)
 		}
 		return fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
 	}
 	if claim.DeletionTimestamp != nil {
-		return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted while the mover wrote into it, and the restored data goes with it once the claim is released", claimName)
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted while its restore Job wrote into it, and the restored data goes with it once the claim is released", claimName)
 	}
 	if !slices.Contains(leased, string(claim.UID)) {
-		return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %[1]s was replaced while the mover wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
-			"and took its Lease on (UID %[3]s). The mover mounts claim %[1]s by name, so it may have written into it; check its data, "+
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %[1]s was replaced while its restore Job wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
+			"and took its Lease on (UID %[3]s). The restore Job mounts claim %[1]s by name, so it may have written into it; check its data, "+
 			"and create a new RestoreRun to restore it", claimName, claim.UID, strings.Join(leased, ", "))
 	}
 	return nil
@@ -1677,7 +1680,7 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 	case claim.DeletionTimestamp == nil && metav1.IsControlledBy(claim, run):
 		return nil
 	}
-	return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted (or replaced) while the mover wrote into it", run.Spec.Into)
+	return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted (or replaced) while its restore Job wrote into it", run.Spec.Into)
 }
 
 // abort ends a run early as Failed. It fails every item that has not

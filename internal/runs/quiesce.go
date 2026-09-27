@@ -858,8 +858,8 @@ type releasePlan struct {
 
 	// appDown is true when the run still holds workloads stopped or
 	// Kustomizations suspended. A step that fails before the restart, such as
-	// a RestoreRun stopping its movers, then reports RestartFailed with the
-	// steps that give the app back by hand, because the app is still down.
+	// a RestoreRun stopping its restore Jobs, then reports RestartFailed with
+	// the steps that give the app back by hand, because the app is still down.
 	appDown bool
 
 	// scheduled is true when a namespace's schedule starts no new run until
@@ -890,9 +890,10 @@ type releasePlan struct {
 // while the run tries again, and restartWorkloads skips what is already
 // back. A release step carries its own advice. While the app is down after a
 // release step failed, the message adds the same scaling steps, to be taken
-// once no mover of the run still writes. A run that is still working says it
-// must not be deleted; only a run that is ending or being deleted says that a
-// person can delete it, or remove its finalizer, once the app runs again.
+// once no restore Job of the run still writes. A run that is still working
+// says it must not be deleted; only a run that is ending or being deleted
+// says that a person can delete it, or remove its finalizer, once the app
+// runs again.
 // When err holds both a restart and a release failure, as BackupRun.release
 // returns them, the message names both and gives both pieces of advice.
 func releaseFailure(err error, plan releasePlan) (string, string) {
@@ -929,7 +930,7 @@ func releaseFailure(err error, plan releasePlan) (string, string) {
 	}
 	if restart == nil && plan.appDown {
 		advice = append(advice, fmt.Sprintf("The app stays stopped until the run gets past this. To give it back sooner, "+
-			"make sure no mover of the run still writes to its claims, then %s yourself.", byHand(plan.stopped, plan.suspended)))
+			"make sure no restore Job of the run still writes to its claims, then %s yourself.", byHand(plan.stopped, plan.suspended)))
 	}
 	message := strings.Join(failed, "; it also ") + ". The run retries until it can"
 	if plan.scheduled {

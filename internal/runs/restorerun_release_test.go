@@ -171,7 +171,8 @@ func TestARestoreThatCannotDeleteItsJobSaysWhatFailed(t *testing.T) {
 		t.Errorf("replicas = %d, want the app still down while the restore Job is there", got)
 	}
 	message := readyMessage(after.Status.Conditions)
-	for _, want := range []string{"restore Job " + job.Name, refused.Error(), "scale Deployment " + appN + " to 2", "resume Kustomization flux-system/" + appN} {
+	for _, want := range []string{"restore Job " + job.Name, refused.Error(), "scale Deployment " + appN + " to 2", "resume Kustomization flux-system/" + appN,
+		"make sure no restore Job of the run still writes to its claims"} {
 		if !strings.Contains(message, want) {
 			t.Errorf("message %q does not name %q", message, want)
 		}

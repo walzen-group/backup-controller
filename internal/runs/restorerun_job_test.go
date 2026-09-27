@@ -480,6 +480,12 @@ func TestOnlyMoverSnapshotsAreCandidates(t *testing.T) {
 	if item := readRestoreRun(t, c).Status.Items[0]; item.SnapshotID != "" {
 		t.Errorf("item = %+v, want no snapshot recorded", item)
 	}
+
+	r, _ = restoreReconciler(t, nil, restoreRun(inPlace), claim(), volumeRestore(), repository())
+	r.Snapshots = snapshots{stranger}
+	restoreStep(t, r)
+	expectRefused(t, r, "the repository holds 1 snapshot, which no VolSync mover wrote (host volsync, paths [/data]): "+
+		"77770000 (host laptop, paths [/data])")
 }
 
 // A repository with no snapshot of the mover's layout fails the item naming
