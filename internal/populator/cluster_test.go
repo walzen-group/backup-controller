@@ -113,6 +113,9 @@ type fakeOperations struct {
 	// or a missing grant gives it.
 	refuseCreate error
 	refuseResume error
+	// beforeResume, when set, runs before each resume is sent, so a test
+	// can change the cluster between Populate's reads and the resume.
+	beforeResume func(context.Context) error
 }
 
 var _ Operations = (*fakeOperations)(nil)
@@ -138,8 +141,14 @@ func (f *fakeOperations) CreateJob(ctx context.Context, job *batchv1.Job) error 
 	return f.Jobs.CreateJob(ctx, job)
 }
 
-// ResumeJob sends the resume to the cluster, unless refuseResume is set.
+// ResumeJob runs beforeResume and sends the resume to the cluster, unless
+// refuseResume is set.
 func (f *fakeOperations) ResumeJob(ctx context.Context, job *batchv1.Job) error {
+	if f.beforeResume != nil {
+		if err := f.beforeResume(ctx); err != nil {
+			return err
+		}
+	}
 	if f.refuseResume != nil {
 		return f.refuseResume
 	}

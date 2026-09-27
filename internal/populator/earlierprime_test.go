@@ -2,6 +2,7 @@ package populator
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/walzen-group/backup-controller/internal/restorejob"
@@ -82,6 +83,33 @@ func TestASuspendedJobOfAnEarlierPrimeIsNeverResumed(t *testing.T) {
 		}
 		if job := ops.job(t, "claim-123"); job != nil && job.UID == old.UID && !ptr.Deref(job.Spec.Suspend, false) {
 			t.Fatalf("sync %d resumed the Job of an earlier prime", sync)
+		}
+	}
+}
+
+// TestAStalePrimeNeverRecordsOrResumesAJob checks that Populate records and
+// resumes no Job while the library's cache still passes an earlier prime
+// claim and the API server already holds a new one under the same name. The
+// Job was built for the earlier prime, so ownedByPrime accepts it against
+// the cached prime; the fresh read shows the prime of now, and Populate
+// returns an error until the cache catches up.
+func TestAStalePrimeNeverRecordsOrResumesAJob(t *testing.T) {
+	ctx := context.Background()
+	ops := populatedOperations(t)
+	old := ops.createEarlierJob(t)
+	stale := params()
+	stale.PvcPrime.UID = earlierPrimeUID
+	callbacks := newCallbacks(ops, monday)
+
+	for sync := range 2 {
+		if err := callbacks.Populate(ctx, stale); !errors.Is(err, errStalePrime) {
+			t.Fatalf("sync %d: Populate() = %v, want errStalePrime", sync, err)
+		}
+		if got := ops.prime(t, "claim-123").Annotations[AnnotationJobUID]; got == string(old.UID) {
+			t.Fatalf("sync %d recorded the Job of the cached prime on the prime of now", sync)
+		}
+		if job := ops.job(t, "claim-123"); !ptr.Deref(job.Spec.Suspend, false) {
+			t.Fatalf("sync %d resumed the Job of the cached prime", sync)
 		}
 	}
 }

@@ -36,6 +36,12 @@ type restore struct {
 // takes the same name, so none is created until the old one is gone.
 var errJobBeingDeleted = errors.New("its restore Job is being deleted; a new one is created once it is gone")
 
+// errStalePrime is a claim whose prime claim the library's cache still shows
+// as an earlier one, while the API server already holds a new prime claim
+// under the same name. Nothing is recorded or resumed until the cache
+// catches up.
+var errStalePrime = errors.New("the library's cache still shows an earlier prime claim; the restore Job waits until it catches up")
+
 // claimError wraps an error of one claim's restore with the claim's name.
 func claimError(claim *corev1.PersistentVolumeClaim, err error) error {
 	return fmt.Errorf("claim %s/%s: %w", claim.Namespace, claim.Name, err)
@@ -109,8 +115,16 @@ func (c *Callbacks) failJob(ctx context.Context, r restore, job *batchv1.Job, fa
 //   - r is the claim's restore.
 //   - job is the claim's running Job, as Populate just read it.
 //
-// It returns an error from a read, from the record or from the resume; a
-// resume the API server refuses returns what jobCallError returns.
+// It returns an error from a read, from the record or from the resume, and
+// an error wrapping errStalePrime when the prime claim read fresh has
+// another UID than the one the library's cache passed. A resume that meets
+// a Job created again under the same name since the read returns its error
+// unchanged (see jobReplaced); any other resume the API server refuses
+// returns what jobCallError returns.
+//
+// The caller checked the Job's owner reference against the cached prime
+// claim, so a fresh prime claim with another UID may be one the Job was
+// never built for, and nothing is recorded on it or resumed.
 //
 // restorejob.Build creates every Job suspended. A Job whose UID the prime
 // claim does not record yet, one this pass created or one a create that
@@ -127,6 +141,10 @@ func (c *Callbacks) resume(ctx context.Context, r restore, job *batchv1.Job) err
 	if err != nil {
 		return fmt.Errorf("read prime claim %s/%s: %w", r.prime.Namespace, r.prime.Name, err)
 	}
+	if prime.UID != r.prime.UID {
+		return claimError(r.claim, fmt.Errorf("%w: prime claim %s/%s has UID %s, the cache shows %s",
+			errStalePrime, prime.Namespace, prime.Name, prime.UID, r.prime.UID))
+	}
 	if types.UID(prime.Annotations[AnnotationJobUID]) != job.UID {
 		return c.recordJob(ctx, prime, job.UID)
 	}
@@ -137,7 +155,11 @@ func (c *Callbacks) resume(ctx context.Context, r restore, job *batchv1.Job) err
 		return err
 	}
 	if err := c.operations.ResumeJob(ctx, job); err != nil {
-		return c.jobCallError(ctx, r, fmt.Errorf("resume restore Job %s/%s: %w", job.Namespace, job.Name, err))
+		err = fmt.Errorf("resume restore Job %s/%s: %w", job.Namespace, job.Name, err)
+		if jobReplaced(err) {
+			return err
+		}
+		return c.jobCallError(ctx, r, err)
 	}
 	return nil
 }
