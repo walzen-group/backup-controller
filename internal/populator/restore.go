@@ -28,8 +28,6 @@ type restore struct {
 	// restore Job writes. It comes from the library's cache and is never
 	// changed in place.
 	prime *corev1.PersistentVolumeClaim
-	// repo is the app's repository Secret.
-	repo *corev1.Secret
 }
 
 // errJobBeingDeleted is a claim whose restore Job is being deleted. A new Job
@@ -208,7 +206,7 @@ func (c *Callbacks) startJob(ctx context.Context, r restore) error {
 	if !state.Stopped {
 		return claimError(r.claim, &stoppingError{state: state})
 	}
-	chosen, err := c.selectSnapshot(ctx, r.vr, r.claim, r.repo)
+	chosen, err := c.selectSnapshot(ctx, r.vr, r.claim)
 	var none *noBackupError
 	switch {
 	case errors.As(err, &none):

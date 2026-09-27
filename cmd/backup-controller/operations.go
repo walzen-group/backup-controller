@@ -96,3 +96,12 @@ func (o *clientOperations) SetStatus(ctx context.Context, vr *backupv1alpha1.Vol
 func (o *clientOperations) UpdateVolumeRestore(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
 	return o.client.Update(ctx, vr)
 }
+
+// ListVolumeRestores lists the VolumeRestores of the namespace.
+func (o *clientOperations) ListVolumeRestores(ctx context.Context, namespace string) ([]backupv1alpha1.VolumeRestore, error) {
+	list := &backupv1alpha1.VolumeRestoreList{}
+	if err := o.client.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}

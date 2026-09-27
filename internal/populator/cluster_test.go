@@ -174,6 +174,17 @@ func (f *fakeOperations) PatchClaim(ctx context.Context, claim *corev1.Persisten
 	return f.cluster.Patch(ctx, claim, patch)
 }
 
+// ListVolumeRestores lists the VolumeRestores of the fake cluster. A fake with
+// no cluster, as the policy envtest builds one, holds none.
+func (f *fakeOperations) ListVolumeRestores(ctx context.Context, namespace string) ([]backupv1alpha1.VolumeRestore, error) {
+	if f.cluster == nil {
+		return nil, nil
+	}
+	list := &backupv1alpha1.VolumeRestoreList{}
+	err := f.cluster.List(ctx, list, client.InNamespace(namespace))
+	return list.Items, err
+}
+
 func (f *fakeOperations) GetSecret(_ context.Context, namespace, name string) (*corev1.Secret, error) {
 	if secret, ok := f.secrets[namespacedName(namespace, name)]; ok {
 		return secret.DeepCopy(), nil

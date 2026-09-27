@@ -219,9 +219,10 @@ func newRunManager(options RunOptions) (ctrl.Manager, error) {
 // process.
 func registerBootstrapWebhook(manager ctrl.Manager, port int) {
 	decider := &bootstrap.Decider{
-		Client: manager.GetAPIReader(),
-		Mapper: manager.GetRESTMapper(),
-		Prober: bootstrap.S3Prober{},
+		Client:    manager.GetAPIReader(),
+		Mapper:    manager.GetRESTMapper(),
+		Prober:    bootstrap.S3Prober{},
+		Snapshots: restic.S3Lister{},
 	}
 	manager.GetWebhookServer().Register(
 		bootstrap.WebhookPath,

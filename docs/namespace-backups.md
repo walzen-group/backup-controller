@@ -1042,8 +1042,36 @@ the Cluster healthy.
 ## Automatic restore
 
 Two objects restore with no run: a claim that its VolumeRestore fills, and a
-Cluster that Flux or tofu creates. This is the canary after a destroy and a new
-apply:
+Cluster that Flux or tofu creates.
+
+When the namespace has quiesced snapshots, both come back to one moment. The
+populator and the bootstrap webhook read the same data: the snapshots of each
+repository that a VolumeRestore of the namespace names. Both give it to one
+function, `restic.SyncedMoment` (internal/restic/synced.go):
+
+1. In each repository, it takes the newest snapshot with the tag `quiesced`
+   and the layout of the mover. With `backup.wlz.li/restore-as-of`, it takes
+   the newest at or before that moment. A repository with no such snapshot
+   does not count, for example the repository of a claim added after the last
+   quiesced run.
+2. The time of these snapshots is the moment. A quiesced BackupRun gives all
+   its snapshots one time, the `restartedAt` of the run.
+3. The populator fills each claim from the quiesced snapshot of that moment
+   (internal/populator/select.go `selectSnapshot`). A claim whose repository
+   has no such snapshot gets the newest snapshot, as before.
+4. The webhook recovers each Cluster to that moment
+   (internal/bootstrap/synced.go `automaticTarget`). If no base backup
+   finished by then, it refuses the Cluster, as it does for a pin.
+
+If two repositories give two different times, a quiesced run did not rewrite
+every snapshot. Then nothing picks a moment. The claim stays Pending with reason
+NoBackupInReach, and the webhook refuses the Cluster. Both messages name the two
+repositories and their snapshots. Set `backup.wlz.li/restore-as-of` on the
+claims and the Cluster to a moment that both repositories reach.
+
+A namespace with no quiesced snapshot restores as the rest of this section
+shows. This is the canary after a destroy and a new apply, recorded on v0.9.x,
+before the rule above:
 
 ```text
 start db=[13 2026-09-24T22:27:08Z,2026-09-24T22:28:14Z,2026-09-24T22:29:14Z] file=[10 2026-09-24T22:14:38Z,2026-09-24T22:15:38Z,2026-09-24T22:27:08Z]

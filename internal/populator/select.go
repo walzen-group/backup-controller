@@ -12,16 +12,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// SnapshotLister lists the snapshots in the restic repository a repository
-// Secret names. restic.S3Lister is the implementation the controller runs
-// with; the tests pass a fixed list.
-type SnapshotLister interface {
-	// Snapshots returns every snapshot, oldest first and by ID among
-	// snapshots of one time, and none for a repository that does not exist
-	// yet.
-	Snapshots(ctx context.Context, secret *corev1.Secret) ([]restic.Snapshot, error)
-}
-
 // selection is the snapshot a claim is filled from.
 type selection struct {
 	// snapshot is the snapshot to restore, when empty is false.
@@ -55,6 +45,9 @@ const (
 	noCandidate
 	// outOfReach is a pin older than every candidate.
 	outOfReach
+	// notSynced is a namespace whose repositories give two moments for
+	// their newest quiesced snapshots (see restic.SyncedMoment).
+	notSynced
 )
 
 // noBackupError is a claim no snapshot in its repository can fill. The claim
@@ -62,13 +55,15 @@ const (
 type noBackupError struct {
 	// problem says which case it is.
 	problem noBackupProblem
-	// pin is the claim's pin, for every problem but noCandidate.
+	// pin is the claim's pin, for badPin, noSnapshot and outOfReach.
 	pin pin
 	// all is every snapshot in the repository, oldest first, for
 	// noCandidate.
 	all []restic.Snapshot
 	// oldest is the oldest candidate, for outOfReach.
 	oldest restic.Snapshot
+	// cause is the *restic.NotSyncedError, for notSynced.
+	cause error
 }
 
 // Error says why no snapshot can fill the claim.
@@ -87,6 +82,8 @@ func (e *noBackupError) Error() string {
 	case outOfReach:
 		return fmt.Sprintf("%s asks for %s; the oldest snapshot, %s, is from %s",
 			e.pin.source, e.pin.value, e.oldest.ShortID(), e.oldest.Time.UTC().Format(time.RFC3339))
+	case notSynced:
+		return e.cause.Error()
 	default:
 		return "no snapshot can fill the claim"
 	}
@@ -95,25 +92,71 @@ func (e *noBackupError) Error() string {
 // selectSnapshot picks the snapshot that fills a claim.
 //
 // Parameters:
-//   - ctx bounds the listing.
+//   - ctx bounds the reads.
 //   - vr and claim give the pin: the claim's backup.wlz.li/restore-as-of
 //     annotation first, then the VolumeRestore's spec.restoreAsOf (see
-//     RestoreAsOf).
-//   - repo is the app's repository Secret, which the lister opens.
+//     RestoreAsOf). vr also names the claim's repository Secret.
+//
+// It reads the snapshots of every repository of the claim's namespace (see
+// namespaceSnapshots), and gives them to restic.SyncedMoment, as the
+// bootstrap webhook does for a Cluster of the namespace. When that gives a
+// moment and the claim's repository holds a quiesced snapshot at it, that
+// snapshot fills the claim, so the volume and the database come back to one
+// moment. Otherwise choose picks from the claim's repository as it does with
+// no quiesced snapshots.
 //
 // It returns the selection, a *noBackupError when no snapshot can fill the
-// claim, and a plain error when the listing fails. A listing error never
-// counts as an empty repository.
-func (c *Callbacks) selectSnapshot(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim, repo *corev1.Secret) (selection, error) {
+// claim, and a plain error when a read fails. A listing error never counts
+// as an empty repository.
+func (c *Callbacks) selectSnapshot(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim) (selection, error) {
 	moment, err := readPin(vr, claim)
 	if err != nil {
 		return selection{}, err
 	}
-	all, err := c.snapshots.Snapshots(ctx, repo)
+	repositories, err := c.namespaceSnapshots(ctx, claim.Namespace, vr.Spec.Repository)
 	if err != nil {
-		return selection{}, fmt.Errorf("list the snapshots in %s: %w", repo.Name, err)
+		return selection{}, err
 	}
-	return choose(all, moment)
+	own := repositories[vr.Spec.Repository]
+	var at *time.Time
+	if moment != nil {
+		at = &moment.at
+	}
+	synced, found, err := restic.SyncedMoment(repositories, at)
+	if err != nil {
+		return selection{}, &noBackupError{problem: notSynced, cause: err}
+	}
+	if found {
+		if snapshot, ok := restic.NewestQuiesced(own, &synced); ok {
+			return selection{snapshot: snapshot}, nil
+		}
+	}
+	return choose(own, moment)
+}
+
+// namespaceSnapshots lists the snapshots of every repository of a namespace.
+//
+// Parameters:
+//   - namespace is the claim's namespace.
+//   - repository is the claim's own repository Secret. It counts even when
+//     the list of VolumeRestores does not show its VolumeRestore yet.
+//
+// It returns the snapshots by the name of the Secret (see
+// restic.NamespaceSnapshots), and an error when the VolumeRestores, a Secret
+// or a repository can not be read.
+func (c *Callbacks) namespaceSnapshots(ctx context.Context, namespace, repository string) (map[string][]restic.Snapshot, error) {
+	restores, err := c.operations.ListVolumeRestores(ctx, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("list the VolumeRestores in %s: %w", namespace, err)
+	}
+	names := []string{repository}
+	for _, vr := range restores {
+		names = append(names, vr.Spec.Repository)
+	}
+	secret := func(ctx context.Context, name string) (*corev1.Secret, error) {
+		return c.operations.GetSecret(ctx, namespace, name)
+	}
+	return restic.NamespaceSnapshots(ctx, names, secret, c.snapshots)
 }
 
 // readPin reads the moment a claim's restore goes back to.

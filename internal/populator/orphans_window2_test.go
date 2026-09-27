@@ -68,6 +68,12 @@ func (o clientOperations) UpdateVolumeRestore(ctx context.Context, vr *backupv1a
 	return o.client.Update(ctx, vr)
 }
 
+func (o clientOperations) ListVolumeRestores(ctx context.Context, namespace string) ([]backupv1alpha1.VolumeRestore, error) {
+	list := &backupv1alpha1.VolumeRestoreList{}
+	err := o.client.List(ctx, list, client.InNamespace(namespace))
+	return list.Items, err
+}
+
 // Window 2 of designs/populator.md finding A: Cleanup releases the
 // VolumeRestore's finalizer before the library deletes the prime and removes
 // its claim finalizer. For a VolumeRestore already being deleted, it goes the

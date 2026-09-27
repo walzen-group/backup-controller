@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-logr/logr"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/restic"
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -59,8 +60,9 @@ const (
 // chooses a new Cluster's bootstrap at admission time, and it keeps a
 // recovered Cluster valid when Flux applies it again.
 type Decider struct {
-	// Client reads ObjectStores, Secrets, Clusters and RestoreRuns. The
-	// handler only ever reads, so a client.Reader is enough.
+	// Client reads ObjectStores, Secrets, Clusters, RestoreRuns and
+	// VolumeRestores. The handler only ever reads, so a client.Reader is
+	// enough.
 	// cmd/backup-controller passes the manager's uncached API reader, which
 	// keeps the controller's Secret grant at get. A cached client would need
 	// list and watch on every Secret in the cluster and would hold them all
@@ -80,6 +82,10 @@ type Decider struct {
 	// which base backups exist. cmd/backup-controller passes S3Prober, and
 	// the tests pass a stub.
 	Prober ArchiveProber
+	// Snapshots lists the snapshots of the restic repositories of the
+	// namespace's VolumeRestores, for the moment of an automatic restore (see
+	// syncedTarget). cmd/backup-controller passes restic.S3Lister.
+	Snapshots restic.SnapshotLister
 	// Budget is how long Handle may spend on one create. Zero means
 	// DefaultBudget. Tests lower it.
 	Budget time.Duration
@@ -121,6 +127,11 @@ const DefaultBudget = 10 * time.Second
 //   - A create is refused when a RestoreRun or the restore-as-of annotation
 //     asks for a recovery and the store holds no completed base backup, or
 //     none finished by the requested moment.
+//   - With no RestoreRun waiting, a create is refused when the repositories
+//     of the namespace's VolumeRestores give two moments for their newest
+//     quiesced snapshots, and it recovers to their one moment when they give
+//     one (see automaticTarget). The moment is refused like a pin when no
+//     base backup finished by it.
 //   - Otherwise, when the store holds a completed base backup, the response
 //     patches the Cluster to recover from it (see setRecovery). When a
 //     RestoreRun waits for the Cluster, the patch also sets the
@@ -327,14 +338,26 @@ func keepDeclared(c creation, run *backupv1alpha1.RestoreRun) admission.Response
 //   - c is the create.
 //   - run is the RestoreRun that waits for the Cluster, or nil.
 //
+// With no run, the target is the moment of the quiesced snapshots of the
+// namespace's volumes when there is one (see automaticTarget), so the
+// database comes back to the moment the populator fills the claims from.
+//
 // It refuses the create when the recovery target is not an RFC 3339 time, or
 // when the target is before the end of the oldest base backup. With no
-// completed base backup it returns the answer of withoutBaseBackup. Otherwise
+// completed base backup it returns the answer of withoutBaseBackup; a moment
+// of quiesced snapshots alone does not ask for a recovery there. Otherwise
 // it returns the answer of recoverFrom, a patch that recovers the Cluster.
 func (d *Decider) recover(ctx context.Context, c creation, run *backupv1alpha1.RestoreRun) admission.Response {
 	target, source, err := restoreTarget(c.cluster, run)
 	if err != nil {
 		return admission.Denied(err.Error())
+	}
+	asked := run != nil || target != nil
+	if run == nil {
+		var refusal *admission.Response
+		if target, source, refusal = d.automaticTarget(ctx, c, target, source); refusal != nil {
+			return *refusal
+		}
 	}
 
 	archive, err := d.Prober.Survey(ctx, c.at, target)
@@ -351,7 +374,7 @@ func (d *Decider) recover(ctx context.Context, c creation, run *backupv1alpha1.R
 		))
 	}
 	if archive.Found == nil {
-		return withoutBaseBackup(c, archive, run != nil || target != nil, source)
+		return withoutBaseBackup(c, archive, asked, source)
 	}
 	return recoverFrom(c, run, target, source)
 }

@@ -98,7 +98,7 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 		return restic.Snapshot{}, err
 	}
 	snapshots := slices.DeleteFunc(slices.Clone(all), func(s restic.Snapshot) bool {
-		return !restic.MoverLayout(s) || quiescedOnly && !slices.Contains(s.Tags, restic.QuiescedTag)
+		return !restic.MoverLayout(s) || quiescedOnly && !restic.Quiesced(s)
 	})
 	if len(snapshots) == 0 {
 		return restic.Snapshot{}, noCandidate(all, quiescedOnly)

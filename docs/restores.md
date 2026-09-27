@@ -20,7 +20,7 @@ flowchart TD
     Q -- "no, it is being created" --> P["its VolumeRestore fills it<br/>the populator's restore Job"]
     Q -- "yes, and the app is using it" --> D["a RestoreRun overwrites it<br/>the run's restore Job"]
 
-    P --> P1["the volume holds the<br/>newest backup"]
+    P --> P1["the volume holds the<br/>newest backup, or the newest<br/>quiesced one"]
     D --> D1["the volume holds the<br/>snapshot you chose"]
 ```
 
@@ -601,6 +601,8 @@ object store through which the Cluster archives:
 | a completed base backup | rewrites the Cluster to recover from it, to the end of the archive |
 | a completed base backup, and a RestoreRun that deleted this Cluster | rewrites it to recover to the run's `restoreAsOf`, and names the run in `backup.wlz.li/restore-run` |
 | a completed base backup, and `backup.wlz.li/restore-as-of` on the Cluster | rewrites it to recover to that moment |
+| a completed base backup, no RestoreRun, and snapshots tagged `quiesced` in the repositories of the namespace's VolumeRestores | rewrites it to recover to the time of the newest quiesced snapshots, at or before `backup.wlz.li/restore-as-of` when it is set. The populator fills the claims from the same snapshots ([namespace-backups.md](namespace-backups.md#automatic-restore)) |
+| no RestoreRun, and two repositories of the namespace whose newest quiesced snapshots have different times | refuses the Cluster: `The volumes of this namespace have no one quiesced moment to recover the database to: ...` |
 | a WAL file under `<prefix>/wals/`, and no completed base backup | refuses the Cluster: `s3://<bucket>/<prefix>/ holds an archive with no completed base backup ...` (the full text is below) |
 | no completed base backup, and a RestoreRun or the annotation asks for a recovery | refuses the Cluster: `... holds no completed base backup to recover from.` |
 | no base backup finished by the moment a run or the annotation asks for | refuses the Cluster, naming the oldest base backup |
@@ -735,7 +737,8 @@ stays after the archive is gone, until you delete it.
 The API server waits 15 seconds for the webhook (`timeoutSeconds` in
 deploy/webhook.yaml). The webhook gives each create a budget of 10 of these
 seconds. The budget starts when the webhook starts to decide. Its Kubernetes
-reads and its object store reads share the budget. The other 5 seconds leave
+reads, its object store reads and its reads of the restic repositories of the
+namespace's VolumeRestores share the budget. The other 5 seconds leave
 time for TLS and the work of the API server.
 
 The budget also limits the lookup of the versions at which the API server

@@ -18,6 +18,7 @@ import (
 
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -55,6 +56,9 @@ type Operations interface {
 	// resourceVersion of the object passed, so it fails with a conflict when
 	// the object has changed since it was read.
 	UpdateVolumeRestore(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error
+	// ListVolumeRestores lists the VolumeRestores of a namespace. Their
+	// repositories give the moment of a synced restore (see selectSnapshot).
+	ListVolumeRestores(ctx context.Context, namespace string) ([]backupv1alpha1.VolumeRestore, error)
 }
 
 // Finalizer is the finalizer the populator keeps on a VolumeRestore while a
@@ -75,7 +79,7 @@ type Callbacks struct {
 	operations Operations
 	namespace  string
 	image      string
-	snapshots  SnapshotLister
+	snapshots  restic.SnapshotLister
 	// paused is true when the controller runs with --pause (see Pause).
 	paused bool
 	// pauseNoted holds the UID of each claim whose wait for the pause was
@@ -93,7 +97,7 @@ type Callbacks struct {
 //     --restore-image.
 //   - snapshots lists a repository's snapshots, to pick the one a claim is
 //     filled from and to tell a first deploy's empty repository apart.
-func New(operations Operations, namespace, image string, snapshots SnapshotLister) *Callbacks {
+func New(operations Operations, namespace, image string, snapshots restic.SnapshotLister) *Callbacks {
 	return &Callbacks{operations: operations, namespace: namespace, image: image, snapshots: snapshots}
 }
 
@@ -113,8 +117,8 @@ func New(operations Operations, namespace, image string, snapshots SnapshotListe
 // Secret into the controller namespace (see copySecret). It then reads the
 // claim's restore Job, JobName(claim UID), fresh from the API server:
 //   - No Job: once no pod of an earlier Job of the claim may still write, it
-//     picks the snapshot (see choose), creates the Job suspended for it,
-//     records the Job's UID on the prime claim and marks the claim
+//     picks the snapshot (see selectSnapshot), creates the Job suspended
+//     for it, records the Job's UID on the prime claim and marks the claim
 //     Restoring. A repository with no snapshot at all and no pin creates no
 //     Job, and Complete binds the claim empty. No snapshot that can fill the
 //     claim marks it Failed with reason NoBackupInReach and returns an
@@ -155,11 +159,10 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 	if err := c.holdVolumeRestore(ctx, vr); err != nil {
 		return err
 	}
-	repo, err := c.copySecret(ctx, vr, params.Pvc)
-	if err != nil {
+	if err := c.copySecret(ctx, vr, params.Pvc); err != nil {
 		return err
 	}
-	return c.populate(ctx, restore{vr: vr, claim: params.Pvc, prime: params.PvcPrime, repo: repo})
+	return c.populate(ctx, restore{vr: vr, claim: params.Pvc, prime: params.PvcPrime})
 }
 
 // Complete reports whether one claim's restore has finished, so the library
@@ -217,11 +220,7 @@ func (c *Callbacks) bindsEmpty(ctx context.Context, params populatormachinery.Po
 	if err != nil {
 		return false, err
 	}
-	repo, err := c.operations.GetSecret(ctx, params.Pvc.Namespace, vr.Spec.Repository)
-	if err != nil {
-		return false, fmt.Errorf("get repository Secret %s/%s: %w", params.Pvc.Namespace, vr.Spec.Repository, err)
-	}
-	chosen, err := c.selectSnapshot(ctx, vr, params.Pvc, repo)
+	chosen, err := c.selectSnapshot(ctx, vr, params.Pvc)
 	var none *noBackupError
 	switch {
 	case errors.As(err, &none):
