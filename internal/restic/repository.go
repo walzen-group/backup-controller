@@ -199,6 +199,26 @@ const (
 	moverDataPath = "/data"
 )
 
+// MoverLayout reports whether a snapshot has the layout VolSync's backup
+// mover gives one, so a restore that writes the snapshot's files at the root
+// of a claim puts them where the mover took them from.
+//
+// Parameters:
+//   - s is the snapshot to judge, as Snapshots returns it.
+//
+// It returns true when the snapshot's host is exactly "volsync" and its paths
+// are exactly the one path "/data". Tags and the original don't count: a
+// retimed copy keeps the host and the paths of the snapshot it copies, and a
+// RestoreRun restores it by its own ID. A snapshot of another host or of
+// other directories was written by something other than a mover, and its
+// files would land in another directory of the claim. The check can't tell
+// a mover's snapshot from one that `restic backup /data --host volsync`
+// wrote, since restic records the same host and path for both, though that
+// one nests its files under data/.
+func MoverLayout(s Snapshot) bool {
+	return s.Hostname == moverHostname && slices.Equal(s.Paths, []string{moverDataPath})
+}
+
 // MoverWritten reports whether a snapshot looks the way VolSync's backup
 // mover writes one, so a backup looking for the snapshot its sync wrote can
 // pass over every other snapshot in the repository.
@@ -206,15 +226,11 @@ const (
 // Parameters:
 //   - s is the snapshot to judge, as Snapshots returns it.
 //
-// It returns true when the snapshot's host is exactly "volsync", its paths
-// are exactly the one path "/data", and it has no original. A snapshot of
-// another host or of other directories was written by something other than a
-// mover, and a snapshot with an original is a rewritten copy, such as the one
-// Retime makes. Tags don't count. The check can't tell a mover's snapshot
-// from one that `restic backup /data --host volsync` wrote elsewhere, since
-// restic records the same host and path for both.
+// It returns true when the snapshot has the mover's layout (see MoverLayout)
+// and no original. A snapshot with an original is a rewritten copy, such as
+// the one Retime makes, which no mover wrote.
 func MoverWritten(s Snapshot) bool {
-	return s.Hostname == moverHostname && slices.Equal(s.Paths, []string{moverDataPath}) && s.Original == ""
+	return MoverLayout(s) && s.Original == ""
 }
 
 // parseSnapshot decodes a decrypted snapshot document stored under the given

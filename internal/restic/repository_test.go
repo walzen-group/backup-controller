@@ -271,3 +271,40 @@ func TestMoverWrittenNeedsHostVolsyncOnlyDataAndNoOriginal(t *testing.T) {
 		}
 	}
 }
+
+// TestMoverLayoutNeedsHostVolsyncAndOnlyDataButAllowsACopy checks each
+// condition MoverLayout puts on a snapshot on its own: host exactly volsync
+// and paths exactly /data and nothing else. A retimed copy keeps the host
+// and the paths of the snapshot it copies, so it has the layout too, and a
+// RestoreRun restores it by its own ID. MoverWritten is MoverLayout for a
+// snapshot with no original.
+func TestMoverLayoutNeedsHostVolsyncAndOnlyDataButAllowsACopy(t *testing.T) {
+	mover := Snapshot{ID: "a", Hostname: "volsync", Paths: []string{"/data"}}
+	cases := []struct {
+		name   string
+		change func(s *Snapshot)
+		want   bool
+	}{
+		{"as a mover writes it", func(*Snapshot) {}, true},
+		{"with tags", func(s *Snapshot) { s.Tags = []string{"quiesced"} }, true},
+		{"a retimed copy", func(s *Snapshot) { s.Original = "b" }, true},
+		{"another host", func(s *Snapshot) { s.Hostname = "volsync-src-notes-data-7xk2p" }, false},
+		{"no host", func(s *Snapshot) { s.Hostname = "" }, false},
+		{"no paths", func(s *Snapshot) { s.Paths = nil }, false},
+		{"a second path", func(s *Snapshot) { s.Paths = []string{"/data", "/extra"} }, false},
+		{"/data twice", func(s *Snapshot) { s.Paths = []string{"/data", "/data"} }, false},
+		{"a path below /data", func(s *Snapshot) { s.Paths = []string{"/data/sub"} }, false},
+		{"another path", func(s *Snapshot) { s.Paths = []string{"/srv"} }, false},
+	}
+	for _, c := range cases {
+		s := mover
+		s.Paths = slices.Clone(mover.Paths)
+		c.change(&s)
+		if got := MoverLayout(s); got != c.want {
+			t.Errorf("%s: MoverLayout(%+v) = %v, want %v", c.name, s, got, c.want)
+		}
+		if got, want := MoverWritten(s), c.want && s.Original == ""; got != want {
+			t.Errorf("%s: MoverWritten(%+v) = %v, want MoverLayout and no original, %v", c.name, s, got, want)
+		}
+	}
+}
