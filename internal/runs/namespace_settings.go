@@ -26,15 +26,6 @@ const (
 	defaultPruneIntervalDays = int32(1)
 )
 
-// invalidSettingError is the error for a namespace annotation that doesn't parse.
-// The run or the item fails with a message that names the annotation, and
-// the run doesn't retry, because no retry can fix the value.
-type invalidSettingError struct{ message string }
-
-// Error returns the message, which names the namespace, the annotation and
-// its value.
-func (e invalidSettingError) Error() string { return e.message }
-
 // namespaceAnnotations returns the annotations of the Namespace with the
 // given name. A Namespace that is gone reads as one without annotations, so
 // the run falls back to the defaults.
@@ -53,7 +44,7 @@ func namespaceAnnotations(ctx context.Context, reader client.Reader, name string
 // run's own spec.timeout when set, or else the namespace's
 // backup.wlz.li/timeout annotation, or else defaultTimeout.
 //
-// It returns an invalidSettingError error when the annotation isn't a positive Go
+// It returns a *refusalError with reason SettingsInvalid when the annotation isn't a positive Go
 // duration such as 10h, and any error from reading the Namespace.
 func timeoutFor(ctx context.Context, reader client.Reader, run *backupv1alpha1.BackupRun) (time.Duration, error) {
 	if run.Spec.Timeout != nil {
@@ -67,7 +58,7 @@ func timeoutFor(ctx context.Context, reader client.Reader, run *backupv1alpha1.B
 // status.quiescedAt. That is the namespace's backup.wlz.li/max-quiesce
 // annotation when set, or else defaultMaxQuiesce.
 //
-// It returns an invalidSettingError error when the annotation isn't a positive Go
+// It returns a *refusalError with reason SettingsInvalid when the annotation isn't a positive Go
 // duration such as 20m, and any error from reading the Namespace.
 func maxQuiesceFor(ctx context.Context, reader client.Reader, namespace string) (time.Duration, error) {
 	return namespaceDuration(ctx, reader, namespace, backupv1alpha1.AnnotationMaxQuiesce, defaultMaxQuiesce, "20m")
@@ -80,7 +71,7 @@ func maxQuiesceFor(ctx context.Context, reader client.Reader, namespace string) 
 //   - fallback is the duration when the annotation is not set or is empty.
 //   - example is a valid value that the error message shows.
 //
-// It returns an invalidSettingError when the value is not a positive Go
+// It returns a *refusalError with reason SettingsInvalid when the value is not a positive Go
 // duration, and any error from reading the Namespace.
 func namespaceDuration(ctx context.Context, reader client.Reader, namespace, annotation string, fallback time.Duration, example string) (time.Duration, error) {
 	annotations, err := namespaceAnnotations(ctx, reader, namespace)
@@ -93,7 +84,7 @@ func namespaceDuration(ctx context.Context, reader client.Reader, namespace, ann
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil || d <= 0 {
-		return 0, invalidSettingError{fmt.Sprintf("namespace %s has %s %q, which is not a duration such as %s", namespace, annotation, value, example)}
+		return 0, refuse(backupv1alpha1.ItemReasonSettingsInvalid, "namespace %s has %s %q, which is not a duration such as %s", namespace, annotation, value, example)
 	}
 	return d, nil
 }
@@ -103,7 +94,7 @@ func namespaceDuration(ctx context.Context, reader client.Reader, namespace, ann
 // namespace's backup.wlz.li/prune-interval-days annotation when set, or else
 // defaultPruneIntervalDays.
 //
-// It returns an invalidSettingError error when the annotation isn't a whole number
+// It returns a *refusalError with reason SettingsInvalid when the annotation isn't a whole number
 // of at least 1, and any error from reading the Namespace.
 func pruneIntervalFor(ctx context.Context, reader client.Reader, namespace string) (int32, error) {
 	annotations, err := namespaceAnnotations(ctx, reader, namespace)
@@ -116,7 +107,7 @@ func pruneIntervalFor(ctx context.Context, reader client.Reader, namespace strin
 	}
 	n, err := strconv.ParseInt(value, 10, 32)
 	if err != nil || n < 1 {
-		return 0, invalidSettingError{fmt.Sprintf("namespace %s has %s %q, which is not a positive count of days", namespace, backupv1alpha1.AnnotationPruneIntervalDays, value)}
+		return 0, refuse(backupv1alpha1.ItemReasonSettingsInvalid, "namespace %s has %s %q, which is not a positive count of days", namespace, backupv1alpha1.AnnotationPruneIntervalDays, value)
 	}
 	return int32(n), nil
 }

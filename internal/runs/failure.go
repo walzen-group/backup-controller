@@ -3,7 +3,6 @@ package runs
 import (
 	"errors"
 	"fmt"
-	"strings"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/quiesce"
@@ -186,36 +185,24 @@ func invalidSpec(format string, args ...any) error {
 //   - err is the error a start check or a start returned. It may be nil.
 //
 // It returns the reason and true for an error on this list, checked in
-// this order with errors.As: a *refusalError (its own reason), an
-// invalidSettingError (SettingsInvalid), a *restorejob.FailureError of a
-// restore Job that ended Failed (RestoreJobFailed), a *restorejob.SpecError
-// of a restore Job the run could not build (RestoreJobRefused), a
-// *claimLostError of a claim that is no longer the run's (ClaimLost), and an
-// *identifyError of a completed sync that left no record of when it ran
-// (NoMoverSnapshot). The item's message is err.Error(). Any other error,
+// this order with errors.As: a *refusalError (its own reason), a
+// *restorejob.FailureError of a restore Job that ended Failed (RestoreJobFailed), and a
+// *restorejob.SpecError of a restore Job the run could not build
+// (RestoreJobRefused). The item's message is err.Error(). Any other error,
 // and nil, gives false: the pass returns the error and retries. An
 // *invalidSpecError is not on the list, because only run-level sites meet
 // one, and an item that recorded it would carry a reason no item has.
 func asItemFailure(err error) (backupv1alpha1.ItemReason, bool) {
 	var refused *refusalError
-	var bad invalidSettingError
 	var jobFailed *restorejob.FailureError
 	var badSpec *restorejob.SpecError
-	var lost *claimLostError
-	var unidentified *identifyError
 	switch {
 	case errors.As(err, &refused):
 		return refused.reason, true
-	case errors.As(err, &bad):
-		return backupv1alpha1.ItemReasonSettingsInvalid, true
 	case errors.As(err, &jobFailed):
 		return backupv1alpha1.ItemReasonRestoreJobFailed, true
 	case errors.As(err, &badSpec):
 		return backupv1alpha1.ItemReasonRestoreJobRefused, true
-	case errors.As(err, &lost):
-		return backupv1alpha1.ItemReasonClaimLost, true
-	case errors.As(err, &unidentified):
-		return backupv1alpha1.ItemReasonNoMoverSnapshot, true
 	}
 	return "", false
 }
@@ -263,8 +250,8 @@ func failRestoreItem(item *backupv1alpha1.RestoreItem, err error) bool {
 //   - err is the error a plan, quiesce or run-level check returned. It may
 //     be nil.
 //
-// It returns true for an *invalidSpecError, a *refusalError, an
-// invalidSettingError, a *quiesce.SpecError, a *quiesce.CrossNamespaceError
+// It returns true for an *invalidSpecError, a *refusalError, a
+// *quiesce.SpecError, a *quiesce.CrossNamespaceError
 // and a *quiesce.InventoryError. It returns false for any other error and
 // for nil. A *refusalError met here, such as a claim repositoryFor does not
 // find while planIntoNewClaim plans, records no item reason: the run's
@@ -272,89 +259,38 @@ func failRestoreItem(item *backupv1alpha1.RestoreItem, err error) bool {
 func asRunRefusal(err error) bool {
 	var spec *invalidSpecError
 	var refused *refusalError
-	var bad invalidSettingError
 	var quiesceSpec *quiesce.SpecError
 	var crossNamespace *quiesce.CrossNamespaceError
 	var inventory *quiesce.InventoryError
-	return errors.As(err, &spec) || errors.As(err, &refused) || errors.As(err, &bad) ||
+	return errors.As(err, &spec) || errors.As(err, &refused) ||
 		errors.As(err, &quiesceSpec) || errors.As(err, &crossNamespace) || errors.As(err, &inventory)
 }
 
-// claimLoss is how the claim of a volume item stopped being the claim the
-// run checked.
-type claimLoss int
-
+// The sentences of a claim that stopped being the run's while its restore
+// Job wrote into it, which an in-place and an into item share. Each takes
+// the claim's name.
 const (
-	// lossUnleased is a run that holds no claim Lease for the item, so it
-	// can not tell which claim the restore Job wrote into.
-	lossUnleased claimLoss = iota
-	// lossGone is a claim that was deleted and is gone.
-	lossGone
-	// lossDeleting is a claim that is being deleted.
-	lossDeleting
-	// lossReplaced is a claim whose UID is not the UID of a claim Lease of
-	// the run for the item.
-	lossReplaced
-	// lossNotOwned is a claim of an into item that the run does not control.
-	lossNotOwned
+	// lostGone is the sentence for a claim that is gone.
+	lostGone = "claim %s was deleted while its restore Job wrote into it, and the restored data went with it"
+	// lostDeleting is the sentence for a claim that is being deleted.
+	lostDeleting = "claim %s was deleted while its restore Job wrote into it, and the restored data goes with it once the claim is released"
 )
 
-// claimLostError says that the claim a volume item restored is no longer
-// the claim the run checked, so the item can not succeed. asItemFailure
-// fails the item with reason ClaimLost.
-type claimLostError struct {
-	// claim names the claim, which is also the item's name.
-	claim string
-	// loss is how the run lost the claim.
-	loss claimLoss
-	// unstarted is true when the restore Job had not run yet: it was still
-	// suspended since its create. The Job then wrote nothing to the claim.
-	unstarted bool
-	// found is the UID of the claim there now, for lossReplaced.
-	found string
-	// leased are the claim UIDs of the run's claim Leases for the item, for
-	// lossReplaced.
-	leased []string
-}
-
-// Error returns the sentence for a person that says how the run lost the
-// claim and what to do next.
-func (e *claimLostError) Error() string {
-	if e.unstarted {
-		return e.beforeJob()
+// claimLostRefusal returns the refusal of a volume item whose claim is no
+// longer the claim the run checked, so the item can not succeed.
+//
+// Parameters:
+//   - unstarted is true when the item's restore Job has not run. Only an
+//     into item checks its claim before the resume of the Job (see
+//     followVolume), so its losses have their own sentence then.
+//   - before is the sentence for a claim lost before the Job ran.
+//   - during is the sentence for a claim lost while the Job wrote into it.
+//   - claim is the claim's name, which each sentence takes.
+//
+// It returns a *refusalError with reason ClaimLost.
+func claimLostRefusal(unstarted bool, before, during, claim string) error {
+	if unstarted {
+		return refuse(backupv1alpha1.ItemReasonClaimLost, before, claim)
 	}
-	switch e.loss {
-	case lossUnleased:
-		return fmt.Sprintf("the run holds no claim Lease for claim %s, so it can't tell whether its restore Job wrote into the claim that is there now. "+
-			"Check the claim's data, and create a new RestoreRun to restore it", e.claim)
-	case lossGone:
-		return fmt.Sprintf("claim %s was deleted while its restore Job wrote into it, and the restored data went with it", e.claim)
-	case lossDeleting:
-		return fmt.Sprintf("claim %s was deleted while its restore Job wrote into it, and the restored data goes with it once the claim is released", e.claim)
-	case lossReplaced:
-		return fmt.Sprintf("claim %[1]s was replaced while its restore Job wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
-			"and took its Lease on (UID %[3]s). The restore Job mounts claim %[1]s by name, so it may have written into it; check its data, "+
-			"and create a new RestoreRun to restore it", e.claim, e.found, strings.Join(e.leased, ", "))
-	case lossNotOwned:
-		return fmt.Sprintf("claim %[1]s is no longer controlled by the run, so it may not be the claim the run created. The restore Job mounts "+
-			"claim %[1]s by name, so it may have written into it; check its data, and create a new RestoreRun to restore it", e.claim)
-	}
-	return fmt.Sprintf("claim %s is no longer the claim the run checked", e.claim)
-}
-
-// beforeJob returns the sentence for a claim that the run lost before its
-// restore Job ran. Only an into item checks its claim before the resume of
-// the Job (see followVolume), so the three losses of an into item have
-// their own sentence.
-func (e *claimLostError) beforeJob() string {
-	switch e.loss {
-	case lossGone:
-		return fmt.Sprintf("claim %s was deleted before its restore Job ran, so the Job wrote nothing", e.claim)
-	case lossDeleting:
-		return fmt.Sprintf("claim %s is being deleted, and its restore Job has not run, so the Job wrote nothing", e.claim)
-	case lossNotOwned:
-		return fmt.Sprintf("claim %s is no longer controlled by the run, and its restore Job has not run, so the Job wrote nothing", e.claim)
-	default:
-		return fmt.Sprintf("claim %s is no longer the claim the run checked, and its restore Job has not run, so the Job wrote nothing", e.claim)
-	}
+	return refuse(backupv1alpha1.ItemReasonClaimLost, during, claim)
 }

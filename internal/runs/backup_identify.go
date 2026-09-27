@@ -39,30 +39,17 @@ func (w syncWindow) holds(at time.Time) bool {
 	return !at.Before(w.start) && !at.After(w.end)
 }
 
-// identifyError says a completed sync left no record of when it ran, so the
-// run can't tell which snapshot in the repository the sync wrote. The item
-// fails with it and records reason NoMoverSnapshot (see asItemFailure); no
-// retry brings the missing time back.
-type identifyError struct {
-	// source names the ReplicationSource whose status lacks the time.
-	source string
-	// field names the status field VolSync did not record usably, such as
-	// lastSyncTime.
-	field string
-	// negative is the duration VolSync recorded when it is below zero, and
-	// zero when the field is missing.
-	negative time.Duration
-}
-
-// Error says which field of the source's status is missing or unusable and
-// why that keeps the run from finding its snapshot.
-func (e *identifyError) Error() string {
-	problem := "has no status." + e.field
-	if e.negative != 0 {
-		problem = fmt.Sprintf("records status.%s as %s, which no sync can take", e.field, e.negative)
-	}
-	return fmt.Sprintf("ReplicationSource %s completed the run's sync but %s, so VolSync did not record when the sync ran "+
-		"and the run can't tell which snapshot in the repository the sync wrote", e.source, problem)
+// unidentified returns the refusal of a completed sync that left no record
+// of when it ran, so the run can't tell which snapshot in the repository the
+// sync wrote. The item fails with reason NoMoverSnapshot; no retry brings
+// the missing time back.
+//
+// Parameters:
+//   - source is the ReplicationSource whose status lacks the time.
+//   - problem says which status field is missing or unusable.
+func unidentified(source *volsyncv1alpha1.ReplicationSource, problem string) error {
+	return refuse(backupv1alpha1.ItemReasonNoMoverSnapshot, "ReplicationSource %s completed the run's sync but %s, so VolSync did not record when the sync ran "+
+		"and the run can't tell which snapshot in the repository the sync wrote", source.Name, problem)
 }
 
 // windowOf returns the window in which restic stamped the snapshots of the
@@ -73,7 +60,7 @@ func (e *identifyError) Error() string {
 //     sync. The caller has checked that its lastManualSync is the run's
 //     trigger, so the sync is the run's.
 //
-// It returns an *identifyError when the status lacks lastSyncTime or
+// It returns the refusal from unidentified when the status lacks lastSyncTime or
 // lastSyncDuration, or records a negative duration.
 //
 // VolSync 0.16.0 sets lastSyncTime when the sync completes, and
@@ -85,16 +72,13 @@ func (e *identifyError) Error() string {
 // syncSkew, lastSyncTime + 1s + syncSkew].
 func windowOf(source *volsyncv1alpha1.ReplicationSource) (syncWindow, error) {
 	status := source.Status
-	missing := func(field string) error {
-		return &identifyError{source: source.Name, field: field}
-	}
 	switch {
 	case status == nil || status.LastSyncTime == nil:
-		return syncWindow{}, missing("lastSyncTime")
+		return syncWindow{}, unidentified(source, "has no status.lastSyncTime")
 	case status.LastSyncDuration == nil:
-		return syncWindow{}, missing("lastSyncDuration")
+		return syncWindow{}, unidentified(source, "has no status.lastSyncDuration")
 	case status.LastSyncDuration.Duration < 0:
-		return syncWindow{}, &identifyError{source: source.Name, field: "lastSyncDuration", negative: status.LastSyncDuration.Duration}
+		return syncWindow{}, unidentified(source, fmt.Sprintf("records status.lastSyncDuration as %s, which no sync can take", status.LastSyncDuration.Duration))
 	}
 	end := status.LastSyncTime.Time
 	start := end.Add(-status.LastSyncDuration.Duration)

@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -108,13 +107,12 @@ func (r *BackupRunReconciler) endIfSettingInvalid(ctx context.Context, run *back
 //   - run is the BackupRun that reads the setting.
 //   - err is the error of the read of the setting. It is not nil.
 //
-// When err is an invalidSettingError, it aborts the run with reason Failed
+// When err is a refusal with reason SettingsInvalid, it aborts the run with reason Failed
 // and the error's text as the message, and returns the error of abort. It
 // returns any other err as it is, for a retry.
 func (r *BackupRunReconciler) abortOnInvalidSetting(ctx context.Context, run *backupv1alpha1.BackupRun, err error) error {
-	var bad invalidSettingError
-	if errors.As(err, &bad) {
-		return r.abort(ctx, run, backupv1alpha1.ReasonFailed, bad.Error())
+	if reason, _ := asItemFailure(err); reason == backupv1alpha1.ItemReasonSettingsInvalid {
+		return r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error())
 	}
 	return err
 }

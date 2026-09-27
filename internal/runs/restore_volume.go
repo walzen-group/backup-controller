@@ -403,7 +403,7 @@ func jobDeleted(name string, replaced bool) error {
 //   - outcome is what restorejob.Read found in the Job and its pods.
 //
 // It returns the outcome's waiting reason while the Job runs, and nil
-// otherwise. The error is a *claimLostError (reason ClaimLost), or the
+// otherwise. The error is a *refusalError with reason ClaimLost, or the
 // outcome's *restorejob.FailureError, when the item fails (see settled), and
 // a plain error from a failed read of the claim or the Leases, which leaves
 // the item Running.
@@ -448,7 +448,7 @@ func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1al
 //     applies.
 //   - item is the volume item; its name is the claim's.
 //
-// It returns nil while the claim is the run's, a *claimLostError (reason
+// It returns nil while the claim is the run's, a *refusalError (reason
 // ClaimLost) when it is not, and a plain error from a failed read of the
 // claim or the Leases, which leaves the item as it was.
 //
@@ -569,7 +569,7 @@ func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1al
 //     UID.
 //   - claimName names the claim, which is also the item's name.
 //
-// It returns nil while that claim is there, and a *claimLostError, which
+// It returns nil while that claim is there, and a *refusalError, which
 // fails the item with reason ClaimLost, when the claim is gone, is being
 // deleted, or is another claim.
 // A run that holds no claim Lease for the item can't tell which claim the
@@ -602,21 +602,24 @@ func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backup
 		}
 	}
 	if len(leased) == 0 {
-		return &claimLostError{claim: claimName, loss: lossUnleased}
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "the run holds no claim Lease for claim %s, so it can't tell whether its restore Job wrote into the claim that is there now. "+
+			"Check the claim's data, and create a new RestoreRun to restore it", claimName)
 	}
 
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
 		if apierrors.IsNotFound(err) {
-			return &claimLostError{claim: claimName, loss: lossGone}
+			return refuse(backupv1alpha1.ItemReasonClaimLost, lostGone, claimName)
 		}
 		return fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
 	}
 	if claim.DeletionTimestamp != nil {
-		return &claimLostError{claim: claimName, loss: lossDeleting}
+		return refuse(backupv1alpha1.ItemReasonClaimLost, lostDeleting, claimName)
 	}
 	if !slices.Contains(leased, string(claim.UID)) {
-		return &claimLostError{claim: claimName, loss: lossReplaced, found: string(claim.UID), leased: leased}
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %[1]s was replaced while its restore Job wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
+			"and took its Lease on (UID %[3]s). The restore Job mounts claim %[1]s by name, so it may have written into it; check its data, "+
+			"and create a new RestoreRun to restore it", claimName, claim.UID, strings.Join(leased, ", "))
 	}
 	return nil
 }

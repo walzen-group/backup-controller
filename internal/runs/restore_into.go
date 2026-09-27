@@ -220,10 +220,10 @@ func (r *RestoreRunReconciler) createOwned(ctx context.Context, run *backupv1alp
 //     create, so it has not run. The error then says that the Job wrote
 //     nothing.
 //
-// It returns nil while the run's own claim is there, and a *claimLostError
-// for an into item when the claim is gone (lossGone), is being deleted
-// (lossDeleting), or is controlled by something other than the run
-// (lossNotOwned). asItemFailure fails the item with it, with reason
+// It returns nil while the run's own claim is there, and a *refusalError
+// for an into item when the claim is gone, is being deleted, or is
+// controlled by something other than the run (see claimLostRefusal).
+// failRestoreItem fails the item with it, with reason
 // ClaimLost. A failed read that is not NotFound comes back as a plain
 // error, and the caller leaves the item as it was.
 //
@@ -237,13 +237,15 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 	err := r.Reader.Get(ctx, key, claim)
 	switch {
 	case apierrors.IsNotFound(err):
-		return &claimLostError{claim: run.Spec.Into, loss: lossGone, unstarted: unstarted}
+		return claimLostRefusal(unstarted, "claim %s was deleted before its restore Job ran, so the Job wrote nothing", lostGone, run.Spec.Into)
 	case err != nil:
 		return fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
 	case claim.DeletionTimestamp != nil:
-		return &claimLostError{claim: run.Spec.Into, loss: lossDeleting, unstarted: unstarted}
+		return claimLostRefusal(unstarted, "claim %s is being deleted, and its restore Job has not run, so the Job wrote nothing", lostDeleting, run.Spec.Into)
 	case !metav1.IsControlledBy(claim, run):
-		return &claimLostError{claim: run.Spec.Into, loss: lossNotOwned, unstarted: unstarted}
+		return claimLostRefusal(unstarted, "claim %s is no longer controlled by the run, and its restore Job has not run, so the Job wrote nothing",
+			"claim %[1]s is no longer controlled by the run, so it may not be the claim the run created. The restore Job mounts "+
+				"claim %[1]s by name, so it may have written into it; check its data, and create a new RestoreRun to restore it", run.Spec.Into)
 	}
 	return nil
 }
