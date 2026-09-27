@@ -189,29 +189,28 @@ func changeBetweenReadAndWrite(t *testing.T, c client.Client, changes int) (clie
 	}), &outcomes
 }
 
-// A scale write that meets a change made since its read is refused with a
-// Conflict, since it carries the resourceVersion it read; scale then reads
-// the Scale again and writes once more, so the app still stops. A workload
-// that keeps changing is left as it is and the Conflict is returned.
-func TestAScaleConflictIsRetried(t *testing.T) {
+// A change to a workload between scale's read of its Scale and its write,
+// such as the status writes a Deployment's controller makes while its pods
+// change, never fails the scale: the write carries no resourceVersion, so
+// the API server applies it to whatever it holds then. The count is the
+// only field the write sets, and the change it raced stays as it was.
+func TestAChangeBetweenReadAndScaleDoesNotFailIt(t *testing.T) {
 	ctx := context.Background()
 	stop := []backupv1alpha1.QuiescedWorkload{{Kind: backupv1alpha1.WorkloadKindDeployment, Name: appN, Replicas: 2}}
 
 	c := newClient(t, deployment())
-	racing, outcomes := changeBetweenReadAndWrite(t, c, 1)
+	racing, outcomes := changeBetweenReadAndWrite(t, c, 100)
 	if err := applyStop(ctx, racing, ns, stop, nil); err != nil {
-		t.Fatalf("stop after one conflict: %v", err)
+		t.Fatalf("stop against a Deployment that keeps changing: %v", err)
 	}
-	if got := replicasOf(t, c); got != 0 || fmt.Sprint(*outcomes) != "[Conflict ok]" {
-		t.Errorf("replicas %d after scale updates %v, want 0 after [Conflict ok]", got, *outcomes)
+	if got := replicasOf(t, c); got != 0 || fmt.Sprint(*outcomes) != "[ok]" {
+		t.Errorf("replicas %d after scale updates %v, want 0 after [ok]", got, *outcomes)
 	}
-
-	c = newClient(t, deployment())
-	racing, _ = changeBetweenReadAndWrite(t, c, 100)
-	if err := applyStop(ctx, racing, ns, stop, nil); !apierrors.IsConflict(err) {
-		t.Errorf("stop against a Deployment that keeps changing: %v, want a Conflict", err)
+	d := &appsv1.Deployment{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: appN}, d); err != nil {
+		t.Fatal(err)
 	}
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas %d after the stop gave up, want 2 left as they were", got)
+	if d.Labels["touched"] != "99" {
+		t.Errorf("Deployment labels %v after the scale, want the racing change touched=99 kept", d.Labels)
 	}
 }

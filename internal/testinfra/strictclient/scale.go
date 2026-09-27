@@ -90,8 +90,10 @@ func (s *scaleClient) Get(ctx context.Context, obj, subResource client.Object, _
 // It returns NotFound when the workload does not exist, a Conflict when the
 // Scale carries a resourceVersion or uid other than the stored one, an
 // Invalid error for a negative replica count, and a BadRequest when the
-// body is not a Scale. On success the body holds the Scale of the stored
-// object, with its new resourceVersion.
+// body is not a Scale. A Scale without a resourceVersion updates the stored
+// object unconditionally, as kube-apiserver does for both kinds. On success
+// the body holds the Scale of the stored object, with its new
+// resourceVersion.
 func (s *scaleClient) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 	o := &client.SubResourceUpdateOptions{}
 	o.ApplyOptions(opts)

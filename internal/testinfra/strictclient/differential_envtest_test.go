@@ -48,7 +48,7 @@ func TestDifferentialAgainstEnvtest(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = env.Stop() })
 			scheme := runtime.NewScheme()
-			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, backupv1alpha1.AddToScheme} {
+			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, autoscalingv1.AddToScheme, backupv1alpha1.AddToScheme} {
 				if err := add(scheme); err != nil {
 					t.Fatal(err)
 				}
@@ -57,7 +57,7 @@ func TestDifferentialAgainstEnvtest(t *testing.T) {
 			scheme.AddKnownTypeWithName(replicationSourceGVK.GroupVersion().WithKind("ReplicationSourceList"), &unstructured.UnstructuredList{})
 			scheme.AddKnownTypeWithName(clusterGVK, &unstructured.Unstructured{})
 			scheme.AddKnownTypeWithName(clusterGVK.GroupVersion().WithKind("ClusterList"), &unstructured.UnstructuredList{})
-			real, err := client.New(cfg, client.Options{Scheme: scheme})
+			server, err := client.New(cfg, client.Options{Scheme: scheme})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -69,7 +69,7 @@ func TestDifferentialAgainstEnvtest(t *testing.T) {
 			strict := strictclient.Build(fake.NewClientBuilder(), scheme, strictclient.Options{Clock: time.Now, CRDs: files})
 
 			want := envtestOps(t, strict)
-			got := envtestOps(t, real)
+			got := envtestOps(t, server)
 			for k, w := range want {
 				if got[k] != w {
 					t.Errorf("%s: strict client %q, envtest %q", k, w, got[k])
@@ -425,8 +425,11 @@ func clusterBeingDeletedOps(t *testing.T, c client.Client, o map[string]string) 
 // that carries only a name leaves in the stored object (the replica count,
 // the generation and the pod template), the Scale the update hands back,
 // and the outcome of an update with a stale resourceVersion, with another
-// uid, with a negative count, and of a read and an update of a workload
-// that does not exist.
+// uid and with a negative count. It then records the outcome of an update
+// from the stale read with its resourceVersion cleared, which both kinds
+// accept as an unconditional update, and the count and generation it
+// stores. Last it records a read and an update of a workload that does not
+// exist.
 func scaleOps(t *testing.T, c client.Client, o map[string]string, kind client.Object) {
 	t.Helper()
 	ctx := context.Background()
@@ -497,10 +500,35 @@ func scaleOps(t *testing.T, c client.Client, o map[string]string, kind client.Ob
 	negative := scale.DeepCopy()
 	negative.Spec.Replicas = -1
 	o[k+"update to -1"] = envtestReason(c.SubResource("scale").Update(ctx, named(), client.WithSubResourceBody(negative)))
+	unconditional := stale.DeepCopy()
+	unconditional.ResourceVersion = ""
+	unconditional.Spec.Replicas = 3
+	outcome := envtestReason(c.SubResource("scale").Update(ctx, named(), client.WithSubResourceBody(unconditional)))
+	if err := c.Get(ctx, client.ObjectKeyFromObject(stored), stored); err != nil {
+		t.Fatal(err)
+	}
+	o[k+"update of a stale read without a resourceVersion"] = fmt.Sprintf("%s, stored %d replicas at generation %d",
+		outcome, replicasOf(stored), stored.GetGeneration())
 
 	missing := named()
 	missing.SetName("missing")
 	o[k+"read of a missing workload"] = envtestReason(c.SubResource("scale").Get(ctx, missing, &autoscalingv1.Scale{}))
 	body := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 1}}
 	o[k+"update of a missing workload"] = envtestReason(c.SubResource("scale").Update(ctx, missing, client.WithSubResourceBody(body)))
+}
+
+// replicasOf returns the stored spec.replicas of a Deployment or a
+// StatefulSet, and -1 for a nil count or any other kind.
+func replicasOf(obj client.Object) int32 {
+	var replicas *int32
+	switch o := obj.(type) {
+	case *appsv1.Deployment:
+		replicas = o.Spec.Replicas
+	case *appsv1.StatefulSet:
+		replicas = o.Spec.Replicas
+	}
+	if replicas == nil {
+		return -1
+	}
+	return *replicas
 }

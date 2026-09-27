@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -25,22 +24,25 @@ import (
 // restart can skip it. Any other refusal is returned wrapped, with the
 // workload's name and the count.
 //
-// It reads the Scale, sets spec.replicas and writes the Scale back with the
-// controller's field manager. The write carries the resourceVersion it read,
-// so a change to the workload in between (a status write by the Deployment
-// controller, say) is a Conflict; scale then reads again and retries, up to
-// the attempts of retry.DefaultRetry, and returns the Conflict after that.
+// It reads the Scale, sets spec.replicas, clears the resourceVersion and
+// writes the Scale back with the controller's field manager. A Scale
+// without a resourceVersion is an unconditional update, which both kinds
+// allow (AllowUnconditionalUpdate in the Deployment and StatefulSet
+// strategies of Kubernetes 1.36), so a status write by the workload's
+// controller between the read and the write does not fail the scale. The
+// API server copies only spec.replicas from the Scale into the object it
+// holds, so no other field can be overwritten. The Scale keeps the UID it
+// read, and a workload deleted and created again in between is a Conflict.
 // The subresource can change nothing but the replica count, which is why
 // the ClusterRole grants no write verb on the workloads themselves.
 func scale(ctx context.Context, c client.Client, object client.Object, replicas int32) error {
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		current := &autoscalingv1.Scale{}
-		if err := c.SubResource("scale").Get(ctx, object, current); err != nil {
-			return err
-		}
+	current := &autoscalingv1.Scale{}
+	err := c.SubResource("scale").Get(ctx, object, current)
+	if err == nil {
 		current.Spec.Replicas = replicas
-		return c.SubResource("scale").Update(ctx, object, client.WithSubResourceBody(current), FieldOwner)
-	})
+		current.ResourceVersion = ""
+		err = c.SubResource("scale").Update(ctx, object, client.WithSubResourceBody(current), FieldOwner)
+	}
 	if err != nil {
 		return fmt.Errorf("scale %s to %d: %w", object.GetName(), replicas, err)
 	}
