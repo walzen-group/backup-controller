@@ -1,35 +1,34 @@
-package main
+package populator
 
 import (
 	"context"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	"github.com/walzen-group/backup-controller/internal/populator"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// clientOperations implements populator.Operations with a real Kubernetes
+// clientOperations implements Operations with a real Kubernetes
 // client. The populator callbacks reach the API server only through that
 // interface, which lets their tests run against a fake. The client is built
 // with client.New and has no cache, so every read goes to the API server,
 // which the restore Job's stop gate needs. Each method is a thin call on the
 // client and returns the client's error unchanged.
 type clientOperations struct {
-	populator.Jobs
+	Jobs
 	client client.Client
 }
 
-// newOperations returns the populator's operations over one uncached client.
+// NewOperations returns the populator's operations over one client.
 //
 // Parameters:
 //   - c is the populator's client, built with client.New, which reads from
 //     the API server directly. It serves the reads and the writes of the
 //     restore Jobs too.
-func newOperations(c client.Client) *clientOperations {
-	return &clientOperations{Jobs: populator.NewJobs(c, c), client: c}
+func NewOperations(c client.Client) Operations {
+	return &clientOperations{Jobs: NewJobs(c, c), client: c}
 }
 
 // GetNamespace reads the named namespace.

@@ -28,7 +28,7 @@ import (
 )
 
 // Operations are the Kubernetes API calls the callbacks make. The binary
-// implements them with a client (clientOperations in cmd/backup-controller),
+// implements them with a client (see NewOperations),
 // and the tests with a strict fake client. Every read goes to the API server
 // directly.
 type Operations interface {

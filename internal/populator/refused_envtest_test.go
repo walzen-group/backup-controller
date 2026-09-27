@@ -39,7 +39,7 @@ import (
 // in fakeOperations' memory, where the test reads the status writes.
 type policyOperations struct {
 	*fakeOperations
-	api clientOperations
+	api Operations
 }
 
 func (p policyOperations) GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error) {
@@ -155,7 +155,7 @@ func sysctlContext() *corev1.PodSecurityContext {
 func TestEnvtestARefusedMoverSecurityContextShowsOnReady(t *testing.T) {
 	ctx := context.Background()
 	controller := startPolicyEnvtest(ctx, t)
-	ops := policyOperations{fakeOperations: &fakeOperations{Jobs: NewJobs(controller, controller), secrets: map[string]*corev1.Secret{}}, api: newClientOperations(controller)}
+	ops := policyOperations{fakeOperations: &fakeOperations{Jobs: NewJobs(controller, controller), secrets: map[string]*corev1.Secret{}}, api: NewOperations(controller)}
 	addRepository(ops.fakeOperations)
 	p := paramsWith(func(vr *backupv1alpha1.VolumeRestore) { vr.Spec.MoverSecurityContext = sysctlContext() })
 

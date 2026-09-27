@@ -17,63 +17,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// clientOperations sends the callbacks' API calls to one client, as
-// cmd/backup-controller's clientOperations sends them to the API server.
-type clientOperations struct {
-	Jobs
-	client client.Client
-}
-
-func newClientOperations(c client.Client) clientOperations {
-	return clientOperations{Jobs: NewJobs(c, c), client: c}
-}
-
-func (o clientOperations) GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error) {
-	ns := &corev1.Namespace{}
-	return ns, o.client.Get(ctx, client.ObjectKey{Name: name}, ns)
-}
-
-func (o clientOperations) GetClaim(ctx context.Context, namespace, name string) (*corev1.PersistentVolumeClaim, error) {
-	claim := &corev1.PersistentVolumeClaim{}
-	return claim, o.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, claim)
-}
-
-func (o clientOperations) GetVolume(ctx context.Context, name string) (*corev1.PersistentVolume, error) {
-	volume := &corev1.PersistentVolume{}
-	return volume, o.client.Get(ctx, client.ObjectKey{Name: name}, volume)
-}
-
-func (o clientOperations) PatchClaim(ctx context.Context, claim *corev1.PersistentVolumeClaim, patch client.Patch) error {
-	return o.client.Patch(ctx, claim, patch)
-}
-
-func (o clientOperations) GetSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
-	secret := &corev1.Secret{}
-	return secret, o.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, secret)
-}
-
-func (o clientOperations) CreateSecret(ctx context.Context, secret *corev1.Secret) error {
-	return o.client.Create(ctx, secret)
-}
-
-func (o clientOperations) DeleteSecret(ctx context.Context, namespace, name string) error {
-	return o.client.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
-}
-
-func (o clientOperations) SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	return o.client.Status().Update(ctx, vr)
-}
-
-func (o clientOperations) UpdateVolumeRestore(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	return o.client.Update(ctx, vr)
-}
-
-func (o clientOperations) ListVolumeRestores(ctx context.Context, namespace string) ([]backupv1alpha1.VolumeRestore, error) {
-	list := &backupv1alpha1.VolumeRestoreList{}
-	err := o.client.List(ctx, list, client.InNamespace(namespace))
-	return list.Items, err
-}
-
 // Window 2 of designs/populator.md finding A: Cleanup releases the
 // VolumeRestore's finalizer before the library deletes the prime and removes
 // its claim finalizer. For a VolumeRestore already being deleted, it goes the
@@ -105,7 +48,7 @@ func TestAFailedPrimeDeleteAfterCleanupIsCompletedByTheOrphanReconciler(t *testi
 		t.Fatal(err)
 	}
 	params := populatormachinery.PopulatorParams{Pvc: stuckClaim(), Unstructured: &unstructured.Unstructured{Object: object}}
-	if err := New(newClientOperations(c), orphanControllerNS, testImage, fixedSnapshots{monday}).Cleanup(ctx, params); err != nil {
+	if err := New(NewOperations(c), orphanControllerNS, testImage, fixedSnapshots{monday}).Cleanup(ctx, params); err != nil {
 		t.Fatalf("Cleanup: %v", err)
 	}
 	if present(t, c, &backupv1alpha1.VolumeRestore{ObjectMeta: metav1.ObjectMeta{Name: orphanVolumeRestore, Namespace: orphanNamespace}}) {

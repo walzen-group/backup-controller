@@ -190,8 +190,8 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 // served.Client wraps it, so a 404 for a version the API server no longer
 // serves is an error the populator retries, never a restore Job that is
 // gone.
-func operationsFor(kubeClient client.Client) *clientOperations {
-	return newOperations(served.Client(kubeClient))
+func operationsFor(kubeClient client.Client) populator.Operations {
+	return populator.NewOperations(served.Client(kubeClient))
 }
 
 // clientOptions returns the options of every client the controller writes

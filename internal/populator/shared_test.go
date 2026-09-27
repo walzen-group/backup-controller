@@ -17,12 +17,12 @@ import (
 )
 
 // strictOperations is a fakeOperations whose VolumeRestore writes go to the
-// strict fake client that holds its Jobs and claims, as clientOperations in
-// cmd/backup-controller sends them: SetStatus updates the status subresource
-// and UpdateVolumeRestore the object. The client keeps the stored
-// VolumeRestore, bumps its resourceVersion on every write, refuses a write
-// whose resourceVersion is stale with a Conflict, and prunes against the
-// pinned CRD. Every successful status write is also recorded in statuses.
+// strict fake client that holds its Jobs and claims, as NewOperations sends
+// them: SetStatus updates the status subresource and UpdateVolumeRestore the
+// object. The client keeps the stored VolumeRestore, bumps its
+// resourceVersion on every write, refuses a write whose resourceVersion is
+// stale with a Conflict, and prunes against the pinned CRD. Every successful
+// status write is also recorded in statuses.
 type strictOperations struct {
 	*fakeOperations
 }
