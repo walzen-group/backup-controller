@@ -127,9 +127,9 @@ linters:
       - path: '^internal/runs/backuprun\.go$'
         linters: [nestif]
         source: '^\s*if (queue != "" |run\.Spec\.All && run\.Status\.RestartedAt == nil && len\(run\.Status\.Quiesced\) > 0 |len\(run\.Status\.Quiesced\) == 0 )\{$'
-      - path: '^internal/runs/(backuprun|clusterwebhook|objects|release_report|restorerun|sources)\.go$'
+      - path: '^internal/runs/(backuprun|clusterwebhook|objects|release_report|restorerun)\.go$'
         linters: [goconst]
-      - path: '^internal/runs/(backuprun|restorerun|sources)\.go$'
+      - path: '^internal/runs/(backuprun|restorerun)\.go$'
         linters: [revive]
         text: '^file-length-limit:'
       - path: '^internal/runs/crdcheck\.go$'
@@ -155,9 +155,6 @@ linters:
       - path: '^internal/runs/schedule\.go$'
         linters: [nestif]
         source: '^\s*if !due\.After\(now\) \{$'
-      - path: '^internal/runs/sources\.go$'
-        linters: [funlen, gocognit]
-        source: '^func ensureSource\('
       # legacy:end
 issues:
   max-issues-per-linter: 0

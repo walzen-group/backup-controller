@@ -650,14 +650,15 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			if !inUse(source) || manualTag(source) == TriggerFor(run.UID) {
 				continue
 			}
-			held := holder(ctx, r.Reader, source)
-			switch {
-			case errors.Is(held, errSourceAbandoned):
-				failBackupItem(item, held)
-			case errors.Is(held, errSourceBusy):
-				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, held.Error()))
-			default:
-				return ctrl.Result{}, held
+			held, err := holder(ctx, r.Reader, source)
+			if failBackupItem(item, err) {
+				continue
+			}
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if held.held() {
+				return after(pollInterval, r.waitFor(ctx, run, held.readyReason(), held.text))
 			}
 		}
 
@@ -897,9 +898,9 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 			return "", nil
 		}
 		tag := TriggerFor(run.UID)
-		_, err := ensureSource(ctx, r.Client, r.Reader, claim, tag, leaseHolder{kind: "BackupRun", run: run, item: item.Name})
-		if errors.Is(err, errSourceBusy) {
-			return err.Error(), nil
+		_, busy, err := ensureSource(ctx, r.Client, r.Reader, claim, tag, leaseHolder{kind: "BackupRun", run: run, item: item.Name})
+		if busy.held() {
+			return busy.text, nil
 		}
 		// A source no run waits for any more and a refused claim fail the
 		// item; any other error leaves it Pending for the next pass.

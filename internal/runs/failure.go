@@ -209,7 +209,7 @@ func asItemFailure(err error) (itemFailure, bool) {
 		return itemFailure{reason: backupv1alpha1.ItemReasonSettingsInvalid, message: err.Error()}, true
 	}
 	var held *sourceHeldError
-	if errors.As(err, &held) && held.abandoned {
+	if errors.As(err, &held) {
 		return itemFailure{reason: backupv1alpha1.ItemReasonSourceAbandoned, message: err.Error()}, true
 	}
 	var jobFailed *restorejob.FailureError
