@@ -149,7 +149,7 @@ func labelledKustomization(ctx context.Context, reader client.Reader, mapper met
 // not parse. It returns a *CrossNamespaceError when the inventory lists t and
 // also lists a workload in a different namespace.
 func suspendable(kustomization *unstructured.Unstructured, key, runNamespace string, t Workload) (bool, error) {
-	if _, err := inventoryIDs(kustomization); err != nil {
+	if err := inventoryIDs(kustomization); err != nil {
 		return false, err
 	}
 	if !inventoryLists(kustomization, t) {
@@ -190,11 +190,11 @@ func OtherNamespaces(kustomization *unstructured.Unstructured, namespace string)
 			continue
 		}
 		id, _ := fields["id"].(string)
-		parts := strings.Split(id, "_")
-		if len(parts) != 4 || parts[2] != appsv1.GroupName || (parts[3] != backupv1alpha1.WorkloadKindDeployment && parts[3] != backupv1alpha1.WorkloadKindStatefulSet) || parts[0] == "" {
+		parsed, ok := parseInventoryID(id)
+		if !ok || parsed.Group != appsv1.GroupName || (parsed.Kind != backupv1alpha1.WorkloadKindDeployment && parsed.Kind != backupv1alpha1.WorkloadKindStatefulSet) || parsed.Namespace == "" {
 			continue
 		}
-		seen[parts[0]] = true
+		seen[parsed.Namespace] = true
 	}
 	if len(seen) < 2 {
 		return nil
@@ -216,7 +216,7 @@ func joinAnd(names []string) string {
 	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
 }
 
-// inventoryIDs returns the ids of a Kustomization's status.inventory.entries.
+// inventoryIDs checks the ids of a Kustomization's status.inventory.entries.
 // kustomize-controller records each object it applied as an entry whose id
 // is "<namespace>_<name>_<group>_<kind>", such as
 // notes_notes_apps_Deployment; the namespace of a cluster-scoped object and
@@ -227,27 +227,26 @@ func joinAnd(names []string) string {
 // kustomize-controller applied that workload and recorded it. It returns an
 // *InventoryError with Problem InventoryMissing when status.inventory.entries
 // is missing or is not a list. It returns an *InventoryError with Problem
-// InventoryEntryMalformed when an entry has no string id of four parts. A
+// InventoryEntryMalformed when an entry has no string id that
+// parseInventoryID reads. A
 // Flux release that moves or reshapes the field then fails the run loudly:
 // read as an empty list, it would make the run stop the workload
 // with its Kustomization still reconciling, and Flux would scale it back up
 // in the middle of the backup.
-func inventoryIDs(kustomization *unstructured.Unstructured) ([]string, error) {
+func inventoryIDs(kustomization *unstructured.Unstructured) error {
 	key := kustomization.GetNamespace() + "/" + kustomization.GetName()
 	entries, found, err := unstructured.NestedSlice(kustomization.Object, "status", "inventory", "entries")
 	if err != nil || !found {
-		return nil, &InventoryError{Kustomization: key, Problem: InventoryMissing}
+		return &InventoryError{Kustomization: key, Problem: InventoryMissing}
 	}
-	ids := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		fields, _ := entry.(map[string]any)
 		id, _ := fields["id"].(string)
-		if strings.Count(id, "_") != 3 {
-			return nil, &InventoryError{Kustomization: key, Problem: InventoryEntryMalformed, Entry: fmt.Sprintf("%v", entry)}
+		if _, ok := parseInventoryID(id); !ok {
+			return &InventoryError{Kustomization: key, Problem: InventoryEntryMalformed, Entry: fmt.Sprintf("%v", entry)}
 		}
-		ids = append(ids, id)
 	}
-	return ids, nil
+	return nil
 }
 
 // inventoryLists reports whether a Kustomization's status.inventory.entries
@@ -263,4 +262,42 @@ func inventoryLists(kustomization *unstructured.Unstructured, t Workload) bool {
 		}
 	}
 	return false
+}
+
+// inventoryID is one id of status.inventory.entries, split into its fields.
+type inventoryID struct {
+	// Namespace is empty for a cluster-scoped object.
+	Namespace string
+	// Name has ":" where the id has "__".
+	Name string
+	// Group is empty for a core object.
+	Group string
+	Kind  string
+}
+
+// parseInventoryID splits an inventory id with the rule of ParseObjMetadata
+// in fluxcd/cli-utils v1.2.3 (pkg/object/objmetadata.go:69-102), which
+// kustomize-controller uses to write the id (internal/inventory/inventory.go:
+// 44-47). The namespace ends at the first "_". The kind starts after the last
+// "_", and the group after the "_" before it. The rest is the name, in which
+// "__" is ":", because ObjMetadata.String writes ":" in an RBAC name as "__"
+// (objmetadata.go:32-35, 115-128).
+//
+// It returns false when the id has fewer "_" than the three fields need.
+func parseInventoryID(id string) (inventoryID, bool) {
+	namespace, rest, ok := strings.Cut(id, "_")
+	if !ok {
+		return inventoryID{}, false
+	}
+	k := strings.LastIndex(rest, "_")
+	if k < 0 {
+		return inventoryID{}, false
+	}
+	rest, kind := rest[:k], rest[k+1:]
+	g := strings.LastIndex(rest, "_")
+	if g < 0 {
+		return inventoryID{}, false
+	}
+	name, group := rest[:g], rest[g+1:]
+	return inventoryID{Namespace: namespace, Name: strings.ReplaceAll(name, "__", ":"), Group: group, Kind: kind}, true
 }
