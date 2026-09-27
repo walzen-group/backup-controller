@@ -290,7 +290,8 @@ func (l Location) sameArchive(other Location) bool {
 // endpoint signed by a public authority needs no bundle, and the image ships
 // the public roots for that case. It returns an error when endpointCA names a
 // Secret with no key, when the Secret can't be read, or when the Secret has no
-// entry under that key.
+// entry under that key. It also returns an error when the endpointCA name is
+// not a string. A malformed endpointCA is not the same as no endpointCA.
 func endpointCA(
 	ctx context.Context,
 	c client.Reader,
@@ -298,8 +299,11 @@ func endpointCA(
 	store *unstructured.Unstructured,
 ) ([]byte, error) {
 	name, found, err := unstructured.NestedString(store.Object, "spec", "configuration", "endpointCA", "name")
-	if err != nil || !found || name == "" {
-		return nil, nil //nolint:nilerr // a malformed endpointCA reads as none today; T2 decides it
+	if err != nil {
+		return nil, fmt.Errorf("ObjectStore %s/%s has a malformed endpointCA: %w", namespace, store.GetName(), err)
+	}
+	if !found || name == "" {
+		return nil, nil
 	}
 	key, found, err := unstructured.NestedString(store.Object, "spec", "configuration", "endpointCA", "key")
 	if err != nil || !found || key == "" {
