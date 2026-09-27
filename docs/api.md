@@ -140,8 +140,8 @@ finalizer starts no new restore.
 Until the prime claim binds, the VolumeRestore carries no finalizer, and a
 delete removes it immediately. Before the library cleans up after a claim, it
 gets the claim's VolumeRestore. If the VolumeRestore is gone, the library
-stops. A claim that someone deletes after its VolumeRestore then keeps the
-library's finalizer `backup.wlz.li/populate-target-protection` and stays
+stops. A claim that someone deletes after its VolumeRestore would then keep the
+library's finalizer `backup.wlz.li/populate-target-protection` and stay
 Terminating. The controller's orphan reconciler releases such a claim.
 [architecture.md](architecture.md#a-claim-whose-volumerestore-is-gone) lists its
 steps and the events it records on the claim.
