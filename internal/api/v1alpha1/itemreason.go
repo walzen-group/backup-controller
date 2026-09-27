@@ -48,8 +48,11 @@ const (
 	// something else.
 	ItemReasonClaimLost ItemReason = "ClaimLost"
 
-	// ItemReasonNoMoverSnapshot is a volume backup whose mover finished, but
-	// the run found no snapshot the mover wrote in the repository.
+	// ItemReasonNoMoverSnapshot is a volume backup whose sync completed, but
+	// whose ReplicationSource status lacks lastSyncTime or lastSyncDuration,
+	// or records a negative duration. Without them VolSync did not record
+	// when the sync ran, so the run can't tell which snapshot in the
+	// repository the sync wrote.
 	ItemReasonNoMoverSnapshot ItemReason = "NoMoverSnapshot"
 
 	// ItemReasonClaimMissing is an item whose claim does not exist when the
