@@ -20,14 +20,14 @@ const surveyParallel = 8
 type Archive struct {
 	// Empty is true when nothing at all exists under the server prefix.
 	Empty bool
-	// Found is a DONE base backup, one that finished at or before the
+	// Found is a complete base backup, one that finished at or before the
 	// target when a target was given. It is nil when none qualifies.
 	Found *BaseBackup
 	// Backups counts the base backup directories under base/, in any state.
 	Backups int
 	// Read counts the backup.info files read, a missing one included.
 	Read int
-	// Oldest is the DONE backup that finished first. It is set only when
+	// Oldest is the complete backup that finished first. It is set only when
 	// Found is nil and every backup.info was read.
 	Oldest *BaseBackup
 }
@@ -56,19 +56,20 @@ func (e *OutOfTimeError) Error() string {
 func (e *OutOfTimeError) Unwrap() error { return e.Err }
 
 // Survey reads one database's archive for the webhook: whether anything
-// exists under its prefix, and whether a DONE base backup exists that a
-// recovery can start from.
+// exists under its prefix, and whether a complete base backup exists that a
+// recovery can start from. A complete backup is one whose backup.info sets
+// begin_time and end_time (see ParseBackupInfo).
 //
 // Parameters:
 //   - at is the database's Location, as ResolveLocation returns it.
-//   - target, when not nil, asks for a DONE backup that finished at or
+//   - target, when not nil, asks for a complete backup that finished at or
 //     before it.
 //
 // It lists base/ with the "/" delimiter, one entry per backup as barman's
 // own catalog does, and reads the backup.info files newest first with at
-// most surveyParallel GETs in flight. It stops at the first qualifying DONE
+// most surveyParallel GETs in flight. It stops at the first qualifying complete
 // backup; which worker finds it does not matter, since only existence
-// counts. A missing backup.info counts as not DONE, as it does for barman.
+// counts. A missing backup.info counts as not complete, as it does for barman.
 // With no backup directory at all, it asks for one key under the server
 // prefix to fill in Empty.
 //
@@ -76,7 +77,7 @@ func (e *OutOfTimeError) Unwrap() error { return e.Err }
 // listing too, so an expired ctx never reads as an empty prefix. It returns
 // an error when the client can't be built, when a listing fails, or when a
 // GET failed and no qualifying backup was found, since the unread file might
-// have been the DONE one.
+// have been the complete one.
 func (p S3Prober) Survey(ctx context.Context, at Location, target *time.Time) (Archive, error) {
 	client, err := p.client(at)
 	if err != nil {
@@ -129,15 +130,15 @@ func prefixEmpty(ctx context.Context, client *minio.Client, at Location) (bool, 
 	return true, nil
 }
 
-// qualifier keeps what Survey finds in the DONE backups that readInfos
+// qualifier keeps what Survey finds in the complete backups that readInfos
 // gives to visit.
 type qualifier struct {
 	// target is the moment that a backup must finish by, or nil for any
-	// DONE backup.
+	// complete backup.
 	target *time.Time
-	// found is the first DONE backup that finished by target.
+	// found is the first complete backup that finished by target.
 	found *BaseBackup
-	// oldest is the DONE backup with the earliest end among those that
+	// oldest is the complete backup with the earliest end among those that
 	// finished after target.
 	oldest *BaseBackup
 }
@@ -166,9 +167,9 @@ func (q *qualifier) visit(b BaseBackup) bool {
 //
 // It reads the catalog as Survey does, the delimited listing of base/ and
 // backup.info files with surveyParallel GETs in flight, but reads every one.
-// A missing backup.info counts as not DONE. It returns an error when the
+// A missing backup.info counts as not complete. It returns an error when the
 // listing fails, when a backup.info can't be downloaded or read, or when a
-// DONE backup's end_time doesn't parse, and one wrapping ctx's error when
+// complete backup's end_time doesn't parse, and one wrapping ctx's error when
 // ctx ends before every file was listed and read. A location with no
 // completed backup gives an empty list and no error.
 func (p S3Prober) BaseBackups(ctx context.Context, at Location) ([]BaseBackup, error) {
@@ -242,7 +243,7 @@ type infoResult struct {
 //
 // Parameters:
 //   - ids are the backup IDs, in the order to read them.
-//   - visit is called, from the calling goroutine only, with each DONE
+//   - visit is called, from the calling goroutine only, with each complete
 //     backup. It returns true to stop reading.
 //
 // It returns how many files were read, a missing one included. It returns
@@ -289,7 +290,7 @@ func feedIDs(ctx context.Context, ids []string) <-chan string {
 
 // readInfoJobs is one readInfos worker. It reads the backup.info of each ID
 // from jobs and sends the result to results. A missing backup.info is a
-// result with no error that is not DONE.
+// result with no error that is not complete.
 func readInfoJobs(ctx context.Context, client *minio.Client, at Location, jobs <-chan string, results chan<- infoResult) {
 	for id := range jobs {
 		key := at.BasePrefix() + id + "/backup.info"
@@ -302,7 +303,7 @@ func readInfoJobs(ctx context.Context, client *minio.Client, at Location, jobs <
 }
 
 // collectInfos takes the results of the readInfos workers and gives each
-// DONE backup to visit.
+// complete backup to visit.
 //
 // Parameters:
 //   - results carries the result of each read.

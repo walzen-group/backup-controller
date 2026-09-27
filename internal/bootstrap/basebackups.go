@@ -75,11 +75,14 @@ func baseBackupAt(key string, raw []byte) (BaseBackup, bool, error) {
 // ParseBackupInfo reads a barman backup.info file, given as raw bytes of
 // key=value lines, and returns the backup it describes.
 //
-// The bool is true when the file's status is DONE. For any other status it
-// returns false with only the ID filled in (from backup_id, which may be
-// empty), and it doesn't read end_time. For a DONE backup it returns an error
-// when end_time is missing or isn't in barman's timestamp format. Lines
-// without an "=" are ignored.
+// The bool is true when the file sets begin_time and end_time. The status
+// field has no effect. This is the rule of the plugin's catalog
+// (barman-cloud v0.6.0 pkg/catalog/catalog.go:372-374, isBackupDone), which
+// picks the base backup of a recovery. barman writes an unset field as None
+// (barman 3.20.0 infofile.py:335-336). When a time is missing or None, it
+// returns false with only the ID filled in (from backup_id, which can be
+// empty). It returns an error when a time is set but is not in barman's
+// timestamp format. Lines without an "=" are ignored.
 func ParseBackupInfo(raw []byte) (BaseBackup, bool, error) {
 	fields := map[string]string{}
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
@@ -93,14 +96,24 @@ func ParseBackupInfo(raw []byte) (BaseBackup, bool, error) {
 		return BaseBackup{}, false, err
 	}
 
-	if fields["status"] != "DONE" {
+	if !barmanTimeSet(fields["begin_time"]) || !barmanTimeSet(fields["end_time"]) {
 		return BaseBackup{ID: fields["backup_id"]}, false, nil
+	}
+	if _, err := parseBarmanTime(fields["begin_time"]); err != nil {
+		return BaseBackup{}, false, fmt.Errorf("begin_time: %w", err)
 	}
 	end, err := parseBarmanTime(fields["end_time"])
 	if err != nil {
 		return BaseBackup{}, false, fmt.Errorf("end_time: %w", err)
 	}
 	return BaseBackup{ID: fields["backup_id"], End: end}, true, nil
+}
+
+// barmanTimeSet tells if a time field of backup.info has a value. barman
+// writes an unset field as None (barman 3.20.0 infofile.py:335-336), and an
+// older file can have no such line.
+func barmanTimeSet(value string) bool {
+	return value != "" && value != "None"
 }
 
 // parseBarmanTime parses a timestamp from backup.info, such as
