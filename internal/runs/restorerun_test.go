@@ -10,6 +10,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	appsv1 "k8s.io/api/apps/v1"
@@ -204,7 +205,7 @@ func TestASyncedRestoreRefusesUntaggedSnapshots(t *testing.T) {
 	if !strings.Contains(run.Status.Items[0].Message, restic.QuiescedTag) {
 		t.Errorf("message = %q, want it to say no snapshot is tagged %s", run.Status.Items[0].Message, restic.QuiescedTag)
 	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
 		t.Error("the Cluster was deleted by a run that could not restore it")
 	}
 }
@@ -244,7 +245,7 @@ func TestADatabaseRestoreDeletesAndFollowsTheCluster(t *testing.T) {
 	if run.Status.Items[0].Phase != backupv1alpha1.ItemDeleted || run.Status.Items[0].BaseBackup != saturday.ID {
 		t.Fatalf("item = %+v, want Deleted from base backup %s", run.Status.Items[0], saturday.ID)
 	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); ok {
+	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); ok {
 		t.Fatal("the Cluster was not deleted")
 	}
 	if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonRecreate {
@@ -266,7 +267,7 @@ func TestADatabaseRestoreDeletesAndFollowsTheCluster(t *testing.T) {
 		t.Fatalf("item phase = %q, want Recovering", phase)
 	}
 
-	_ = unstructured.SetNestedField(recovered.Object, healthyPhase, "status", "phase")
+	_ = unstructured.SetNestedField(recovered.Object, cnpg.HealthyPhase, "status", "phase")
 	if err := c.Status().Update(context.Background(), recovered); err != nil {
 		t.Fatal(err)
 	}
@@ -378,9 +379,9 @@ func oldInstance() (*corev1.Pod, *corev1.PersistentVolumeClaim) {
 	meta := func() metav1.ObjectMeta {
 		return metav1.ObjectMeta{
 			Name: pgN + "-1", Namespace: ns,
-			Labels: map[string]string{clusterLabel: pgN},
+			Labels: map[string]string{cnpg.ClusterLabel: pgN},
 			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: ClusterGVK.GroupVersion().String(), Kind: ClusterGVK.Kind, Name: pgN, UID: "old-cluster-uid",
+				APIVersion: cnpg.ClusterGVK.GroupVersion().String(), Kind: cnpg.ClusterGVK.Kind, Name: pgN, UID: "old-cluster-uid",
 			}},
 		}
 	}
@@ -511,7 +512,7 @@ func TestADatabaseWithoutABaseBackupIsNotDeleted(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonNoBackupInReach {
 		t.Fatalf("phase = %q, reason = %q", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
 		t.Fatal("the Cluster was deleted although no base backup reaches the moment")
 	}
 }
@@ -538,7 +539,7 @@ func TestANamespaceRestoreLeavesTheDatabasesWhenAVolumeFails(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.Items[1].Phase != backupv1alpha1.ItemSkipped {
 		t.Fatalf("run = %+v, want Failed with the Cluster skipped", run.Status)
 	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
 		t.Fatal("the Cluster was deleted after a volume restore failed")
 	}
 }
@@ -889,7 +890,7 @@ func TestADatabaseRestoreWhoseDeleteFailedDeletesTheOldClusterAgain(t *testing.T
 		annotations := u.GetAnnotations()
 		annotations[backupv1alpha1.AnnotationRestoreRun] = "back-to-monday"
 		u.SetAnnotations(annotations)
-		_ = unstructured.SetNestedField(u.Object, healthyPhase, "status", "phase")
+		_ = unstructured.SetNestedField(u.Object, cnpg.HealthyPhase, "status", "phase")
 	})
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), old, objectStore(), storeSecret())
@@ -898,7 +899,7 @@ func TestADatabaseRestoreWhoseDeleteFailedDeletesTheOldClusterAgain(t *testing.T
 	refused := false
 	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == ClusterGVK.Kind && !refused {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == cnpg.ClusterGVK.Kind && !refused {
 				refused = true
 				return apierrors.NewServiceUnavailable("etcd leader changed")
 			}
@@ -915,7 +916,7 @@ func TestADatabaseRestoreWhoseDeleteFailedDeletesTheOldClusterAgain(t *testing.T
 	if run.Status.Phase.Finished() || run.Status.Items[0].Phase != backupv1alpha1.ItemDeleted {
 		t.Errorf("phase = %q, item = %+v; want the run waiting with the item Deleted", run.Status.Phase, run.Status.Items[0])
 	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); ok {
+	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); ok {
 		t.Error("the old Cluster is still there; the run took it for its recovery")
 	}
 }
@@ -955,7 +956,7 @@ func TestANamespaceRestoreLeavesAnOptedOutClusterAlone(t *testing.T) {
 			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
 				t.Errorf("phase = %q, items = %+v; want Succeeded with the volume restored", run.Status.Phase, run.Status.Items)
 			}
-			if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+			if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
 				t.Error("the opted-out Cluster was deleted")
 			}
 		})
@@ -979,7 +980,7 @@ func TestARestoreThatSkippedEveryItemFails(t *testing.T) {
 		t.Errorf("phase = %q, reason = %q, message = %q; want Failed, NoBackupInReach, %q",
 			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), want)
 	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
 		t.Error("the opted-out Cluster was deleted")
 	}
 }
@@ -997,7 +998,7 @@ func TestARestoreOfAnOptedOutDatabaseIsInvalid(t *testing.T) {
 		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, naming %s",
 			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation)
 	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
 		t.Error("the opted-out Cluster was deleted")
 	}
 }
@@ -1031,7 +1032,7 @@ func TestARefusedRestoreWhoseReleaseFailedEndsInvalid(t *testing.T) {
 		refusal = ending.Message
 	}
 
-	back, _ := getUnstructured(t, c, ClusterGVK, ns, pgN)
+	back, _ := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN)
 	annotations := back.GetAnnotations()
 	delete(annotations, bootstrap.OptOutAnnotation)
 	back.SetAnnotations(annotations)
@@ -1268,7 +1269,7 @@ func TestANamespaceRestoreLeavesAClusterWithADeclaredBootstrapAlone(t *testing.T
 			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
 				t.Errorf("phase = %q, items = %+v; want Succeeded with the volume restored", run.Status.Phase, run.Status.Items)
 			}
-			if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+			if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
 				t.Errorf("the Cluster declaring %s was deleted", name)
 			}
 		})
@@ -1289,7 +1290,7 @@ func TestARestoreOfADatabaseWithADeclaredBootstrapIsInvalid(t *testing.T) {
 		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, naming spec.bootstrap.pg_basebackup",
 			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
 	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
+	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
 		t.Error("the Cluster declaring pg_basebackup was deleted")
 	}
 }

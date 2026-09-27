@@ -11,6 +11,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -761,7 +762,7 @@ func TestADatabaseRunTakesABaseBackup(t *testing.T) {
 	step(t, r)
 	step(t, r)
 
-	backup, ok := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
+	backup, ok := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, runUID))
 	if !ok {
 		t.Fatal("no Backup was created")
 	}
@@ -786,7 +787,7 @@ func TestADatabaseRunTakesABaseBackup(t *testing.T) {
 func TestAHibernatedDatabaseIsSkipped(t *testing.T) {
 	sleeping := cluster(func(u *unstructured.Unstructured) {
 		annotations := u.GetAnnotations()
-		annotations[hibernationAnnotation] = "on"
+		annotations[cnpg.HibernationAnnotation] = "on"
 		u.SetAnnotations(annotations)
 	})
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), sleeping)
@@ -798,7 +799,7 @@ func TestAHibernatedDatabaseIsSkipped(t *testing.T) {
 	if run.Status.Items[0].Phase != backupv1alpha1.ItemSkipped || run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("run = %+v, want the Cluster skipped and the run Succeeded", run.Status)
 	}
-	if _, ok := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID)); ok {
+	if _, ok := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, runUID)); ok {
 		t.Error("a Backup was created for a hibernated Cluster")
 	}
 }
@@ -873,7 +874,7 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 	}
 
 	complete(t, c)
-	backup, _ := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
+	backup, _ := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, runUID))
 	_ = unstructured.SetNestedField(backup.Object, "completed", "status", "phase")
 	if err := c.Status().Update(context.Background(), backup); err != nil {
 		t.Fatal(err)
@@ -910,7 +911,7 @@ func quiescedRunToUpload(t *testing.T) (*BackupRunReconciler, client.Client) {
 	}
 
 	complete(t, c)
-	backup, _ := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
+	backup, _ := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, runUID))
 	_ = unstructured.SetNestedField(backup.Object, "completed", "status", "phase")
 	if err := c.Status().Update(context.Background(), backup); err != nil {
 		t.Fatal(err)
@@ -1072,7 +1073,7 @@ func TestADatabaseThatCannotStartDoesNotHoldTheApp(t *testing.T) {
 	healthy := r.Client
 	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == BackupGVK {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == cnpg.BackupGVK {
 				return apierrors.NewInternalError(errors.New(webhook))
 			}
 			return cl.Create(ctx, obj, opts...)
@@ -1115,7 +1116,7 @@ func TestADatabaseThatCannotStartDoesNotHoldTheApp(t *testing.T) {
 
 	r.Client = healthy
 	pass()
-	if _, ok := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID)); !ok {
+	if _, ok := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, runUID)); !ok {
 		t.Fatal("no Backup after the webhook came back")
 	}
 	for _, item := range readBackupRun(t, c).Status.Items {
@@ -1616,7 +1617,7 @@ func TestReadyNamesARetryAndABusySourceTogether(t *testing.T) {
 	}
 	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == BackupGVK {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == cnpg.BackupGVK {
 				return apierrors.NewInternalError(errors.New(`failed calling webhook "vbackup.cnpg.io": connect: connection refused`))
 			}
 			return cl.Create(ctx, obj, opts...)
@@ -1636,7 +1637,7 @@ func TestReadyNamesARetryAndABusySourceTogether(t *testing.T) {
 // volumes. The API server's discovery serves no version of Cluster there,
 // which means there are no Clusters.
 func TestANamespaceRunWithoutCloudNativePGBacksUpTheVolumes(t *testing.T) {
-	r, c, _ := servedBackupReconciler(t, []string{ClusterGVK.Group}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+	r, c, _ := servedBackupReconciler(t, []string{cnpg.ClusterGVK.Group}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository())
 	step(t, r)
 

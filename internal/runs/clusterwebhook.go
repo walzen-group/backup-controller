@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/served"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -16,7 +17,7 @@ import (
 // chart/templates/webhook.yaml, apiVersions ["v1"]). With the rules'
 // matchPolicy Equivalent, the API server converts a creation at any other
 // served version to v1 and calls the webhook, for as long as it serves v1.
-var webhookClusterKind = ClusterGVK
+var webhookClusterKind = cnpg.ClusterGVK
 
 // servedElsewhere returns the versions at which the API server serves the
 // kind of gvk when it serves that kind, but not at gvk's version.

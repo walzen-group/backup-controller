@@ -10,6 +10,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/served"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -544,7 +545,7 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 		return nil, invalidSpec("spec.repository alone restores into a new claim, so spec.into is required, and it must name a claim that does not exist yet. " +
 			"To overwrite an existing claim from this repository, set spec.claim to it as well; the run then restores it in place once no pod mounts it.")
 	case run.Spec.Database != "":
-		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Spec.Database)
+		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Spec.Database)
 		if err != nil {
 			return nil, err
 		}
@@ -564,7 +565,7 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 	if err != nil {
 		return nil, err
 	}
-	clusters, err := enabledClusters(ctx, r.Reader, r.RESTMapper(), run.Namespace)
+	clusters, err := cnpg.EnabledClusters(ctx, r.Reader, r.RESTMapper(), run.Namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -883,7 +884,7 @@ func nothingWritten(claim string) string {
 // the store or its Secrets fails in a way a retry may fix, and when listing
 // the base backups fails.
 func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, name string, at *time.Time) (string, string, error) {
-	cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), namespace, name)
+	cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), namespace, name)
 	if err != nil {
 		return "", "", err
 	}
@@ -947,7 +948,7 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // While a mover the run stopped is not gone yet, the run waits with reason
 // WaitingForShutdown and gives nothing back (rule X2). After a Cluster is
 // deleted, work also waits with reason WaitingForShutdown until the old
-// Cluster's instance pods and PVCs are gone (see instanceLeft). Only then does
+// Cluster's instance pods and PVCs are gone (see cnpg.InstanceLeft). Only then does
 // it start the stopped workloads again and resume the Kustomizations it
 // suspended, and it waits with reason WaitingForRecreate, whose message asks
 // for the Cluster to be created again. The run finishes once every item is
@@ -1082,7 +1083,7 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 				return ctrl.Result{}, err
 			}
 			if item.Phase == backupv1alpha1.ItemDeleted {
-				left, err := instanceLeft(ctx, r.Reader, run.Namespace, item.Name)
+				left, err := cnpg.InstanceLeft(ctx, r.Reader, run.Namespace, item.Name)
 				if err != nil {
 					return ctrl.Result{}, err
 				}
@@ -1335,7 +1336,7 @@ func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backup
 func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
-		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
+		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 		if err != nil {
 			return err
 		}
@@ -1370,7 +1371,7 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		return r.deleteCluster(ctx, cluster)
 
 	case backupv1alpha1.ItemDeleted:
-		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
+		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 		switch {
 		case err != nil:
 			return err
@@ -1392,7 +1393,7 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 		}
 
 	case backupv1alpha1.ItemRecovering:
-		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
+		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 		switch {
 		case err != nil:
 			return err
@@ -1402,7 +1403,7 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 			// The webhook recovers a Cluster only for a run whose item says
 			// Deleted, so one created again now carries no mark of this run.
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, "the recovered Cluster was replaced by one this run did not recover"
-		case clusterPhase(cluster) == healthyPhase:
+		case cnpg.Phase(cluster) == cnpg.HealthyPhase:
 			item.Phase = backupv1alpha1.ItemSucceeded
 		}
 	default:
@@ -1479,10 +1480,10 @@ func archives(cluster *unstructured.Unstructured) bool {
 // deleteCluster deletes the Cluster the run read. The delete carries the
 // Cluster's UID as a precondition, so it never reaches a Cluster of the same
 // name created since the read. A Cluster that is already gone is not an
-// error. The delete goes out at the version the Cluster was read at, which
-// getCluster looked up; a delete the API server refuses because it has
-// stopped serving that version since is an error (see served.VersionGone),
-// never a Cluster that is gone.
+// error. The delete goes out at the version that cnpg.GetCluster read the
+// Cluster at. The API server can stop to serve that version after the read.
+// If it then refuses the delete, the result is an error (see
+// served.VersionGone). It is never a Cluster that is gone.
 func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster *unstructured.Unstructured) error {
 	uid := cluster.GetUID()
 	err := served.VersionGone(r.RESTMapper(), cluster.GroupVersionKind(), r.Delete(ctx, cluster, client.Preconditions{UID: &uid}))
@@ -2213,7 +2214,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 			}
 			// A Cluster its owner has created again is back, and the note
 			// about its next creation would be wrong.
-			cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
+			cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 			if err != nil {
 				return ctrl.Result{}, err
 			}

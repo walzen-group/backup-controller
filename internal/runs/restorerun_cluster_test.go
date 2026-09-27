@@ -9,6 +9,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,7 +39,7 @@ func databaseRestore(t *testing.T) (*RestoreRunReconciler, client.Client) {
 	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemDeleted || item.ClusterUID != "old-cluster-uid" {
 		t.Fatalf("item = %+v, want Deleted with the old Cluster's UID", item)
 	}
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); ok {
+	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); ok {
 		t.Fatal("the Cluster was not deleted")
 	}
 	return r, c
@@ -75,7 +76,7 @@ func archivingNowhere(u *unstructured.Unstructured) {
 // markHealthy writes the phase CloudNativePG reports for a Cluster that is up.
 func markHealthy(t *testing.T, c client.Client, u *unstructured.Unstructured) {
 	t.Helper()
-	_ = unstructured.SetNestedField(u.Object, healthyPhase, "status", "phase")
+	_ = unstructured.SetNestedField(u.Object, cnpg.HealthyPhase, "status", "phase")
 	if err := c.Status().Update(context.Background(), u); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +94,7 @@ func stepRestore(t *testing.T, r *RestoreRunReconciler, name string) {
 // is gone.
 func clusterUID(t *testing.T, c client.Client) types.UID {
 	t.Helper()
-	u, ok := getUnstructured(t, c, ClusterGVK, ns, pgN)
+	u, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN)
 	if !ok {
 		return ""
 	}
@@ -106,7 +107,7 @@ func refuseFirstClusterDelete(c client.Client) client.Client {
 	refused := false
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == ClusterGVK.Kind && !refused {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == cnpg.ClusterGVK.Kind && !refused {
 				refused = true
 				return apierrors.NewServiceUnavailable("etcd leader changed")
 			}
@@ -165,7 +166,7 @@ func TestAnOldClusterThatOptsOutBeforeTheDeleteIsSkipped(t *testing.T) {
 		t.Fatalf("item = %+v, want Deleted with the old Cluster's UID", item)
 	}
 
-	old, _ := getUnstructured(t, c, ClusterGVK, ns, pgN)
+	old, _ := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN)
 	optedOut(old)
 	if err := c.Update(context.Background(), old); err != nil {
 		t.Fatal(err)
@@ -320,7 +321,7 @@ func TestARecoveredClusterReplacedDuringRecoveryFailsTheRun(t *testing.T) {
 		if err := c.Delete(context.Background(), recovered); err != nil {
 			t.Fatal(err)
 		}
-		deleting, _ := getUnstructured(t, c, ClusterGVK, ns, pgN)
+		deleting, _ := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN)
 		if deleting.GetDeletionTimestamp() == nil {
 			t.Fatal("the Cluster is not being deleted")
 		}

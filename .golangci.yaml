@@ -133,15 +133,11 @@ linters:
       - path: '^internal/runs/backuprun\.go$'
         linters: [nestif]
         source: '^\s*if (queue != "" |run\.Spec\.All && run\.Status\.RestartedAt == nil && len\(run\.Status\.Quiesced\) > 0 |len\(run\.Status\.Quiesced\) == 0 )\{$'
-      - path: '^internal/runs/(backuprun|clusterwebhook|cnpg|exclusive|lease|objects|quiesce|restorerun|sources)\.go$'
+      - path: '^internal/runs/(backuprun|clusterwebhook|exclusive|lease|objects|quiesce|restorerun|sources)\.go$'
         linters: [goconst]
       - path: '^internal/runs/(backuprun|quiesce|restorerun|sources)\.go$'
         linters: [revive]
         text: '^file-length-limit:'
-      - path: '^internal/runs/cnpg\.go$'
-        linters: [revive]
-        text: '^function-result-limit:'
-        source: '^func backupResult\('
       - path: '^internal/runs/crdcheck\.go$'
         linters: [funlen, gocognit]
         source: '^func walkFields\('

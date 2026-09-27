@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/robfig/cron/v3"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/served"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -192,7 +193,7 @@ func (s *Scheduler) anythingEnabled(ctx context.Context, namespace string) (bool
 	if err != nil || len(claims) > 0 {
 		return len(claims) > 0, err
 	}
-	clusters, err := enabledClusters(ctx, s.Reader, s.RESTMapper(), namespace)
+	clusters, err := cnpg.EnabledClusters(ctx, s.Reader, s.RESTMapper(), namespace)
 	return len(clusters) > 0, err
 }
 
@@ -258,7 +259,7 @@ func (s *Scheduler) exportPinned(ctx context.Context, namespace string) error {
 		}
 	}
 
-	clusters, err := served.List(ctx, s.Reader, s.RESTMapper(), ClusterGVK.GroupKind(), client.InNamespace(namespace))
+	clusters, err := served.List(ctx, s.Reader, s.RESTMapper(), cnpg.ClusterGVK.GroupKind(), client.InNamespace(namespace))
 	if err != nil {
 		return err
 	}

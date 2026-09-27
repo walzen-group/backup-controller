@@ -9,6 +9,7 @@ import (
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
@@ -242,7 +243,7 @@ func TestATimedOutDatabaseItemNamesItsPhaseOnce(t *testing.T) {
 // Cluster pgN, as CloudNativePG does.
 func setBackupPhase(t *testing.T, c client.Client, phase string) {
 	t.Helper()
-	backup, ok := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
+	backup, ok := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, runUID))
 	if !ok {
 		t.Fatal("no Backup was created")
 	}
@@ -259,7 +260,7 @@ func TestAnInvalidBackupDefinitionFailsTheItem(t *testing.T) {
 	step(t, r)
 	step(t, r)
 	step(t, r)
-	backup, _ := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
+	backup, _ := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, runUID))
 	_ = unstructured.SetNestedField(backup.Object, "invalid backup definition", "status", "phase")
 	_ = unstructured.SetNestedField(backup.Object, "no plugin configured", "status", "error")
 	if err := c.Status().Update(context.Background(), backup); err != nil {

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -137,7 +138,7 @@ func TestARefusedItemRecordsItsReason(t *testing.T) {
 	foreign.Labels = nil
 	sleeping := cluster(func(u *unstructured.Unstructured) {
 		annotations := u.GetAnnotations()
-		annotations[hibernationAnnotation] = "on"
+		annotations[cnpg.HibernationAnnotation] = "on"
 		u.SetAnnotations(annotations)
 	})
 	inPlace := func() *backupv1alpha1.RestoreRun {

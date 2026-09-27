@@ -13,6 +13,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
@@ -53,7 +54,7 @@ const (
 // scheme registers each one, and its list kind, so the fake client can store
 // them.
 var unstructuredKinds = []schema.GroupVersionKind{
-	ClusterGVK, BackupGVK, KustomizationGVK, WorkloadGVK,
+	cnpg.ClusterGVK, cnpg.BackupGVK, KustomizationGVK, WorkloadGVK,
 	{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueue"},
 	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "LocalQueue"},
 	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "Workload"},
@@ -292,7 +293,7 @@ func cluster(mutate ...func(*unstructured.Unstructured)) *unstructured.Unstructu
 			}},
 		},
 	}}
-	c.SetGroupVersionKind(ClusterGVK)
+	c.SetGroupVersionKind(cnpg.ClusterGVK)
 	c.SetNamespace(ns)
 	c.SetName(pgN)
 	c.SetUID("old-cluster-uid")

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -95,7 +96,7 @@ func TestADatabaseIsBackedUpAtTheVersionCloudNativePGServes(t *testing.T) {
 	step(t, r) // admit, no queue
 	step(t, r) // start
 
-	backup, ok := getUnstructured(t, c, nextGVK(BackupGVK), ns, backupName(pgN, runUID))
+	backup, ok := getUnstructured(t, c, nextGVK(cnpg.BackupGVK), ns, cnpg.BackupName(pgN, runUID))
 	if !ok {
 		t.Fatalf("no Backup at %s; run = %+v", nextVersion, readBackupRun(t, c).Status)
 	}
@@ -130,9 +131,9 @@ func TestANamespaceRunFindsClustersAtTheVersionCloudNativePGServes(t *testing.T)
 func clusterListGone(c client.Client) client.Client {
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind() == ClusterGVK.GroupVersion().WithKind("ClusterList") {
+			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind() == cnpg.ClusterGVK.GroupVersion().WithKind("ClusterList") {
 				return apierrors.NewGenericServerResponse(http.StatusNotFound, "list",
-					schema.GroupResource{Group: ClusterGVK.Group, Resource: "clusters"}, "", "404 page not found", 0, true)
+					schema.GroupResource{Group: cnpg.ClusterGVK.Group, Resource: "clusters"}, "", "404 page not found", 0, true)
 			}
 			return cl.List(ctx, list, opts...)
 		},
@@ -160,17 +161,17 @@ func TestAClusterListAtAVersionNoLongerServedIsRetried(t *testing.T) {
 // serving is an error too, never a namespace with nothing to back up.
 func TestEnabledClustersRetriesAListAtAVersionNoLongerServed(t *testing.T) {
 	c := newClient(t, cluster())
-	if _, err := enabledClusters(context.Background(), clusterListGone(c), c.RESTMapper(), ns); err == nil || !retryable(err) {
-		t.Errorf("enabledClusters error = %v, want one the caller retries", err)
+	if _, err := cnpg.EnabledClusters(context.Background(), clusterListGone(c), c.RESTMapper(), ns); err == nil || !retryable(err) {
+		t.Errorf("cnpg.EnabledClusters error = %v, want one the caller retries", err)
 	}
 }
 
 // A database backup in a cluster without the CloudNativePG CRDs is refused
 // with a message that says so. The API server's discovery serves no version
-// of Cluster there, which getCluster reports as an error for which
+// of Cluster there, which cnpg.GetCluster reports as an error for which
 // meta.IsNoMatchError is true, and never as a Cluster that is missing.
 func TestADatabaseBackupWithoutCloudNativePGSaysTheCRDsAreMissing(t *testing.T) {
-	r, c, _ := servedBackupReconciler(t, []string{ClusterGVK.Group}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }))
+	r, c, _ := servedBackupReconciler(t, []string{cnpg.ClusterGVK.Group}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }))
 	step(t, r)
 
 	run := readBackupRun(t, c)

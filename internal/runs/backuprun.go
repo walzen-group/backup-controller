@@ -9,6 +9,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -220,7 +221,7 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 		return []backupv1alpha1.BackupItem{pending("ReplicationSource", claim.Name)}, nil
 
 	case run.Spec.Database != "":
-		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Spec.Database)
+		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Spec.Database)
 		if err != nil {
 			if meta.IsNoMatchError(err) {
 				return nil, invalidSpec("no Cluster %s in this namespace; the cluster has no CloudNativePG CRDs", run.Spec.Database)
@@ -240,7 +241,7 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 		if err != nil {
 			return nil, err
 		}
-		clusters, err := enabledClusters(ctx, r.Reader, r.RESTMapper(), run.Namespace)
+		clusters, err := cnpg.EnabledClusters(ctx, r.Reader, r.RESTMapper(), run.Namespace)
 		if err != nil {
 			return nil, err
 		}
@@ -907,17 +908,17 @@ func (r *BackupRunReconciler) startItem(ctx context.Context, run *backupv1alpha1
 		item.Phase, item.Trigger = backupv1alpha1.ItemRunning, tag
 
 	case "Cluster":
-		cluster, found, err := getCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
+		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 		switch {
 		case err != nil:
 			return "", err
 		case !found:
 			failBackupItem(item, refuse(backupv1alpha1.ItemReasonClusterMissing, "the Cluster %s no longer exists", item.Name))
-		case hibernated(cluster):
+		case cnpg.Hibernated(cluster):
 			item.Phase, item.Reason = backupv1alpha1.ItemSkipped, backupv1alpha1.ItemReasonClusterHibernated
 			item.Message = "the Cluster is hibernated; CloudNativePG fails a Backup of a hibernated Cluster"
 		default:
-			name, err := ensureBackup(ctx, r.Client, run.Namespace, item.Name, run.UID)
+			name, err := cnpg.EnsureBackup(ctx, r.Client, run.Namespace, item.Name, run.UID)
 			if apierrors.IsInvalid(err) {
 				failBackupItem(item, refuse(backupv1alpha1.ItemReasonBackupRefused, "%v", err))
 				return "", nil
@@ -1324,7 +1325,7 @@ func (r *BackupRunReconciler) retimeRecorded(ctx context.Context, run *backupv1a
 }
 
 // collectDatabase records the result of a Running database item once its
-// CloudNativePG Backup has one (see backupResult).
+// CloudNativePG Backup has one (see cnpg.BackupResult).
 //
 // Parameters:
 //   - run is the BackupRun, for its namespace.
@@ -1341,16 +1342,18 @@ func (r *BackupRunReconciler) retimeRecorded(ctx context.Context, run *backupv1a
 // failed one makes it Failed with CloudNativePG's error. A failed read
 // leaves the item as it was, for the next pass.
 func (r *BackupRunReconciler) collectDatabase(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) string {
-	done, ok, message, err := backupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
-	switch {
-	case err != nil:
-	case !done:
-		item.Message = message
-		return message
-	case ok:
+	outcome, err := cnpg.BackupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
+	if err != nil {
+		return ""
+	}
+	switch outcome.Phase {
+	case cnpg.BackupWaiting, cnpg.BackupUnknownPhase:
+		item.Message = outcome.Message
+		return outcome.Message
+	case cnpg.BackupCompleted:
 		item.Phase, item.Message = backupv1alpha1.ItemSucceeded, ""
-	default:
-		item.Phase, item.Message = backupv1alpha1.ItemFailed, message
+	case cnpg.BackupFailed:
+		item.Phase, item.Message = backupv1alpha1.ItemFailed, outcome.Message
 	}
 	return ""
 }
@@ -1422,10 +1425,10 @@ func (r *BackupRunReconciler) repositorySecret(ctx context.Context, namespace, c
 //
 // For a volume item that recorded its snapshot and has not moved it yet,
 // it returns the sentence of unmovedNote. For any other volume item it
-// returns what syncGoesOn says of the sync VolSync goes on with. For a
-// database item whose Backup waits in a phase CloudNativePG 1.30 does not
-// have, it returns the sentence of unknownBackupPhase, so a run that times
-// out there says which phase it waited in. A failed read gives "", since the
+// returns what syncGoesOn says of the sync VolSync goes on with. A database
+// item can have a Backup in the phase cnpg.BackupUnknownPhase. For that item,
+// it returns the message of cnpg.BackupResult. Thus a run that gets to its
+// timeout shows the phase that it waited in. A failed read gives "", since the
 // sentence only explains the item's failure.
 func (r *BackupRunReconciler) runningNote(ctx context.Context, run *backupv1alpha1.BackupRun, item backupv1alpha1.BackupItem) string {
 	if item.Kind != "Cluster" {
@@ -1434,11 +1437,11 @@ func (r *BackupRunReconciler) runningNote(ctx context.Context, run *backupv1alph
 		}
 		return r.syncGoesOn(ctx, run, item, nil)
 	}
-	done, _, note, err := backupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
-	if err != nil || done {
+	outcome, err := cnpg.BackupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
+	if err != nil || outcome.Phase != cnpg.BackupUnknownPhase {
 		return ""
 	}
-	return note
+	return outcome.Message
 }
 
 // abort ends a run early as Failed. It fails every Pending or Running item

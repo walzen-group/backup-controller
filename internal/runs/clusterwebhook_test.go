@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/cnpg"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -83,7 +84,7 @@ func TestADatabaseRestoreDeletesNoClusterTheWebhookCannotSee(t *testing.T) {
 			readyMessage(run.Status.Conditions), backupv1alpha1.ReasonClusterVersionUnsupported)
 	}
 	checkClusterUnsupported(t, readyMessage(run.Status.Conditions))
-	if _, ok := getUnstructured(t, c, nextGVK(ClusterGVK), ns, pgN); !ok {
+	if _, ok := getUnstructured(t, c, nextGVK(cnpg.ClusterGVK), ns, pgN); !ok {
 		t.Error("the Cluster was deleted")
 	}
 }
@@ -133,7 +134,7 @@ func TestAPlannedRestoreDeletesNoClusterTheWebhookCannotSee(t *testing.T) {
 	if readyReason(after.Status.Conditions) != backupv1alpha1.ReasonClusterVersionUnsupported {
 		t.Errorf("reason = %q, want %s", readyReason(after.Status.Conditions), backupv1alpha1.ReasonClusterVersionUnsupported)
 	}
-	if _, ok := getUnstructured(t, c, nextGVK(ClusterGVK), ns, pgN); !ok {
+	if _, ok := getUnstructured(t, c, nextGVK(cnpg.ClusterGVK), ns, pgN); !ok {
 		t.Error("the Cluster was deleted")
 	}
 }

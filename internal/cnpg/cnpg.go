@@ -1,4 +1,7 @@
-package runs
+// Package cnpg reads CloudNativePG Clusters and creates and reads their
+// Backups for the BackupRun and RestoreRun reconcilers. It holds no
+// decision about a run.
+package cnpg
 
 import (
 	"context"
@@ -11,7 +14,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,20 +32,20 @@ var (
 	BackupGVK  = schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Backup"}
 )
 
-// hibernationAnnotation is the annotation that tells CloudNativePG to stop a
+// HibernationAnnotation is the annotation that tells CloudNativePG to stop a
 // Cluster's database. A Backup of a hibernated Cluster fails, and it stays
 // failed after the Cluster wakes.
-const hibernationAnnotation = "cnpg.io/hibernation"
+const HibernationAnnotation = "cnpg.io/hibernation"
 
-// healthyPhase is the status.phase CloudNativePG reports for a Cluster that
+// HealthyPhase is the status.phase CloudNativePG reports for a Cluster that
 // is up.
-const healthyPhase = "Cluster in healthy state"
+const HealthyPhase = "Cluster in healthy state"
 
-// clusterLabel is the label CloudNativePG puts on each instance pod and PVC it
+// ClusterLabel is the label CloudNativePG puts on each instance pod and PVC it
 // creates for a Cluster. Its value is the Cluster's name.
-const clusterLabel = "cnpg.io/cluster"
+const ClusterLabel = "cnpg.io/cluster"
 
-// instanceLeft looks for an instance pod or PVC of a Cluster that is still in
+// InstanceLeft looks for an instance pod or PVC of a Cluster that is still in
 // the namespace. A RestoreRun calls it after it deletes a Cluster. Until
 // nothing is left, the run waits with reason WaitingForShutdown, and it
 // restarts the workloads it stopped only after that.
@@ -66,8 +68,8 @@ const clusterLabel = "cnpg.io/cluster"
 // which takes up to the Cluster's smartShutdownTimeout. Until then the
 // Cluster's Services still reach the pod, and a new Cluster can't take its
 // names.
-func instanceLeft(ctx context.Context, c client.Reader, namespace, name string) (string, error) {
-	selector := client.MatchingLabels{clusterLabel: name}
+func InstanceLeft(ctx context.Context, c client.Reader, namespace, name string) (string, error) {
+	selector := client.MatchingLabels{ClusterLabel: name}
 	pods := &corev1.PodList{}
 	if err := c.List(ctx, pods, client.InNamespace(namespace), selector); err != nil {
 		return "", fmt.Errorf("list the pods of Cluster %s/%s: %w", namespace, name, err)
@@ -87,7 +89,7 @@ func instanceLeft(ctx context.Context, c client.Reader, namespace, name string) 
 	return "", nil
 }
 
-// getCluster reads one Cluster at the version the API server serves (see
+// GetCluster reads one Cluster at the version the API server serves (see
 // served.Kind).
 //
 // Parameters:
@@ -101,7 +103,7 @@ func instanceLeft(ctx context.Context, c client.Reader, namespace, name string) 
 // CloudNativePG CRDs. A read at a version the API server has stopped serving
 // returns a *served.VersionGoneError, which never reads as a missing
 // Cluster. Any other failed lookup or read is returned wrapped.
-func getCluster(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace, name string) (*unstructured.Unstructured, bool, error) {
+func GetCluster(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace, name string) (*unstructured.Unstructured, bool, error) {
 	cluster, err := served.Get(ctx, c, mapper, ClusterGVK.GroupKind(), types.NamespacedName{Namespace: namespace, Name: name})
 	if apierrors.IsNotFound(err) && !served.IsNotServed(err) {
 		return nil, false, nil
@@ -112,7 +114,7 @@ func getCluster(ctx context.Context, c client.Reader, mapper meta.RESTMapper, na
 	return cluster, true, nil
 }
 
-// enabledClusters lists the Clusters in a namespace that carry the annotation
+// EnabledClusters lists the Clusters in a namespace that carry the annotation
 // backup.wlz.li/enabled: "true", sorted by name. A Cluster that is being
 // deleted is left out.
 //
@@ -126,7 +128,7 @@ func getCluster(ctx context.Context, c client.Reader, mapper meta.RESTMapper, na
 // server has stopped serving is an error (see served.VersionGone): taking it
 // for an empty namespace would plan a run without its databases. Every other
 // failed lookup or list is an error too.
-func enabledClusters(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace string) ([]unstructured.Unstructured, error) {
+func EnabledClusters(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace string) ([]unstructured.Unstructured, error) {
 	clusters, err := served.List(ctx, c, mapper, ClusterGVK.GroupKind(), client.InNamespace(namespace))
 	if served.IsNotServed(err) {
 		return nil, nil
@@ -144,29 +146,29 @@ func enabledClusters(ctx context.Context, c client.Reader, mapper meta.RESTMappe
 	return enabled, nil
 }
 
-// hibernated reports whether a Cluster is hibernated, which means it carries
+// Hibernated reports whether a Cluster is hibernated, which means it carries
 // the annotation cnpg.io/hibernation: "on" and CloudNativePG has stopped its
 // database.
-func hibernated(cluster *unstructured.Unstructured) bool {
-	return cluster.GetAnnotations()[hibernationAnnotation] == "on"
+func Hibernated(cluster *unstructured.Unstructured) bool {
+	return cluster.GetAnnotations()[HibernationAnnotation] == "on"
 }
 
-// clusterPhase returns the Cluster's status.phase as CloudNativePG reports
+// Phase returns the Cluster's status.phase as CloudNativePG reports
 // it, or an empty string when it has none.
 // An empty or unknown phase is a legitimate state, since CloudNativePG
 // reports many phases while a Cluster comes up, and it fails closed: a
-// RestoreRun waits for healthyPhase up to its timeout and never takes
+// RestoreRun waits for HealthyPhase up to its timeout and never takes
 // another phase for a healthy Cluster.
-func clusterPhase(cluster *unstructured.Unstructured) string {
+func Phase(cluster *unstructured.Unstructured) string {
 	phase, _, _ := unstructured.NestedString(cluster.Object, "status", "phase")
 	return phase
 }
 
-// backupName returns the name of the Backup a run creates for a Cluster: the
+// BackupName returns the name of the Backup a run creates for a Cluster: the
 // Cluster's name, a dash, and the first eight characters of the run's UID.
 // Because the name comes from the UID, a restarted controller finds the Backup
 // it made.
-func backupName(cluster string, uid types.UID) string {
+func BackupName(cluster string, uid types.UID) string {
 	short := string(uid)
 	if len(short) > 8 {
 		short = short[:8]
@@ -174,14 +176,14 @@ func backupName(cluster string, uid types.UID) string {
 	return cluster + "-" + short
 }
 
-// ensureBackup creates a CloudNativePG Backup that asks for a base backup of a
+// EnsureBackup creates a CloudNativePG Backup that asks for a base backup of a
 // Cluster through the barman-cloud plugin. It is the same object the plugin's
 // own on-demand path creates.
 //
 // Parameters:
 //   - namespace is the run's namespace, which holds the Cluster.
 //   - cluster is the Cluster's name.
-//   - uid is the run's UID. backupName builds the Backup's name from it.
+//   - uid is the run's UID. BackupName builds the Backup's name from it.
 //
 // It returns the Backup's name. A Backup of that name that already exists
 // counts as created, so a second call for the same run is safe. The Backup
@@ -190,7 +192,7 @@ func backupName(cluster string, uid types.UID) string {
 // from c's RESTMapper. A failed lookup, and a create at a version the API
 // server has stopped serving (see served.VersionGone), return an error and
 // the caller tries again.
-func ensureBackup(ctx context.Context, c client.Client, namespace, cluster string, uid types.UID) (string, error) {
+func EnsureBackup(ctx context.Context, c client.Client, namespace, cluster string, uid types.UID) (string, error) {
 	gvk, err := served.Kind(c.RESTMapper(), BackupGVK.GroupKind())
 	if err != nil {
 		return "", fmt.Errorf("create the Backup of Cluster %s/%s: %w", namespace, cluster, err)
@@ -204,7 +206,7 @@ func ensureBackup(ctx context.Context, c client.Client, namespace, cluster strin
 	}}
 	backup.SetGroupVersionKind(gvk)
 	backup.SetNamespace(namespace)
-	backup.SetName(backupName(cluster, uid))
+	backup.SetName(BackupName(cluster, uid))
 	backup.SetLabels(map[string]string{backupv1alpha1.LabelManagedBy: backupv1alpha1.ManagedByValue})
 	if err := served.VersionGone(c.RESTMapper(), gvk, c.Create(ctx, backup)); err != nil && !apierrors.IsAlreadyExists(err) {
 		return "", fmt.Errorf("create Backup %s/%s: %w", namespace, backup.GetName(), err)
@@ -212,53 +214,81 @@ func ensureBackup(ctx context.Context, c client.Client, namespace, cluster strin
 	return backup.GetName(), nil
 }
 
-// backupResult reads the status.phase of the Backup with the given name.
+// BackupPhase is the state of a CloudNativePG Backup. BackupResult gets it
+// from status.phase.
+type BackupPhase int
+
+const (
+	// BackupWaiting is a Backup that has no phase yet, or a phase of
+	// CloudNativePG 1.30 that can continue: pending, started, running,
+	// finalizing or walArchivingFailing.
+	BackupWaiting BackupPhase = iota
+	// BackupUnknownPhase is a Backup whose status.phase is not a phase of
+	// CloudNativePG 1.30. The run waits for completed or failed.
+	BackupUnknownPhase
+	// BackupCompleted is a Backup in the phase completed.
+	BackupCompleted
+	// BackupFailed is a Backup in the phase failed or invalid backup
+	// definition. CloudNativePG does not continue such a Backup.
+	BackupFailed
+)
+
+// BackupOutcome is the result that BackupResult gets from a Backup.
+type BackupOutcome struct {
+	// Phase is the state of the Backup.
+	Phase BackupPhase
+	// Message is the error from CloudNativePG for BackupFailed, and the
+	// sentence of unknownBackupPhase for BackupUnknownPhase. It is empty for
+	// the other phases.
+	Message string
+}
+
+// BackupResult gets the status.phase of the Backup with the given name.
 //
 // Parameters:
-//   - c reads the Backup, and mapper looks up the version at which the API
-//     server serves it (see served.Get).
-//   - namespace and name name the Backup.
+//   - c reads the Backup. mapper finds the version at which the API server
+//     serves Backup (see served.Get).
+//   - namespace and name identify the Backup.
 //
-// The result done is true once the Backup can go no further, and ok is true
-// when it completed. The phases are those of CloudNativePG 1.30
-// (api/v1/backup_types.go:32-58):
-//   - "completed" is done and ok.
-//   - "failed" and "invalid backup definition" are done and not ok, and
-//     message holds CloudNativePG's error from status.error. CloudNativePG
-//     never goes on with an invalid definition.
-//   - No phase yet, "pending", "started", "running", "finalizing" and
-//     "walArchivingFailing" are not done: CloudNativePG has not reconciled
-//     the Backup yet, is taking it, or retries it, and the run waits up to
+// It returns the outcome of the Backup. It returns an error if it cannot
+// read the Backup. A read at a version that the API server does not serve
+// now is also an error.
+//
+// The phases are those of CloudNativePG 1.30 (api/v1/backup_types.go:32-58):
+//   - "completed" gives BackupCompleted.
+//   - "failed" and "invalid backup definition" give BackupFailed. The
+//     message is the error from status.error. CloudNativePG does not
+//     continue a Backup with an invalid definition.
+//   - No phase, "pending", "started", "running", "finalizing" and
+//     "walArchivingFailing" give BackupWaiting. In these phases,
+//     CloudNativePG has not reconciled the Backup yet, makes it, or tries it
+//     again. The run waits up to its timeout.
+//   - Any other value gives BackupUnknownPhase. The message names
+//     status.phase and the value (see unknownBackupPhase). A new
+//     CloudNativePG release can add a phase that does not change the
+//     behaviour that the run uses. Thus the run waits for completed or
+//     failed. The run shows the phase in its Ready message while it waits.
+//     It also shows the phase in the message of the item if the run gets to
 //     its timeout.
-//   - Any other value is not done, and message names status.phase and the
-//     value (see unknownBackupPhase). A CloudNativePG release may add a
-//     phase that changes nothing the run relies on, so the run waits for
-//     completed or failed. It names the phase in its Ready message while it
-//     waits, and in the item's message when it reaches its timeout.
-//
-// For a Backup that is not done, message is empty in every known phase.
-//
-// It returns an error when the Backup can't be read, a read at a version the
-// API server has stopped serving included.
-func backupResult(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace, name string) (done, ok bool, message string, err error) {
+func BackupResult(ctx context.Context, c client.Reader, mapper meta.RESTMapper, namespace, name string) (BackupOutcome, error) {
 	backup, err := served.Get(ctx, c, mapper, BackupGVK.GroupKind(), types.NamespacedName{Namespace: namespace, Name: name})
 	if err != nil {
-		return false, false, "", fmt.Errorf("get Backup %s/%s: %w", namespace, name, err)
+		return BackupOutcome{}, fmt.Errorf("get Backup %s/%s: %w", namespace, name, err)
 	}
 	phase, _, _ := unstructured.NestedString(backup.Object, "status", "phase")
 	switch phase {
 	case "completed":
-		return true, true, "", nil
+		return BackupOutcome{Phase: BackupCompleted}, nil
 	case "failed", "invalid backup definition":
 		message, _, _ := unstructured.NestedString(backup.Object, "status", "error")
 		if message == "" {
 			message = fmt.Sprintf("the Backup %s/%s reports status.phase %q", namespace, name, phase)
 		}
-		return true, false, message, nil
+		return BackupOutcome{Phase: BackupFailed, Message: message}, nil
 	case "", "pending", "started", "running", "finalizing", "walArchivingFailing":
-		return false, false, "", nil
+		return BackupOutcome{Phase: BackupWaiting}, nil
 	}
-	return false, false, unknownBackupPhase(namespace, name, phase), nil
+	return BackupOutcome{Phase: BackupUnknownPhase, Message: unknownBackupPhase(namespace, name, phase)}, nil
 }
 
 // unknownBackupPhase returns the sentence for a Backup whose status.phase is
@@ -274,7 +304,3 @@ func unknownBackupPhase(namespace, name, phase string) string {
 	return fmt.Sprintf("CloudNativePG reports status.phase %q on Backup %s/%s, which is not a phase of CloudNativePG 1.30; "+
 		"the run waits for completed or failed up to its timeout (see docs/compatibility.md)", phase, namespace, name)
 }
-
-// newTime returns a pointer to a copy of t, so a caller can set a *metav1.Time
-// field from a function's result in one expression.
-func newTime(t metav1.Time) *metav1.Time { return &t }
