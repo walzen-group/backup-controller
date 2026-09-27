@@ -347,3 +347,39 @@ func TestAnIntoRestoreFromARepositoryNamesTheInPlaceShape(t *testing.T) {
 		}
 	}
 }
+
+// A claim with the spec.into name that someone else creates between the
+// run's last read and its own create ends the run Failed: the create finds
+// the name taken, and the run creates no restore Job, whose --delete would
+// empty that claim. The foreign claim is left as it was.
+func TestAnIntoRestoreRefusesAClaimCreatedAtItsCreate(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
+	restoreStep(t, r) // plan
+	foreign := boundClaim("scratch")
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if pvc, ok := obj.(*corev1.PersistentVolumeClaim); ok && pvc.Name == foreign.Name {
+				if err := cl.Create(ctx, foreign); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	restoreStep(t, r)
+	r.Client = c
+	run := stepUntilFinished(t, r, c, 3)
+
+	if jobs := restoreJobs(t, c); len(jobs) != 0 {
+		t.Errorf("restore Jobs = %d, want none on a claim the run did not create", len(jobs))
+	}
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
+		!strings.Contains(readyMessage(run.Status.Conditions), "claim scratch already exists and this run did not create it") {
+		t.Fatalf("phase = %q, message = %q; want Failed naming the claim", run.Status.Phase, readyMessage(run.Status.Conditions))
+	}
+	after := &corev1.PersistentVolumeClaim{}
+	get(t, c, ns, foreign.Name, after)
+	if after.ResourceVersion != foreign.ResourceVersion || len(after.OwnerReferences) != 0 || after.DeletionTimestamp != nil {
+		t.Errorf("claim = %+v, want the foreign claim untouched", after.ObjectMeta)
+	}
+}
