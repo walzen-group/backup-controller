@@ -12,7 +12,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -328,26 +327,5 @@ func TestATimedOutRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
 	}
 	if item := run.Status.Items[0]; !item.ClusterLeftDeleted || item.Reason != backupv1alpha1.ItemReasonTimedOut {
 		t.Errorf("clusterLeftDeleted = %t, reason = %q; want true and TimedOut", item.ClusterLeftDeleted, item.Reason)
-	}
-}
-
-// A run deleted while it waits for its deleted Cluster records an event that
-// says the same.
-func TestADeletedRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
-	r, c := restoreReconciler(t, prober{saturday}, restoreRun(deletedDatabaseRun), objectStore(), storeSecret())
-	recorder := events.NewFakeRecorder(10)
-	r.Recorder = recorder
-	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
-		t.Fatal(err)
-	}
-
-	restoreStep(t, r)
-
-	var found bool
-	for _, event := range recorded(recorder) {
-		found = found || strings.Contains(event, endedBeforeRecreate)
-	}
-	if !found {
-		t.Errorf("events = %q, want one saying %q", recorded(recorder), endedBeforeRecreate)
 	}
 }

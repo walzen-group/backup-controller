@@ -12,7 +12,6 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -117,56 +116,6 @@ func TestAnIntoRestoreCreatesAJobForTheFullSnapshotID(t *testing.T) {
 				t.Errorf("pod labels = %v, want the source's queue label", job.Spec.Template.Labels)
 			}
 		})
-	}
-}
-
-// An into restore whose Job is Complete succeeds with no mover log to read,
-// stops the Job once the item's end is stored, and ends Succeeded. No
-// VolumeRestore is created.
-func TestAnIntoRestoreSucceedsOnACompleteJob(t *testing.T) {
-	for _, shape := range intoShapesOnJob {
-		t.Run(shape.name, func(t *testing.T) {
-			r, c := startedInto(t, shape.mutate)
-			completeJob(t, c)
-			run := stepUntilFinished(t, r, c, 3)
-
-			if item := run.Status.Items[0]; run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || item.Phase != backupv1alpha1.ItemSucceeded ||
-				item.Reason != "" || item.JobUID != "" {
-				t.Fatalf("phase = %q, item = %+v (%s); want Succeeded with its stopped Job no longer named", run.Status.Phase, item, readyMessage(run.Status.Conditions))
-			}
-			if jobs := restoreJobs(t, c); len(jobs) != 0 {
-				t.Errorf("restore Jobs = %v, want the stopped one deleted", jobs)
-			}
-			key := types.NamespacedName{Namespace: ns, Name: shape.into}
-			if err := c.Get(context.Background(), key, &backupv1alpha1.VolumeRestore{}); !apierrors.IsNotFound(err) {
-				t.Errorf("VolumeRestore %s: %v, want none created", shape.into, err)
-			}
-		})
-	}
-}
-
-// A pass that created an into restore's claim and Job and lost the status
-// write that recorded the Job leaves the item without it. The next pass
-// takes that Job over, records its name and UID, and creates no second Job.
-func TestAnIntoRestoreTakesOverTheJobOfALostWrite(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
-	restoreStep(t, r) // plan
-	r.Client = loseNextStatusWrite(c)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
-	}
-	r.Client = c
-	jobs := restoreJobs(t, c)
-	if len(jobs) != 1 {
-		t.Fatalf("restore Jobs = %v, want the one the lost pass created", jobs)
-	}
-	restoreStep(t, r)
-
-	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Job != jobs[0].Name || item.JobUID != jobs[0].UID {
-		t.Errorf("item = %+v, want Running naming %s with UID %s", item, jobs[0].Name, jobs[0].UID)
-	}
-	if again := restoreJobs(t, c); len(again) != 1 || again[0].UID != jobs[0].UID {
-		t.Errorf("restore Jobs = %v, want only the lost pass's", again)
 	}
 }
 

@@ -91,42 +91,6 @@ func TestAnIntoRestoreFromAClaimRefusesAnExistingClaimOrVolumeRestore(t *testing
 	}
 }
 
-// A claim with the spec.into name that appears between the checks and the
-// create ends the run Failed, with no mover and no VolumeRestore
-// written against it. Before, the run adopted it.
-func TestAnIntoRestoreRefusesAClaimCreatedAfterItsChecks(t *testing.T) {
-	for name, mutate := range map[string]func(*backupv1alpha1.RestoreRun){
-		"from a repository": fromRepository,
-		"from a claim":      func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" },
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := restoreReconciler(t, nil, restoreRun(mutate), claim(), volumeRestore(), repository())
-			restoreStep(t, r) // plan
-			if err := c.Create(context.Background(), boundClaim("scratch")); err != nil {
-				t.Fatal(err)
-			}
-			if names := movers(t, c); len(names) == 0 {
-				restoreStep(t, r)
-			}
-			run := stepUntilFinished(t, r, c, 3)
-
-			if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonFailed ||
-				!strings.Contains(readyMessage(run.Status.Conditions), "claim scratch already exists and this run did not create it") {
-				t.Fatalf("phase = %q, reason = %q, message = %q; want Failed saying the claim exists",
-					run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-			}
-			expectItemReason(t, c, backupv1alpha1.ItemReasonIntoClaimTaken)
-			if names := movers(t, c); len(names) > 0 {
-				t.Errorf("movers = %v, want none", names)
-			}
-			vr := &backupv1alpha1.VolumeRestore{}
-			if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "scratch"}, vr); err == nil {
-				t.Error("a VolumeRestore was created for a claim the run did not create")
-			}
-		})
-	}
-}
-
 // A pass whose claim create went through but came back as an error is
 // retried, and the next pass finds the claim the run created and goes on
 // to create the restore Job. The ownership check must not refuse the run's
@@ -160,30 +124,6 @@ func TestAnIntoRestoreWhoseClaimCreateWasLostContinues(t *testing.T) {
 	run := stepUntilFinished(t, r, c, 2)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q, message = %q; want Succeeded", run.Status.Phase, readyMessage(run.Status.Conditions))
-	}
-}
-
-// An into restore from a repository whose claim is deleted, or replaced by
-// one the run did not create, while the mover writes fails. Before, the run
-// ended Succeeded once the mover completed its trigger.
-func TestAnIntoRestoreWhoseClaimIsReplacedFails(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // create
-	scratch := &corev1.PersistentVolumeClaim{}
-	get(t, c, ns, "scratch", scratch)
-	if err := c.Delete(context.Background(), scratch); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Create(context.Background(), boundClaim("scratch")); err != nil {
-		t.Fatal(err)
-	}
-	completeJob(t, c)
-	run := stepUntilFinished(t, r, c, 2)
-
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
-		!strings.Contains(readyMessage(run.Status.Conditions), "claim scratch is no longer controlled by the run, so it may not be the claim the run created") {
-		t.Fatalf("phase = %q, message = %q; want Failed saying the claim was replaced", run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
 }
 

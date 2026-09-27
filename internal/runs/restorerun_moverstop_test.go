@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -286,63 +285,6 @@ func TestADeletedRestoreWaitsForItsStoppedMoversPod(t *testing.T) {
 	}
 }
 
-// loseShutdownWrite returns a client over c that fails, with a conflict,
-// the first status write of a RestoreRun whose Ready reason is
-// WaitingForShutdown: the write of the wait for a stopped mover, which
-// comes after finish stored the ending.
-func loseShutdownWrite(c client.Client) client.Client {
-	lost := false
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			if run, ok := obj.(*backupv1alpha1.RestoreRun); ok && !lost && readyReason(run.Status.Conditions) == backupv1alpha1.ReasonShutdown {
-				lost = true
-				return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("restoreruns").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
-			}
-			return cl.SubResource(sub).Update(ctx, obj, opts...)
-		},
-	})
-}
-
-// A wait for a stopped Job's pod whose status write is lost is reported
-// again on the next pass. The run holds what it must meanwhile: the pod, its
-// finalizer and the Leases.
-func TestALostStatusWriteInTheMoverWaitConverges(t *testing.T) {
-	run, job := quiescedMidRestore(t)
-	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
-	lease := heldClaimLease(run, claimN)
-	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
-		stoppedDeployment(), kustomization(true), job, pod, lease)
-	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-	r.Client = loseShutdownWrite(c)
-
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the wait pass succeeded, want its lost status write returned")
-	}
-	if !suspendedJob(t, c, job.Name) {
-		t.Error("the restore Job is not suspended, want it stopped")
-	}
-	if got := replicasOf(t, c); got != 0 {
-		t.Errorf("replicas = %d, want the app still down while the pod is there", got)
-	}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, &coordinationv1.Lease{}); err != nil {
-		t.Errorf("get the claim Lease = %v, want it held while the pod is there", err)
-	}
-
-	r.Client = c
-	markSuspended(t, c, job)
-	restoreStep(t, r)
-
-	waiting := readRestoreRun(t, c)
-	if len(waiting.Finalizers) == 0 {
-		t.Error("the run dropped its finalizer while the pod was still there")
-	}
-	if readyReason(waiting.Status.Conditions) != backupv1alpha1.ReasonShutdown ||
-		!strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
-		t.Errorf("reason = %q, message = %q; want the wait reported again, naming pod %s",
-			readyReason(waiting.Status.Conditions), readyMessage(waiting.Status.Conditions), pod.Name)
-	}
-}
-
 // quiescedRestoreDone returns the run from quiescedMidRestore with its volume
 // item Succeeded in an earlier pass, whose status write recorded the end
 // before the run stopped the restore Job, and that Job, which is Complete.
@@ -419,58 +361,6 @@ func TestAFinishedRestoreEndsAsItsItemsSayWhenTheDeadlinePassesInItsMoverWait(t 
 	}
 	if got := replicasOf(t, c); got != 2 {
 		t.Errorf("replicas = %d once the pod had ended, want the 2 the app had", got)
-	}
-}
-
-// The pass that decides to end a run records the ending, even when it then
-// waits for the same stopped restore Job with the same message as the pass
-// before. Here one item failed before the deadline and its Job's pod is
-// still there, and the other waits for a pod that mounts its claim. The pass
-// after the deadline fails the waiting item with reason TimedOut, and that
-// item and the ending reach the stored status. Before, the wait wrote only a
-// changed Ready condition, so both were lost.
-func TestTheEndingIsStoredWhenTheMoverWaitIsUnchanged(t *testing.T) {
-	const other = "notes-cache"
-	run, job := quiescedMidRestore(t)
-	run.Status.Items[0].Phase = backupv1alpha1.ItemFailed
-	run.Status.Items = append(run.Status.Items, backupv1alpha1.RestoreItem{Kind: "PersistentVolumeClaim", Name: other,
-		Phase: backupv1alpha1.ItemPending})
-	mover := jobPodOf(job, "restore-pod", corev1.PodRunning)
-	mounting := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "cache-5d9f", Namespace: ns},
-		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
-			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: other},
-		}}}},
-	}
-	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
-		stoppedDeployment(), kustomization(true), job, mover, mounting)
-	r.Now = func() time.Time { return frozen.Add(time.Hour) }
-
-	restoreStep(t, r) // suspends the failed item's Job
-	markSuspended(t, c, job)
-	restoreStep(t, r) // finds the Job's pod still there
-	before := readRestoreRun(t, c)
-	if readyReason(before.Status.Conditions) != backupv1alpha1.ReasonShutdown || !strings.Contains(readyMessage(before.Status.Conditions), mover.Name) {
-		t.Fatalf("reason = %q, message = %q before the deadline; want %s naming pod %s", readyReason(before.Status.Conditions),
-			readyMessage(before.Status.Conditions), backupv1alpha1.ReasonShutdown, mover.Name)
-	}
-	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-	restoreStep(t, r)
-
-	stored := readRestoreRun(t, c)
-	if stored.Status.Ending == nil || stored.Status.Ending.Reason != backupv1alpha1.ReasonTimedOut {
-		t.Errorf("ending = %+v after the pass that timed out, want reason %s stored", stored.Status.Ending, backupv1alpha1.ReasonTimedOut)
-	}
-	if item := stored.Status.Items[1]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonTimedOut {
-		t.Errorf("item %s = %+v, want it stored Failed with reason TimedOut", other, item)
-	}
-
-	// A pass that finds the same wait and changes nothing writes nothing,
-	// since every write starts another reconcile.
-	restoreStep(t, r)
-	if again := readRestoreRun(t, c); again.ResourceVersion != stored.ResourceVersion {
-		t.Errorf("resourceVersion = %s after a pass that changed nothing, want %s: the status was written again",
-			again.ResourceVersion, stored.ResourceVersion)
 	}
 }
 

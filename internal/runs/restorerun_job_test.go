@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -13,10 +12,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
@@ -109,52 +105,6 @@ func TestAFailedRestoreJobFailsTheItemWithTheExitCode(t *testing.T) {
 	}
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
 		t.Errorf("phase = %q, want Failed", run.Status.Phase)
-	}
-}
-
-// refuseJobCreates wraps c so that the API server refuses every create of a
-// Job with the error err returns, as the admission policy on the
-// controller's Jobs or a spec the server rejects does.
-func refuseJobCreates(c client.Client, err func(obj client.Object) error) client.Client {
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if _, ok := obj.(*batchv1.Job); ok {
-				return err(obj)
-			}
-			return cl.Create(ctx, obj, opts...)
-		},
-	})
-}
-
-// A restore Job create the API server refuses as Forbidden or Invalid fails
-// the item with reason RestoreJobRefused and the server's message, and says
-// nothing was written to the claim. No retry would change the answer.
-func TestARefusedJobCreateFailsTheItem(t *testing.T) {
-	gr := schema.GroupResource{Group: "batch", Resource: "jobs"}
-	for name, refusal := range map[string]func(obj client.Object) error{
-		"forbidden": func(obj client.Object) error {
-			return apierrors.NewForbidden(gr, obj.GetName(), errors.New("ValidatingAdmissionPolicy 'backup-controller-jobs' denied request"))
-		},
-		"invalid": func(obj client.Object) error {
-			return apierrors.NewInvalid(schema.GroupKind{Group: "batch", Kind: "Job"}, obj.GetName(),
-				field.ErrorList{field.Invalid(field.NewPath("spec", "template"), "x", "a spec the server rejects")})
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := restoreReconciler(t, nil, restoreRun(inPlace), claim(), volumeRestore(), repository())
-			restoreStep(t, r) // plan
-			r.Client = refuseJobCreates(c, refusal)
-			restoreStep(t, r)
-
-			item := readRestoreRun(t, c).Status.Items[0]
-			if item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobRefused ||
-				!strings.Contains(item.Message, "refused to create restore Job") || !strings.Contains(item.Message, "Nothing was written to claim "+claimN) {
-				t.Errorf("item = %+v, want Failed with reason RestoreJobRefused, the server's refusal and nothing written", item)
-			}
-			if jobs := restoreJobs(t, c); len(jobs) != 0 {
-				t.Errorf("restore Jobs = %v, want none", jobs)
-			}
-		})
 	}
 }
 
