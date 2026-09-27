@@ -253,9 +253,8 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 // while this run repeats its restart.
 //
 // Right before it drops the finalizer, finalize records the
-// ClusterLeftDeleted events (see announceLeftDeleted). A failed read of a
-// Cluster comes back as an error, and the finalizer stays until a retry
-// gets past it.
+// ClusterLeftDeleted events (see announceLeftDeleted). These events only
+// inform a person, so a failed read of a Cluster never keeps the finalizer.
 func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
@@ -276,9 +275,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err))
 	}
-	if err := r.announceLeftDeleted(ctx, run); err != nil {
-		return ctrl.Result{}, err
-	}
+	r.announceLeftDeleted(ctx, run)
 	if err := dropFinalizer(ctx, r.Client, run); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -305,16 +302,15 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 //     that records status.items[].clusterLeftDeleted, which a run that timed
 //     out or aborted set when it failed the item (see leftDeleted).
 //
-// It returns the error of a failed read of a Cluster, and nil otherwise. It
-// records nothing when the reconciler has no event recorder.
+// It records nothing when the reconciler has no event recorder.
 //
 // The run is about to go, so the event is the only place that note can
 // appear. It reads the Cluster first: one its owner has created again, with
 // a UID other than the item's clusterUID, gets no event, since the note
 // speaks of a creation still to come.
-func (r *RestoreRunReconciler) announceLeftDeleted(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+func (r *RestoreRunReconciler) announceLeftDeleted(ctx context.Context, run *backupv1alpha1.RestoreRun) {
 	if r.Recorder == nil {
-		return nil
+		return
 	}
 	for _, item := range run.Status.Items {
 		if !leftDeleted(item) {
@@ -324,13 +320,18 @@ func (r *RestoreRunReconciler) announceLeftDeleted(ctx context.Context, run *bac
 		// about its next creation would be wrong.
 		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 		if err != nil {
-			return err
+			// The event only informs a person. A read that fails, for
+			// example because CloudNativePG is not installed now or the
+			// controller lost its access to Clusters, must not keep the
+			// finalizer: the run skips the event and logs the error.
+			log.FromContext(ctx).Error(err, "could not read the Cluster the run left deleted; the run records no ClusterLeftDeleted event for it",
+				"namespace", run.Namespace, "name", run.Name, "cluster", item.Name)
+			continue
 		}
 		if !found || cluster.GetUID() == item.ClusterUID {
 			r.Recorder.Eventf(run, nil, corev1.EventTypeWarning, "ClusterLeftDeleted", "Restore", "%s", fitNote(clusterLeftDeleted(item.Name)))
 		}
 	}
-	return nil
 }
 
 // releaseFailed reports on the run that it could not stop one of its movers,
