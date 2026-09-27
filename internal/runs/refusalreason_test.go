@@ -52,6 +52,17 @@ func deleteVolumeRestore(t *testing.T, c client.Client) {
 	}
 }
 
+// dropRepository removes spec.repository from the RestoreRun back-to-monday,
+// so its spec names neither a claim nor a repository.
+func dropRepository(t *testing.T, c client.Client) {
+	t.Helper()
+	run := readRestoreRun(t, c)
+	run.Spec.Repository = ""
+	if err := c.Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // deleteRepositorySecret deletes the repository Secret, which the case
 // seeded.
 func deleteRepositorySecret(t *testing.T, c client.Client) {
@@ -122,11 +133,11 @@ func restoreItemAfter(t *testing.T, run *backupv1alpha1.RestoreRun, between func
 // sourceSettingsFor, volumeAffinity, the quiesce pre-check's foreign
 // source, startItem's hibernated and missing Cluster, checkVolume's
 // repositoryFor, the in-place quiesce pre-check's Lease of a repository
-// Secret that is gone, the into start checks (repositoryFor and the Lease
-// of a repository Secret that is gone), and restoreDatabase's
-// clustersRestoredElsewhere. An item that fails for a reason not yet typed
-// records no reason, even when another item failed with one in the same
-// pass.
+// Secret that is gone, the into start checks (repositoryFor, the Lease of
+// a repository Secret that is gone, and a spec that no longer names a
+// source), and restoreDatabase's clustersRestoredElsewhere. An item that
+// fails for a reason not yet typed records no reason, even when another
+// item failed with one in the same pass.
 func TestARefusedItemRecordsItsReason(t *testing.T) {
 	quiescing := backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true })
 	unbound := claim()
@@ -236,6 +247,11 @@ func TestARefusedItemRecordsItsReason(t *testing.T) {
 			return restoreItemAfter(t, restoreRun(fromRepository), deleteRepositorySecret, repository())
 		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonRepositorySecretMissing,
 			"repository Secret " + repoN + " does not exist in this namespace, so the run can't take the Lease that keeps other runs' movers off the repository" + intoNothingWrittenEnd}},
+
+		{"into RestoreRun from a repository, spec.repository removed after plan", func(t *testing.T) endedItem {
+			return restoreItemAfter(t, restoreRun(fromRepository), dropRepository, repository())
+		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonSpecInvalid,
+			"one of spec.claim and spec.repository is required" + intoNothingWrittenEnd}},
 
 		{"RestoreRun of a Cluster another RestoreRun holds, found at restoreDatabase", func(t *testing.T) endedItem {
 			started := metav1.NewTime(frozen)
