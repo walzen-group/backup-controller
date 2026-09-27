@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -311,4 +312,169 @@ func (c *Callbacks) populate(ctx context.Context, r restore) error {
 	default:
 		return c.followJob(ctx, r, job)
 	}
+}
+
+// errJobOfEarlierPrime is a claim whose restore Job was built for an earlier
+// prime claim, one the library has since created again under the same name.
+// That Job's volume went with its prime, so nothing it did counts for the
+// prime the library has now.
+var errJobOfEarlierPrime = errors.New("its restore Job filled an earlier prime claim; it is stopped, and a new one is created once it is gone")
+
+// ownedByPrime reports whether a restore Job was built for a prime claim,
+// by the owner reference createJob gives every Job.
+//
+// Parameters:
+//   - job is the claim's Job, as just read.
+//   - prime is the prime claim the library passes now.
+//
+// The library creates a prime claim again under the same name, with a new
+// UID, when the old one is gone before the claim is filled. The owner
+// reference carries the UID of the prime the Job was built for, so a Job of
+// the earlier prime has none that names the prime of now.
+func ownedByPrime(job *batchv1.Job, prime *corev1.PersistentVolumeClaim) bool {
+	for _, owner := range job.OwnerReferences {
+		if owner.UID == prime.UID {
+			return true
+		}
+	}
+	return false
+}
+
+// stopEarlierJob stops a restore Job that was built for an earlier prime
+// claim, so that a Job for the prime of now can take its name.
+//
+// Parameters:
+//   - r is the claim's restore.
+//   - job is the Job of the earlier prime, as Populate just read it, not
+//     being deleted.
+//
+// It always returns an error, so the library requeues the claim and does
+// not call Complete in this sync: a *stoppingError while a pod of the Job
+// may still write, the error of the stop, or errJobOfEarlierPrime once the
+// stop has deleted the Job.
+//
+// restorejob.Stop suspends the Job when it is not finished, waits for its
+// pods to end and deletes it by its UID, so a Job created under the name
+// since the read is left alone. The Job is never recorded on the prime of
+// now and never resumed, and a later sync creates the new Job once this
+// one is gone.
+func (c *Callbacks) stopEarlierJob(ctx context.Context, r restore, job *batchv1.Job) error {
+	state, err := restorejob.Stop(ctx, c.operations, restorejob.RefOf(job))
+	switch {
+	case err != nil:
+		return claimError(r.claim, fmt.Errorf("%w; stopping it: %w", errJobOfEarlierPrime, err))
+	case !state.Stopped:
+		return claimError(r.claim, &stoppingError{state: state})
+	default:
+		return claimError(r.claim, errJobOfEarlierPrime)
+	}
+}
+
+// mayResume reports whether a recorded restore Job may start its pod, from
+// the app claim and the prime claim's volume as the API server holds them
+// now.
+//
+// Parameters:
+//   - r is the claim's restore.
+//   - prime is the prime claim, read fresh by the caller.
+//
+// It returns false when the app claim is gone, was created again, is being
+// deleted, or names a volume, and when the prime claim's volume no longer
+// names the prime claim in its claimRef. It returns an error when a read
+// fails.
+//
+// A deleted claim's Job is Cleanup's or the orphan reconciler's to stop. Once
+// Complete has returned true, the library points the prime's volume at the
+// app claim, and the PV controller then binds the app claim to it. A Job
+// resumed in that window would write the app's volume.
+func (c *Callbacks) mayResume(ctx context.Context, r restore, prime *corev1.PersistentVolumeClaim) (bool, error) {
+	claim, err := c.operations.GetClaim(ctx, r.claim.Namespace, r.claim.Name)
+	if err != nil {
+		return false, fmt.Errorf("read claim %s/%s: %w", r.claim.Namespace, r.claim.Name, err)
+	}
+	if claim.UID != r.claim.UID || claim.DeletionTimestamp != nil || claim.Spec.VolumeName != "" {
+		return false, nil
+	}
+	if prime.Spec.VolumeName == "" {
+		return false, nil
+	}
+	volume, err := c.operations.GetVolume(ctx, prime.Spec.VolumeName)
+	if err != nil {
+		return false, fmt.Errorf("read volume %s of prime claim %s/%s: %w", prime.Spec.VolumeName, prime.Namespace, prime.Name, err)
+	}
+	ref := volume.Spec.ClaimRef
+	return ref != nil && ref.Namespace == prime.Namespace && ref.Name == prime.Name && ref.UID == prime.UID, nil
+}
+
+// jobRefusedError is a restore Job create or resume that the API server
+// refused with 403 Forbidden or 422 Invalid, such as an admission policy
+// that refuses the Job's pod security context. The same request fails the
+// same way until the VolumeRestore or the cluster changes.
+type jobRefusedError struct {
+	// err is the failed call's error, with the API server's answer.
+	err error
+}
+
+// Error returns the failed call's error.
+func (e *jobRefusedError) Error() string {
+	return e.err.Error()
+}
+
+// Unwrap returns the failed call's error.
+func (e *jobRefusedError) Unwrap() error {
+	return e.err
+}
+
+// uidField is the path of an object's UID in the API server's field errors.
+var uidField = field.NewPath("metadata", "uid").String()
+
+// jobReplaced reports whether a failed resume met a restore Job created
+// again under the same name since the resumed one was read.
+//
+// Parameters:
+//   - err is the failed resume's error, wrapped with what the call was.
+//
+// It returns true only for a 422 Invalid whose typed status carries a
+// FieldValueInvalid cause on field metadata.uid. The resume is a merge
+// patch that carries the UID of the Job as read, and the API server answers
+// a patch that would change a stored object's UID with that cause
+// (ValidateObjectMetaAccessorUpdate, k8s.io/apimachinery@v0.36.0
+// pkg/api/validation/objectmeta.go:332). That answer says the Job was
+// replaced, so the caller retries without the RestoreJobRefused reason, and
+// the next sync reads the new Job.
+func jobReplaced(err error) bool {
+	var status apierrors.APIStatus
+	if !apierrors.IsInvalid(err) || !errors.As(err, &status) || status.Status().Details == nil {
+		return false
+	}
+	for _, cause := range status.Status().Details.Causes {
+		if cause.Type == metav1.CauseTypeFieldValueInvalid && cause.Field == uidField {
+			return true
+		}
+	}
+	return false
+}
+
+// jobCallError returns the error of a failed restore Job create or resume,
+// and records a refusal on the VolumeRestore's status first.
+//
+// Parameters:
+//   - r is the claim's restore.
+//   - err is the failed call's error, wrapped with what the call was.
+//
+// It returns err unchanged unless the API server refused the call with 403
+// Forbidden or 422 Invalid, which apierrors reads from the typed status of
+// the error. For a refusal it marks the claim Failed with reason
+// RestoreJobRefused and the API server's answer, and returns a
+// *jobRefusedError, or the error of that status write. Either way the
+// library requeues the claim and the next sync tries the call again.
+func (c *Callbacks) jobCallError(ctx context.Context, r restore, err error) error {
+	if !apierrors.IsForbidden(err) && !apierrors.IsInvalid(err) {
+		return err
+	}
+	refusal := &jobRefusedError{err: err}
+	if err := c.markFailed(ctx, r.vr, r.claim, backupv1alpha1.ReasonRestoreJobRefused, refusal); err != nil {
+		return err
+	}
+	return claimError(r.claim, refusal)
 }

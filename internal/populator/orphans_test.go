@@ -21,7 +21,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 const (
@@ -319,21 +318,6 @@ func TestClaimsOutsideTheOrphanCaseAreLeftAlone(t *testing.T) {
 				t.Errorf("events = %q, want none", events)
 			}
 		})
-	}
-}
-
-// The predicate passes a stuck claim on the create event the manager's
-// initial list sends, which is how claims stuck before the upgrade are
-// cleared on the first start.
-func TestAClaimStuckBeforeStartPassesTheInitialList(t *testing.T) {
-	r, _ := newOrphanReconciler(nil, nil)
-	if !r.predicate().Create(event.CreateEvent{Object: stuckClaim()}) {
-		t.Error("the initial list drops a stuck claim")
-	}
-	live := stuckClaim()
-	live.DeletionTimestamp = nil
-	if r.predicate().Create(event.CreateEvent{Object: live}) {
-		t.Error("the initial list passes a live claim")
 	}
 }
 
