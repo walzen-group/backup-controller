@@ -154,6 +154,35 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return r.restore(ctx, run)
 }
 
+// restore makes one pass over a RestoreRun past its checks: through
+// restoreIntoEmptyClaim for an into restore, and through work otherwise.
+//
+// Parameters:
+//   - run is the RestoreRun, with a phase, no ending recorded, and not
+//     being deleted.
+//
+// It returns what the pass returns. When the pass failed on a VolSync
+// request at a version the API server no longer serves, the error is also
+// shown on the run's Ready condition (see showVolSyncWait), and an error of
+// that status write is joined to it.
+//
+// The run changes nothing on that error and retries it on every pass, with
+// an app it has stopped kept stopped, until its spec.timeout: the deadline
+// check at the start of each pass needs no VolSync object, so the run then
+// ends TimedOut, stops its restore Jobs and gives the app back.
+func (r *RestoreRunReconciler) restore(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
+	pass := r.work
+	if run.Spec.Into != "" {
+		pass = r.restoreIntoEmptyClaim
+	}
+	result, err := pass(ctx, run)
+	kind, unserved := volsyncUnserved(err)
+	if !unserved {
+		return result, err
+	}
+	return result, errors.Join(err, r.showVolSyncWait(ctx, run, kind, err))
+}
+
 // start makes the first pass over a new run: it checks the installed
 // RestoreRun CRD, then plans the run.
 //
