@@ -114,11 +114,9 @@ type fakeOperations struct {
 	// jobCreates counts the restore Job creates sent, those the API server
 	// refused included.
 	jobCreates int
-	// refuseCreate and refuseResume, when set, are the API server's answer
-	// to every restore Job create and every resume, as an admission policy
-	// or a missing grant gives it.
+	// refuseCreate, when set, is the API server's answer to every restore
+	// Job create, as an admission policy or a missing grant gives it.
 	refuseCreate error
-	refuseResume error
 	// beforeResume, when set, runs before each resume is sent, so a test
 	// can change the cluster between Populate's reads and the resume.
 	beforeResume func(context.Context) error
@@ -147,16 +145,12 @@ func (f *fakeOperations) CreateJob(ctx context.Context, job *batchv1.Job) error 
 	return f.Jobs.CreateJob(ctx, job)
 }
 
-// ResumeJob runs beforeResume and sends the resume to the cluster, unless
-// refuseResume is set.
+// ResumeJob runs beforeResume and sends the resume to the cluster.
 func (f *fakeOperations) ResumeJob(ctx context.Context, job *batchv1.Job) error {
 	if f.beforeResume != nil {
 		if err := f.beforeResume(ctx); err != nil {
 			return err
 		}
-	}
-	if f.refuseResume != nil {
-		return f.refuseResume
 	}
 	return f.Jobs.ResumeJob(ctx, job)
 }
