@@ -744,9 +744,29 @@ hack/e2e/cnpg/empty-archive-repair.sh does these steps on the e2e cluster:
 3. It runs step 10.
 4. It recovers a second Cluster from the repaired archive and counts its rows.
 
+### Webhook decisions that follow barman and the plugin
+
+From v0.9.0, the webhook reads a Cluster and its archive with the rules of
+barman and of the barman-cloud plugin. [compatibility.md](compatibility.md)
+cites each rule.
+
+- The store comes from the last `barman-cloud.cloudnative-pg.io` entry in
+  `spec.plugins`. The serverName comes from the last enabled entry that sets
+  it, also when the value is empty. `isWALArchiver` does not decide whether a
+  Cluster archives.
+- A base backup is complete when its `backup.info` has `begin_time` and
+  `end_time`, as in the catalog of the plugin. The `status` field does not
+  count.
+- A prefix holds an archive only when WAL files are under `wals/`, as in
+  `barman-cloud-check-wal-archive`. A prefix with only failed base backups and
+  no WAL now gets an empty database. v0.8.x refused such a Cluster.
+- The webhook refuses an empty database when the ObjectStore status records a
+  completed backup for the serverName and the listing found no archive. The
+  refusal message gives the repair.
+
 ### Ready reasons that are new or mean more
 
-A dashboard or an alert that reads the Ready reason of a run sees three new
+A dashboard or an alert that reads the Ready reason of a run sees four new
 reasons. It also sees seven reasons that cover more cases than before. A
 VolumeRestore has one new reason. api.md has the full table for a
 [BackupRun](api.md#ready-reasons), for a
@@ -755,6 +775,7 @@ VolumeRestore has one new reason. api.md has the full table for a
 
 | Reason | From v0.9.0 |
 | --- | --- |
+| Paused | new: the controller runs with `--pause`. The run changed nothing. It starts when the controller runs without the flag. See [Pause the controller](#pause-the-controller) |
 | CRDOutdated | new: the run ended before it changed anything. The installed CRD of its kind does not have a field that the controller writes, or the controller may not read that CRD |
 | RestartFailed | new: the run could not give its app back. It stays unfinished until it can. The app is still down |
 | ReleaseFailed | new: the app is back. The run stays unfinished until it can release its Leases, its Kueue Workload or a restore Job that it stopped |
