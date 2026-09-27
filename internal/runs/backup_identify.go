@@ -8,7 +8,9 @@ import (
 	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
+	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // syncSkew is how far the clock of the node a mover runs on may differ from
@@ -162,4 +164,43 @@ func (found identified) note() string {
 	}
 	return fmt.Sprintf("the sync also left %s %s from failed attempts; they stay in the repository until retention forgets them",
 		noun, strings.Join(ids, ", "))
+}
+
+// relistAfter is how long a volume item waits after a listing that found no
+// snapshot of its sync before a listing that finds none makes the claim
+// empty. It is pollInterval plus one second, because the status keeps the
+// time of the first listing in whole seconds.
+const relistAfter = pollInterval + time.Second
+
+// noSnapshotListed records one listing of a claim's repository that found no
+// snapshot the item's completed sync wrote, and succeeds the item as an
+// empty claim once two such listings lie far enough apart.
+//
+// Parameters:
+//   - item is the Running volume item whose sync completed. It is changed
+//     in place.
+//   - now is the time of this pass, which the first such listing records
+//     in status.items[].noSnapshotListedAt.
+//
+// VolSync's mover takes no snapshot of a volume that holds nothing but
+// lost+found and still reports success, so a sync with no snapshot in its
+// window backed up an empty claim. An S3 listing can lag the mover's write,
+// though, so one listing that shows no snapshot proves nothing. The first
+// one records its time and keeps the item Running. A later pass lists the
+// repository again (see identifySnapshot), and when that listing, at least
+// relistAfter after the first, still shows no snapshot, the item succeeds
+// with Empty set. A pass sooner than that leaves the item as it is.
+func noSnapshotListed(item *backupv1alpha1.BackupItem, now time.Time) {
+	listed := item.NoSnapshotListedAt
+	switch {
+	case listed == nil:
+		item.NoSnapshotListedAt = newTime(metav1.NewTime(now).Rfc3339Copy())
+		item.Message = fmt.Sprintf("the repository listed no snapshot of the sync at %s; the run lists it again after %s "+
+			"before it takes the volume for empty", now.UTC().Format(time.RFC3339), relistAfter)
+	case now.Before(listed.Add(relistAfter)):
+		// The first listing is too recent for a second to count.
+	default:
+		item.Phase, item.Empty = backupv1alpha1.ItemSucceeded, true
+		item.Message = "the volume held no files, so VolSync took no snapshot"
+	}
 }

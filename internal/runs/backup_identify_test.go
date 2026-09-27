@@ -11,6 +11,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -96,6 +97,16 @@ func volumeRunOver(t *testing.T, list restic.Lister, objects ...client.Object) (
 	return r, c
 }
 
+// listTwice reconciles the run once, and once more relistAfter later, so a
+// sync with no snapshot in its window gets the second listing that makes its
+// claim empty.
+func listTwice(t *testing.T, r *BackupRunReconciler) {
+	t.Helper()
+	step(t, r)
+	r.Now = func() time.Time { return frozen.Add(relistAfter) }
+	step(t, r)
+}
+
 // A sync whose mover logs VolSync did not keep still yields its snapshot:
 // the run finds it in the repository by the window of the sync.
 func TestABackupFindsItsSnapshotWithoutLogs(t *testing.T) {
@@ -137,11 +148,12 @@ func TestTheNewestSnapshotInTheWindowWins(t *testing.T) {
 
 // A sync that completed with no new snapshot in the repository backed up an
 // empty claim: VolSync's mover skips a volume that holds only lost+found and
-// still reports Successful. The item succeeds with Empty set.
+// still reports Successful. Once a second listing, relistAfter later, also
+// shows no snapshot, the item succeeds with Empty set.
 func TestNoSnapshotInTheWindowIsAnEmptyClaim(t *testing.T) {
 	r, c := volumeRunOver(t, snapshots{sunday, monday})
 	completeSync(t, c, frozen.Add(time.Minute), 20*time.Second)
-	step(t, r)
+	listTwice(t, r)
 
 	item := readBackupRun(t, c).Status.Items[0]
 	if item.Phase != backupv1alpha1.ItemSucceeded || !item.Empty || item.Snapshot != "" || item.SnapshotID != "" {
@@ -152,13 +164,83 @@ func TestNoSnapshotInTheWindowIsAnEmptyClaim(t *testing.T) {
 	}
 }
 
+// laggingListing is a restic.Lister whose listing lags the repository by a
+// given number of calls, as an S3 listing can after a write: the first lag
+// calls return the older list, and every later call returns the newer one.
+type laggingListing struct {
+	older, newer snapshots
+	lag, calls   int
+}
+
+// Snapshots returns the older list for the first lag calls and the newer one
+// after that.
+func (l *laggingListing) Snapshots(ctx context.Context, secret *corev1.Secret) ([]restic.Snapshot, error) {
+	l.calls++
+	if l.calls <= l.lag {
+		return l.older.Snapshots(ctx, secret)
+	}
+	return l.newer.Snapshots(ctx, secret)
+}
+
+// A listing that does not show the mover's snapshot yet is no proof of an
+// empty claim. The first pass that finds no snapshot keeps the item Running
+// and records when it listed, and a pass at least pollInterval later lists
+// again. That pass finds the snapshot, and the item records it.
+func TestALaggingListingIsNoEmptyClaim(t *testing.T) {
+	list := &laggingListing{older: snapshots{sunday}, newer: snapshots{sunday, monday}, lag: 1}
+	r, c := volumeRunOver(t, list)
+	completeSync(t, c, monday.Time.Add(2*time.Second), 3*time.Second)
+	step(t, r)
+
+	item := readBackupRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemRunning || item.Empty || item.NoSnapshotListedAt == nil {
+		t.Fatalf("item = %+v after a listing without the snapshot, want it Running with the listing's time recorded", item)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(pollInterval + time.Second) }
+	step(t, r)
+
+	item = readBackupRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemSucceeded || item.Empty || item.SnapshotID != monday.ID || item.NoSnapshotListedAt != nil {
+		t.Fatalf("item = %+v, want Succeeded with snapshot %s", item, monday.ID)
+	}
+}
+
+// Two listings that both show no snapshot of the sync, pollInterval apart,
+// make the claim empty. A pass sooner than that lists again but decides
+// nothing.
+func TestASecondEmptyListingMakesTheClaimEmpty(t *testing.T) {
+	r, c := volumeRunOver(t, snapshots{sunday, monday})
+	completeSync(t, c, frozen.Add(time.Minute), 20*time.Second)
+	step(t, r)
+
+	first := readBackupRun(t, c).Status.Items[0]
+	if first.Phase != backupv1alpha1.ItemRunning || first.Empty || first.NoSnapshotListedAt == nil {
+		t.Fatalf("item = %+v after the first listing, want it Running with the listing's time recorded", first)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(pollInterval / 2) }
+	step(t, r)
+	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Empty ||
+		!item.NoSnapshotListedAt.Equal(first.NoSnapshotListedAt) {
+		t.Fatalf("item = %+v a pass before pollInterval passed, want it Running with the first listing's time", item)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(pollInterval + time.Second) }
+	step(t, r)
+	item := readBackupRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemSucceeded || !item.Empty || item.SnapshotID != "" {
+		t.Fatalf("item = %+v, want Succeeded and Empty after the second empty listing", item)
+	}
+}
+
 // Snapshots in the window that another host wrote, or that hold other
 // paths than /data, are no mover's: a sync with only those in its window
 // took no snapshot.
 func TestASnapshotOfAnotherHostOrPathIsIgnored(t *testing.T) {
 	r, c := volumeRunOver(t, sameTimeRepository(t))
 	completeSync(t, c, sameTimeAt(10, 3, 1), 2*time.Minute+10*time.Second)
-	step(t, r)
+	listTwice(t, r)
 
 	item := readBackupRun(t, c).Status.Items[0]
 	if item.Phase != backupv1alpha1.ItemSucceeded || !item.Empty || item.SnapshotID != "" {
@@ -171,7 +253,7 @@ func TestASnapshotOfAnotherHostOrPathIsIgnored(t *testing.T) {
 func TestARetimedCopyIsNotTheMoversSnapshot(t *testing.T) {
 	r, c := volumeRunOver(t, sameTimeRepository(t))
 	completeSync(t, c, sameTimeAt(9, 0, 2), 3*time.Second)
-	step(t, r)
+	listTwice(t, r)
 
 	item := readBackupRun(t, c).Status.Items[0]
 	if item.Phase != backupv1alpha1.ItemSucceeded || !item.Empty || item.SnapshotID != "" {
@@ -213,7 +295,7 @@ func TestIdentifyWindowAllowsSkew(t *testing.T) {
 			snapshot := moverSnapshot("5a5a5a5a", tc.at)
 			r, c := volumeRunOver(t, snapshots{sunday, snapshot})
 			completeSync(t, c, ended, 30*time.Second)
-			step(t, r)
+			listTwice(t, r)
 
 			item := readBackupRun(t, c).Status.Items[0]
 			if item.Phase != backupv1alpha1.ItemSucceeded {

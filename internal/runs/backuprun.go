@@ -1123,8 +1123,8 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 // identifySnapshot). On a run that stopped its workloads the item then stays
 // Running until the status holding the snapshot's full ID is written, and a
 // later pass, once status.restartedAt is set, moves that snapshot to it and
-// tags it quiesced (see retimeRecorded). A failed read of the source leaves the item as it was,
-// for the next pass.
+// tags it quiesced (see retimeRecorded). A failed read of the source leaves
+// the item as it was, for the next pass.
 func (r *BackupRunReconciler) collectVolume(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) {
 	source := &volsyncv1alpha1.ReplicationSource{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source); err != nil {
@@ -1188,17 +1188,16 @@ func (r *BackupRunReconciler) failedSync(ctx context.Context, run *backupv1alpha
 // lacks it fails the item with reason NoMoverSnapshot. The snapshot is the
 // newest a mover wrote in that window (see identify), and the item records
 // its full ID, its short ID and its time, and names the sync's other
-// snapshots in its message. With no such snapshot the sync backed up an
-// empty claim: VolSync's mover takes no snapshot of a volume that holds
-// nothing but lost+found and still reports success, so the item succeeds
-// with Empty set. A failed listing leaves the item Running with the error in
-// its message, and the next pass tries again until the run's timeout.
+// snapshots in its message. A listing with no such snapshot counts toward an
+// empty claim, which takes two listings a poll interval apart (see
+// noSnapshotListed). A failed listing leaves the item Running with the error
+// in its message, and the next pass tries again until the run's timeout.
 //
 // The item of a run that stopped its workloads stays Running with the
 // snapshot recorded, so the status holds the original's full ID before any
-// rewrite. A crash after the
-// rewrite then finds the rewritten copy through that ID, where a new search
-// would find no snapshot and take the claim for empty.
+// rewrite. A crash after the rewrite then finds the rewritten copy through
+// that ID, where a new search would find no snapshot and take the claim for
+// empty.
 func (r *BackupRunReconciler) identifySnapshot(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem, source *volsyncv1alpha1.ReplicationSource) {
 	window, err := windowOf(source)
 	if err != nil {
@@ -1211,11 +1210,11 @@ func (r *BackupRunReconciler) identifySnapshot(ctx context.Context, run *backupv
 		return
 	}
 	if !found.found {
-		item.Phase, item.Empty = backupv1alpha1.ItemSucceeded, true
-		item.Message = "the volume held no files, so VolSync took no snapshot"
+		noSnapshotListed(item, r.Now())
 		return
 	}
 	s := found.snapshot
+	item.NoSnapshotListedAt = nil
 	item.SnapshotID, item.Snapshot, item.SnapshotTime = s.ID, s.ShortID(), newTime(metav1.NewTime(s.Time))
 	item.Message = found.note()
 	if !stoppedWorkloads(run) {

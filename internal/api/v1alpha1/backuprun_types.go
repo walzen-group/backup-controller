@@ -157,6 +157,15 @@ type BackupItem struct {
 	// no files. The repository gains no snapshot from such a run.
 	// +optional
 	Empty bool `json:"empty,omitempty"`
+	// NoSnapshotListedAt is when the run first listed the repository after
+	// the volume's sync completed and found no snapshot the sync wrote. An
+	// S3 listing can lag a write, so one such listing does not prove the
+	// volume empty: a pass at least a poll interval later lists the
+	// repository again, and only when that listing also shows no snapshot
+	// does the item succeed with Empty set. A snapshot a later listing finds
+	// clears it.
+	// +optional
+	NoSnapshotListedAt *metav1.Time `json:"noSnapshotListedAt,omitempty"`
 	// Backup is the name of the CloudNativePG Backup the run created for a
 	// database.
 	// +optional
