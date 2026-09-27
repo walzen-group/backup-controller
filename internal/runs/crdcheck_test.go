@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,9 +36,21 @@ func withOldCRD(file string) []string {
 	return files
 }
 
+// crdObjectCache holds the CRD files that readCRD decoded so far, keyed by
+// the path as the test gives it. Each file is then decoded one time per test
+// binary. An entry does not change after readCRD stores it.
+var crdObjectCache sync.Map // string -> *unstructured.Unstructured
+
 // readCRD decodes the CRD file at path.
+//
+// It returns a deep copy of the decoded object, so the caller can change it.
+// The first call for a path decodes the file, and later calls copy the
+// cached object. A file that can't be read or decoded fails the test.
 func readCRD(t *testing.T, path string) *unstructured.Unstructured {
 	t.Helper()
+	if crd, ok := crdObjectCache.Load(path); ok {
+		return crd.(*unstructured.Unstructured).DeepCopy()
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -46,7 +59,8 @@ func readCRD(t *testing.T, path string) *unstructured.Unstructured {
 	if err := yaml.Unmarshal(data, &crd.Object); err != nil {
 		t.Fatalf("decode %s: %v", path, err)
 	}
-	return crd
+	cached, _ := crdObjectCache.LoadOrStore(path, crd)
+	return cached.(*unstructured.Unstructured).DeepCopy()
 }
 
 // v081CRDDir holds the CRDs of v0.8.1, the release before the run's ending and

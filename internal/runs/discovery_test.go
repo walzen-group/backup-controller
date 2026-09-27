@@ -3,11 +3,8 @@ package runs
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -24,7 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
@@ -119,27 +115,9 @@ func discoveryMapper(t *testing.T, s *runtime.Scheme, crdFiles []string, removed
 		add(gvk, plural.Resource, !clusterScoped[gvk.GroupKind()])
 	}
 	for _, path := range crdFiles {
-		f, err := os.Open(path)
-		if err != nil {
-			t.Fatalf("open %s: %v", path, err)
+		for _, r := range servedResources(t, path) {
+			add(r.gvk, r.plural, r.namespaced)
 		}
-		dec := utilyaml.NewYAMLOrJSONDecoder(f, 4096)
-		for {
-			var crd apiextensionsv1.CustomResourceDefinition
-			if err := dec.Decode(&crd); err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				t.Fatalf("decode %s: %v", path, err)
-			}
-			for _, v := range crd.Spec.Versions {
-				if v.Served {
-					gvk := schema.GroupVersionKind{Group: crd.Spec.Group, Version: v.Name, Kind: crd.Spec.Names.Kind}
-					add(gvk, crd.Spec.Names.Plural, crd.Spec.Scope == apiextensionsv1.NamespaceScoped)
-				}
-			}
-		}
-		_ = f.Close()
 	}
 
 	resources := make([]*restmapper.APIGroupResources, 0, len(groups))
@@ -151,6 +129,51 @@ func discoveryMapper(t *testing.T, s *runtime.Scheme, crdFiles []string, removed
 		resources = append(resources, g)
 	}
 	return restmapper.NewDiscoveryRESTMapper(resources)
+}
+
+// servedResource is one kind at one version that a CRD file serves, as
+// discoveryMapper adds it.
+type servedResource struct {
+	gvk        schema.GroupVersionKind
+	plural     string
+	namespaced bool
+}
+
+// servedResourceCache holds the result of servedResources for each CRD file
+// read so far, keyed by the path as the test gives it. Each file is then
+// decoded one time per test binary, and not one time for each client.
+var servedResourceCache sync.Map // string -> []servedResource
+
+// servedResources returns each served version of each CRD in the file at
+// path, in file order and in the order of the CRD's versions. It reads the
+// CRDs with strictclient.ReadCRDs, which decodes the file one time per test
+// binary. A file that can't be read or decoded fails the test.
+//
+// The tests share the returned slice. The caller must not
+// change it.
+func servedResources(t *testing.T, path string) []servedResource {
+	t.Helper()
+	if r, ok := servedResourceCache.Load(path); ok {
+		return r.([]servedResource)
+	}
+	crds, err := strictclient.ReadCRDs(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var served []servedResource
+	for _, crd := range crds {
+		for _, v := range crd.Spec.Versions {
+			if v.Served {
+				served = append(served, servedResource{
+					gvk:        schema.GroupVersionKind{Group: crd.Spec.Group, Version: v.Name, Kind: crd.Spec.Names.Kind},
+					plural:     crd.Spec.Names.Plural,
+					namespaced: crd.Spec.Scope == apiextensionsv1.NamespaceScoped,
+				})
+			}
+		}
+	}
+	r, _ := servedResourceCache.LoadOrStore(path, served)
+	return r.([]servedResource)
 }
 
 // servingOnly wraps c so that every call first looks up the object's group,

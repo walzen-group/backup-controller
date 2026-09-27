@@ -3,7 +3,6 @@ package runs
 import (
 	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -34,7 +33,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-	"sigs.k8s.io/yaml"
 )
 
 // frozen is the time the tests' clocks stand at. A test reaches a deadline by
@@ -443,7 +441,8 @@ func deploymentScale(sub string, obj client.Object, opts []client.SubResourceUpd
 
 // ownCRDObjects reads this project's CustomResourceDefinitions, the files in
 // files whose name starts with backup.wlz.li_, as unstructured objects a fake
-// client can hold.
+// client can hold. Each object is a new deep copy from readCRD, so a client
+// can change its objects and the next test still gets the file's content.
 func ownCRDObjects(t *testing.T, files []string) []client.Object {
 	t.Helper()
 	var objects []client.Object
@@ -451,15 +450,7 @@ func ownCRDObjects(t *testing.T, files []string) []client.Object {
 		if !strings.HasPrefix(filepath.Base(path), backupv1alpha1.GroupVersion.Group+"_") {
 			continue
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
-		}
-		crd := &unstructured.Unstructured{}
-		if err := yaml.Unmarshal(data, &crd.Object); err != nil {
-			t.Fatalf("decode %s: %v", path, err)
-		}
-		objects = append(objects, crd)
+		objects = append(objects, readCRD(t, path))
 	}
 	return objects
 }

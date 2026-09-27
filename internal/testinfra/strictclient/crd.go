@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -89,11 +90,17 @@ func crdCacheKey(paths []string) string {
 	return strings.Join(abs, "\x00")
 }
 
-// loadCRDs reads CustomResourceDefinition manifests (YAML or JSON, one or
-// more documents per file) and builds their structural schemas.
+// loadCRDs builds the crdSet of the CRD manifests in paths (YAML or JSON, one
+// or more documents per file).
 //
 // It returns an error when a file cannot be read or decoded, or when a
 // version's schema is not structural. Documents of other kinds are skipped.
+//
+// cachedFile parses each file one time per process. loadCRDs then
+// merges the sets of the files in order. A later file's schema for a kind
+// replaces the schema of an earlier file. A status subresource that one of
+// the files declares stays. This is the same result as one pass over all the
+// files.
 //
 // The schemas are built as kube-apiserver 1.36.3 builds them when it starts
 // serving a CRD: the v1 validation is converted to the internal version and
@@ -107,34 +114,111 @@ func loadCRDs(paths []string) (*crdSet, error) {
 		status:  map[schema.GroupVersionKind]bool{},
 	}
 	for _, path := range paths {
-		if err := set.addFile(path); err != nil {
-			return nil, fmt.Errorf("strictclient: CRD file %s: %w", path, err)
+		file := cachedFile(path)
+		if file.err != nil {
+			return nil, fmt.Errorf("strictclient: CRD file %s: %w", path, file.err)
 		}
+		maps.Copy(set.schemas, file.set.schemas)
+		maps.Copy(set.status, file.set.status)
 	}
 	return set, nil
 }
 
-func (s *crdSet) addFile(path string) error {
+// fileCache holds the CRD files parsed so far in this process, keyed by the
+// absolute path (see crdCacheKey). Thus a test binary decodes each file one
+// time, also when many file lists hold the file. An entry does not change
+// after cachedFile loads it.
+var fileCache sync.Map // string -> *fileEntry
+
+// fileEntry is one fileCache slot. once makes concurrent first callers wait
+// for a single parse.
+type fileEntry struct {
+	once sync.Once
+	// crds are the CustomResourceDefinition documents of the file, in file
+	// order. ReadCRDs gives out deep copies of them.
+	crds []*apiextensionsv1.CustomResourceDefinition
+	// set is the crdSet of this file alone.
+	set *crdSet
+	err error
+}
+
+// cachedFile returns the parsed CRD file at path. The first call parses the
+// file, and each later call gets the same entry. The entry keeps a parse
+// error, because the test data in the files does not change. It is safe
+// for concurrent use.
+func cachedFile(path string) *fileEntry {
+	e, _ := fileCache.LoadOrStore(crdCacheKey([]string{path}), &fileEntry{})
+	entry, ok := e.(*fileEntry)
+	if !ok {
+		panic(fmt.Sprintf("strictclient: the CRD file cache holds a %T", e))
+	}
+	entry.once.Do(func() {
+		entry.crds, entry.err = decodeCRDFile(path)
+		if entry.err != nil {
+			return
+		}
+		entry.set = &crdSet{
+			schemas: map[schema.GroupVersionKind]*structuralschema.Structural{},
+			status:  map[schema.GroupVersionKind]bool{},
+		}
+		for _, crd := range entry.crds {
+			if entry.err = entry.set.add(crd.DeepCopy()); entry.err != nil {
+				return
+			}
+		}
+	})
+	return entry
+}
+
+// ReadCRDs returns the CustomResourceDefinitions in the manifest file at
+// path. A test uses it to get the same CRDs that the client prunes against.
+//
+// Parameters:
+//   - path is a YAML or JSON file with one or more documents. ReadCRDs
+//     skips the documents of other kinds.
+//
+// It returns deep copies in file order, so the caller can change them. It
+// returns an error when the file cannot be read or decoded, or when a
+// version's schema is not structural.
+//
+// cachedFile decodes the file one time per process and keeps it in
+// fileCache. Thus a test that builds many clients does not decode the YAML
+// again. It is safe for concurrent use.
+func ReadCRDs(path string) ([]*apiextensionsv1.CustomResourceDefinition, error) {
+	file := cachedFile(path)
+	if file.err != nil {
+		return nil, fmt.Errorf("strictclient: CRD file %s: %w", path, file.err)
+	}
+	out := make([]*apiextensionsv1.CustomResourceDefinition, len(file.crds))
+	for i, crd := range file.crds {
+		out[i] = crd.DeepCopy()
+	}
+	return out, nil
+}
+
+// decodeCRDFile decodes the CustomResourceDefinition documents of the file
+// at path, in file order. It skips the documents of other kinds. It returns
+// an error when the file cannot be read or decoded.
+func decodeCRDFile(path string) ([]*apiextensionsv1.CustomResourceDefinition, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close() //nolint:errcheck // read-only file
 	dec := utilyaml.NewYAMLOrJSONDecoder(f, 4096)
+	var crds []*apiextensionsv1.CustomResourceDefinition
 	for {
-		var crd apiextensionsv1.CustomResourceDefinition
-		if err := dec.Decode(&crd); err != nil {
+		crd := &apiextensionsv1.CustomResourceDefinition{}
+		if err := dec.Decode(crd); err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				return crds, nil
 			}
-			return err
+			return nil, err
 		}
 		if crd.Kind != "CustomResourceDefinition" {
 			continue
 		}
-		if err := s.add(&crd); err != nil {
-			return err
-		}
+		crds = append(crds, crd)
 	}
 }
 
