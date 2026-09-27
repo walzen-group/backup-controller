@@ -9,41 +9,10 @@
 package runs
 
 import (
-	"time"
-
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
-	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
-
-// FieldOwner is the field manager name, backupv1alpha1.FieldManager, of
-// the run controllers. The quiesce package sends the same name with its
-// writes to workloads and Kustomizations.
-const FieldOwner = client.FieldOwner(backupv1alpha1.FieldManager)
-
-// Finalizer keeps a deleted run in place until the controller has put back
-// whatever the run changed: a stopped workload, a suspended Kustomization, or
-// a restore Job it created.
-const Finalizer = "backup.wlz.li/run-cleanup"
-
-// pollInterval is how long a waiting run waits before it checks again. The
-// controller doesn't watch the movers' progress, so this interval sets how
-// soon a run notices that a mover has finished.
-const pollInterval = 10 * time.Second
-
-// after returns a result that requeues the run once the duration d has
-// passed. When err is set, it returns only err, with an empty result, because
-// controller-runtime ignores a requeue that comes with an error and logs a
-// warning about the pair.
-func after(d time.Duration, err error) (ctrl.Result, error) {
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{RequeueAfter: d}, nil
-}
 
 // TriggerFor returns the manual trigger tag that a BackupRun writes onto a
 // ReplicationSource: "backuprun-" followed by the run's UID.

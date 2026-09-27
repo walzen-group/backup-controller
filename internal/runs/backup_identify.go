@@ -2,6 +2,8 @@ package runs
 
 import (
 	"cmp"
+	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -10,7 +12,10 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // syncSkew is how far the clock of the node a mover runs on may differ from
@@ -219,4 +224,212 @@ func noSnapshotListed(item *backupv1alpha1.BackupItem, now time.Time) {
 // pick it.
 func unmovedNote(item backupv1alpha1.BackupItem) string {
 	return fmt.Sprintf("snapshot %s is saved but was not moved to the restart moment or tagged %s", item.Snapshot, restic.QuiescedTag)
+}
+
+// identifySnapshot records the snapshot a completed sync wrote, found in the
+// repository, and succeeds the item when the run need not move it.
+//
+// Parameters:
+//   - run is the BackupRun, for its namespace and whether it stopped its
+//     workloads.
+//   - item is the Running volume item whose sync completed. It is changed
+//     in place.
+//   - source is the item's ReplicationSource, whose status records when the
+//     sync ran.
+//
+// The window comes from the source's status (see windowOf); a status that
+// lacks it fails the item with reason NoMoverSnapshot. The snapshot is the
+// newest a mover wrote in that window (see identify), and the item records
+// its full ID, its short ID and its time, and names the sync's other
+// snapshots in its message. A listing with no such snapshot counts toward an
+// empty claim, which takes two listings a poll interval apart (see
+// noSnapshotListed). A failed listing leaves the item Running with the error
+// in its message, and the next pass tries again until the run's timeout.
+//
+// The item of a run that stopped its workloads stays Running with the
+// snapshot recorded, so the status holds the original's full ID before any
+// rewrite. A crash after the rewrite then finds the rewritten copy through
+// that ID, where a new search would find no snapshot and take the claim for
+// empty.
+func (r *BackupRunReconciler) identifySnapshot(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem, source *volsyncv1alpha1.ReplicationSource) {
+	window, err := windowOf(source)
+	if err != nil {
+		failBackupItem(item, err)
+		return
+	}
+	found, err := r.findSnapshot(ctx, run, item.Name, window)
+	if err != nil {
+		item.Message = fmt.Sprintf("the run could not list the repository for the snapshot its sync wrote: %v", err)
+		return
+	}
+	if !found.found {
+		noSnapshotListed(item, r.Now())
+		return
+	}
+	s := found.snapshot
+	item.NoSnapshotListedAt = nil
+	item.SnapshotID, item.Snapshot, item.SnapshotTime = s.ID, s.ShortID(), newTime(metav1.NewTime(s.Time))
+	item.Message = found.note()
+	if !stoppedWorkloads(run) {
+		item.Phase = backupv1alpha1.ItemSucceeded
+	}
+}
+
+// findSnapshot lists the repository of a claim and picks the snapshot one
+// sync of it wrote.
+//
+// Parameters:
+//   - run is the BackupRun, for its namespace and its UID.
+//   - claimName names the claim whose repository is listed.
+//   - window is the sync's window (see windowOf).
+//
+// It returns what identify found. It returns an error when the reconciler
+// has no Snapshots lister, and when the repository Secret, the repository or
+// the namespace's BackupRuns can't be read.
+func (r *BackupRunReconciler) findSnapshot(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string, window syncWindow) (identified, error) {
+	if r.Snapshots == nil {
+		return identified{}, errors.New("the controller has no repository lister")
+	}
+	secret, err := r.repositorySecret(ctx, run.Namespace, claimName)
+	if err != nil {
+		return identified{}, err
+	}
+	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
+	if err != nil {
+		return identified{}, err
+	}
+	recorded, err := r.recordedSnapshots(ctx, run, claimName)
+	if err != nil {
+		return identified{}, err
+	}
+	return identify(window, snapshots, recorded), nil
+}
+
+// recordedSnapshots returns the full snapshot IDs that other BackupRuns in
+// the run's namespace recorded for items of the same claim, as a set.
+//
+// Parameters:
+//   - run is the BackupRun that looks for its snapshot; its own items are
+//     left out.
+//   - claimName names the claim.
+//
+// It reads the BackupRuns through the uncached Reader, so a run that
+// recorded its snapshot a moment ago is seen. It returns an error when the
+// list fails.
+func (r *BackupRunReconciler) recordedSnapshots(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) (map[string]bool, error) {
+	runs := &backupv1alpha1.BackupRunList{}
+	if err := r.Reader.List(ctx, runs, client.InNamespace(run.Namespace)); err != nil {
+		return nil, fmt.Errorf("list BackupRuns in %s: %w", run.Namespace, err)
+	}
+	recorded := map[string]bool{}
+	for _, other := range runs.Items {
+		if other.UID == run.UID {
+			continue
+		}
+		for _, item := range other.Status.Items {
+			if item.Kind == backupv1alpha1.ItemKindSource && item.Name == claimName && item.SnapshotID != "" {
+				recorded[item.SnapshotID] = true
+			}
+		}
+	}
+	return recorded, nil
+}
+
+// retimeRecorded moves the recorded snapshot of a run that stopped its
+// workloads to the run's restart moment, tags it quiesced, and succeeds the
+// item.
+//
+// Parameters:
+//   - run is the BackupRun, for its namespace, its record of the workloads
+//     it stopped, and status.restartedAt.
+//   - item is the Running volume item, whose snapshotID an earlier pass
+//     recorded. It is changed in place.
+//
+// Every volume item of such a run cut its clone while the workloads were
+// stopped, because the run starts them again only once each clone is cut or
+// its item has failed (see clonesCut and giveUpUncut). The item therefore
+// waits in Running while status.restartedAt is unset, as it is while another
+// item's clone is not cut yet, and is moved once the restart moment is
+// recorded. The item then records the rewritten snapshot's IDs and time and
+// succeeds. When the rewrite fails, for example because another process
+// holds a lock on the repository, the item stays Running with the error in
+// its message and the next pass tries again, so the run never reports
+// success for a snapshot a synced restore can't use. A run that stopped no
+// workload succeeds the item with the snapshot as it was recorded.
+func (r *BackupRunReconciler) retimeRecorded(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) {
+	if !stoppedWorkloads(run) {
+		item.Phase = backupv1alpha1.ItemSucceeded
+		return
+	}
+	if run.Status.RestartedAt == nil {
+		item.Message = fmt.Sprintf("snapshot %s is saved and waits for the workloads to start again, to be moved to that moment and tagged %s",
+			item.Snapshot, restic.QuiescedTag)
+		return
+	}
+	moved, err := r.retime(ctx, run.Namespace, item.Name, item.SnapshotID, run.Status.RestartedAt.Time)
+	if err != nil {
+		item.Message = fmt.Sprintf("snapshot %s is saved and waits to be moved to %s and tagged %s: %v",
+			item.Snapshot, run.Status.RestartedAt.UTC().Format(time.RFC3339), restic.QuiescedTag, err)
+		return
+	}
+	item.Phase, item.Message = backupv1alpha1.ItemSucceeded, ""
+	item.SnapshotID, item.Snapshot, item.SnapshotTime = moved.ID, moved.ShortID(), newTime(metav1.NewTime(moved.Time))
+}
+
+// stoppedWorkloads reports whether the run stopped at least one workload, as
+// its status.quiesced records. Only such a run has a moment when nothing
+// wrote to the volumes or the databases: its restart moment, which is what
+// its snapshots are moved to.
+func stoppedWorkloads(run *backupv1alpha1.BackupRun) bool {
+	return run.Spec.All && len(run.Status.Quiesced) > 0
+}
+
+// retime moves a snapshot a mover saved to a new time and tags it quiesced,
+// so a RestoreRun with syncDatabaseToVolume can find it.
+//
+// Parameters:
+//   - namespace and claimName name the claim that was backed up. retime reads
+//     the repository Secret through the claim's VolumeRestore.
+//   - id is the snapshot's full ID, as the item recorded it when the run
+//     found the snapshot in the repository.
+//   - at is the time the snapshot should carry. The caller passes the run's
+//     status.restartedAt.
+//
+// It returns the rewritten snapshot, which has a new ID. It returns an error
+// when no ID is given, when the reconciler has no Retimer, when the Secret
+// can't be read, and when the rewrite fails. A *restic.LockedError means
+// another process holds a lock on the repository, and the caller tries again
+// on its next pass. A snapshot an earlier call already rewrote comes back as
+// that copy (see restic.Repository.Retime).
+func (r *BackupRunReconciler) retime(ctx context.Context, namespace, claimName, id string, at time.Time) (restic.Snapshot, error) {
+	if id == "" {
+		return restic.Snapshot{}, errors.New("no snapshot is recorded to move")
+	}
+	if r.Retimer == nil {
+		return restic.Snapshot{}, errors.New("the controller has no snapshot retimer")
+	}
+	secret, err := r.repositorySecret(ctx, namespace, claimName)
+	if err != nil {
+		return restic.Snapshot{}, err
+	}
+	return r.Retimer.Retime(ctx, secret, id, at, restic.QuiescedTag)
+}
+
+// repositorySecret reads the Secret holding the restic repository settings
+// for the claim named claimName. It finds the Secret's name in
+// spec.repository of the claim's VolumeRestore.
+func (r *BackupRunReconciler) repositorySecret(ctx context.Context, namespace, claimName string) (*corev1.Secret, error) {
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: claimName}, claim); err != nil {
+		return nil, err
+	}
+	vr, err := volumeRestoreFor(ctx, r.Reader, claim)
+	if err != nil {
+		return nil, err
+	}
+	secret := &corev1.Secret{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: vr.Spec.Repository}, secret); err != nil {
+		return nil, fmt.Errorf("get Secret %s: %w", vr.Spec.Repository, err)
+	}
+	return secret, nil
 }
