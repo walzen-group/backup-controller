@@ -894,3 +894,124 @@ func TestSplitDestinationSeparatesBucketFromPrefix(t *testing.T) {
 		}
 	}
 }
+
+// lastBackup is the lastSuccessfulBackupTime that the recovery window cases
+// write into the status of the ObjectStore.
+const lastBackup = "2026-09-20T03:00:01Z"
+
+// storeWithWindows builds the ObjectStore from storeAt, pointed at the given
+// fake S3 server, with the given status.serverRecoveryWindow. A nil windows
+// map leaves the status out.
+func storeWithWindows(endpoint string, windows map[string]any) *unstructured.Unstructured {
+	s := storeAt(endpoint)
+	if windows != nil {
+		_ = unstructured.SetNestedMap(s.Object, windows, "status", "serverRecoveryWindow")
+	}
+	return s
+}
+
+// completedWindow is a recovery window as plugin-barman-cloud v0.15.0 writes
+// it when the catalog of the server holds a completed backup
+// (internal/cnpgi/instance/recovery_window.go:52-61).
+func completedWindow() map[string]any {
+	return map[string]any{
+		"firstRecoverabilityPoint": "2026-09-19T03:00:01Z",
+		"lastSuccessfulBackupTime": lastBackup,
+	}
+}
+
+// TestAnEmptyPrefixIsRefusedWhenTheStoreStatusRecordsABackup checks that the
+// webhook does not start an empty database when the listing of the prefix
+// finds nothing, but the ObjectStore status records a completed backup for
+// the server name. A listing that reads another place than the plugin writes
+// would otherwise start an empty database beside a full archive, and the
+// plugin would then refuse to archive it. The refusal names the prefix, the empty
+// listing and the recorded backup. The case runs for the default path and for
+// the opt-out annotation, which both start initdb on an empty prefix.
+func TestAnEmptyPrefixIsRefusedWhenTheStoreStatusRecordsABackup(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cluster *unstructured.Unstructured
+	}{
+		{"default", cluster(t, nil)},
+		{"opted out", optedOut(t)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := recordedS3(t, barmanstore.MustLoad(t, "empty"))
+			objectStore := storeWithWindows(server.URL, map[string]any{"app-pg": completedWindow()})
+
+			response := decideWith(t, tc.cluster, S3Prober{}, objectStore)
+
+			if response.Allowed {
+				t.Fatalf("the cluster was admitted over an empty listing that the store status contradicts (patches %v)", response.Patches)
+			}
+			message := response.Result.Message
+			for _, want := range []string{"s3://backups/app/app-pg/", "status.serverRecoveryWindow", `"app-pg"`, lastBackup, "app/app-pg-store"} {
+				if !strings.Contains(message, want) {
+					t.Errorf("the refusal %q does not say %q", message, want)
+				}
+			}
+		})
+	}
+}
+
+// nextVersion is the version a future CloudNativePG and barman-cloud release
+// is imagined to move Cluster and ObjectStore to, with the same fields.
+const nextVersion = "v2"
+
+// servedAtNext returns a scheme and a RESTMapper for a cluster that serves
+// Cluster and ObjectStore at nextVersion alone. The fake client knows no
+// other version of either kind, so a request at v1 fails as it would on
+// such a cluster.
+func servedAtNext(t *testing.T) (*runtime.Scheme, meta.RESTMapper) {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := corev1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := backupv1alpha1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	cnpg := schema.GroupVersion{Group: ClusterListGVK.Group, Version: nextVersion}
+	barman := schema.GroupVersion{Group: ObjectStoreGVK.Group, Version: nextVersion}
+	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{corev1.SchemeGroupVersion, backupv1alpha1.GroupVersion, cnpg, barman})
+	for _, gvk := range []schema.GroupVersionKind{cnpg.WithKind("Cluster"), barman.WithKind("ObjectStore")} {
+		s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+		s.AddKnownTypeWithName(gvk.GroupVersion().WithKind(gvk.Kind+"List"), &unstructured.UnstructuredList{})
+		mapper.Add(gvk, meta.RESTScopeNamespace)
+	}
+	for gvk := range s.AllKnownTypes() {
+		if gvk.Group == "" || gvk.Group == backupv1alpha1.GroupVersion.Group {
+			mapper.Add(gvk, meta.RESTScopeNamespace)
+		}
+	}
+	return s, mapper
+}
+
+// decideAtNext sends a create of the Cluster app/app-pg to a Decider on a
+// cluster that serves Cluster and ObjectStore at nextVersion alone, with
+// store() and secret() and the objects in existing, all moved to
+// nextVersion where they are Clusters or ObjectStores.
+func decideAtNext(t *testing.T, prober ArchiveProber, existing ...*unstructured.Unstructured) admission.Response {
+	t.Helper()
+	s, mapper := servedAtNext(t)
+	objects := []runtime.Object{secret()}
+	for _, u := range append([]*unstructured.Unstructured{store()}, existing...) {
+		u.SetGroupVersionKind(u.GroupVersionKind().GroupKind().WithVersion(nextVersion))
+		objects = append(objects, u)
+	}
+	c := fake.NewClientBuilder().WithScheme(s).WithRESTMapper(mapper).WithRuntimeObjects(objects...).Build()
+	decider := &Decider{Client: c, Mapper: c.RESTMapper(), Prober: prober}
+	return create(t, decider, cluster(t, nil))
+}
+
+// On a cluster whose CloudNativePG and barman-cloud serve Cluster and
+// ObjectStore at a new version alone, the webhook reads the Cluster's
+// ObjectStore and lists the Clusters at that version, and admits a new
+// Cluster over an empty prefix as before.
+func TestTheWebhookReadsKindsAtTheVersionTheyAreServedAt(t *testing.T) {
+	response := decideAtNext(t, stubProber{has: false})
+	if !response.Allowed {
+		t.Fatalf("the Cluster was refused: %v", response.Result)
+	}
+}

@@ -3,15 +3,17 @@ package main
 import (
 	"errors"
 	"flag"
+
+	// has one before main runs. This package imports controller-runtime
+	// --kubeconfig flag in its init function, so the default FlagSet already
+	// real here.
+	"slices"
 	"strings"
 	"testing"
 
-	// This import is here for its side effect. pkg/client/config registers a
-	// --kubeconfig flag in its init function, so the default FlagSet already
-	// has one before main runs. This package imports controller-runtime
-	// through runs.go as well, so the collision these tests guard against is
-	// real here.
 	_ "sigs.k8s.io/controller-runtime/pkg/client/config"
+	// This import is here for its side effect. pkg/client/config registers a
+	// through runs.go as well, so the collision these tests guard against is
 )
 
 // TestKubeconfigFlagReusesOneSomethingElseRegistered checks that
@@ -87,5 +89,42 @@ func TestTheRunOptionsCarryTheRestoreImage(t *testing.T) {
 	}
 	if options.RestoreImage != "restic.example/restic:1" || options.Namespace != "elsewhere" {
 		t.Errorf("options = %+v, want the image and namespace the command line set", options)
+	}
+}
+
+// --pause parses into RunOptions.Paused, and the controller runs without the
+// pause when the command line leaves the flag out.
+func TestThePauseFlagSetsRunOptionsPaused(t *testing.T) {
+	for name, tc := range map[string]struct {
+		args []string
+		want bool
+	}{
+		"with --pause":    {args: []string{"--pause"}, want: true},
+		"without --pause": {args: nil, want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fs := flag.NewFlagSet("t", flag.ContinueOnError)
+			options := runFlags(fs)
+			if err := fs.Parse(append([]string{"--restore-image=" + pinnedRestoreImage}, tc.args...)); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			got, err := options()
+			if err != nil || got.Paused != tc.want {
+				t.Errorf("Paused = %t, %v; want %t", got.Paused, err, tc.want)
+			}
+		})
+	}
+}
+
+// The chart passes --pause only when the pause value is true.
+func TestTheChartPassesPauseOnlyWhenSet(t *testing.T) {
+	for value, want := range map[string]bool{"true": true, "false": false} {
+		output, err := renderChart(t, "restoreImage="+pinnedRestoreImage, "pause="+value)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, output)
+		}
+		if got := slices.Contains(controllerArgs(t, output), "--pause"); got != want {
+			t.Errorf("pause=%s: --pause in the args = %t, want %t", value, got, want)
+		}
 	}
 }

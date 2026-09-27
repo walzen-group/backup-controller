@@ -3,11 +3,20 @@ package restic
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/walzen-group/backup-controller/internal/testinfra/s3fake"
+	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
 )
 
 // fixture is testdata/repo, a version 2 repository that restic 0.19.1 wrote
@@ -148,4 +157,256 @@ func TestParseRepositoryReadsEveryFormResticReads(t *testing.T) {
 			t.Errorf("ParseRepository(%q) accepted it", bad)
 		}
 	}
+}
+
+// emptyFirstPage is a ListObjectsV2 answer that holds no key and says more
+// follow. S3 may cut a page short at any count, none included.
+const emptyFirstPage = `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>repo</Name><Prefix>locks/</Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><Delimiter>/</Delimiter><IsTruncated>true</IsTruncated><NextContinuationToken>page-2</NextContinuationToken></ListBucketResult>`
+
+// firstPageThenCancel answers the first page of a ListObjectsV2 with
+// emptyFirstPage and calls cancel when the client closes that answer, which
+// minio-go does once it has read the page and before it asks for the next.
+// Every other request goes to next.
+type firstPageThenCancel struct {
+	next   http.RoundTripper
+	cancel context.CancelFunc
+}
+
+// RoundTrip serves one request as the type's comment says.
+func (f firstPageThenCancel) RoundTrip(r *http.Request) (*http.Response, error) {
+	query := r.URL.Query()
+	if query.Get("list-type") != "2" || query.Has("continuation-token") {
+		return f.next.RoundTrip(r)
+	}
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": {"application/xml"}},
+		Body:          cancelOnClose{Reader: strings.NewReader(emptyFirstPage), cancel: f.cancel},
+		ContentLength: int64(len(emptyFirstPage)),
+		Request:       r,
+	}, nil
+}
+
+// cancelOnClose is a response body that calls cancel when it is closed.
+type cancelOnClose struct {
+	io.Reader
+	cancel context.CancelFunc
+}
+
+// Close calls cancel.
+func (c cancelOnClose) Close() error {
+	c.cancel()
+	return nil
+}
+
+// TestAListingCutShortByTheContextIsAnError checks that S3Store.List fails
+// when its context ends between two pages of the listing. minio-go then
+// stops without an error, and a List that took the names so far as all of
+// them would report a repository whose lock is live as unlocked. The s3fake
+// server holds a lock; the first page comes back empty and truncated, and
+// the context ends once minio-go has read it. Finding W5.
+func TestAListingCutShortByTheContextIsAnError(t *testing.T) {
+	server := s3fake.New(t, "repo")
+	server.Put("repo", "locks/0123abcd", s3fake.Object{Body: []byte("lock")})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client, err := minio.New(server.Endpoint(), &minio.Options{
+		Creds:     credentials.NewStaticV4(server.AccessKey, server.SecretKey, ""),
+		Transport: firstPageThenCancel{next: http.DefaultTransport, cancel: cancel},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &S3Store{client: client, at: Location{Endpoint: server.Endpoint(), Bucket: "repo"}}
+
+	names, err := store.List(ctx, "locks")
+
+	if err == nil {
+		t.Fatalf("List gave no error and %v, although the context ended before the second page", names)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want it to wrap context.Canceled", err)
+	}
+}
+
+// TestSnapshotsSkipsAnUnreadableSnapshotFile checks that Snapshots leaves out
+// a snapshot file that does not decrypt and lists the others, as restic
+// snapshots does: FindFilteredSnapshots warns "Ignoring" and goes on when a
+// snapshot fails to load (restic v0.18.1 cmd/restic/find.go:51-55,
+// cmd/restic/cmd_snapshots.go:77). The fixture is the recorded timed
+// repository, with its oldest snapshot file truncated.
+func TestSnapshotsSkipsAnUnreadableSnapshotFile(t *testing.T) {
+	f := fixtures(t, "timed")[0]
+	store, repo := f.writable(t)
+	want := f.snapshots(t)
+	if len(want) < 2 {
+		t.Fatalf("the fixture lists %d snapshots, the test needs 2", len(want))
+	}
+	corrupt := want[0].ID
+	if err := os.WriteFile(filepath.Join(string(store), "snapshots", corrupt), []byte("truncated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.Snapshots(context.Background())
+	if err != nil {
+		t.Fatalf("one unreadable snapshot file failed the listing: %v", err)
+	}
+	if len(got) != len(want)-1 {
+		t.Fatalf("got %d snapshots, want the %d readable ones", len(got), len(want)-1)
+	}
+	for _, s := range got {
+		if s.ID == corrupt {
+			t.Fatalf("the unreadable snapshot %s is listed", corrupt)
+		}
+	}
+}
+
+// missingSnapshotStore is a Store whose listing of snapshots/ names one more
+// file than the store holds, as a listing does when a restic forget deletes
+// the file between the list and the read.
+type missingSnapshotStore struct{ Store }
+
+// List adds a snapshot name that the store does not hold.
+func (s missingSnapshotStore) List(ctx context.Context, dir string) ([]string, error) {
+	names, err := s.Store.List(ctx, dir)
+	if dir == "snapshots" {
+		names = append(names, "0000000000000000000000000000000000000000000000000000000000000000")
+	}
+	return names, err
+}
+
+// TestSnapshotsFailsOnAFileGoneAfterTheListing checks that a snapshot file
+// that the listing names and the read does not find fails the listing. A
+// concurrent forget causes this, and the caller retries on the error.
+func TestSnapshotsFailsOnAFileGoneAfterTheListing(t *testing.T) {
+	f := fixtures(t, "timed")[0]
+	repo := &Repository{store: missingSnapshotStore{DirStore(filepath.Join(f.dir, "repo"))}, master: f.open(t).master}
+	if _, err := repo.Snapshots(context.Background()); err == nil {
+		t.Fatal("a snapshot file gone after the listing gave no error")
+	}
+}
+
+// The tests in this file read testdata/same-time, a repository that
+// hack/fixtures/restic-same-time.sh wrote with the restic of the VolSync mover
+// image: two mover snapshots with identical times, and one snapshot for each
+// way a snapshot can differ from what a mover writes.
+
+// sameTime returns the same-time fixture recorded with the restic version
+// versions.json pins for the mover, and fails the test when there is none.
+func sameTime(t *testing.T) recordedFixture {
+	t.Helper()
+	name := "restic-" + versions.Of(t, "restic-mover")
+	dir := filepath.Join("testdata", "same-time", name)
+	return recordedFixture{name: "same-time/" + name, dir: dir}
+}
+
+// reversedStore is a Store whose List returns the names in the reverse of the
+// order the wrapped store gives. A DirStore and S3 both list names sorted, so
+// this is the one way a test can hand Snapshots two snapshots with the same
+// time in the other order.
+type reversedStore struct{ Store }
+
+// List returns the wrapped store's names in reverse order.
+func (s reversedStore) List(ctx context.Context, dir string) ([]string, error) {
+	names, err := s.Store.List(ctx, dir)
+	slices.Reverse(names)
+	return names, err
+}
+
+// TestSnapshotsOrdersSameTimeSnapshotsByID checks that Snapshots returns the
+// snapshots restic lists, oldest first and, among snapshots with the same
+// time, by ID, whatever order the store lists the files in. restic stamps two
+// backups given the same --time with identical times, and restic snapshots
+// lists such snapshots in no set order, so the tie needs an order of its own
+// for "the newest snapshot" to name one snapshot every time.
+func TestSnapshotsOrdersSameTimeSnapshotsByID(t *testing.T) {
+	f := sameTime(t)
+	want := f.snapshots(t)
+	slices.SortFunc(want, func(a, b recordedSnapshot) int {
+		if c := a.Time.Compare(b.Time); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	var kinds map[string][]string
+	f.readJSON(t, "kinds.json", &kinds)
+	if m := kinds["mover"]; len(m) != 2 || !snapshotTime(want, m[0]).Equal(snapshotTime(want, m[1])) {
+		t.Fatalf("the fixture's two mover snapshots %v should have identical times", m)
+	}
+
+	master := f.open(t).master
+	for _, store := range []Store{DirStore(filepath.Join(f.dir, "repo")), reversedStore{DirStore(filepath.Join(f.dir, "repo"))}} {
+		got, err := (&Repository{store: store, master: master}).Snapshots(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := make([]string, 0, len(got))
+		for _, s := range got {
+			ids = append(ids, s.ID)
+		}
+		wantIDs := make([]string, 0, len(want))
+		for _, s := range want {
+			wantIDs = append(wantIDs, s.ID)
+		}
+		if !slices.Equal(ids, wantIDs) {
+			t.Errorf("%T: Snapshots lists %v, want %v (by time, then ID)", store, ids, wantIDs)
+		}
+	}
+}
+
+// snapshotTime returns the time of the snapshot with the given ID in the
+// list restic printed, and the zero time when the list has no such snapshot.
+func snapshotTime(snapshots []recordedSnapshot, id string) time.Time {
+	for _, s := range snapshots {
+		if s.ID == id {
+			return s.Time
+		}
+	}
+	return time.Time{}
+}
+
+// TestMoverWrittenAcceptsOnlyWhatAMoverWrites checks MoverWritten against
+// snapshots real restic wrote. Every snapshot VolSync's mover script wrote in
+// the recorded timed, same-second and killed-mover repositories must pass, and
+// in the same-time repository only the two written as the mover writes them
+// may pass: the snapshot of another host, the one with a second path, the one
+// of another directory and the retimed copy are passed over.
+func TestMoverWrittenAcceptsOnlyWhatAMoverWrites(t *testing.T) {
+	for _, kind := range []string{"timed", "same-second", "killed-mover"} {
+		for _, f := range fixtures(t, kind) {
+			for _, s := range f.snapshots(t) {
+				if !MoverWritten(recordedAsSnapshot(s)) {
+					t.Errorf("%s: MoverWritten rejects %s, which the mover wrote", f.name, s.ShortID)
+				}
+			}
+		}
+	}
+
+	f := sameTime(t)
+	var kinds map[string][]string
+	f.readJSON(t, "kinds.json", &kinds)
+	written := map[string]string{}
+	for kind, ids := range kinds {
+		for _, id := range ids {
+			written[id] = kind
+		}
+	}
+	snapshots := f.snapshots(t)
+	if len(snapshots) != len(written) || len(kinds) != 5 {
+		t.Fatalf("kinds.json names %d snapshots of %d kinds, restic lists %d", len(written), len(kinds), len(snapshots))
+	}
+	for _, s := range snapshots {
+		kind := written[s.ID]
+		if got, want := MoverWritten(recordedAsSnapshot(s)), kind == "mover"; got != want {
+			t.Errorf("MoverWritten(%s, written as %q) = %v, want %v", s.ShortID, kind, got, want)
+		}
+	}
+}
+
+// recordedAsSnapshot converts an entry of restic snapshots --json into the
+// Snapshot this package reads.
+func recordedAsSnapshot(s recordedSnapshot) Snapshot {
+	return Snapshot{ID: s.ID, Time: s.Time, Hostname: s.Hostname, Paths: s.Paths, Tags: s.Tags, Original: s.Original}
 }
