@@ -28,5 +28,5 @@ and decisions.
 | --- | --- |
 | the populator mechanism and the three callbacks | whether the repository Secret is copied or lives in the controller's namespace, if the ClusterRole's reach becomes an objection |
 | the API group `backup.wlz.li`, with VolumeRestore, BackupRun and RestoreRun at v1alpha1 | how long a large volume's restore runs against the library's requeue behaviour, which only a large restore answers |
-| VolSync and the barman-cloud plugin move the data; the controller schedules, triggers and checks | |
+| VolSync's mover writes the volume backups, the controller's restore Job runs restic for every volume restore, and the barman-cloud plugin moves the database data; the controller schedules, triggers and checks | |
 | every backed-up claim the infrastructure repository writes names a VolumeRestore; neither delivery path renders the ReplicationDestination populator any more | |

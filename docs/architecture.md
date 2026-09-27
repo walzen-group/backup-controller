@@ -8,10 +8,12 @@
 | the run manager | internal/runs, on controller-runtime | BackupRun and RestoreRun objects, the scheduler that creates a BackupRun at each tick of a Namespace's `backup.wlz.li/schedule`; it also runs the populator's orphan reconciler from internal/populator, which releases a deleted claim whose VolumeRestore is gone |
 | the bootstrap webhook | internal/bootstrap | a CloudNativePG Cluster on CREATE, and a recovered one on UPDATE |
 
-internal/volsync builds the ReplicationDestinations both the populator and a
-RestoreRun create, and internal/restic reads a repository's snapshots for the
-restore checks and each BackupRun's `snapshotTime`, and rewrites a quiesced
-run's snapshots. Databases below covers the
+internal/restorejob builds, reads and stops the restore Job that both the
+populator and a RestoreRun create
+([How the restore Job is built](#how-the-restore-job-is-built)), and
+internal/restic reads a repository's snapshots for the restore checks, the
+populator's choice of snapshot and each BackupRun's snapshot, and rewrites a
+quiesced run's snapshots. Databases below covers the
 database side of all three parts; the sections after it are about the
 populator, and the volume runs are in [namespace-backups.md](namespace-backups.md).
 
@@ -25,22 +27,25 @@ In the app's namespace:
 | Kueue Workload, one per run, named in the run's `status.workload` | each BackupRun, which also writes its `PodsReady` condition | deleted when the run ends |
 | ReplicationSource named after each claim marked `backup.wlz.li/enabled` | each BackupRun, owned by the claim and labelled `app.kubernetes.io/managed-by: backup-controller` | stays, and goes with the claim; a failed mover leaves it in place, and VolSync keeps retrying |
 | CloudNativePG Backup `<cluster>-<suffix>` | each BackupRun, one per Cluster marked `backup.wlz.li/enabled` | stays, as CloudNativePG's backup record |
-| ReplicationDestination | a RestoreRun that restores a volume: in place, or with `claim:` and `into:`, or with `repository:` and `into:` | deleted once the item's end is in the run's status |
-| Lease `backup-controller-claim-<claim uid>` and `backup-controller-repo-<secret uid>` | a run, right before it creates its mover object for an item | released once the item's end is in the run's status and its stopped mover's Job and pods are gone, and taken over by another run when its holder is gone or finished |
+| restore Job `restore-<run uid>-<item index>`, with the run as its controller | a RestoreRun that restores a volume: in place, or with `claim:` and `into:`, or with `repository:` and `into:`; created suspended and resumed once the run's status records it | stopped and deleted once the item's end is in the run's status; the garbage collector deletes one the run never recorded when the run goes |
+| Lease `backup-controller-claim-<claim uid>` and `backup-controller-repo-<secret uid>` | a run, right before it creates its ReplicationSource trigger or restore Job for an item | released once the item's end is in the run's status and no pod of its stopped restore Job can still write, and taken over by another run when its holder is gone or finished |
 | Lease `backup-controller-quiesce` in the run's namespace | a run, before it records the plan that stops the workloads of a BackupRun with `all: true`, or of a RestoreRun that lists `quiesce` | released once the run's stored status shows the workloads back; taken over when its holder has finished, is gone or has given the workloads back |
-| a scratch claim named by `into:` | a RestoreRun with `into:`, owned by the run; it carries no data source, and the run's ReplicationDestination fills it | deleted with the RestoreRun, the claim's dataset included |
+| a scratch claim named by `into:` | a RestoreRun with `into:`, owned by the run; it carries no data source, and the run's restore Job fills it | deleted with the RestoreRun, the claim's dataset included |
 
 In the controller's namespace, for each claim the populator fills: a copy of the
-repository Secret and a ReplicationDestination, both deleted when the fill ends,
-and the prime claim the library creates and hands over. When the claim is
-deleted after its VolumeRestore, the orphan reconciler deletes all three
+repository Secret and the restore Job `restore-<claim uid>`, both gone when the
+fill ends, and the prime claim the library creates and hands over. The Job
+names the prime claim as its owner, so the garbage collector deletes a Job the
+populator lost track of once the library deletes the prime. When the claim is
+deleted after its VolumeRestore, the orphan reconciler stops the Job and deletes
+the other two
 ([A claim whose VolumeRestore is gone](#a-claim-whose-volumerestore-is-gone)).
 
 On objects the controller does not own:
 
 | Object | Write | When |
 | --- | --- | --- |
-| Deployment or StatefulSet marked `backup.wlz.li/quiesce` | `spec.replicas` to 0, then back to the recorded value | during a BackupRun with `all: true` |
+| Deployment or StatefulSet marked `backup.wlz.li/quiesce` | the replica count to 0, then back to the recorded value, through the `scale` subresource: a read of the Scale, then an update without a resourceVersion, which changes nothing but `spec.replicas` (internal/runs/scale.go) | during a BackupRun with `all: true` |
 | Deployment or StatefulSet a RestoreRun's `quiesce` lists | the same | from the RestoreRun's start until its volumes are restored and its databases deleted |
 | the workload's Flux Kustomization | `spec.suspend` on, then off, only when the run found it running and its `status.inventory` lists the workload | the same as its workload |
 | a snapshot in the volume's restic repository | a new snapshot file at the run's `restartedAt`, tagged `quiesced`, replacing the one the mover wrote, under a lock file in locks/ | after the mover of a BackupRun that stopped workloads |
@@ -48,7 +53,8 @@ On objects the controller does not own:
 | a recovered Cluster | the `initdb` a GitOps tool applies again, dropped | on UPDATE, in the webhook |
 | a Cluster in a database RestoreRun | deleted, so it is created again and recovered | when the restore starts |
 | a claim being filled | the library's `backup.wlz.li` annotations and finalizer | while the fill runs |
-| a claim being deleted whose VolumeRestore is gone | the library's finalizer `backup.wlz.li/populate-target-protection` removed by the orphan reconciler, and its WaitingForMover and DataSourceGone events | once the claim's destination, mover pod, mover Job, Secret copy and prime claim are gone |
+| the prime claim `prime-<claim uid>` | the annotation `backup.wlz.li/restore-job-uid` with the UID of its restore Job, through a merge patch that carries the prime's UID | when the populator creates the Job; the populator resumes only the Job this annotation names |
+| a claim being deleted whose VolumeRestore is gone | the library's finalizer `backup.wlz.li/populate-target-protection` removed by the orphan reconciler, and its WaitingForMover and DataSourceGone events | once no pod of the claim's restore Jobs can still write, and its Secret copy and prime claim are gone |
 | the VolumeRestore a claim fills from | the finalizer `backup.wlz.li/volume-populator` | while any claim is listed in its `status.claims`; the populator adds it on its first call for a claim, which the library makes once the claim's prime claim is bound |
 
 Before a run changes anything, the run manager reads the installed CRD of the
@@ -64,9 +70,9 @@ rule this needs.
 
 A backup and a restore of one claim or repository never run at once. Each run
 acquires a `coordination.k8s.io` Lease for the claim and one for the repository
-before it creates its mover object, so the API server admits exactly one of two
-runs that reach that moment together, and a run that finds a Lease held waits
-with reason SourceBusy.
+before it triggers its backup mover or creates its restore Job, so the API
+server admits exactly one of two runs that reach that moment together, and a
+run that finds a Lease held waits with reason SourceBusy.
 [namespace-backups.md](namespace-backups.md#one-mover-at-a-time) has the
 messages and the takeover rule.
 
@@ -83,7 +89,9 @@ messages and the release rule.
 Its own BackupRuns and RestoreRuns carry a finalizer, which releases whatever a
 run changed when the run fails, times out or is deleted. The sources it writes
 make VolSync create the clone claim `volsync-<claim>-src`, the restic cache
-claims and the mover Jobs; those are VolSync's objects.
+claims and the backup mover Jobs; those are VolSync's objects. The restore Jobs
+are the controller's own, and the cache claim of each Job's pod is an
+ephemeral volume that goes with the pod.
 
 ## Databases
 
@@ -302,6 +310,59 @@ requests.
 The ClusterRole the process runs under is listed in
 [packaging.md](packaging.md#rbac-the-controller-needs), rule by rule.
 
+## How the restore Job is built
+
+Every volume restore writes through one Job shape, which
+restorejob.Build (internal/restorejob/spec.go:219) is the only code to write.
+A RestoreRun creates one per volume item in the run's namespace, and the
+populator one per claim in the controller's namespace, beside the prime claim.
+
+| Part | Value |
+| --- | --- |
+| name | `restore-<run uid>-<item index>` for a RestoreRun, `restore-<claim uid>` for the populator; at most 48 characters, so never shortened |
+| owner | a controller reference to the RestoreRun, or a plain reference to the populator's prime claim |
+| labels, on the Job and its pod | `app.kubernetes.io/managed-by: backup-controller`, `app.kubernetes.io/component: restore`, and `backup.wlz.li/restore-run: <run uid>` or `backup.wlz.li/restore-claim: <claim uid>`. The pod also carries the settings' `moverPodLabels`, under these, which win over a key they share. The Job itself never carries the Kueue queue label |
+| annotations | `backup.wlz.li/snapshot-id` (the full ID), `backup.wlz.li/claim` and `backup.wlz.li/repository` |
+| spec | `suspend: true` at creation, one pod at a time, `backoffLimit: 3`, `podReplacementPolicy: Failed`, and a pod failure policy that fails the Job at once on exit code 10 or 12 and ignores a pod with the condition DisruptionTarget or TerminationTarget |
+| init container `unlock` | `restic unlock`, with the cache and /tmp mounted and no data |
+| container `restore` | `restic restore <full ID> --target /data --include-xattr user.* --retry-lock 30m --delete`, run directly as the container's command with no shell |
+| image | the controller's `--restore-image`, for both containers |
+| environment | `envFrom` the repository Secret, then `RESTIC_CACHE_DIR=/cache` |
+| security | no ServiceAccount token; the settings' `moverSecurityContext` as the pod security context; each container drops ALL capabilities, allows no privilege escalation and has a read-only root filesystem. In a namespace annotated `volsync.backube/privileged-movers: "true"` it also runs as user 0 with DAC_OVERRIDE, CHOWN and FOWNER, the way VolSync's restic mover does there |
+| volumes | the claim at /data; a generic ephemeral volume at /cache of `cacheStorageClassName` and `cacheCapacity`, 1Gi without one; an in-memory emptyDir at /tmp |
+| termination message | `FallbackToLogsOnError` on both containers, so a failed container's status carries the tail of restic's log |
+
+The owner creates the Job suspended and records its name and UID: a RestoreRun
+in the item's `job` and `jobUID`, the populator in the prime claim's
+`backup.wlz.li/restore-job-uid` annotation. A later pass reads that record back
+from the API server and only then resumes the Job with a merge patch that
+carries the Job's UID. A create that the API server answered with an error but
+stored anyway leaves a Job no record names, and it stays suspended with no pod
+until its owner stops it or the garbage collector deletes it.
+
+restorejob.Read (internal/restorejob/read.go:120) decides on the Job's
+terminal conditions alone: `Complete=True` is success and `Failed=True` is
+failure. The Job controller adds either only once every pod of the Job has
+ended. The exit code, restic's last lines and the reason a pod waits come from
+the pods whose `batch.kubernetes.io/controller-uid` label is the Job's UID, and
+they are shown to a person and decide nothing.
+
+restorejob.Stop (internal/restorejob/stop.go:125) suspends a running Job, waits
+until one read shows `spec.suspend` true and the condition `Suspended=True`
+and every pod with the Job's UID has ended or was never scheduled and is being
+deleted, and then deletes the Job with Foreground propagation and a UID
+precondition. It reads the Job and the pods straight from the API server,
+never from a cache. A Job that is gone goes straight to the pod check on its
+recorded UID, so the pods of a Job someone deleted with Orphan propagation
+still hold the stop until they end.
+
+The ClusterRole grants create and delete on every Job in the cluster, which
+RBAC cannot narrow to these Jobs. The admission policy
+[in packaging.md](packaging.md#admission-policy-on-the-restore-jobs) lets the
+controller's ServiceAccount create and change only Jobs of this shape, and
+[decisions.md](decisions.md#narrow-the-jobs-grant-with-an-admission-policy)
+records what it leaves open.
+
 ## Built on lib-volume-populator
 
 The controller is a thin provider on top of
@@ -324,9 +385,9 @@ the library runs no pod of ours, and the three callbacks below do the work:
 
 | Callback | This controller's implementation |
 | --- | --- |
-| `PopulateFn` | create the ReplicationDestination pointed at the prime claim |
-| `PopulateCompleteFn` | report true when the destination's `status.lastManualSync` matches the trigger it was given |
-| `PopulateCleanupFn` | delete the ReplicationDestination |
+| `PopulateFn` | copy the repository Secret, select the snapshot, create the suspended restore Job `restore-<claim uid>` that writes it into the prime claim, record the Job's UID on the prime claim, and resume the Job on a later call; a failed Job is recorded as RestoreFailed, stopped, and replaced once it is gone |
+| `PopulateCompleteFn` | report true when the claim's restore Job was built for this prime claim and has `Complete=True`, or, with no Job, when the repository holds no snapshot at all and nothing pins the claim |
+| `PopulateCleanupFn` | stop every restore Job of the claim, and return an error until none of its pods can still write; then delete the Secret copy |
 
 Each callback receives `PopulatorParams`, which carries the Kubernetes client,
 the original claim, the prime claim, the storage class, the data source object
@@ -354,25 +415,24 @@ The copied `selected-node` annotation is the reason this design also settles a
 placement problem the snapshot path has.
 
 With VolSync's populator, two independent decisions pick a worker. The scheduler
-picks one for the app's pod and writes it onto the claim; the restore mover is
-placed by its own affinity and the clone is made wherever it ran. They can
-disagree, and the volume wins: the pod has to run on the worker that holds the
+picks one for the app's pod and writes it onto the claim; VolSync's restore
+mover is placed by its own affinity and the clone is made wherever it ran.
+They can disagree, and the volume wins: the pod has to run on the worker that holds the
 volume, whatever node the scheduler first chose. The walzen test cluster
 showed exactly that on 2026-09-13: a claim annotated
 `selected-node: talos-unraid-w-2` whose PersistentVolume sat on
 talos-unraid-w-1.
 
 Here the annotation is carried onto the prime claim, so the volume is created on
-the worker the scheduler chose for the pod, and the mover follows the volume it
-has to mount. The scheduler picks the worker once, and the volume and the
-mover both go to it.
+the worker the scheduler chose for the pod, and the restore Job's pod, which
+sets no node selector, follows the volume it has to mount. The scheduler picks
+the worker once, and the volume and the restore both go to it.
 
 ## Object flow for one restore
 
 This is the path a claim follows when it is created and its `dataSourceRef` names
-a VolumeRestore. A RestoreRun writes into a claim the same way, through a
-ReplicationDestination with `copyMethod: Direct`, but in the app's namespace
-and without the populator library;
+a VolumeRestore. A RestoreRun writes into a claim with the same restore Job, in
+the app's namespace and without the populator library;
 [restores.md](restores.md#submitting-a-restore) has those runs.
 
 ```mermaid
@@ -381,25 +441,28 @@ sequenceDiagram
     participant sched as scheduler
     participant lib as populator library
     participant ctl as backup-controller
-    participant vs as VolSync
+    participant job as restore Job
 
     Note over sched: claim notes-data is Pending,<br/>its dataSourceRef names a VolumeRestore
     sched->>sched: tries to place the app's pod,<br/>annotates the claim with selected-node
 
     lib->>lib: creates prime-<uid> in backup-system<br/>same class, size and selected-node, no data source
     lib->>ctl: PopulateFn
+    ctl->>ctl: copies the repository Secret into backup-system,<br/>lists the repository, selects the snapshot
+    ctl->>job: creates restore-<uid>, suspended,<br/>restic restore <full ID> into prime-<uid>
+    ctl->>ctl: records the Job's UID on prime-<uid>
 
-    ctl->>ctl: copies the repository Secret into backup-system
-    ctl->>vs: creates ReplicationDestination restore-<uid><br/>copyMethod Direct, destinationPVC prime-<uid>
-    vs->>vs: the mover runs, queued like every other mover
-    vs-->>ctl: status.lastManualSync == <uid>
+    lib->>ctl: PopulateFn again
+    ctl->>job: resumes it
+    job->>job: its pod runs, queued like every other mover,<br/>restic exits 0
+    job-->>ctl: condition Complete=True
 
     lib->>ctl: PopulateCompleteFn
     ctl-->>lib: true
 
     lib->>lib: patches the PersistentVolume's claimRef<br/>from prime-<uid> to notes-data
     lib->>ctl: PopulateCleanupFn
-    ctl->>vs: deletes the ReplicationDestination
+    ctl->>job: deletes the Job once its pod has ended
     ctl->>ctl: deletes the copied Secret
     lib->>lib: deletes the prime claim
 
@@ -410,16 +473,23 @@ Every object the restore created is gone by the end. What survives is the
 PersistentVolume, now bound to the app's claim, and it is an ordinary dataset
 with no origin.
 
+The populator resumes the Job only while the app claim has no volume yet and
+the prime's PersistentVolume still names the prime in its `claimRef`, both read
+straight from the API server, so a Job never starts writing into a volume the
+library has already handed to the app.
+
 ## Why the repository Secret is copied
 
-VolSync resolves `spec.restic.repository` as a Secret in the ReplicationDestination's
-own namespace. The prime claim lives in the controller's namespace, so the
-destination does too, and the app's repository Secret is in the app's namespace.
+The restore Job reads the repository Secret through `envFrom`, which names a
+Secret in the Job's own namespace. The prime claim lives in the controller's
+namespace, so the Job does too, and the app's repository Secret is in the
+app's namespace.
 
 The controller copies that Secret into its own namespace for the length of the
 restore and deletes it in `PopulateCleanupFn`. The copy is named for the claim's
 UID, so two restores never collide, and it exists only while a restore is
-running.
+running. A RestoreRun's Job runs in the app's namespace and reads the app's
+Secret where it is.
 
 [decisions.md](decisions.md) records the alternative that was weighed, which is
 a repository Secret that lives in the controller's namespace from the start.
@@ -428,17 +498,28 @@ a repository Secret that lives in the controller's namespace from the start.
 
 | Case | What happens |
 | --- | --- |
-| the repository has no snapshot yet, a first deploy | VolSync completes with nothing to write; the library hands the empty volume to the app's claim, and the app starts on an empty volume, which matches what the snapshot path does today |
-| the restore fails | `PopulateCompleteFn` keeps returning false, the library never hands the volume over, the app's claim stays Pending and its pod does not start. The VolumeRestore reports RestoreFailed with `claim <name>: ` and the mover's logs for as long as VolSync keeps retrying the mover, also while other claims of the same VolumeRestore restore or finish, and the ReplicationDestination's status and events hold the rest |
-| the claim's `restoreAsOf` is older than every snapshot | the VolumeRestore reports NoBackupInReach, the controller creates no ReplicationDestination, and the claim stays Pending until the moment is changed or the claim is recreated without it |
-| the VolumeRestore is deleted mid-restore | its finalizer `backup.wlz.li/volume-populator` keeps it Terminating until every claim it fills has finished or been deleted, and each claim's cleanup deletes that claim's destination and Secret copy first |
+| the repository has no snapshot at all yet, a first deploy | the populator creates no restore Job, `PopulateCompleteFn` returns true, and the library hands the empty volume to the app's claim, so the app starts on an empty volume, which matches what the snapshot path does. A wrong repository prefix in the Secret looks the same |
+| the repository holds snapshots, and none has a VolSync mover's layout (host `volsync`, paths `[/data]`) | the VolumeRestore reports NoBackupInReach and names the snapshots it passed over, no Job is created, and the claim stays Pending; nothing binds empty |
+| the restore fails | the Job ends with `Failed=True`. The populator records RestoreFailed with `claim <name>: ` and restic's exit code and last lines on the VolumeRestore, stops the Job, and once the Job is gone selects the snapshot again and creates a new one. The library never hands the volume over meanwhile, the app's claim stays Pending and its pod does not start. RestoreFailed stays also while other claims of the same VolumeRestore restore or finish |
+| the API server refuses the restore Job, such as the admission policy refusing the VolumeRestore's `moverSecurityContext` | the VolumeRestore reports RestoreJobRefused with the API server's answer, the claim stays Pending, and every sync tries again |
+| the Job's pod never starts, such as an image it cannot pull | prod's Kueue evicts it after five minutes and the Job starts another; the claim stays Pending, and the VolumeRestore's Restoring message shows why the pod waits |
+| the claim's `restoreAsOf` is older than every snapshot | the VolumeRestore reports NoBackupInReach, the controller creates no restore Job, and the claim stays Pending until the moment is changed or the claim is recreated without it |
+| the VolumeRestore is deleted mid-restore | its finalizer `backup.wlz.li/volume-populator` keeps it Terminating until every claim it fills has finished or been deleted, and each claim's cleanup stops that claim's restore Job and deletes its Secret copy first |
 | the VolumeRestore is deleted before a claim's prime claim binds | the VolumeRestore carries no finalizer yet and goes at once. The claim stays Pending; once it is deleted, the orphan reconciler cleans up after it ([A claim whose VolumeRestore is gone](#a-claim-whose-volumerestore-is-gone)) |
 | the controller is down | claims stay Pending. Nothing is half-written and no app starts on an empty volume. A process whose run manager stopped exits, so the kubelet restarts it |
-| the controller restarts mid-restore | every object is named from the app claim's UID, so the next reconcile finds the existing destination and creates no second one |
-| two apps restore at once | each destination carries the backup queue label, so Kueue admits them the way it admits every other mover |
+| the controller restarts mid-restore | the Job is named from the app claim's UID, so the next call finds it and creates no second one |
+| the library creates the prime claim again under the same name | a Job built for the earlier prime, by its owner reference, is stopped and replaced; its Complete condition never completes the new prime |
+| two apps restore at once | each Job's pod carries the backup queue label from `moverPodLabels`, so Kueue admits them the way it admits every other mover |
 | the app's claim is deleted while the app runs | the pod loses its volume and stays down until the refill completes, which is what deleting a claim already does |
-| the app's claim is deleted mid-restore | the library's own garbage collection removes the prime claim; `PopulateCleanupFn` removes the destination and the Secret copy |
+| the app's claim is deleted mid-restore | the library calls `PopulateCleanupFn`, which stops the Job before the prime claim goes, and removes the Secret copy |
 | the app's claim is deleted after its VolumeRestore | the library can no longer clean up, and the orphan reconciler does it in its place ([A claim whose VolumeRestore is gone](#a-claim-whose-volumerestore-is-gone)) |
+
+Every class on the walzen cluster binds WaitForFirstConsumer, and there the
+prime claim is provisioned for the node the library copied onto it. On a class
+that binds Immediate, the PersistentVolume controller could bind the prime to
+an Available static PersistentVolume of that class, and the Job's `--delete`
+would then remove that volume's other files. The declared setup has no such
+volume.
 
 ## A claim whose VolumeRestore is gone
 
@@ -448,7 +529,7 @@ the branch that cleans up after a deleted claim (lib-volume-populator v3.3.0
 populator-machinery/controller.go:661-671). A claim deleted after its
 VolumeRestore would keep the library's finalizer
 `backup.wlz.li/populate-target-protection` and stay Terminating, and its prime
-claim, Secret copy and ReplicationDestination would stay in the controller's
+claim, Secret copy and restore Job would stay in the controller's
 namespace.
 
 A VolumeRestore can be deleted before its claim in two ways. It carries no
@@ -473,29 +554,27 @@ uncached reads from the API server, and goes on only when the API server answers
 NotFound for the VolumeRestore. A VolumeRestore that exists in any state leaves
 the claim to the library. Then, in the controller's namespace, it:
 
-1. deletes the ReplicationDestination `restore-<uid>`; when that delete finds
-   the destination there, it records WaitingForMover and looks again 30
-   seconds later, because VolSync may create the mover Job for that
-   destination after any look the same pass could take;
-2. lists the pods of the mover Job `volsync-dst-restore-<uid>`, and once no pod
-   is left reads the Job itself; while a pod or the Job is left, it records
+1. stops every restore Job of the claim the way `PopulateCleanupFn` does: it
+   stops the Job `restore-<uid>` by its own UID, then lists the pods labelled
+   `backup.wlz.li/restore-claim: <uid>` and waits for the pods of every Job
+   UID they carry, which finds the pods of a Job someone deleted and of every
+   earlier Job of the claim. While one of them may still write, it records
    WaitingForMover on the claim and looks again 30 seconds later;
-3. deletes the Secret copy and the prime claim `prime-<uid>`;
-4. removes `backup.wlz.li/populate-target-protection` from the claim, and
+2. deletes the Secret copy and the prime claim `prime-<uid>`;
+3. removes `backup.wlz.li/populate-target-protection` from the claim, and
    records DataSourceGone.
 
-The reconciler deletes the Secret copy and the prime claim only once the mover
-pod and its Job are gone. A restic restore killed half way leaves its lock in
-the repository, and a Job with no pod, before its first pod or between two
-retries, can still start one. Every delete accepts an object that is already
-gone, and the finalizer goes last, so a pass that fails part way starts again
-from step 1 and finishes on a later pass. Only a pass whose delete in step 1
-finds the destination already gone goes on to step 2.
+The reconciler deletes the Secret copy and the prime claim only once no pod of
+the claim's restore Jobs can still write. A restore stopped half way may still
+be writing the prime, and its restic holds a lock in the repository until it
+has ended. Every delete accepts an object that is already gone, and the
+finalizer goes last, so a pass that fails part way starts again from step 1
+and finishes on a later pass.
 
 | Event | Type | Message |
 | --- | --- | --- |
-| WaitingForMover | Normal | `VolumeRestore <name> is gone; deleted ReplicationDestination restore-<uid>, and looks for its mover once 30s have passed before the cleanup goes on` on the pass that deletes the destination; once 30 seconds have passed since that delete, `VolumeRestore <name> is gone; waiting for mover pod <namespace>/<pod> (phase <phase>) of ReplicationDestination restore-<uid> to go before the cleanup finishes`, or `mover Job <namespace>/volsync-dst-restore-<uid>` in place of the pod once only the Job is left |
-| DataSourceGone | Warning | `VolumeRestore <name> was deleted before the populator finished with this claim; deleted ReplicationDestination restore-<uid>, Secret copy <secret> and prime claim prime-<uid> in <namespace>, and removed finalizer backup.wlz.li/populate-target-protection` |
+| WaitingForMover | Normal | `VolumeRestore <name> is gone; <what the stop waits for> before the cleanup goes on`, where the wait reads, for example, `restore Job restore-<uid>: waiting for pods restore-<uid>-x7k2p to end` or `restore Job restore-<uid>: waiting for the Job controller to suspend it` |
+| DataSourceGone | Warning | `VolumeRestore <name> was deleted before the populator finished with this claim; stopped restore Job restore-<uid>, deleted Secret copy <secret> and prime claim prime-<uid> in <namespace>, and removed finalizer backup.wlz.li/populate-target-protection` |
 
 To follow one claim's cleanup, read the claim's events:
 
@@ -547,7 +626,7 @@ never lists it.
 | the webhook Service, its cert-manager Issuer and Certificate, and the MutatingWebhookConfiguration | the controller's namespace, and cluster-scoped for the configuration | always |
 | the VolumeRestore | the app's namespace | as long as the app declares it |
 | the prime claim | the controller's namespace | one restore |
-| the ReplicationDestination | the controller's namespace | one restore |
+| the restore Job and its pod | the controller's namespace | one restore; the populator deletes it once its pod has ended |
 | the copied repository Secret | the controller's namespace | one restore |
-| the mover's restic metadata cache claim | the controller's namespace | one restore, and VolSync deletes it with the destination |
+| the restore pod's restic metadata cache claim | the controller's namespace | the life of the pod, as a generic ephemeral volume |
 | the restored PersistentVolume | cluster-scoped | the life of the app's claim |

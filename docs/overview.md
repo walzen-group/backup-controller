@@ -84,10 +84,14 @@ For a claim naming a VolumeRestore, the controller:
 
 1. creates an ordinary empty volume with the claim's storage class, size and
    selected node, and no data source of any kind
-2. creates a VolSync ReplicationDestination with `copyMethod: Direct` pointed at
-   that volume, so VolSync's mover restores restic straight into it
-3. waits for the mover to report the restore complete
-4. deletes the ReplicationDestination
+2. lists the restic repository and selects the newest snapshot with the layout
+   a VolSync mover writes, or the newest at or before the claim's
+   `backup.wlz.li/restore-as-of`
+3. creates a restore Job that mounts that volume and runs `restic restore`
+   for that snapshot, named by its full ID, in the same restic image VolSync
+   backs up with
+4. waits for the Job's condition `Complete=True`, then deletes the Job once
+   its pod has ended
 5. hands the filled volume to the app's claim, which binds
 
 ```mermaid
@@ -95,15 +99,14 @@ flowchart LR
     repo[("restic repository")]
     app["the app's volume<br/>no origin, no snapshot"]
 
-    repo -- "the mover restores straight in" --> app
+    repo -- "the restore Job restores straight in" --> app
 ```
 
-Two objects exist while that runs, the empty volume and the destination, and
-both are gone when it ends. What stays on the pool is the one dataset the app
-asked for.
+Two objects exist while that runs, the empty volume and the Job, and the Job is
+gone when it ends. What stays on the pool is the one dataset the app asked for.
 
 The app's dataset is then a plain dataset with no origin. No snapshot is held
-open for it, it never grows toward a second copy, and the destination keeps no
+open for it, it never grows toward a second copy, and no second dataset keeps a
 permanent copy.
 
 ## What an app keeps
@@ -113,8 +116,8 @@ permanent copy.
 | delete the claim and it refills | yes | yes |
 | the pod cannot start on an empty volume | yes, the claim stays unbound | yes, the same |
 | a rebuilt cluster comes back filled | yes | yes |
-| the restore runs in the cluster's backup queue | yes | yes, the destination carries the same label |
-| repository credentials live only where VolSync reads them | yes | yes |
+| the restore runs in the cluster's backup queue | yes | yes, the restore Job's pod carries the same label |
+| repository credentials live only where VolSync reads them | yes | the app's Secret, and a copy in the controller's namespace for the length of a fill |
 | steady-state disk | one shared set of blocks, plus everything overwritten since | one dataset |
 
 ## Databases
@@ -192,9 +195,11 @@ Cluster's archive, reads its base backups and follows a restore.
 | Requirement | Why |
 | --- | --- |
 | Kubernetes with `AnyVolumeDataSource` available | a claim has to be able to name a custom kind in `dataSourceRef`; the walzen test cluster runs v1.36.3 |
-| VolSync installed, with its ReplicationSource and ReplicationDestination CRDs | the controller writes one source per backed-up claim and one destination per restore, and never moves data itself |
+| VolSync installed, with its ReplicationSource CRD | the controller writes one source per backed-up claim, and VolSync's mover writes every backup |
+| a restic image, passed as `--restore-image` | the restore Job runs restic from it; the controller refuses to start without the flag. Pass the image VolSync runs its restic mover in, pinned by digest ([packaging.md](packaging.md#restore-image)) |
+| Kubernetes 1.30 or later, for ValidatingAdmissionPolicy | the admission policy that narrows the controller's grant on Jobs to restore Jobs of its own shape |
 | a CSI driver whose ordinary provisioning makes an independent volume | true of zfs-localpv, which only clones when the source is a snapshot |
-| a restic repository Secret in the app's namespace | named by the claim's VolumeRestore, and read by every mover of that volume |
+| a restic repository Secret in the app's namespace | named by the claim's VolumeRestore, and read by every backup mover and restore Job of that volume |
 | Kueue, for namespace runs | each BackupRun is admitted as one Workload through the namespace's LocalQueue |
 | CloudNativePG and the barman-cloud plugin, for databases | the base backups the runs request, and the archives the webhook recovers from |
 | cert-manager, for the webhook | its serving certificate and the CA injected into the webhook configuration |
@@ -203,14 +208,16 @@ Cluster's archive, reads its base backups and follows a restore.
 
 ## Where the boundary sits
 
-For a fill, the controller creates a ReplicationDestination, polls its status,
-and deletes it. It reads and writes PersistentVolumeClaims and patches one
-PersistentVolume per restore. It runs no mover and mounts no volume. If a
-restore fails, the failure is VolSync's and is reported in VolSync's objects and
-events.
+For a fill, the controller creates a restore Job, reads its conditions and its
+pods, and stops and deletes it. It reads and writes PersistentVolumeClaims and
+patches one PersistentVolume per restore. The controller's own process mounts
+no volume; the Job's pod runs restic from the image the installer passes. A
+failed restore is reported on the VolumeRestore with restic's exit code and
+last lines, and the Job and its pod hold the rest.
 
 It does read repositories, and writes one kind of file in them. The restore
-checks and each BackupRun's `snapshotTime` read the restic repository's own
+checks, the populator's choice of snapshot and each BackupRun's snapshot read
+the restic repository's own
 files through the S3 client in internal/restic, with the password and keys from
 the repository Secret, and a BackupRun that stopped workloads writes each of its
 snapshots again at the moment it restarted them. Copying that Secret for a fill

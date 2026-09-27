@@ -189,13 +189,46 @@ restartedAt: "2026-09-24T22:15:45Z"
    flux-system/notes yourself; the run then goes on by itself.` A restart skips
    a workload that already stands at its recorded count and a Kustomization
    that is not suspended, so doing that by hand lets the run go on.
-5. It reads the snapshot each mover logged, `snapshot d1cb7739 saved`, and the
-   time restic stamped on it from the repository itself. When step 2 stopped a
-   workload, it writes the snapshot again at `restartedAt`, as the next section
-   describes. Then it deletes the Workload.
+5. It finds each volume's snapshot in the repository itself, once VolSync has
+   completed the run's trigger: the newest snapshot a mover wrote (host
+   `volsync`, the one path `/data`, no original) whose time lies in the sync's
+   window, from `lastSyncTime - lastSyncDuration` to `lastSyncTime`, widened
+   by one second for the whole-second `lastSyncTime` and by 5 seconds on each
+   side for the clocks of the mover's node and VolSync's manager. A snapshot
+   another BackupRun recorded for the claim is never a candidate. The item
+   records the snapshot's full ID in `snapshotID`, its short ID and the time
+   restic stamped on it. When step 2 stopped a workload, it writes the snapshot
+   again at `restartedAt`, as the next section describes. Then it deletes the
+   Workload.
 
 On the canary, the writer was down 34 seconds, most of it the pod's 30-second
 termination grace, because its shell loop does not handle SIGTERM.
+
+The run never reads the mover's log to find the snapshot, so a VolSync that
+keeps no log, or one it could not read, changes nothing. A sync can leave more
+than one snapshot: VolSync retries a failed mover pod inside the same sync, and
+a pod that saved its snapshot and then failed at `forget` leaves it. The newest
+one is the attempt that succeeded, and the item's message names the others:
+`the sync also left snapshot 2edf5bab from failed attempts; they stay in the
+repository until retention forgets them`. A sync with no snapshot in its window
+backed up a claim that held nothing but lost+found, which VolSync's mover skips
+while it still reports success. An S3 listing can lag the mover's write, so
+the item records the first empty listing in `noSnapshotListedAt` and waits:
+`the repository listed no snapshot of the sync at <time>; the run lists it
+again after 11s before it takes the volume for empty`. Only when that second
+listing finds none either does the item succeed with `empty: true` and `the
+volume held no files, so VolSync took no snapshot`. A completed sync whose
+ReplicationSource status lacks `lastSyncTime` or `lastSyncDuration` fails the
+item with reason NoMoverSnapshot, because the run can't tell which snapshot
+the sync wrote.
+
+A repository holds the backups of one claim. The window tells two syncs of
+different claims apart only when the claim Lease and the repository Lease keep
+them from running at once, and one run may take the repository Lease for two of
+its own claims, so two claims sharing a repository could each take the other's
+snapshot. VolSync's own `restic forget --host volsync` after each backup would
+also apply one claim's retention to the other's snapshots. The walzen
+infrastructure repository declares one repository per volume.
 
 A finalizer performs step 4 and deletes the Workload on failure, on timeout and
 when the run is deleted. When a step there fails, the run stays unfinished and
@@ -437,11 +470,9 @@ the tag stays. When the source still carries the run's tag, has not completed
 it, and reports a Failed mover in a sync VolSync started after the run's
 `startedAt`, the run fails the item with the mover's logs at once, and the
 failure shows on the run before its timeout. It leaves the ReplicationSource
-alone. A mover that failed on a lock is reported with the explanation first:
-`The restic repository is locked (repository is already locked): a lock that
-another restic process holds or left behind, such as one of a mover that was
-killed, keeps restic from taking the lock it needs. ... The next backup does so
-by itself once the lock is older than 30 minutes. Mover logs: ...`
+alone. The item's reason is MoverFailed and its message is `Mover logs: `
+followed by the logs as VolSync kept them, whatever they say; a mover that
+failed on a lock shows restic's `repository is already locked` there.
 
 A later run waits only for a tag some run still needs. When the tag's run
 failed, timed out or was deleted, or the tag was written by v0.7.x or v0.8.x, no
@@ -514,7 +545,9 @@ or Backup the API server rejects as invalid.
 
 A start that fails with an error a retry may fix, such as a CloudNativePG
 webhook that cannot be reached, no longer ends the pass. The item stays Pending
-with `not started yet: <error>`, the Ready condition gets reason Retrying with
+with `not started yet: <error>`, and the error in `lastStartError`, which a
+start that succeeds clears and a run that gives the item up adds to its
+message. The Ready condition gets reason Retrying with
 a message that names every such item and every wait, `retrying the start of
 notes-pg: <error>; ReplicationSource notes-data is still completing the backup
 of BackupRun scheduled-20260926-0900`, and the run keeps working: the quiesced
@@ -533,7 +566,8 @@ cluster has no CloudNativePG CRDs`.
 
 A backup and a restore of the same claim or repository never run at once. Each
 run acquires a `coordination.k8s.io` Lease for the claim and one for the
-repository right before it creates its mover object, the claim's named
+repository right before it triggers its mover or creates its restore Job, the
+claim's named
 `backup-controller-claim-<claim uid>` and the repository's
 `backup-controller-repo-<secret uid>`. Creating a Lease is atomic, so of two
 runs that reach that moment in the same instant the API server admits one, and
@@ -552,24 +586,34 @@ A run that finds another run holding either Lease waits with reason SourceBusy:
 BackupRun scheduled-20260926-0900 holds Lease backup-controller-claim-3f2a1c7e-9d2b for notes-data; this run starts once that run has finished with it
 ```
 
-Right before it creates its mover object, a run also looks for the other
-kind's mover object on the claim or its repository: a BackupRun for a
-ReplicationDestination of an unfinished RestoreRun, and a RestoreRun for a
+Right before it triggers its mover or creates its restore Job, a run also looks
+for the other kind's work on the claim or its repository: a BackupRun for a
+restore Job of the controller whose `backup.wlz.li/claim` or
+`backup.wlz.li/repository` annotation names them, and a RestoreRun for a
 ReplicationSource whose backup is in progress. It waits for one with reason
-SourceBusy as well:
+SourceBusy as well. A restore Job holds the claim while its RestoreRun is
+unfinished and the run's item has not finished:
 
 ```text
-RestoreRun notes-back-to-friday is restoring claim notes-data from repository notes-restic-data with ReplicationDestination restore-3f2a1c7e; this run starts once that restore has finished
+RestoreRun notes-back-to-friday is restoring claim notes-data from repository notes-restic-data with restore Job restore-<run uid>-0; this run starts once that restore has finished
 ```
 
-A namespace BackupRun makes both checks, the Leases and the mover objects, for
+Past that, and for a Job of the populator or of a run that is gone, the Job
+holds them while the Job controller may still start a pod for it or one of its
+pods may still run restic:
+
+```text
+restore Job restore-<run uid>-0 of RestoreRun notes-back-to-friday may still write claim notes-data from repository notes-restic-data; this run starts once the Job is stopped and its pods have ended
+```
+
+A namespace BackupRun makes both checks, the Leases and the other kind's work, for
 every claim before it stops anything. A read that fails there comes back as an
 error and stops nothing, so the run never stops an app for a backup that then
 waits, or on a read it could not make.
 
 No Lease guards a claim that does not exist, and the item reports it: a backup
 fails the item with `the claim <name> no longer exists`. A repository Secret
-that does not exist fails the item before any mover object exists, because a
+that does not exist fails the item before any mover or restore Job exists, because a
 mover started without the repository's Lease would run unguarded once the
 Secret appears:
 
@@ -681,23 +725,19 @@ PersistentVolumeClaim canary-namespace-backup-data: no snapshot at or before 202
 Cluster canary-namespace-backup-pg: no base backup finished by 2026-09-24T22:12:00Z; the oldest, 20260924T221544, finished at 2026-09-24T22:15:45Z
 ```
 
-Without the first check, VolSync's mover prints `No eligible snapshots found`,
-exits 0, and the restore reports success having written nothing.
+The run considers only the snapshots with the layout a VolSync mover writes,
+host `volsync` and paths exactly `[/data]`, and refuses the run with reason
+NoBackupInReach, before anything is created, when a repository holds none.
+The restore Job restores the selected snapshot by its full ID, so two
+snapshots in one second are each restored as selected.
 
-The run then checks that the snapshot it selected is one the mover will restore
-when it is pinned to that snapshot's second, and refuses the run with reason
-NoBackupInReach, before anything is created, when it is not:
-
-```text
-snapshot 6e473100 (2026-09-26T09:03:53Z) shares its second with snapshot 2edf5bab, and VolSync's mover picks by the whole second, so it would restore 2edf5bab. Choose 2edf5bab or a snapshot in another second
-```
-
-[restores.md](restores.md#which-snapshot-a-run-restores) has every case,
-including the one a `syncDatabaseToVolume` run adds. Right before the run
-creates a destination, it lists the repository once more: a snapshot a backup's
-retention removed after the checks, a snapshot that backup rewrote at another
-time, or one the mover would now pick instead, fails the item with the cause
-and `. Nothing was written to claim <claim>. Create a new RestoreRun to select
+[restores.md](restores.md#which-snapshot-a-run-restores) has the rules, and
+[Restore a whole namespace to one moment](#restore-a-whole-namespace-to-one-moment)
+the one a `syncDatabaseToVolume` run adds. Right before the run
+creates a restore Job, it lists the repository once more: a snapshot a backup's
+retention removed after the checks, or a snapshot that backup rewrote at
+another time, fails the item with reason SnapshotChanged, the cause and `.
+Nothing was written to claim <claim>. Create a new RestoreRun to select
 again`.
 
 A missing repository Secret fails the check with `no repository Secret <name>
@@ -845,9 +885,9 @@ spec:
 2. It suspends each listed workload's Flux Kustomization, by the rule in
    [Which Kustomization a run suspends](#which-kustomization-a-run-suspends),
    scales the workload to zero, and waits until no pod of it is left.
-3. It restores each volume with `restoreAsOf` set to the time of the quiesced
-   snapshot it selected, which is `syncedTo`, so the mover selects that
-   snapshot.
+3. It restores each volume from the quiesced snapshot it selected, whose time
+   is `syncedTo`, with a restore Job that restores that snapshot by its full
+   ID.
 4. It deletes each Cluster and waits until the Cluster's instance pods and
    PVCs are gone, as [A database restore](#a-database-restore) describes. Then
    it gives the workloads their replicas back and resumes the Kustomizations it
@@ -953,4 +993,5 @@ that carries the username `backup-controller`, as
 [Quiesced snapshots](#quiesced-snapshots) describes.
 
 The tests read, and rewrite a copy of, a fixture restic 0.19.1 wrote. The
-controller runs no restic binary and pins no image beside VolSync's.
+controller process runs no restic binary. Its restore Jobs run restic from the
+image the installer passes as `--restore-image`, VolSync's mover image in prod.

@@ -17,9 +17,12 @@ kuport is the pattern it copies:
 | version input | `kuport_version` | `backup_controller_version: "v0.5.4"`, kept current by a Renovate comment |
 
 The unit depends on networking/cilium, cluster/volsync, cluster/zfs-localpv and
-cluster/kueue, so the ReplicationDestination kind it creates objects against, the
-storage classes it provisions into and the ClusterQueue its LocalQueue names all
-exist first.
+cluster/kueue, so the ReplicationSource kind its runs write, the storage
+classes it provisions into and the ClusterQueue its LocalQueue names all exist
+first. From v0.9.0 the volsync unit also gives it the restic image its restore
+Job runs, which the module appends to the controller's args as
+`--restore-image`; [upgrading.md](upgrading.md#step-5-change-the-infra-units)
+has the change.
 
 The module downloads the release's rendered manifest and applies it in three
 groups:

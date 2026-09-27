@@ -17,15 +17,18 @@ is how data is lost:
 ```mermaid
 flowchart TD
     Q{"Does the claim<br/>already exist?"}
-    Q -- "no, it is being created" --> P["its VolumeRestore fills it<br/>the populator + VolSync"]
-    Q -- "yes, and the app is using it" --> D["a RestoreRun overwrites it<br/>a ReplicationDestination, copyMethod Direct"]
+    Q -- "no, it is being created" --> P["its VolumeRestore fills it<br/>the populator's restore Job"]
+    Q -- "yes, and the app is using it" --> D["a RestoreRun overwrites it<br/>the run's restore Job"]
 
     P --> P1["the volume holds the<br/>newest backup"]
     D --> D1["the volume holds the<br/>snapshot you chose"]
 ```
 
-Both paths go through this controller. The left one acts on its own when a
-claim is created; the right one runs only when someone submits a RestoreRun.
+Both paths go through this controller, and both write through the same
+restore Job, which runs `restic restore` for one snapshot named by its full ID
+([architecture.md](architecture.md#how-the-restore-job-is-built) has its shape). The left
+path acts on its own when a claim is created; the right one runs only when
+someone submits a RestoreRun.
 
 ## Choosing
 
@@ -49,7 +52,7 @@ flowchart TD
 | --- | --- | --- | --- |
 | rebuild from the newest backup | nothing, delete the claim | yes, to release the claim | the volume's current contents |
 | read an older snapshot beside the live volume | a RestoreRun with `into:` | no | nothing |
-| write an older snapshot into the existing volume | a RestoreRun naming the claim | yes, the mover mounts the claim | the volume's current contents |
+| write an older snapshot into the existing volume | a RestoreRun naming the claim | yes, the restore Job mounts the claim | the volume's current contents |
 
 The middle row is the one to reach for when the question is whether an older
 backup is any better, because it answers that without betting the current data on
@@ -87,17 +90,17 @@ That makes the in-place restore the only way back for a fixed-name volume, and
 one of two ways back for a dynamic one. The runs find a fixed-name claim's
 repository through the VolumeRestore carrying the claim's own name.
 
-The in-place restore itself is indifferent to the shape. Its
-ReplicationDestination names `destinationPVC` and writes into whatever claim
-that is, without knowing how the claim was provisioned.
+The in-place restore itself is indifferent to the shape. Its restore Job mounts
+the claim by name at /data and writes into whatever claim that is, without
+knowing how the claim was provisioned.
 
 ## Why an in-place restore needs the workload stopped
 
-The mover mounts the claim and writes into it. ReadWriteOnce lets every pod on
-the node that has the claim attached mount it, and only ReadWriteOncePod limits
-a claim to one pod. The mover and the app both land on the node holding the
-volume, so Kubernetes lets both mount it at once. Two writers
-on one filesystem is how the volume being restored is corrupted.
+The restore Job's pod mounts the claim and writes into it. ReadWriteOnce lets
+every pod on the node that has the claim attached mount it, and only
+ReadWriteOncePod limits a claim to one pod. The Job's pod and the app both land
+on the node holding the volume, so Kubernetes lets both mount it at once. Two
+writers on one filesystem is how the volume being restored is corrupted.
 
 Stopping the workload is what prevents it. A RestoreRun with `quiesce` stops the
 workloads that list names itself, as
@@ -113,29 +116,26 @@ what deployed it. In the walzen infrastructure repository a Flux app is
 suspended and scaled down by hand, and a terragrunt unit is applied with its
 workload at zero; that repository's docs/cluster/backups/ has both procedures.
 
-Two in-place restores of one claim run one after the other. Before it creates
-its ReplicationDestination, a run lists the destinations in its namespace, and
-while the restic mover of another destination writes into the claim, the run
-waits with reason ClaimInUse:
+Two in-place restores of one claim run one after the other. While the first
+run's restore Job has a pod that mounts the claim, the second run waits with
+reason ClaimInUse and a message naming that pod. The first run keeps the
+claim's Lease until it has stopped its Job and every pod of it has ended, so
+once the pod has gone the second run waits with reason SourceBusy:
 
 ```text
-ReplicationDestination restore-1a2b3c4d-0 is restoring into claim notes-data
+RestoreRun back-to-friday holds Lease backup-controller-claim-3f2a1c7e-9d2b for notes-data; this run starts once that run has finished with it
 ```
 
-That check also catches a destination someone created by hand. Once the first
-run has deleted its destination, the mover pod of the first run may still mount
-the claim, and the second run waits with reason ClaimInUse and a message naming
-that pod. The first run keeps the claim's Lease until its mover's Job and pods
-are gone, so once the pod has gone the second run waits with reason SourceBusy
-and a message naming the first run. The second run then starts on its own.
+The second run then starts on its own.
 
 A run stops the app only when it can go on. On the pass that records its
 plan, before it stops anything, it checks every volume item it has not started:
 a backup of the claim or of its repository that is uploading, or a Lease
 another run holds on either, makes it wait in phase Waiting with reason
 SourceBusy and the workloads still running, and a read that fails comes back
-as an error and stops nothing. The check at the mover object remains the one
-that counts ([One mover at a time](namespace-backups.md#one-mover-at-a-time)).
+as an error and stops nothing. The check right before the run creates the
+restore Job remains the one that counts
+([One mover at a time](namespace-backups.md#one-mover-at-a-time)).
 A volume item whose repository Secret is gone fails in that same check, with
 the message shown under [Which snapshot a run restores](#which-snapshot-a-run-restores),
 and a run left with no item to restore stops nothing and ends. The run also
@@ -176,8 +176,8 @@ mechanism, the scheduler and the measured runs.
 ## Submitting a restore
 
 Both restore shapes are one object. The claim's own VolumeRestore supplies the
-repository, the cache class and the mover's queue label, so a run states only
-which volume and how far back:
+repository, the cache class and the queue label of the restore Job's pod, so a
+run states only which volume and how far back:
 
 ```yaml
 apiVersion: backup.wlz.li/v1alpha1
@@ -206,31 +206,26 @@ spec:
 ```
 
 The run creates `canary-backup-friday` empty, with the source claim's size and
-storage class, and copies the node the source claim's volume is on. A
-ReplicationDestination of the run's own, with `copyMethod: Direct`, writes the
-selected snapshot into that claim through a mover pod the scheduler places on
-that node, so the mover's log says which snapshot it restored and the run
-confirms it the way it does in place. Mount `canary-backup-friday` from a
-throwaway pod once the run reaches Succeeded and compare. The claim carries an
-ownerReference to the RestoreRun, so deleting the run deletes the claim and its
-dataset with it; keep the run until the comparison is done. The
-ReplicationDestination carries no ownerReference: the run deletes it itself
-when the restore ends, or when the run is deleted, and waits for its mover to
-stop.
+storage class, and copies the node the source claim's volume is on. The run's
+own restore Job writes the selected snapshot into that claim through a pod the
+scheduler places on that node, and the run reads the result from the Job the
+way it does in place. Mount `canary-backup-friday` from a throwaway pod once the
+run reaches Succeeded and compare. The claim carries an ownerReference to the
+RestoreRun, so deleting the run deletes the claim and its dataset with it; keep
+the run until the comparison is done. The restore Job carries a controller
+reference to the run as well, and the run stops and deletes the Job itself when
+the restore ends, or when the run is deleted.
 
-The run writes only into a claim it created itself. A claim named `into`, or a
-ReplicationDestination named restore-<first 8 characters of the run's UID>-<item
-index>, that the run does not control fails the run, and so does a claim named
-`into` that appears after the checks:
+The run writes only into a claim it created itself. A claim named `into` that
+the run does not control fails the run with reason IntoClaimTaken, and so does
+a claim named `into` that appears after the checks:
 
 ```text
 claim canary-backup-friday already exists and this run did not create it. spec.into names a new claim for the run to create, and a restore never writes into a claim it did not create. Choose a name no claim in this namespace has. To overwrite an existing claim, restore it in place with spec.claim.
 ```
 
 Before it creates anything, a run lists the repository's snapshots and fails
-with reason NoBackupInReach when none is at or before `restoreAsOf`. VolSync's
-mover would otherwise print `No eligible snapshots found`, exit 0, and report
-success having written nothing.
+with reason NoBackupInReach when none is at or before `restoreAsOf`.
 
 `database: <cluster>` restores one database and `all: true` every enabled volume
 and database in the namespace; [namespace-backups.md](namespace-backups.md)
@@ -251,11 +246,11 @@ spec:
 
 With no source claim, the run has no size to copy and no node to put the new
 claim on, so `intoSize` is required. The run creates `scratch` as a plain claim
-of that size with no data source, and a ReplicationDestination with
-`copyMethod: Direct` whose mover writes the selected snapshot into it. The
-mover pod is the claim's first consumer, so on a WaitForFirstConsumer class the
-scheduler places the claim wherever the mover pod runs.
-[decisions.md](decisions.md#restore-a-repository-into-a-plain-claim-through-a-direct-replicationdestination)
+of that size with no data source, and a restore Job whose pod writes the
+selected snapshot into it. That pod is the claim's first consumer, so on a
+WaitForFirstConsumer class the scheduler places the claim wherever the pod
+runs.
+[decisions.md](decisions.md#restore-a-repository-into-a-plain-claim-the-restore-job-fills)
 records why this path skips the populator. A run that names only
 `spec.repository` is refused before it creates anything: `spec.repository alone
 restores into a new claim, so spec.into is required, and it must name a claim
@@ -263,85 +258,79 @@ that does not exist yet. To overwrite an existing claim from this repository,
 set spec.claim to it as well; the run then restores it in place once no pod
 mounts it.`
 
-`scratch` is Bound while the mover still writes into it, so wait for the run to
-reach Succeeded before you mount it. A mover that fails ends the run Failed
-with its logs, and a restore still unfinished at `timeout` ends it TimedOut with
-`claim scratch had not been restored by <time>`.
+`scratch` is Bound while the restore Job still writes into it, so wait for the
+run to reach Succeeded before you mount it. A Job that fails ends the run
+Failed with restic's exit code, and a restore still unfinished at `timeout`
+ends it TimedOut with `claim scratch had not been restored by <time>`.
 
-Before a run records its end, and before a deleted run drops its finalizer, the
-run deletes its ReplicationDestination and waits in phase Waiting, with reason
-WaitingForShutdown, until the mover's Job and that Job's pods are gone. A Job
-with no pod can still start one, and a restic restore killed half way leaves
-its lock in the repository. The message names what is left:
-
-```text
-waiting for the mover of ReplicationDestination restore-9b7d4e21-0, which the run stopped while it restored scratch, to go: its Job volsync-dst-restore-9b7d4e21-0 is still there. The run gives the app back and lets other runs at the claim only after that
-```
-
-Every restore that created a destination shows this wait at its end, even
-when the mover finished long ago. VolSync may still be in the middle of a
-reconcile of the destination when the run deletes it, and can create the
-mover's Job a moment later. So the run looks for the Job and its pods only
-once 10 seconds have passed since the delete, and until then the message says
-so:
+Before a run reports its final phase, and before a deleted run drops its
+finalizer, the run stops each restore Job it created. It suspends a Job that is
+still running, and the Job controller then deletes the Job's pods: restic gets
+SIGTERM as the container's only process, removes its lock and exits. The run
+waits in phase Waiting, with reason WaitingForShutdown, until every pod that
+carries the Job's UID in its `batch.kubernetes.io/controller-uid` label has
+ended, then deletes the Job with Foreground propagation. A Job that completed
+has only ended pods, so that wait passes at once. The message names what is
+left:
 
 ```text
-waiting for the mover of ReplicationDestination restore-9b7d4e21-0, which the run stopped while it restored scratch, to go: the run deleted the destination, and looks for the mover's Job and pods once 10s have passed since the delete. The run gives the app back and lets other runs at the claim only after that
+waiting for the restore Job of claim scratch, which the run stopped, to end: restore Job restore-<run uid>-0: waiting for pods restore-<run uid>-0-x7k2p to end. The run gives the app back and lets other runs at the claim only after that
 ```
 
-When the run fails to delete the destination, or to read the Job and its pods,
-it stays unfinished and tries again on every pass. It reports RestartFailed while a
+The run reads the Job and its pods straight from the API server for this wait,
+because a cached list that lagged behind could show a pod as ended while restic
+still writes. A pod that was never scheduled and is already being deleted
+passes too: the API server gives it grace period 0, and the scheduler can no
+longer bind it (compatibility.md, Kubernetes).
+
+When the run fails to suspend, read or delete the Job, or to list its pods, it
+stays unfinished and tries again on every pass. It reports RestartFailed while a
 workload it stopped is still down, and ReleaseFailed once the app is back or
 when it stopped none. The message names the step and the error, and ends with
 what a person can delete by hand:
 
 ```text
-could not stop the mover of its ReplicationDestination restore-9b7d4e21-0: <error>. The run retries until it can. Fix the cause, or delete ReplicationDestination restore-9b7d4e21-0, its mover's Job volsync-dst-restore-9b7d4e21-0 and that Job's pods yourself; either way the run then finishes by itself.
+could not stop its restore Job restore-<run uid>-0: <error>. The run retries until it can. Fix the cause, or delete Job restore-<run uid>-0 with its pods yourself (kubectl delete job restore-<run uid>-0 --cascade=foreground) and make sure none of its pods still runs; the run then finishes by itself.
 ```
 
 A run with `quiesce` that reports RestartFailed for this step adds the
-workloads to scale back once no mover of the run still writes to its claims.
-[api.md](api.md#ready-reasons-of-a-restorerun) lists every reason a RestoreRun
-reports.
+workloads to scale back once no restore Job of the run still writes to its
+claims. [api.md](api.md#ready-reasons-of-a-restorerun) lists every reason a
+RestoreRun reports.
 
 ### Which snapshot a run restores
 
-The run compares `restoreAsOf` with each snapshot's time in whole seconds, the
-way VolSync's mover does: the mover drops the fraction of a second from both
-before it compares them. A snapshot taken at 06:00:00.7 is in reach of
-`restoreAsOf: "2026-09-13T06:00:00Z"`, which is also the time a BackupRun
-reports for it.
+The run compares `restoreAsOf` with each snapshot's time in whole seconds: it
+drops the fraction of a second from both before it compares them. A snapshot
+taken at 06:00:00.7 is in reach of `restoreAsOf: "2026-09-13T06:00:00Z"`, which
+is also the time a BackupRun reports for it. Among snapshots of the same time
+the one with the higher ID counts as the newer, and `previous` steps back
+through each of them, so two snapshots in one second are each reachable.
 
-The run records the snapshot it selected in `status.items[].snapshot` and its
-time in `status.items[].snapshotTime`. The mover gets that time in whole seconds
-as `restoreAsOf`, with no `previous`. Were the mover handed the run's own
-`restoreAsOf` and `previous`, it would choose again when it starts, and a
-scheduled backup that finished in between would change which snapshot is the
-newest, or the one before it.
+Only a snapshot with the layout a VolSync mover writes is a candidate: host
+`volsync` and paths exactly `[/data]`. A retimed `quiesced` copy keeps both and
+counts. The restore Job writes a snapshot's files at the root of the claim, and
+a snapshot of another directory would put them somewhere else, so a repository
+holding none but such snapshots ends the run with reason NoBackupInReach and
+names the newest five it passed over:
 
-The mover gets a second, and no snapshot ID: it lists the snapshots itself and
-restores the newest one in that second. So the
-checks refuse a selection the mover would not restore, and the run ends Failed
-with reason NoBackupInReach before anything is created. Each message says what
-the mover would restore instead, or why nothing can be told:
+```text
+the repository holds 3 snapshots, none written by a VolSync mover (host volsync, paths [/data]): 6e473100 (host laptop, paths [/home/me/notes]), 2edf5bab (host laptop, paths [/home/me/notes]), d1cb7739 (host laptop, paths [/home/me/notes])
+```
 
-| Case | Message |
-| --- | --- |
-| another snapshot shares the selected one's second | `snapshot 6e473100 (2026-09-26T09:03:53Z) shares its second with snapshot 2edf5bab, and VolSync's mover picks by the whole second, so it would restore 2edf5bab. Choose 2edf5bab or a snapshot in another second` |
-| the other snapshot in that second is not tagged `quiesced`, which a `syncDatabaseToVolume` run requires | `... shares its second with snapshot 2edf5bab, which is not tagged quiesced, ... Set restoreAsOf before 2026-09-26T09:03:53Z, or previous, to choose a quiesced snapshot in another second` |
-| two snapshots carry the same time to the nanosecond | `snapshot 6e473100 (2026-09-26T09:03:53Z) has the same time as snapshot 2edf5bab, to the nanosecond, and restic lists such snapshots in no set order, so VolSync's mover may restore 2edf5bab. Choose a snapshot in another second` |
-| the selected snapshot has no path containing /data, as the mover writes them | `snapshot 6e473100 (2026-09-26T09:03:53Z) has no path containing /data (its paths: /, /etc), and VolSync's mover passes over such snapshots, so it cannot restore 6e473100. Choose a snapshot a VolSync mover took` |
-| any snapshot in the repository lists /data after its first path, which the mover misreads | `snapshot 2edf5bab lists /data after its first path (its paths: /, /data), which VolSync's mover misreads as a snapshot of its own dated the day the mover runs, so the run cannot tell which snapshot the mover would restore from this repository. VolSync writes snapshots with /data as their only path; restore from a repository that holds only those` |
+The run records the snapshot it selected in `status.items[].snapshotID`, its
+full 64-character ID, with the short ID in `snapshot` and its time in
+`snapshotTime`. The restore Job runs `restic restore <full ID>`. restic reads a
+full ID straight as that one snapshot file and applies no host, path or time
+filter to it, so the Job restores exactly the snapshot the checks selected, or
+fails. A scheduled backup that finished in between changes nothing.
 
-A repository holding such a snapshot is refused as a whole, whatever the run
-selected.
-
-The run lists the repository once more right before it creates the destination,
+The run lists the repository once more right before it creates the restore Job,
 so nothing is created from a selection the repository no longer holds. A
 backup's `restic forget` that removed the selected snapshot after the checks, or
-a quiesced backup that rewrote it under another ID and time, fails the item and
-says so, each followed by `. Nothing was written to claim <claim>. Create a new
-RestoreRun to select again`:
+a quiesced backup that rewrote it under another ID and time, fails the item with
+reason SnapshotChanged and says so, each followed by `. Nothing was written to
+claim <claim>. Create a new RestoreRun to select again`:
 
 ```text
 snapshot 6e473100 (2026-09-26T09:03:53Z), which the checks selected, is no longer in the repository; a backup's retention (restic forget) removed it after the checks
@@ -354,16 +343,37 @@ snapshot 6e473100, which the checks selected, was rewritten as 2edf5bab at 2026-
 A repository Secret or a VolumeRestore that is gone by then fails the item the
 same way, with the same ending.
 
-A pass can create the destination and then lose the status write that records
-it. The item is still Pending on the next pass, which finds the item's
-ReplicationDestination, named restore-<first 8 characters of the run's
-UID>-<item index>, carrying the run's trigger. The run adopts that
-destination: the item moves to Running with it, and the restore goes on as if
-the write had gone through. The pass that created the destination ran every
-check first, and the item still succeeds only when the mover's log names the
-selected snapshot (see [What the mover restored](#what-the-mover-restored)).
-A mover pod of that destination may already mount the claim; the run does not
-wait for it with `ClaimInUse`, since it is the run's own mover.
+Every restore Job is created suspended, so no pod runs restic until the run
+has recorded the Job. The status write that moves the item to Running records
+the Job's name in `job` and its UID in `jobUID`. A later pass reads the stored
+run again straight from the API server, and resumes the Job only while that run
+still has the item Running on the same Job and has not decided to end. Until
+then the item's message reads `starting: the restore Job was created
+suspended, and the run resumes it once the status records it`. An API server
+that refuses the resume as Forbidden or Invalid fails the item with reason
+RestoreJobRefused and `the API server refused to resume restore Job <job>,
+which never ran: <answer>`, followed by the nothing-was-written ending.
+
+A pass can create the Job and then lose the status write that records it. The
+item is still Pending on the next pass, which finds the Job under the item's
+name, restore-<run uid>-<item index>, labelled `backup.wlz.li/restore-run` with
+the run's UID. The run adopts that Job only when its
+`backup.wlz.li/snapshot-id` annotation is the full ID the item recorded: the
+item moves to Running with it, and the restore goes on as if the write had gone
+through. A Job with another ID is the controller's own bug, and the item fails
+with reason RestoreJobFailed, `restore Job <job> restores snapshot <a>, and the
+run selected <b>; the run stops it`. A Job under that name the run did not
+create fails the item with reason RestoreJobRefused, and the run leaves that
+Job alone. The Job's pod may already mount the claim; the run does not wait for
+it with ClaimInUse, since it is the run's own.
+
+A create that the API server answered with an error, such as a 504 on a request
+that outlived its deadline, can still store the Job later, after a later pass
+failed the item or after the run finished. Such a Job was never recorded, so no
+pass resumes it, and it stays suspended with no pod. A run that has not
+finished finds it by name and stops it with its other Jobs. One stored after the
+run finished stays beside the finished run until the run is deleted, and the
+garbage collector deletes it then through its controller reference.
 
 One kind of snapshot holds data older than its time. When a BackupRun fails a
 volume item, VolSync keeps retrying that sync with the clone it cut when the
@@ -375,41 +385,105 @@ the item message that says this. Such a snapshot carries no `quiesced` tag, so a
 the volume then holds the newest data captured for that claim, stamped later
 than the data is from.
 
-### What the mover restored
+### How a restore Job ends
 
-VolSync completes a restore whatever its mover did, so the run reads the
-mover's log. `status.latestMoverStatus` of the item's ReplicationDestination
-holds the filtered log of the mover that completed the run's trigger, and the
-item succeeds only when that log names the recorded snapshot:
+Only the Job's terminal conditions decide. The item succeeds
+when the Job has `Complete=True`, which the Job controller adds only once restic
+exited 0 for the item's snapshot and the pod has ended. It fails with reason
+RestoreJobFailed when the Job has `Failed=True`, and the message shows restic's
+exit code and the last lines of its log, which the pod's container status
+carries (`terminationMessagePolicy: FallbackToLogsOnError`). A restore of a
+snapshot that retention removed after the recheck ends:
 
 ```text
-restoring snapshot 6e473100 of [/data] at 2026-09-26 09:03:53.753460659 +0000 UTC by root@volsync to .
+the restore Job failed (BackoffLimitExceeded): restic exited 1 (failure) in container restore: "...Fatal: failed to find snapshot..."
 ```
 
-An item whose log names no snapshot fails, and the message says why the run
-cannot confirm what the claim holds: the log named another snapshot, the mover
-found none, the log named a snapshot and also said it found none, the log was
-empty, or the item records no snapshot to compare with. A mover that restored
-another snapshot names both: `the mover restored snapshot 2edf5bab where the
-checks selected 6e473100; claim canary-backup now holds 2edf5bab`. A mover that
-found nothing says what the claim holds now: `the mover found no snapshot at or
-before 2026-09-26T09:03:53Z and wrote nothing; claim canary-backup holds what it
-held before`, or `claim scratch is empty` for an `into` restore.
+The claim then holds what it held before, because restic failed before it wrote
+anything. When no pod of the Job is left to read, the message reads `the
+restore Job failed (<reason>), and no pod of it shows how restic ended:
+"<condition message>"`. The container is `unlock` when the init container
+failed, and `restore` otherwise.
 
-VolSync keeps only the last `MOVER_LOG_MAX_BYTES` bytes of the filtered log,
-1024 by default, so a mover whose log is cut short fails the item as well:
-`the mover finished, but its logs name no snapshot, so the run cannot confirm
-what claim canary-backup holds. VolSync keeps only the last MOVER_LOG_MAX_BYTES
-bytes (1024 by default) of the filtered log. Logs: ...`. A VolSync installed
-with `MOVER_LOG_MAX_BYTES` set to 0 or a very small value therefore leaves every
-restore unconfirmed, and each one fails.
+| Exit code | Meaning the message gives | What the Job does |
+| --- | --- | --- |
+| 0 | success | completes |
+| 1 | failure | retries, up to four pods |
+| 3 | some source data could not be read | retries |
+| 10 | no repository | fails at once |
+| 11 | the repository is locked | retries; the next pod's unlock removes a lock that has gone stale |
+| 12 | wrong password | fails at once |
+| 130 | interrupted | the pod was stopped; see below |
+| 137 | killed with SIGKILL, such as out of memory or at the end of its grace period | retries |
+| other | unknown exit code, counted as a failure | retries |
 
-An in-place item also succeeds only into the claim its mover wrote. Right
-before it creates the item's ReplicationDestination, the run creates or
-updates the claim's Lease, whose name holds the claim's UID. When the mover's
-log checks out, the run reads the claim again and fails the item if the claim
-is gone, is being deleted, or has a UID that none of the run's claim Leases
-for the item holds. The message says which:
+A pod that Kubernetes or Kueue stops, marked with the pod condition
+DisruptionTarget or TerminationTarget, does not count toward the Job's four
+attempts, and the Job starts a replacement once that pod has ended. Prod's Kueue
+evicts a pod that is not ready five minutes after admission and marks it that
+way, so a pod that never starts, with an image it cannot pull or a Secret key
+it cannot find, never fails the Job. The item stays Running and its message
+shows why the newest pod waits:
+
+```text
+waiting: restore: ImagePullBackOff: "Back-off pulling image ..."
+```
+
+or, for a pod the scheduler has not placed, `waiting: unscheduled:
+<reason>: "<message>"`. The run ends at its `timeout`, and the item's message
+then carries the same wait.
+
+Before the restore, the `unlock` init container runs `restic unlock`, which
+removes only locks older than 30 minutes. A restic that died long ago left such
+a lock, and `restic restore` would otherwise refuse the repository with exit 11
+at once, because restic does not skip a stale exclusive lock when it acquires its
+own. The restore then waits up to 30 minutes for a live exclusive lock, such as
+the controller's own rewrite of a quiesced snapshot or a `restic prune` someone
+runs by hand (`--retry-lock 30m`). A lock that turns stale during that wait
+still blocks it: restic exits 11, the pod counts as a failed attempt, and the
+next pod's `unlock` removes the lock. While restic waits, its container is
+running, so a run that times out then shows no waiting reason.
+
+A stopped Job's pod is deleted, and restic gets SIGTERM directly, since it is
+the container's command with no shell in front of it. Once restic has opened
+the repository it removes its lock and exits 130, well inside the pod's grace
+period; a stop before that ends it with exit 1 (`config cannot be loaded:
+context canceled`). The e2e test TestStoppingARestoreEndsResticAtOnce
+(test/e2e/restore_job_test.go) watches it end. The claim then holds a partial
+restore.
+
+The Job runs no `sync` after restic exits. The kubelet unmounts the volume once
+the container has ended, and the next reader of the claim reads it through the
+same filesystem. A node that crashes in the seconds after restic exits can lose
+the last writes that had not reached the disk yet.
+
+The Job restores with `--delete`, so files the snapshot does not hold are
+removed, and the claim ends up holding exactly the snapshot. In a namespace
+annotated `volsync.backube/privileged-movers: "true"` it runs as root with the
+capabilities DAC_OVERRIDE, CHOWN and FOWNER, and restic restores each file's
+owner, the way VolSync's own mover does in such a namespace.
+
+A Job that is gone, or whose name holds a Job with another UID, was deleted
+before it finished, and the item fails with reason RestoreJobDeleted: `the
+restore Job <job> was deleted before it finished`, with `, and a Job with
+another UID holds its name now` when that is so. The run never creates a second
+Job for the item. Its pods keep the recorded UID in their controller-uid label,
+so the run gives nothing back until each of them has ended, whatever
+propagation the delete used. A Job the run no longer controls fails the item
+with reason RestoreJobFailed, `the restore Job <job> is no longer controlled by
+the run`, and is stopped the same way.
+
+A run that ends early, by its timeout or an abort, reads each
+running item's Job first. A Job that completed as the deadline passed records
+the item Succeeded, and one that failed records restic's exit code; only an
+item whose Job has not ended gets the run's message.
+
+An in-place item also succeeds only into the claim the run checked. Right
+before it creates the item's restore Job, the run creates or updates the
+claim's Lease, whose name holds the claim's UID. When the Job has completed,
+the run reads the claim again and fails the item with reason ClaimLost if the
+claim is gone, is being deleted, or has a UID that none of the run's claim
+Leases for the item holds. The message says which:
 
 ```text
 claim notes-data was deleted while the mover wrote into it, and the restored data went with it
@@ -418,19 +492,27 @@ claim notes-data was replaced while the mover wrote into it: the claim there now
 the run holds no claim Lease for claim notes-data, so it can't tell whether the mover wrote into the claim that is there now. Check the claim's data, and create a new RestoreRun to restore it
 ```
 
-The second message appears when someone deletes the claim while the mover's
-pod mounts it: Kubernetes keeps the claim, Terminating, until that pod is gone
-(pvc-protection), so the mover can finish into a claim that is about to go.
+The second message appears when someone deletes the claim while the Job's pod
+mounts it: Kubernetes keeps the claim, Terminating, until that pod is gone
+(pvc-protection), so the Job can finish into a claim that is about to go.
 
 ### When VolSync stops serving v1alpha1
 
-The controller reads and writes ReplicationDestinations only at
-volsync.backube/v1alpha1 (see [compatibility](compatibility.md)). A RestoreRun
-that meets an API server serving VolSync's kinds at another version fails
-every VolSync request with an error naming the kind and v1alpha1, and retries
-it until v1alpha1 is served again. An app the run has already stopped stays
-stopped until then. Upgrade the controller
-before VolSync, and no run meets that error.
+A RestoreRun reads VolSync only to wait for a backup of its claim or repository
+in progress, through the ReplicationSources at volsync.backube/v1alpha1 (see
+[compatibility](compatibility.md#following-the-versions-the-api-server-serves)).
+A run that meets an API server serving ReplicationSource at another version
+changes nothing, shows reason VolSyncUnsupported on its Ready condition, and
+retries on every pass:
+
+```text
+the API server serves VolSync's ReplicationSource <versions> and no longer at volsync.backube/v1alpha1, the one version this backup-controller reads and writes; the run changes nothing and retries until that version is served again or spec.timeout has passed, and then ends TimedOut and gives the app back (see docs/compatibility.md): <error>
+```
+
+An app the run has already stopped stays stopped until then. Stopping the
+run's restore Jobs and giving the app back needs no VolSync object, so a run
+that passes its `timeout`, or is deleted, still does both. Upgrade the
+controller before VolSync, and no run meets that error.
 
 ## Databases restore themselves
 
