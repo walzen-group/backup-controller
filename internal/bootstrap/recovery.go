@@ -102,6 +102,36 @@ func restoreTarget(cluster *unstructured.Unstructured, run *backupv1alpha1.Resto
 // from. It returns an error only when the unstructured object can't be read or
 // written at those paths.
 func setRecovery(cluster *unstructured.Unstructured, store, serverName string, target *time.Time) error {
+	recovery := recoveryBootstrap(cluster, target)
+
+	unstructured.RemoveNestedField(cluster.Object, "spec", "bootstrap", "initdb")
+
+	if err := unstructured.SetNestedMap(cluster.Object, recovery, "spec", "bootstrap", "recovery"); err != nil {
+		return fmt.Errorf("set the recovery bootstrap: %w", err)
+	}
+	if err := setExternalCluster(cluster, store, serverName); err != nil {
+		return err
+	}
+
+	annotations := cluster.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[SkipCheckAnnotation] = "enabled"
+	cluster.SetAnnotations(annotations)
+	return nil
+}
+
+// recoveryBootstrap makes the spec.bootstrap.recovery of a Cluster that
+// setRecovery rewrites.
+//
+// Parameters:
+//   - cluster is the Cluster before setRecovery changes it. Its initdb gives
+//     the database, the owner and the secret.
+//   - target is the moment to recover to, or nil for the end of the archive.
+//
+// It returns the recovery, with RecoverySource as its source.
+func recoveryBootstrap(cluster *unstructured.Unstructured, target *time.Time) map[string]any {
 	recovery := map[string]any{"source": RecoverySource}
 	if target != nil {
 		recovery["recoveryTarget"] = map[string]any{"targetTime": target.UTC().Format(time.RFC3339)}
@@ -125,13 +155,20 @@ func setRecovery(cluster *unstructured.Unstructured, store, serverName string, t
 	if secret, found, err := unstructured.NestedMap(cluster.Object, "spec", "bootstrap", "initdb", "secret"); err == nil && found {
 		recovery["secret"] = secret
 	}
+	return recovery
+}
 
-	unstructured.RemoveNestedField(cluster.Object, "spec", "bootstrap", "initdb")
-
-	if err := unstructured.SetNestedMap(cluster.Object, recovery, "spec", "bootstrap", "recovery"); err != nil {
-		return fmt.Errorf("set the recovery bootstrap: %w", err)
-	}
-
+// setExternalCluster adds the externalClusters entry named RecoverySource to
+// a Cluster, or replaces the entry with that name.
+//
+// Parameters:
+//   - cluster is the Cluster that setRecovery rewrites. setExternalCluster
+//     changes it in place.
+//   - store and serverName tell where the entry reads from, through the
+//     Barman Cloud plugin.
+//
+// It returns an error when spec.externalClusters cannot be read or written.
+func setExternalCluster(cluster *unstructured.Unstructured, store, serverName string) error {
 	entry := map[string]any{
 		"name": RecoverySource,
 		"plugin": map[string]any{
@@ -165,13 +202,6 @@ func setRecovery(cluster *unstructured.Unstructured, store, serverName string, t
 	if err := unstructured.SetNestedSlice(cluster.Object, external, "spec", "externalClusters"); err != nil {
 		return fmt.Errorf("set the external clusters: %w", err)
 	}
-
-	annotations := cluster.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-	annotations[SkipCheckAnnotation] = "enabled"
-	cluster.SetAnnotations(annotations)
 	return nil
 }
 

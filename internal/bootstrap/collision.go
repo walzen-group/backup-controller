@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 // archiveHolder finds an existing Cluster that already archives to the same
@@ -56,9 +57,7 @@ func archiveHolder(
 		return "", fmt.Errorf("list the Clusters: %w", err)
 	}
 
-	// The ObjectStores are listed once, on the first archiving Cluster, so a
-	// cluster with no other archiving Cluster lists none.
-	var stores map[types.NamespacedName]*unstructured.Unstructured
+	stores := &storeIndex{c: c, mapper: mapper}
 	for i := range clusters.Items {
 		other := &clusters.Items[i]
 		if other.GetNamespace() == namespace && other.GetName() == name {
@@ -68,30 +67,102 @@ func archiveHolder(
 		if !found {
 			continue
 		}
-		if stores == nil {
-			var err error
-			if stores, err = objectStores(ctx, c, mapper); err != nil {
-				return "", err
-			}
-		}
-		theirStore, ok := stores[types.NamespacedName{Namespace: other.GetNamespace(), Name: store}]
-		if !ok {
-			// Not in the list is what NotFound means for a single read.
-			continue
-		}
-		theirs, err := storeLocation(theirStore, serverName)
-		var noDestination *destinationError
-		if errors.As(err, &noDestination) {
-			continue
-		}
+		theirStore, err := stores.get(ctx, types.NamespacedName{Namespace: other.GetNamespace(), Name: store})
 		if err != nil {
-			return "", fmt.Errorf("find where %s/%s archives: %w", other.GetNamespace(), other.GetName(), err)
+			return "", err
 		}
-		if theirs.sameArchive(at) {
+		theirs, found, err := archiveOf(other, theirStore, serverName)
+		if err != nil {
+			return "", err
+		}
+		if found && theirs.sameArchive(at) {
 			return fmt.Sprintf("%s/%s", other.GetNamespace(), other.GetName()), nil
 		}
 	}
 	return "", nil
+}
+
+// storeIndex gives archiveHolder the ObjectStores by namespace and name. It
+// lists the ObjectStores once, on the first archiving Cluster, so a cluster
+// with no other archiving Cluster lists none.
+type storeIndex struct {
+	// c lists the ObjectStores.
+	c client.Reader
+	// mapper looks up the version at which the API server serves them.
+	mapper meta.RESTMapper
+	// stores holds the list from objectStores. It is nil until the first get.
+	stores map[types.NamespacedName]*unstructured.Unstructured
+}
+
+// get returns the ObjectStore with the given key, or nil when the list does
+// not hold it. It returns the error of objectStores when the list fails.
+func (x *storeIndex) get(ctx context.Context, key types.NamespacedName) (*unstructured.Unstructured, error) {
+	if x.stores == nil {
+		stores, err := objectStores(ctx, x.c, x.mapper)
+		if err != nil {
+			return nil, err
+		}
+		x.stores = stores
+	}
+	return x.stores[key], nil
+}
+
+// archiveOf finds where another Cluster archives, for archiveHolder.
+//
+// Parameters:
+//   - other is the other Cluster, which the error names.
+//   - store is the ObjectStore that other names, from the list of
+//     objectStores, or nil when the list does not hold it.
+//   - serverName is the server name of other, as Archiver returns it.
+//
+// It returns the Location and true. It returns false when store is nil or
+// names no s3:// destination, since other then archives nowhere. It returns
+// an error when the destination of store cannot be read.
+func archiveOf(other, store *unstructured.Unstructured, serverName string) (Location, bool, error) {
+	if store == nil {
+		// Not in the list is what NotFound means for a single read.
+		return Location{}, false, nil
+	}
+	theirs, err := storeLocation(store, serverName)
+	var noDestination *destinationError
+	if errors.As(err, &noDestination) {
+		return Location{}, false, nil
+	}
+	if err != nil {
+		return Location{}, false, fmt.Errorf("find where %s/%s archives: %w", other.GetNamespace(), other.GetName(), err)
+	}
+	return theirs, true, nil
+}
+
+// sharedArchive refuses the create of a Cluster whose archive another
+// Cluster already holds (see archiveHolder).
+//
+// Parameters:
+//   - mapper is the RESTMapper that the create looks versions up with.
+//   - c is the create. Its at field is where the Cluster would archive.
+//
+// It returns the refusal and true when another Cluster archives there, or
+// when the lists fail. It returns false when the create goes on.
+//
+// Two databases that archive to one prefix interleave their WAL and leave the
+// archive unrestorable, which is silent and permanent. Nothing else on the
+// cluster can see this problem before it occurs: each Cluster is valid on its
+// own, and the pair is the problem. Where a Cluster archives does not depend
+// on how it bootstraps, so a Cluster that declares its own bootstrap is
+// checked too.
+func (d *Decider) sharedArchive(ctx context.Context, mapper meta.RESTMapper, c creation) (admission.Response, bool) {
+	holder, err := archiveHolder(ctx, d.Client, mapper, c.req.Namespace, c.req.Name, c.at)
+	if err != nil {
+		return readFailed(ctx, c.logger, c.budget, "listing the Clusters and their ObjectStores", err), true
+	}
+	if holder == "" {
+		return admission.Response{}, false
+	}
+	c.logger.Info("refusing the Cluster", "reason", "another database archives here", "holder", holder, "prefix", c.at.Prefix)
+	return admission.Denied(fmt.Sprintf(
+		"%s already archives to %s/%s. Two databases writing one archive interleave their WAL and leave it unrestorable. Give this Cluster an archive of its own, or a serverName that is not %q. The check compares bucket and prefix whatever the endpointURL says, because two endpoints can name one service; if %s really archives to a different S3 service, give one of the two its own prefix in destinationPath.",
+		holder, c.at.Bucket, c.at.Prefix, c.serverName, holder,
+	)), true
 }
 
 // objectStores lists every Barman Cloud ObjectStore in every namespace, for

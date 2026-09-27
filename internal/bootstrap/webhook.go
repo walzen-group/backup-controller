@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/go-logr/logr"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -173,17 +174,50 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	}
 	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	return d.create(ctx, creation{req: req, logger: logger, budget: budget})
+}
 
-	cluster := &unstructured.Unstructured{}
-	if err := json.Unmarshal(req.Object.Raw, cluster); err != nil {
+// creation holds what Handle knows about one Cluster create while it decides
+// the create.
+type creation struct {
+	// req is the admission request of the create.
+	req admission.Request
+	// logger logs the decision. It carries the namespace and the name of the
+	// Cluster.
+	logger logr.Logger
+	// budget is the time that Handle gives to the create. readFailed names it.
+	budget time.Duration
+	// cluster is the Cluster from the request.
+	cluster *unstructured.Unstructured
+	// method is the bootstrap method that the Cluster declares (see
+	// declaredBootstrap).
+	method string
+	// store and serverName tell where the Cluster archives (see Archiver).
+	store, serverName string
+	// at is the Location of the archive, from ResolveLocation.
+	at Location
+}
+
+// create decides a Cluster create that is not a dry run.
+//
+// Parameters:
+//   - ctx carries the deadline of the budget of the create.
+//   - c holds the request, the logger and the budget from Handle. create
+//     fills the other fields.
+//
+// It returns the answer that Handle gives (see Handle).
+func (d *Decider) create(ctx context.Context, c creation) admission.Response {
+	c.cluster = &unstructured.Unstructured{}
+	if err := json.Unmarshal(c.req.Object.Raw, c.cluster); err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
-	method := declaredBootstrap(cluster)
+	c.method = declaredBootstrap(c.cluster)
 
-	store, serverName, found := Archiver(cluster)
+	var found bool
+	c.store, c.serverName, found = Archiver(c.cluster)
 	if !found {
-		logger.Info("leaving the Cluster alone", "reason", "it archives nowhere")
+		c.logger.Info("leaving the Cluster alone", "reason", "it archives nowhere")
 		return admission.Allowed("no archiving plugin")
 	}
 
@@ -194,55 +228,28 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	// A lookup that runs discovery ends with the budget too.
 	mapper = boundedMapper{RESTMapper: mapper, ctx: ctx}
 
-	at, err := ResolveLocation(ctx, d.Client, mapper, req.Namespace, store, serverName)
+	at, err := ResolveLocation(ctx, d.Client, mapper, c.req.Namespace, c.store, c.serverName)
 	if err != nil {
 		// The store is named and unreadable. Refusing is the failure that gets
 		// noticed; allowing would create an empty database beside a full
 		// archive and report success.
-		return readFailed(ctx, logger, budget, fmt.Sprintf("reading the ObjectStore %s/%s and its Secrets", req.Namespace, store), err)
+		return readFailed(ctx, c.logger, c.budget, fmt.Sprintf("reading the ObjectStore %s/%s and its Secrets", c.req.Namespace, c.store), err)
 	}
+	c.at = at
 
-	// Two databases archiving to one prefix interleave their WAL and leave the
-	// archive unrestorable, which is silent and permanent. Nothing else on the
-	// cluster can see this coming: each Cluster is valid on its own, and the
-	// pair is the problem. Where a Cluster archives does not depend on how it
-	// bootstraps, so a Cluster declaring its own bootstrap is checked too.
-	holder, err := archiveHolder(ctx, d.Client, mapper, req.Namespace, req.Name, at)
-	if err != nil {
-		return readFailed(ctx, logger, budget, "listing the Clusters and their ObjectStores", err)
-	}
-	if holder != "" {
-		logger.Info("refusing the Cluster", "reason", "another database archives here", "holder", holder, "prefix", at.Prefix)
-		return admission.Denied(fmt.Sprintf(
-			"%s already archives to %s/%s. Two databases writing one archive interleave their WAL and leave it unrestorable. Give this Cluster an archive of its own, or a serverName that is not %q. The check compares bucket and prefix whatever the endpointURL says, because two endpoints can name one service; if %s really archives to a different S3 service, give one of the two its own prefix in destinationPath.",
-			holder, at.Bucket, at.Prefix, serverName, holder,
-		))
+	if refusal, refused := d.sharedArchive(ctx, mapper, c); refused {
+		return refusal
 	}
 
 	// The opt-out asks for an empty database, which only initdb gives, so it
-	// changes nothing for a Cluster that declares another bootstrap. An empty
-	// database can archive only into an empty prefix: CloudNativePG refuses a
-	// prefix that holds WAL, and the skip annotation would let the new
-	// database overwrite the old one's segments.
-	if cluster.GetAnnotations()[OptOutAnnotation] == OptOutValue && method == "" {
-		archive, err := d.Prober.Survey(ctx, at, nil)
-		if err != nil {
-			return surveyFailed(logger, at, err)
-		}
-		if !archive.Empty {
-			logger.Info("refusing the Cluster", "reason", "opted out over an old archive", "prefix", at.ServerPrefix())
-			return admission.Denied(fmt.Sprintf(
-				"The Cluster asks for an empty database (%s: %s), and s3://%s/%s still holds the archive of an earlier one. CloudNativePG will not archive a new database into a prefix that holds WAL, so this one would never be backed up. To discard the old archive, delete everything under s3://%s/%s and create the Cluster again. To keep it, give this Cluster a serverName that is not %q.",
-				OptOutAnnotation, OptOutValue, at.Bucket, at.ServerPrefix(), at.Bucket, at.ServerPrefix(), serverName,
-			))
-		}
-		logger.Info("leaving the Cluster to initdb", "reason", "opted out by annotation, and the prefix is empty")
-		return admission.Allowed("opted out")
+	// changes nothing for a Cluster that declares another bootstrap.
+	if c.cluster.GetAnnotations()[OptOutAnnotation] == OptOutValue && c.method == "" {
+		return d.optOut(ctx, c)
 	}
 
-	run, err := waitingRun(ctx, d.Client, req.Namespace, req.Name)
+	run, err := waitingRun(ctx, d.Client, c.req.Namespace, c.req.Name)
 	if err != nil {
-		return readFailed(ctx, logger, budget, "listing the RestoreRuns in "+req.Namespace, err)
+		return readFailed(ctx, c.logger, c.budget, "listing the RestoreRuns in "+c.req.Namespace, err)
 	}
 
 	// A Cluster that already names a bootstrap other than initdb was written
@@ -250,25 +257,75 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	// restore input, a pg_basebackup by a replica or a migration. It keeps its
 	// own source, unless a RestoreRun is waiting to recover it: then two
 	// sources name one database, and neither may win by accident.
-	if method != "" {
-		if run != nil {
-			return admission.Denied(fmt.Sprintf(
-				"RestoreRun %s is waiting to recover %s/%s, and the Cluster declares its own spec.bootstrap.%s. Remove the declared bootstrap (for a recovery, the terragrunt restore input or the postgres-recovery component), or delete the RestoreRun.",
-				run.Name, req.Namespace, req.Name, method,
-			))
-		}
-		logger.Info("leaving the Cluster alone", "reason", "it declares its own bootstrap", "method", method)
-		return admission.Allowed("declares its own bootstrap")
+	if c.method != "" {
+		return keepDeclared(c, run)
 	}
+	return d.recover(ctx, c, run)
+}
 
-	target, source, err := restoreTarget(cluster, run)
+// optOut decides the create of a Cluster that carries OptOutAnnotation set to
+// OptOutValue and declares no bootstrap other than initdb.
+//
+// An empty database can archive only into an empty prefix. CloudNativePG
+// refuses a prefix that holds WAL, and the skip annotation would let the new
+// database overwrite the segments of the old one. So optOut allows the create
+// when the prefix is empty and refuses it when the prefix holds anything.
+func (d *Decider) optOut(ctx context.Context, c creation) admission.Response {
+	archive, err := d.Prober.Survey(ctx, c.at, nil)
+	if err != nil {
+		return surveyFailed(c.logger, c.at, err)
+	}
+	if !archive.Empty {
+		c.logger.Info("refusing the Cluster", "reason", "opted out over an old archive", "prefix", c.at.ServerPrefix())
+		return admission.Denied(fmt.Sprintf(
+			"The Cluster asks for an empty database (%s: %s), and s3://%s/%s still holds the archive of an earlier one. CloudNativePG will not archive a new database into a prefix that holds WAL, so this one would never be backed up. To discard the old archive, delete everything under s3://%s/%s and create the Cluster again. To keep it, give this Cluster a serverName that is not %q.",
+			OptOutAnnotation, OptOutValue, c.at.Bucket, c.at.ServerPrefix(), c.at.Bucket, c.at.ServerPrefix(), c.serverName,
+		))
+	}
+	c.logger.Info("leaving the Cluster to initdb", "reason", "opted out by annotation, and the prefix is empty")
+	return admission.Allowed("opted out")
+}
+
+// keepDeclared decides the create of a Cluster that declares a bootstrap
+// other than initdb.
+//
+// Parameters:
+//   - c is the create. Its method field names the declared bootstrap.
+//   - run is the RestoreRun that waits for the Cluster, or nil.
+//
+// It refuses the create when a RestoreRun waits for the Cluster, and allows
+// the Cluster unchanged when no RestoreRun waits.
+func keepDeclared(c creation, run *backupv1alpha1.RestoreRun) admission.Response {
+	if run != nil {
+		return admission.Denied(fmt.Sprintf(
+			"RestoreRun %s is waiting to recover %s/%s, and the Cluster declares its own spec.bootstrap.%s. Remove the declared bootstrap (for a recovery, the terragrunt restore input or the postgres-recovery component), or delete the RestoreRun.",
+			run.Name, c.req.Namespace, c.req.Name, c.method,
+		))
+	}
+	c.logger.Info("leaving the Cluster alone", "reason", "it declares its own bootstrap", "method", c.method)
+	return admission.Allowed("declares its own bootstrap")
+}
+
+// recover decides the create of a Cluster that declares no bootstrap other
+// than initdb and did not opt out.
+//
+// Parameters:
+//   - c is the create.
+//   - run is the RestoreRun that waits for the Cluster, or nil.
+//
+// It refuses the create when the recovery target is not an RFC 3339 time, or
+// when the target is before the end of the oldest base backup. With no
+// completed base backup it returns the answer of withoutBaseBackup. Otherwise
+// it returns the answer of recoverFrom, a patch that recovers the Cluster.
+func (d *Decider) recover(ctx context.Context, c creation, run *backupv1alpha1.RestoreRun) admission.Response {
+	target, source, err := restoreTarget(c.cluster, run)
 	if err != nil {
 		return admission.Denied(err.Error())
 	}
 
-	archive, err := d.Prober.Survey(ctx, at, target)
+	archive, err := d.Prober.Survey(ctx, c.at, target)
 	if err != nil {
-		return surveyFailed(logger, at, err)
+		return surveyFailed(c.logger, c.at, err)
 	}
 	// A target before the oldest base backup's end is one Postgres can never
 	// reach. CloudNativePG would keep the Cluster in recovery reporting that
@@ -276,43 +333,75 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	if archive.Found == nil && archive.Oldest != nil && target != nil {
 		return admission.Denied(fmt.Sprintf(
 			"%s asks for %s, and no base backup in %s/%s finished by then%s.",
-			source, target.Format(time.RFC3339), at.Bucket, at.BasePrefix(), oldest([]BaseBackup{*archive.Oldest}),
+			source, target.Format(time.RFC3339), c.at.Bucket, c.at.BasePrefix(), oldest([]BaseBackup{*archive.Oldest}),
 		))
 	}
 	if archive.Found == nil {
-		if run != nil || target != nil {
-			return admission.Denied(fmt.Sprintf(
-				"%s asks for a recovery, and %s/%s holds no completed base backup to recover from.",
-				source, at.Bucket, at.BasePrefix(),
-			))
-		}
-		// CloudNativePG refuses to archive a new database into a prefix that
-		// holds WAL, so a database started empty over anything at all could
-		// never be backed up, and a recovery has no base backup to start
-		// from. An empty prefix is the only place initdb is safe.
-		if !archive.Empty {
-			logger.Info("refusing the Cluster", "reason", "an archive with no completed base backup", "prefix", at.ServerPrefix())
-			return admission.Denied(noDoneBackup(at, serverName, archive.Backups))
-		}
-		logger.Info("leaving the Cluster to initdb", "reason", "no completed base backup in the store", "prefix", at.BasePrefix())
-		return admission.Allowed("no base backup")
+		return withoutBaseBackup(c, archive, run != nil || target != nil, source)
 	}
+	return recoverFrom(c, run, target, source)
+}
 
-	if err := setRecovery(cluster, store, serverName, target); err != nil {
+// withoutBaseBackup decides the create of a Cluster whose store holds no
+// completed base backup.
+//
+// Parameters:
+//   - c is the create.
+//   - archive is what Survey found under the prefix of the Cluster.
+//   - asked is true when a RestoreRun or the restore-as-of annotation asks for
+//     a recovery.
+//   - source names what asks for the recovery, for the message.
+//
+// It refuses the create when something asks for a recovery, and when the
+// prefix holds anything. It allows the Cluster unchanged when nothing asks
+// for a recovery and the prefix is empty.
+func withoutBaseBackup(c creation, archive Archive, asked bool, source string) admission.Response {
+	if asked {
+		return admission.Denied(fmt.Sprintf(
+			"%s asks for a recovery, and %s/%s holds no completed base backup to recover from.",
+			source, c.at.Bucket, c.at.BasePrefix(),
+		))
+	}
+	// CloudNativePG refuses to archive a new database into a prefix that
+	// holds WAL, so a database started empty over anything at all could
+	// never be backed up, and a recovery has no base backup to start
+	// from. An empty prefix is the only place initdb is safe.
+	if !archive.Empty {
+		c.logger.Info("refusing the Cluster", "reason", "an archive with no completed base backup", "prefix", c.at.ServerPrefix())
+		return admission.Denied(noDoneBackup(c.at, c.serverName, archive.Backups))
+	}
+	c.logger.Info("leaving the Cluster to initdb", "reason", "no completed base backup in the store", "prefix", c.at.BasePrefix())
+	return admission.Allowed("no base backup")
+}
+
+// recoverFrom returns the patch that makes the Cluster of a create recover
+// from its store (see setRecovery).
+//
+// Parameters:
+//   - c is the create.
+//   - run is the RestoreRun that waits for the Cluster, or nil. When it is
+//     set, the patch also sets the backup.wlz.li/restore-run annotation to
+//     the name of the run.
+//   - target is the moment to recover to, or nil for the end of the archive.
+//   - source names what asks for the recovery, for the log.
+//
+// It returns an HTTP 500 when the Cluster cannot be changed or encoded.
+func recoverFrom(c creation, run *backupv1alpha1.RestoreRun, target *time.Time, source string) admission.Response {
+	if err := setRecovery(c.cluster, c.store, c.serverName, target); err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	if run != nil {
-		annotations := cluster.GetAnnotations()
+		annotations := c.cluster.GetAnnotations()
 		annotations[backupv1alpha1.AnnotationRestoreRun] = run.Name
-		cluster.SetAnnotations(annotations)
+		c.cluster.SetAnnotations(annotations)
 	}
 
-	patched, err := json.Marshal(cluster)
+	patched, err := json.Marshal(c.cluster)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	logger.Info("recovering the Cluster from its object store", "prefix", at.BasePrefix(), "target", target, "for", source)
-	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
+	c.logger.Info("recovering the Cluster from its object store", "prefix", c.at.BasePrefix(), "target", target, "for", source)
+	return admission.PatchResponseFromRaw(c.req.Object.Raw, patched)
 }
 
 // mapper returns the RESTMapper the handler looks versions up with: Mapper,
