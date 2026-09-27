@@ -247,11 +247,14 @@ func acquireQuiesceLease(ctx context.Context, c client.Client, reader client.Rea
 //     gives.
 //   - conditions are the run's status.conditions before it ends.
 //
-// When the run was waiting for another run (reason SourceBusy), the message
-// adds that wait's own message, so it says what the run waited for.
+// When the run was waiting, for another run (reason SourceBusy) or for the
+// API server to serve VolSync's version again (reason VolSyncUnsupported),
+// the message adds that wait's own message, so it says what the run waited
+// for.
 func timedOutMessage(deadline time.Time, conditions []metav1.Condition) string {
 	message := fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339))
-	if ready := meta.FindStatusCondition(conditions, backupv1alpha1.ConditionReady); ready != nil && ready.Reason == backupv1alpha1.ReasonSourceBusy {
+	ready := meta.FindStatusCondition(conditions, backupv1alpha1.ConditionReady)
+	if ready != nil && (ready.Reason == backupv1alpha1.ReasonSourceBusy || ready.Reason == backupv1alpha1.ReasonVolSyncUnsupported) {
 		message += "; it was waiting: " + ready.Message
 	}
 	return message

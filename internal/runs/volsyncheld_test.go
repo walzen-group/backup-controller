@@ -195,7 +195,8 @@ func TestADeletedRestoreStopsItsJobWhenVolSyncDropsV1alpha1(t *testing.T) {
 // middle of a restore waits and retries: each pass returns the error, and
 // the run's Ready condition shows it with reason VolSyncUnsupported, naming
 // the kind and the versions served, while the app stays stopped. Once the
-// run passes spec.timeout it ends TimedOut: it stops the restore Job of its
+// run passes spec.timeout it ends TimedOut, with a Ready message that names
+// the VolSync wait: it stops the restore Job of its
 // Running item, which needs no VolSync object, and gives the app back.
 func TestARestoreWaitsOnAnUnservedVolSyncUntilItTimesOut(t *testing.T) {
 	run, job := quiescedMidRestore(t)
@@ -228,6 +229,9 @@ func TestARestoreWaitsOnAnUnservedVolSyncUntilItTimesOut(t *testing.T) {
 	done := readRestoreRun(t, c)
 	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
 		t.Errorf("phase = %q, reason = %q; want Failed, TimedOut", done.Status.Phase, readyReason(done.Status.Conditions))
+	}
+	if wait := readyMessage(waiting.Status.Conditions); !strings.Contains(readyMessage(done.Status.Conditions), "; it was waiting: "+wait) {
+		t.Errorf("Ready message = %q, want it to name the VolSync wait %q", readyMessage(done.Status.Conditions), wait)
 	}
 	if jobs := restoreJobs(t, c); len(jobs) != 0 {
 		t.Errorf("restore Jobs = %v, want the stopped Job deleted", jobs)
