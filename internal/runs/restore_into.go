@@ -336,12 +336,12 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 	if busy.held() {
 		return r.waitAtChecks(ctx, run, busy)
 	}
-	snapshot, reason, err := r.selectSnapshot(ctx, run, settings.Secret, at, false)
+	snapshot, err := r.selectSnapshot(ctx, run, settings.Secret, at, false)
+	if _, refused := asItemFailure(err); refused {
+		return r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, err.Error())
+	}
 	if err != nil {
 		return ctrl.Result{}, err
-	}
-	if reason != "" {
-		return r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, reason)
 	}
 	item := backupv1alpha1.RestoreItem{
 		Kind: backupv1alpha1.ItemKindClaim, Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning,

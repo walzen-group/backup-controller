@@ -121,7 +121,7 @@ linters:
       - path: '^internal/quiesce/restart\.go$'
         linters: [funlen, gocognit]
         source: '^func Restart\('
-      - path: '^internal/runs/(clusterwebhook|release_report|restore_end|restore_into|restore_plan|restore_quiesce|restore_work)\.go$'
+      - path: '^internal/runs/(clusterwebhook|release_report|restore_end|restore_into|restore_quiesce|restore_work)\.go$'
         linters: [goconst]
       - path: '^internal/runs/crdcheck\.go$'
         linters: [funlen, gocognit]
@@ -130,9 +130,6 @@ linters:
         linters: [revive]
         text: '^confusing-results:'
         source: '^func releaseFailure\('
-      - path: '^internal/runs/restore_plan\.go$'
-        linters: [funlen, gocognit]
-        source: '^func \(r \*RestoreRunReconciler\) (plan|items|clustersRestoredElsewhere)\('
       - path: '^internal/runs/restore_work\.go$'
         linters: [funlen, gocognit]
         source: '^func \(r \*RestoreRunReconciler\) work\('
@@ -145,10 +142,6 @@ linters:
       - path: '^internal/runs/restore_end\.go$'
         linters: [funlen, gocognit]
         source: '^func \(r \*RestoreRunReconciler\) finalize\('
-      - path: '^internal/runs/restore_checks\.go$'
-        linters: [revive]
-        text: '^confusing-results:'
-        source: '^func \(r \*RestoreRunReconciler\) checkDatabase\('
       - path: '^internal/runs/restore_work\.go$'
         linters: [nestif]
         source: '^\s*if (stopped\(run\) && anyRestorePending\(run\.Status\.Items\) |volumesDone )\{$'

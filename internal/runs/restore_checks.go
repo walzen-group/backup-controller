@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -28,18 +27,19 @@ import (
 //   - quiescedOnly limits the choice to snapshots tagged quiesced. plan sets
 //     it on a run with spec.syncDatabaseToVolume.
 //
-// It returns the snapshot, or a reason when there is none. When
-// repositoryFor refuses the claim, because the claim or its VolumeRestore is
-// missing, it returns that *refusalError, and plan fails the item with it
-// (see failRestoreItem). It returns a plain error when listing the
-// repository fails, and when a read fails for any other reason.
+// It returns the snapshot. When there is none, it returns the
+// *refusalError of selectSnapshot. When repositoryFor refuses the claim,
+// because the claim or its VolumeRestore is missing, it returns that
+// *refusalError. plan fails the item with a refusal (see failRestoreItem).
+// It returns a plain error when listing the repository fails, and when a
+// read fails for any other reason.
 //
 // This is the only place a missing snapshot is caught. VolSync restores
 // nothing and still reports success when no snapshot matches.
-func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
+func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
-		return restic.Snapshot{}, "", err
+		return restic.Snapshot{}, err
 	}
 	return r.selectSnapshot(ctx, run, settings.Secret, at, quiescedOnly)
 }
@@ -86,64 +86,65 @@ func (r *RestoreRunReconciler) volumeBackedUp(ctx context.Context, run *backupv1
 // snapshots in one second, or with the same time, are each restored as
 // selected.
 //
-// It returns a reason, and no error, when the Secret doesn't exist, when no
-// snapshot is a candidate (naming the snapshots it passed over, see
-// noCandidate), when none is at or before the moment, and when
-// spec.previous reaches past the oldest candidate. It returns an error when
-// the Secret can't be read for another reason and when listing the
-// repository fails.
-func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
-	all, reason, err := r.listRepository(ctx, run, secretName)
-	if reason != "" || err != nil {
-		return restic.Snapshot{}, reason, err
+// It returns a *refusalError with reason RepositorySecretMissing when the
+// Secret doesn't exist. It returns a *refusalError with reason
+// NoBackupInReach when no snapshot is a candidate (see noCandidate), when
+// none is at or before the moment, and when spec.previous reaches past the
+// oldest candidate. It returns a plain error when the Secret can't be read
+// for another reason and when listing the repository fails.
+func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, error) {
+	all, err := r.repositorySnapshots(ctx, run, secretName)
+	if err != nil {
+		return restic.Snapshot{}, err
 	}
 	snapshots := slices.DeleteFunc(slices.Clone(all), func(s restic.Snapshot) bool {
 		return !restic.MoverLayout(s) || quiescedOnly && !slices.Contains(s.Tags, restic.QuiescedTag)
 	})
 	if len(snapshots) == 0 {
-		return restic.Snapshot{}, noCandidate(all, quiescedOnly), nil
+		return restic.Snapshot{}, noCandidate(all, quiescedOnly)
 	}
 
 	index := len(snapshots) - 1
 	if at != nil {
 		found, ok := restic.AtOrBefore(snapshots, *at)
 		if !ok {
-			return restic.Snapshot{}, fmt.Sprintf("no snapshot at or before %s; the oldest, %s, is from %s",
-				at.UTC().Format(time.RFC3339), snapshots[0].ShortID(), snapshots[0].Time.UTC().Format(time.RFC3339)), nil
+			return restic.Snapshot{}, refuse(backupv1alpha1.ItemReasonNoBackupInReach, "no snapshot at or before %s; the oldest, %s, is from %s",
+				at.UTC().Format(time.RFC3339), snapshots[0].ShortID(), snapshots[0].Time.UTC().Format(time.RFC3339))
 		}
 		index = slices.IndexFunc(snapshots, func(s restic.Snapshot) bool { return s.ID == found.ID })
 	}
 	if run.Spec.Previous != nil {
 		index -= int(*run.Spec.Previous)
 		if index < 0 {
-			return restic.Snapshot{}, fmt.Sprintf("previous %d reaches past the oldest snapshot", *run.Spec.Previous), nil
+			return restic.Snapshot{}, refuse(backupv1alpha1.ItemReasonNoBackupInReach, "previous %d reaches past the oldest snapshot", *run.Spec.Previous)
 		}
 	}
-	return snapshots[index], "", nil
+	return snapshots[index], nil
 }
 
-// noCandidate returns the reason of a run whose repository holds no
-// snapshot selectSnapshot may restore.
+// noCandidate refuses a run whose repository holds no snapshot
+// selectSnapshot may restore.
 //
 // Parameters:
 //   - all is every snapshot in the repository, oldest first.
 //   - quiescedOnly is selectSnapshot's: the run takes only snapshots tagged
 //     quiesced.
 //
-// It says the repository is empty; or that none of its snapshots has the
-// mover's layout, naming the newest ones with their hosts and paths (see
-// passedOver); or that none of those is tagged quiesced.
-func noCandidate(all []restic.Snapshot, quiescedOnly bool) string {
+// It returns a *refusalError with reason NoBackupInReach. Its text says one
+// of three things. The repository is empty. Or none of its snapshots has the
+// mover's layout, and the text names the newest ones with their hosts and
+// paths (see passedOver). Or none of those has the tag quiesced.
+func noCandidate(all []restic.Snapshot, quiescedOnly bool) error {
 	if len(all) == 0 {
-		return "the repository holds no snapshot"
+		return refuse(backupv1alpha1.ItemReasonNoBackupInReach, "the repository holds no snapshot")
 	}
 	if slices.ContainsFunc(all, restic.MoverLayout) && quiescedOnly {
-		return fmt.Sprintf("the repository holds no snapshot tagged %s; only a BackupRun that stopped the workloads writes one", restic.QuiescedTag)
+		return refuse(backupv1alpha1.ItemReasonNoBackupInReach, "the repository holds no snapshot tagged %s; only a BackupRun that stopped the workloads writes one", restic.QuiescedTag)
 	}
 	if len(all) == 1 {
-		return "the repository holds 1 snapshot, which no VolSync mover wrote (host volsync, paths [/data]): " + passedOver(all)
+		return refuse(backupv1alpha1.ItemReasonNoBackupInReach, "the repository holds 1 snapshot, which no VolSync mover wrote (host volsync, paths [/data]): %s", passedOver(all))
 	}
-	return fmt.Sprintf("the repository holds %d snapshots, none written by a VolSync mover (host volsync, paths [/data]): %s",
+	return refuse(backupv1alpha1.ItemReasonNoBackupInReach, "the repository holds %d snapshots, none written by a VolSync mover (host volsync, paths [/data]): %s",
 		len(all), passedOver(all))
 }
 
@@ -214,76 +215,59 @@ func (r *RestoreRunReconciler) repositorySnapshots(ctx context.Context, run *bac
 	return snapshots, nil
 }
 
-// listRepository lists every snapshot in a run's restic repository, oldest
-// first, for the checks that still take a reason as a string.
+// checkDatabase finds the base backup that a recovery of one Cluster would
+// start from.
 //
 // Parameters:
-//   - run is the RestoreRun; the Secret is read in its namespace.
-//   - secretName names the repository Secret.
+//   - namespace and name give the Cluster.
+//   - at is the moment to recover to. The base backup is the newest one
+//     that finished at or before it, or the newest of all when it is nil.
 //
-// It returns the snapshots. It returns the refusal's text as the reason,
-// and no error, when the Secret doesn't exist. It returns an error when the
-// Secret can't be read for another reason and when listing the repository
-// fails.
-//
-// It turns the typed refusal of repositorySnapshots back into a string,
-// which selectSnapshot still returns as its reason.
-func (r *RestoreRunReconciler) listRepository(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string) ([]restic.Snapshot, string, error) {
-	snapshots, err := r.repositorySnapshots(ctx, run, secretName)
-	var refused *refusalError
-	if errors.As(err, &refused) {
-		return nil, refused.Error(), nil
-	}
-	return snapshots, "", err
-}
-
-// checkDatabase finds the base backup that a recovery of one Cluster would
-// start from. The Cluster is the one its namespace and name arguments give.
-// The base backup is the newest one that finished at or before the time given
-// in at, or the newest of all when no time is given.
-//
-// It returns the base backup's ID, or a reason when there is none. It also
-// returns a reason when the Cluster is missing, archives nowhere, or names an
-// object store that is missing or incomplete. A store with no completed base
-// backup is a reason too, because deleting the Cluster would bring it back
-// empty. It returns an error when the Cluster can't be read, when a read of
-// the store or its Secrets fails in a way a retry may fix, and when listing
-// the base backups fails.
-func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, name string, at *time.Time) (string, string, error) {
+// It returns the base backup's ID. It returns a *refusalError when there is
+// none: with reason ClusterMissing when the Cluster is missing, with reason
+// ClusterArchivesNowhere when the Cluster archives nowhere, and with reason
+// NoBackupInReach when the Cluster names an object store that is missing or
+// incomplete, when the store holds no completed base backup, and when no
+// base backup finished by the moment. A store with no completed base backup
+// is a refusal, because deleting the Cluster would bring it back empty. It
+// returns a plain error when the Cluster can't be read, when a read of the
+// store or its Secrets fails in a way a retry may fix, and when listing the
+// base backups fails.
+func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, name string, at *time.Time) (string, error) {
 	cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), namespace, name)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	if !found {
-		return "", fmt.Sprintf("no Cluster %s in this namespace", name), nil
+		return "", refuse(backupv1alpha1.ItemReasonClusterMissing, "no Cluster %s in this namespace", name)
 	}
 	store, serverName, archives := bootstrap.Archiver(cluster)
 	if !archives {
-		return "", "the Cluster archives nowhere, so it has no backup to restore", nil
+		return "", refuse(backupv1alpha1.ItemReasonClusterArchivesNowhere, "the Cluster archives nowhere, so it has no backup to restore")
 	}
 	location, err := bootstrap.ResolveLocation(ctx, r.Reader, r.RESTMapper(), namespace, store, serverName)
 	if err != nil {
 		if retryable(err) {
-			return "", "", err
+			return "", err
 		}
-		return "", err.Error(), nil
+		return "", refuse(backupv1alpha1.ItemReasonNoBackupInReach, "%v", err)
 	}
 	backups, err := r.Prober.BaseBackups(ctx, location)
 	if err != nil {
-		return "", "", fmt.Errorf("list the base backups of %s: %w", name, err)
+		return "", fmt.Errorf("list the base backups of %s: %w", name, err)
 	}
 	if len(backups) == 0 {
-		return "", fmt.Sprintf("%s/%s holds no completed base backup; deleting the Cluster would bring it back empty", location.Bucket, location.BasePrefix()), nil
+		return "", refuse(backupv1alpha1.ItemReasonNoBackupInReach, "%s/%s holds no completed base backup; deleting the Cluster would bring it back empty", location.Bucket, location.BasePrefix())
 	}
 	if at == nil {
-		return backups[len(backups)-1].ID, "", nil
+		return backups[len(backups)-1].ID, nil
 	}
 	backup, ok := bootstrap.AtOrBefore(backups, *at)
 	if !ok {
-		return "", fmt.Sprintf("no base backup finished by %s; the oldest, %s, finished at %s",
-			at.UTC().Format(time.RFC3339), backups[0].ID, backups[0].End.UTC().Format(time.RFC3339)), nil
+		return "", refuse(backupv1alpha1.ItemReasonNoBackupInReach, "no base backup finished by %s; the oldest, %s, finished at %s",
+			at.UTC().Format(time.RFC3339), backups[0].ID, backups[0].End.UTC().Format(time.RFC3339))
 	}
-	return backup.ID, "", nil
+	return backup.ID, nil
 }
 
 // selectedNodeAnnotation is the claim annotation that names the node a claim's

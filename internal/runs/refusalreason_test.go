@@ -125,9 +125,8 @@ func restoreItemAfter(t *testing.T, run *backupv1alpha1.RestoreRun, between func
 // repositoryFor, the in-place quiesce pre-check's Lease of a repository
 // Secret that is gone, the into start checks (repositoryFor and the Lease
 // of a repository Secret that is gone), and restoreDatabase's
-// clustersRestoredElsewhere. An item that fails for a reason not yet typed
-// records no reason, even when another item failed with one in the same
-// pass.
+// clustersRestoredElsewhere. An item fails with its own reason, even when
+// another item failed with another reason in the same pass.
 func TestARefusedItemRecordsItsReason(t *testing.T) {
 	quiescing := backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true })
 	unbound := claim()
@@ -190,10 +189,10 @@ func TestARefusedItemRecordsItsReason(t *testing.T) {
 		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonClusterMissing,
 			"the Cluster " + pgN + " no longer exists"}},
 
-		{"synced RestoreRun, a claim's VolumeRestore missing: the Cluster records no reason", func(t *testing.T) endedItem {
+		{"synced RestoreRun, a claim's VolumeRestore missing: the Cluster records NoBackupInReach", func(t *testing.T) endedItem {
 			run := restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true })
 			return restoreItemOfKind(t, run, backupv1alpha1.ItemKindCluster, claim(), repository(), cluster(), objectStore(), storeSecret())
-		}, endedItem{backupv1alpha1.ItemFailed, "",
+		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonNoBackupInReach,
 			"no volume selected a quiesced snapshot, so there is no moment to recover the database to"}},
 
 		{"in-place RestoreRun with quiesce, repository Secret deleted after plan", func(t *testing.T) endedItem {

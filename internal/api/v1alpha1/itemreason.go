@@ -103,8 +103,8 @@ const (
 	// is still retrying a backup that no run waits for any more.
 	ItemReasonSourceAbandoned ItemReason = "SourceAbandoned"
 
-	// ItemReasonClusterMissing is a database backup whose Cluster does not
-	// exist when the run starts it.
+	// ItemReasonClusterMissing is a database backup or restore whose Cluster
+	// does not exist when the run starts or checks it.
 	ItemReasonClusterMissing ItemReason = "ClusterMissing"
 
 	// ItemReasonClusterHibernated is a database backup the run skipped
@@ -143,4 +143,19 @@ const (
 	// cut before the backup.wlz.li/max-quiesce limit ran out and the run
 	// gave the workloads back.
 	ItemReasonCloneNotCut ItemReason = "CloneNotCut"
+
+	// ItemReasonNoBackupInReach is a restore that has no backup the run's
+	// moment reaches: no snapshot or base backup is at or before the moment,
+	// spec.previous reaches past the oldest one, or a synced restore has no
+	// quiesced moment that every item shares. The run wrote and deleted
+	// nothing.
+	ItemReasonNoBackupInReach ItemReason = "NoBackupInReach"
+
+	// ItemReasonClusterArchivesNowhere is a database restore whose Cluster
+	// archives its WAL nowhere, so it has no backup to restore.
+	ItemReasonClusterArchivesNowhere ItemReason = "ClusterArchivesNowhere"
+
+	// ItemReasonOtherItemFailed is an item the run left alone because
+	// another item of the run failed.
+	ItemReasonOtherItemFailed ItemReason = "OtherItemFailed"
 )
