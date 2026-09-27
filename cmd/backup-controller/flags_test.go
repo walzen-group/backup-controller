@@ -3,16 +3,14 @@ package main
 import (
 	"errors"
 	"flag"
-
-	// has one before main runs. This package imports controller-runtime
-	// --kubeconfig flag in its init function, so the default FlagSet already
-	// real here.
-	"slices"
 	"testing"
 
-	_ "sigs.k8s.io/controller-runtime/pkg/client/config"
 	// This import is here for its side effect. pkg/client/config registers a
+	// --kubeconfig flag in its init function, so the default FlagSet already
+	// has one before main runs. This package imports controller-runtime
 	// through runs.go as well, so the collision these tests guard against is
+	// real here.
+	_ "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 // TestKubeconfigFlagReusesOneSomethingElseRegistered checks that
@@ -82,18 +80,5 @@ func TestThePauseFlagSetsRunOptionsPaused(t *testing.T) {
 				t.Errorf("Paused = %t, %v; want %t", got.Paused, err, tc.want)
 			}
 		})
-	}
-}
-
-// The chart passes --pause only when the pause value is true.
-func TestTheChartPassesPauseOnlyWhenSet(t *testing.T) {
-	for value, want := range map[string]bool{"true": true, "false": false} {
-		output, err := renderChart(t, "restoreImage="+pinnedRestoreImage, "pause="+value)
-		if err != nil {
-			t.Fatalf("helm template: %v\n%s", err, output)
-		}
-		if got := slices.Contains(controllerArgs(t, output), "--pause"); got != want {
-			t.Errorf("pause=%s: --pause in the args = %t, want %t", value, got, want)
-		}
 	}
 }

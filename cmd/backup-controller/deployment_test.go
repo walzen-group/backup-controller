@@ -4,77 +4,53 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
 )
-
-// TestOneControllerRunsAtATime checks that the Deployment in deploy/ and the
-// chart's Deployment replace the pod with the Recreate strategy.
-//
-// The controller runs without leader election. Under the default
-// RollingUpdate, a rollout starts the new pod before it stops the old one,
-// and for that while two schedulers write BackupRuns and two reconcilers
-// work on the same runs.
-func TestOneControllerRunsAtATime(t *testing.T) {
-	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deployment.yaml"))
-	if err != nil {
-		t.Fatalf("read deploy/deployment.yaml: %v", err)
-	}
-	deployment := &appsv1.Deployment{}
-	if err := yaml.Unmarshal(content, deployment); err != nil {
-		t.Fatalf("parse deploy/deployment.yaml: %v", err)
-	}
-	if deployment.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
-		t.Errorf("deploy/deployment.yaml has strategy %q, want Recreate", deployment.Spec.Strategy.Type)
-	}
-
-	chart, err := os.ReadFile(filepath.Join("..", "..", "chart", "templates", "deployment.yaml"))
-	if err != nil {
-		t.Fatalf("read the chart's deployment: %v", err)
-	}
-	if !strings.Contains(string(chart), "type: Recreate") {
-		t.Error("the chart's Deployment does not use the Recreate strategy")
-	}
-}
 
 // pinnedRestoreImage is VolSync's mover image as hack/e2e/volsync/pins.json
 // pins it, used here only as a realistic value to render with.
 const pinnedRestoreImage = "quay.io/backube/volsync:0.16.0@sha256:0d03a6aad57569eba2c0eaa0848cf4a908d9744b372ff2224bb291a320f36d76"
 
-// renderChart runs helm template over the chart and returns what it printed
-// and the error it ended with.
+// renderChartIn runs helm template over the chart for a release in a
+// namespace and returns what it printed.
 //
 // Parameters:
-//   - t fails the test when helm is not on the PATH. The tests run in the
-//     flake's shell, which carries helm, and a missing helm must not pass as
-//     a chart that renders.
+//   - t fails the test when helm is not on the PATH or the render fails. The
+//     tests run in the flake's shell, which carries helm, and a missing helm
+//     must not pass as a chart that renders.
+//   - namespace is the release's namespace, where the chart puts the
+//     controller's ServiceAccount.
 //   - set holds helm's --set assignments, one per entry.
-func renderChart(t *testing.T, set ...string) (string, error) {
+func renderChartIn(t *testing.T, namespace string, set ...string) string {
 	t.Helper()
 	helm, err := exec.LookPath("helm")
 	if err != nil {
 		t.Fatalf("helm is not on the PATH; run the tests in the flake's shell: %v", err)
 	}
-	args := []string{"template", "backup-controller", filepath.Join("..", "..", "chart")}
+	args := []string{"template", "backup-controller", filepath.Join("..", "..", "chart"), "--namespace", namespace}
 	for _, value := range set {
 		args = append(args, "--set", value)
 	}
-	output, err := exec.Command(helm, args...).CombinedOutput()
-	return string(output), err
+	output, err := exec.Command(helm, args...).Output()
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, output)
+	}
+	return string(output)
 }
 
-// controllerContainer returns the controller container of the Deployment
-// in a multi-document YAML render.
+// controllerDeployment returns the Deployment with the controller container
+// in a multi-document YAML render, and that container.
 //
 // Parameters:
-//   - t fails the test when the render holds no such Deployment or container.
+//   - t fails the test when the render holds no such Deployment.
 //   - render is the output of helm template or the content of a manifest.
-func controllerContainer(t *testing.T, render string) corev1.Container {
+func controllerDeployment(t *testing.T, render string) (*appsv1.Deployment, corev1.Container) {
 	t.Helper()
 	for _, document := range strings.Split(render, "\n---") {
 		deployment := &appsv1.Deployment{}
@@ -83,98 +59,70 @@ func controllerContainer(t *testing.T, render string) corev1.Container {
 		}
 		for _, container := range deployment.Spec.Template.Spec.Containers {
 			if container.Name == "controller" {
-				return container
+				return deployment, container
 			}
 		}
 	}
 	t.Fatalf("no Deployment with a controller container in:\n%s", render)
-	return corev1.Container{}
+	return nil, corev1.Container{}
 }
 
-// controllerArgs returns the args of the controller container of the
-// Deployment in a multi-document YAML render (see controllerContainer).
-func controllerArgs(t *testing.T, render string) []string {
-	t.Helper()
-	return controllerContainer(t, render).Args
-}
-
-// TestTheChartPassesTheRestoreImage checks that the chart passes the
-// restoreImage value to the controller container as --restore-image,
-// unchanged and exactly once.
-func TestTheChartPassesTheRestoreImage(t *testing.T) {
-	output, err := renderChart(t, "restoreImage="+pinnedRestoreImage)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, output)
-	}
-	if got := restoreImageArgs(controllerArgs(t, output)); len(got) != 1 || got[0] != "--restore-image="+pinnedRestoreImage {
-		t.Errorf("the controller's --restore-image args are %q, want one with %s", got, pinnedRestoreImage)
-	}
-}
-
-// restoreImageArgs returns the entries of args that set --restore-image.
-func restoreImageArgs(args []string) []string {
-	var found []string
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "--restore-image") {
-			found = append(found, arg)
-		}
-	}
-	return found
-}
-
-// TestTheGoMemoryLimitIsTheContainersLimit checks that the controller
-// container in deploy/deployment.yaml and in the chart's render sets
-// GOMEMLIMIT from its own memory limit through the downward API, in bytes,
-// and that both set it the same way.
+// TestTheDeploymentShape checks the controller's Deployment in deploy/ and in
+// the chart's render:
 //
-// Without GOMEMLIMIT the Go runtime collects only when the heap doubles
-// since the last collection. A repository Open holds 32 MiB for scrypt, and
-// the garbage it leaves let the heap grow past the container's former 128Mi limit
-// until the kubelet OOMKilled the controller during the e2e suite. With the
-// limit known, the runtime collects before the heap reaches it.
-func TestTheGoMemoryLimitIsTheContainersLimit(t *testing.T) {
+//   - Both replace the pod with the Recreate strategy. The controller runs
+//     without leader election. Under the default RollingUpdate, a rollout
+//     starts the new pod before it stops the old one, and for that while two
+//     schedulers write BackupRuns and two reconcilers work on the same runs.
+//   - Both set GOMEMLIMIT from the container's own memory limit through the
+//     downward API, in bytes. Without it the Go runtime collects only when the
+//     heap doubles. A repository Open holds 32 MiB for scrypt, and the garbage
+//     it left let the heap grow past the former 128Mi limit until the kubelet
+//     OOMKilled the controller during the e2e suite.
+//   - The chart passes the restoreImage value as --restore-image, unchanged
+//     and exactly once, and --pause only when the pause value is true.
+func TestTheDeploymentShape(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deployment.yaml"))
 	if err != nil {
 		t.Fatalf("read deploy/deployment.yaml: %v", err)
 	}
-	render, err := renderChart(t, "restoreImage="+pinnedRestoreImage)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, render)
-	}
-	want := corev1.EnvVar{
-		Name: "GOMEMLIMIT",
-		ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
-			ContainerName: "controller",
-			Resource:      "limits.memory",
-			Divisor:       resource.MustParse("1"),
-		}},
-	}
+	render := renderChartIn(t, "backup-system", "restoreImage="+pinnedRestoreImage)
 	for source, manifest := range map[string]string{"deploy/deployment.yaml": string(content), "the chart": render} {
-		container := controllerContainer(t, manifest)
-		got := goMemLimit(container.Env)
-		if got == nil {
-			t.Errorf("%s sets no GOMEMLIMIT on the controller container", source)
-			continue
-		}
-		if got.Value != "" || got.ValueFrom == nil || got.ValueFrom.ResourceFieldRef == nil ||
-			got.ValueFrom.ResourceFieldRef.ContainerName != want.ValueFrom.ResourceFieldRef.ContainerName ||
-			got.ValueFrom.ResourceFieldRef.Resource != want.ValueFrom.ResourceFieldRef.Resource ||
-			got.ValueFrom.ResourceFieldRef.Divisor.Cmp(want.ValueFrom.ResourceFieldRef.Divisor) != 0 {
-			t.Errorf("%s sets GOMEMLIMIT to %+v, want the controller's limits.memory in bytes", source, got)
+		deployment, container := controllerDeployment(t, manifest)
+		if deployment.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+			t.Errorf("%s has strategy %q, want Recreate", source, deployment.Spec.Strategy.Type)
 		}
 		if _, ok := container.Resources.Limits[corev1.ResourceMemory]; !ok {
 			t.Errorf("%s sets no memory limit for GOMEMLIMIT to follow", source)
 		}
-	}
-}
-
-// goMemLimit returns the GOMEMLIMIT entry of a container's env, or nil when
-// there is none.
-func goMemLimit(env []corev1.EnvVar) *corev1.EnvVar {
-	for i := range env {
-		if env[i].Name == "GOMEMLIMIT" {
-			return &env[i]
+		i := slices.IndexFunc(container.Env, func(env corev1.EnvVar) bool { return env.Name == "GOMEMLIMIT" })
+		if i < 0 {
+			t.Errorf("%s sets no GOMEMLIMIT on the controller container", source)
+			continue
+		}
+		got := container.Env[i]
+		if got.Value != "" || got.ValueFrom == nil || got.ValueFrom.ResourceFieldRef == nil ||
+			got.ValueFrom.ResourceFieldRef.ContainerName != "controller" ||
+			got.ValueFrom.ResourceFieldRef.Resource != "limits.memory" ||
+			got.ValueFrom.ResourceFieldRef.Divisor.Value() != 1 {
+			t.Errorf("%s sets GOMEMLIMIT to %+v, want the controller's limits.memory in bytes", source, got)
 		}
 	}
-	return nil
+
+	_, container := controllerDeployment(t, render)
+	var images []string
+	for _, arg := range container.Args {
+		if strings.HasPrefix(arg, "--restore-image") {
+			images = append(images, arg)
+		}
+	}
+	if len(images) != 1 || images[0] != "--restore-image="+pinnedRestoreImage {
+		t.Errorf("the controller's --restore-image args are %q, want one with %s", images, pinnedRestoreImage)
+	}
+	for value, want := range map[string]bool{"true": true, "false": false} {
+		_, container := controllerDeployment(t, renderChartIn(t, "backup-system", "restoreImage="+pinnedRestoreImage, "pause="+value))
+		if got := slices.Contains(container.Args, "--pause"); got != want {
+			t.Errorf("pause=%s: --pause in the args = %t, want %t", value, got, want)
+		}
+	}
 }

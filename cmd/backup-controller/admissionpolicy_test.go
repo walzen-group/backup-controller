@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -21,31 +20,6 @@ const (
 // two deploy/ writes. They say which chart and version rendered an object and
 // decide nothing about it.
 var chartOnlyLabels = []string{"helm.sh/chart", "app.kubernetes.io/version", "app.kubernetes.io/managed-by"}
-
-// renderChartIn runs helm template over the chart for a release in a
-// namespace and returns what it printed.
-//
-// Parameters:
-//   - t fails the test when helm is not on the PATH or the render fails.
-//   - namespace is the release's namespace, where the chart puts the
-//     controller's ServiceAccount.
-//   - set holds helm's --set assignments, one per entry.
-func renderChartIn(t *testing.T, namespace string, set ...string) string {
-	t.Helper()
-	helm, err := exec.LookPath("helm")
-	if err != nil {
-		t.Fatalf("helm is not on the PATH; run the tests in the flake's shell: %v", err)
-	}
-	args := []string{"template", "backup-controller", filepath.Join("..", "..", "chart"), "--namespace", namespace}
-	for _, value := range set {
-		args = append(args, "--set", value)
-	}
-	output, err := exec.Command(helm, args...).Output()
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, output)
-	}
-	return string(output)
-}
 
 // documentsOfKind returns the documents of a multi-document YAML text whose
 // kind is the given one, parsed into maps.

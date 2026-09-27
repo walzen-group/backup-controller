@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -95,16 +96,24 @@ var grants = []grant{
 	{"", "persistentvolumeclaims/finalizers", []string{"update"}, "owner references to a claim, under OwnerReferencesPermissionEnforcement"},
 }
 
-// TestTheClusterRoleCoversEverythingTheControllerDoes checks that the
-// ClusterRole in deploy/rbac.yaml allows every verb in grants.
+// TestTheManifestsGrantWhatTheControllerNeeds checks that the ClusterRole in
+// deploy/rbac.yaml allows every verb in grants, and that the ClusterRole in
+// the chart's templates/rbac.yaml grants exactly the same permissions.
 //
 // v0.1.1 installed cleanly, reported Running and Available, and filled
 // nothing, because its ClusterRole could not list pods. Nothing caught it. The
 // offline check compared deploy/rbac.yaml against a table in the docs, and
 // both had been written from the same wrong premise.
-func TestTheClusterRoleCoversEverythingTheControllerDoes(t *testing.T) {
+//
+// The chart and deploy/ install the same controller, so a permission added to
+// one and forgotten in the other gives an install that works only one way.
+// Both roles are reduced to single permissions (see permissions), so two rules
+// in one file and one merged rule in the other compare equal. An extra or
+// missing verb, resource, API group or resource name fails the test. The
+// envtest TestEnvtestTheControllerChangesWorkloadsOnlyThroughScale checks
+// that the shipped role cannot write a workload itself.
+func TestTheManifestsGrantWhatTheControllerNeeds(t *testing.T) {
 	role := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
-
 	for _, want := range grants {
 		for _, verb := range want.verbs {
 			if !allows(role, want.group, want.resource, verb) {
@@ -113,52 +122,14 @@ func TestTheClusterRoleCoversEverythingTheControllerDoes(t *testing.T) {
 			}
 		}
 	}
-}
 
-// TestTheChartGrantsTheSameRulesAsDeploy checks that the ClusterRole in the
-// chart's templates/rbac.yaml grants exactly the permissions of the one in
-// deploy/rbac.yaml. The chart and deploy/ install the same controller, so a
-// permission added to one and forgotten in the other gives an install that
-// works only one way.
-//
-// Both roles are reduced to single permissions (see permissions), so two rules
-// in one file and one merged rule in the other compare equal. An extra or
-// missing verb, resource, API group or resource name fails the test, which
-// names each permission one side grants and the other lacks.
-func TestTheChartGrantsTheSameRulesAsDeploy(t *testing.T) {
-	deploy := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
 	chart := readChartRules(t, filepath.Join("..", "..", "chart", "templates", "rbac.yaml"))
-
-	inDeploy, inChart := permissions(deploy.Rules), permissions(chart)
-	if len(inDeploy) == 0 {
-		t.Fatal("deploy/rbac.yaml grants nothing, so there is nothing to compare")
-	}
+	inDeploy, inChart := permissions(role.Rules), permissions(chart)
 	for _, missing := range difference(inDeploy, inChart) {
 		t.Errorf("deploy/ grants %s and the chart does not", missing)
 	}
 	for _, extra := range difference(inChart, inDeploy) {
 		t.Errorf("the chart grants %s and deploy/ does not", extra)
-	}
-}
-
-// TestNoRuleWritesAWorkloadItself checks that neither ClusterRole, in
-// deploy/ or in the chart, lets the controller write a Deployment or a
-// StatefulSet itself. Quiesce changes the replica count through the scale
-// subresource (see scale in internal/runs), which can change nothing else.
-// A write verb on the objects would let the controller's ServiceAccount
-// change any workload's image, command or volumes in any namespace.
-func TestNoRuleWritesAWorkloadItself(t *testing.T) {
-	deploy := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
-	chart := &rbacv1.ClusterRole{Rules: readChartRules(t, filepath.Join("..", "..", "chart", "templates", "rbac.yaml"))}
-	for source, role := range map[string]*rbacv1.ClusterRole{"deploy/": deploy, "the chart": chart} {
-		for _, resource := range []string{"deployments", "statefulsets"} {
-			for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
-				if allows(role, "apps", resource, verb) || allows(role, "*", resource, verb) || allows(role, "apps", "*", verb) ||
-					allows(role, "*", "*", verb) {
-					t.Errorf("%s allows %s on %s; quiesce needs only the scale subresource", source, verb, resourceName("apps", resource))
-				}
-			}
-		}
 	}
 }
 
@@ -257,20 +228,10 @@ func readChartRules(t *testing.T, path string) []rbacv1.PolicyRule {
 // wildcard, on the resource in the API group.
 func allows(role *rbacv1.ClusterRole, group, resource, verb string) bool {
 	for _, rule := range role.Rules {
-		if !contains(rule.APIGroups, group) || !contains(rule.Resources, resource) {
+		if !slices.Contains(rule.APIGroups, group) || !slices.Contains(rule.Resources, resource) {
 			continue
 		}
-		if contains(rule.Verbs, verb) || contains(rule.Verbs, "*") {
-			return true
-		}
-	}
-	return false
-}
-
-// contains reports whether haystack holds needle.
-func contains(haystack []string, needle string) bool {
-	for _, item := range haystack {
-		if item == needle {
+		if slices.Contains(rule.Verbs, verb) || slices.Contains(rule.Verbs, "*") {
 			return true
 		}
 	}
