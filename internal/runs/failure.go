@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/restorejob"
 )
 
 // refusalError is an error no retry can fix: something an item needs is
@@ -173,11 +174,14 @@ type itemFailure struct {
 //
 // It returns the failure and true for an error on this list, checked in
 // this order with errors.As: a *refusalError (its own reason), an
-// invalidSettingError (SettingsInvalid), and a *sourceHeldError for a source
-// no run waits for (SourceAbandoned). The message is err.Error(). Any other
-// error, and nil, gives false: the pass returns the error and retries. An
-// *invalidSpecError is not on the list, because only run-level sites meet
-// one, and an item that recorded it would carry a reason no item has.
+// invalidSettingError (SettingsInvalid), a *sourceHeldError for a source no
+// run waits for (SourceAbandoned), a *restorejob.FailureError of a restore
+// Job that ended Failed (RestoreJobFailed), and a *restorejob.SpecError of
+// a restore Job the run could not build (RestoreJobRefused). The message is
+// err.Error(). Any other error, and nil, gives false: the pass returns the
+// error and retries. An *invalidSpecError is not on the list, because only
+// run-level sites meet one, and an item that recorded it would carry a
+// reason no item has.
 func asItemFailure(err error) (itemFailure, bool) {
 	var refused *refusalError
 	if errors.As(err, &refused) {
@@ -190,6 +194,14 @@ func asItemFailure(err error) (itemFailure, bool) {
 	var held *sourceHeldError
 	if errors.As(err, &held) && held.abandoned {
 		return itemFailure{reason: backupv1alpha1.ItemReasonSourceAbandoned, message: err.Error()}, true
+	}
+	var jobFailed *restorejob.FailureError
+	if errors.As(err, &jobFailed) {
+		return itemFailure{reason: backupv1alpha1.ItemReasonRestoreJobFailed, message: err.Error()}, true
+	}
+	var badSpec *restorejob.SpecError
+	if errors.As(err, &badSpec) {
+		return itemFailure{reason: backupv1alpha1.ItemReasonRestoreJobRefused, message: err.Error()}, true
 	}
 	return itemFailure{}, false
 }
