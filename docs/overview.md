@@ -193,7 +193,7 @@ flowchart LR
 | a rebuilt cluster comes back with its databases | no | yes |
 | restore to a moment | a git commit that changes the bootstrap, and a revert after the restore | a RestoreRun with `restoreAsOf` |
 | WAL archiving and base backup storage | the barman-cloud plugin | the same plugin, unchanged |
-| start a database empty on purpose | the default | the annotation `backup.wlz.li/bootstrap: initdb`, over an empty prefix. First delete the old archive or give the Cluster a new `serverName` |
+| start a database empty on purpose | the default | the annotation `backup.wlz.li/bootstrap: initdb`, over a prefix with no WAL under `wals/`. First delete the old archive or give the Cluster a new `serverName` |
 
 [restores.md](restores.md) has every case that the webhook decides.
 [architecture.md](architecture.md#databases) tells how the controller finds

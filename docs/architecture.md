@@ -261,20 +261,24 @@ The webhook's checks run in this order:
    archives to the same bucket and prefix. A failed list refuses it too.
 6. A Cluster carrying `backup.wlz.li/bootstrap: initdb` and declaring no other
    bootstrap method gets a Survey without a target. It passes unchanged when
-   its prefix is empty. The webhook refuses it when anything is there.
+   the listing finds no WAL under `<prefix>/wals/`. The webhook refuses it
+   when WAL is there.
 7. The webhook looks for a RestoreRun that waits for this Cluster. A Cluster
    that declares a bootstrap method other than `initdb` passes unchanged. If a
    run waits for it, the webhook refuses it.
 8. The target comes from the run or from `backup.wlz.li/restore-as-of`. A
    target that does not parse refuses the Cluster.
-9. Survey reads the store. A DONE backup, by the target when there is one,
-   leads to the recovery patch below. Without such a backup, the result is one
-   of these:
+9. Survey reads the store. A complete backup (its `backup.info` has
+   `begin_time` and `end_time`), by the target when there is one, leads to the
+   recovery patch below. Without such a backup, the result is one of these:
    - If a run or the annotation asks for a recovery, the webhook refuses the
-     Cluster. If a DONE backup exists but finished too late, the refusal names
-     the oldest DONE backup.
-   - If anything is under the prefix, the webhook refuses the Cluster.
-   - If the prefix is empty, the Cluster passes unchanged and starts empty.
+     Cluster. If a complete backup exists but finished too late, the refusal
+     names the oldest complete backup.
+   - If the listing finds WAL under `<prefix>/wals/`, the webhook refuses the
+     Cluster.
+   - If the ObjectStore status records a completed backup for the serverName,
+     the webhook refuses the Cluster.
+   - Otherwise the Cluster passes unchanged and starts empty.
 
 If the budget ends during a Kubernetes read in steps 4, 5 or 7, the webhook
 answers HTTP 500 and names the step. If the budget ends during a Survey, the
