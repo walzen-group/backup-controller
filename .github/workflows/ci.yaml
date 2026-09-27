@@ -33,11 +33,22 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@v14
 
+      # The Go build cache keeps the compiled dependencies between runs, so a
+      # run compiles only the packages of this repository. The key changes
+      # with the dependencies and the toolchain. go test runs with -count=1,
+      # so the cache never replaces a test run with a stored result.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum', 'flake.lock') }}
+
       - name: go vet
         run: nix develop -c go vet ./...
 
       - name: go test
-        run: nix develop -c go test ./... -race
+        run: nix develop -c go test -count=1 ./... -race
 
       - name: golangci-lint
         run: nix develop -c golangci-lint run

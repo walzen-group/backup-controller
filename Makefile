@@ -25,7 +25,7 @@ build:
 
 ## test: run the suite with the race detector.
 test:
-	$(NIX) go test ./... -race
+	$(NIX) go test -count=1 ./... -race
 
 ## vet: run go vet over every package.
 vet:
