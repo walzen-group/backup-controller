@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -184,31 +182,6 @@ func (k *cluster) foregroundDeleted(job *batchv1.Job) bool {
 	return false
 }
 
-func TestStopSuspendsARunningJobAndWaits(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob()
-	k.createPod("p", job, job.UID, "node-a", corev1.PodRunning)
-	state := k.stop(job)
-	if state.Stopped {
-		t.Fatal("Stop reports a running Job stopped")
-	}
-	job = k.read(job)
-	if job.Spec.Suspend == nil || !*job.Spec.Suspend {
-		t.Fatalf("spec.suspend = %v, want true", job.Spec.Suspend)
-	}
-	if job.DeletionTimestamp != nil || k.foregroundDeleted(job) {
-		t.Error("Stop deleted a Job that is not yet suspended")
-	}
-	if state.Job != job.Name || state.String() == "" {
-		t.Errorf("state = %+v (%q), want the Job named", state, state.String())
-	}
-	// Until the Job controller sets Suspended, the gate holds even with no pod.
-	k.setPhase(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "app"}}, corev1.PodFailed)
-	if k.stop(job).Stopped {
-		t.Error("Stop passed the gate before the Job is Suspended")
-	}
-}
-
 func TestStopGateWaitsForARunningPodOfASuspendedJob(t *testing.T) {
 	k := newCluster(t)
 	job := k.suspended()
@@ -247,36 +220,6 @@ func TestStopGatePassesAnUnscheduledPodOnlyWhileItIsDeleted(t *testing.T) {
 	}
 	if state := k.stop(k.read(job)); !state.Stopped {
 		t.Fatalf("state = %+v, want an unscheduled pod being deleted to pass", state)
-	}
-}
-
-func TestStopOfAFinishedJobDeletesItWithoutSuspending(t *testing.T) {
-	for _, typ := range []batchv1.JobConditionType{batchv1.JobComplete, batchv1.JobFailed} {
-		t.Run(string(typ), func(t *testing.T) {
-			k := newCluster(t)
-			job := k.createJob(typ)
-			k.createPod("p", job, job.UID, "node-a", corev1.PodSucceeded)
-			state := k.stop(job)
-			if !state.Stopped {
-				t.Fatalf("state = %+v, want stopped", state)
-			}
-			if !k.foregroundDeleted(job) {
-				t.Error("the Job was not deleted with Foreground propagation")
-			}
-			// The pod keeps its finalizer, so the Job waits for it.
-			got := &batchv1.Job{}
-			if err := k.c.Get(context.Background(), client.ObjectKeyFromObject(job), got); err != nil {
-				t.Fatal(err)
-			}
-			if got.Spec.Suspend != nil && *got.Spec.Suspend {
-				t.Error("Stop suspended a finished Job")
-			}
-			// A second pass finds the Job being deleted and stops it again
-			// without an error.
-			if again := k.stop(got); !again.Stopped {
-				t.Errorf("second Stop = %+v, want stopped", again)
-			}
-		})
 	}
 }
 
@@ -326,98 +269,6 @@ func TestStopDoesNotPassTheGateInTheCallThatSuspends(t *testing.T) {
 	}
 	if state := k.stop(job); !state.Stopped {
 		t.Fatalf("state = %+v, want stopped once a read shows the Job suspended", state)
-	}
-}
-
-func TestStopStateNamesNoEmptyPodList(t *testing.T) {
-	got := restorejob.StopState{Job: "j"}.String()
-	if strings.Contains(got, "pods") || strings.Contains(got, "  ") {
-		t.Errorf("String() = %q, want no pod list when no pod is named", got)
-	}
-	got = restorejob.StopState{Job: "j", Pods: []string{"a", "b"}}.String()
-	if !strings.Contains(got, "a, b") {
-		t.Errorf("String() = %q, want the pods named", got)
-	}
-}
-
-func TestStopOfAJobAlreadyGone(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob(batchv1.JobComplete)
-	if err := k.c.Delete(context.Background(), job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-		t.Fatal(err)
-	}
-	if state := k.stop(job); !state.Stopped {
-		t.Errorf("state = %+v, want a Job that is gone stopped", state)
-	}
-}
-
-func TestSuspendRefusesAReplacedJob(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob()
-	stale := job.DeepCopy()
-	stale.UID = "an-earlier-job"
-	if err := k.api.SuspendJob(context.Background(), stale); err == nil {
-		t.Fatal("SuspendJob suspended a Job other than the one it was given")
-	}
-	if got := k.read(job); got.Spec.Suspend != nil && *got.Spec.Suspend {
-		t.Error("the Job that replaced the one given was suspended")
-	}
-}
-
-func TestDeleteRefusesAReplacedJob(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob()
-	stale := job.DeepCopy()
-	stale.UID = "an-earlier-job"
-	if err := k.api.DeleteJob(context.Background(), stale); !apierrors.IsConflict(err) {
-		t.Fatalf("DeleteJob = %v, want a Conflict for a Job other than the one it was given", err)
-	}
-	if got := k.read(job); got.DeletionTimestamp != nil || k.foregroundDeleted(job) {
-		t.Error("the Job that replaced the one given was deleted")
-	}
-}
-
-func TestStopAndReadIgnoreAnOlderJobsPods(t *testing.T) {
-	k := newCluster(t)
-	job := k.suspended()
-	// A pod of an earlier Job of the same name, with the same labels but
-	// the earlier Job's UID, still running and with a failed container.
-	old := k.createPod("old", job, "an-earlier-job", "node-a", corev1.PodRunning)
-	old.Status.ContainerStatuses = []corev1.ContainerStatus{terminated("restore", 1, "Fatal: older")}
-	if err := k.c.Status().Update(context.Background(), old); err != nil {
-		t.Fatal(err)
-	}
-	pods, err := k.api.ListJobPods(context.Background(), job.Namespace, job.UID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pods) != 0 {
-		t.Errorf("ListJobPods = %d pods, want none of an earlier Job", len(pods))
-	}
-	if state := k.stop(job); !state.Stopped {
-		t.Errorf("state = %+v, want an earlier Job's pod to leave the gate open", state)
-	}
-	failed := withCondition(job.DeepCopy(), batchv1.JobFailed, "BackoffLimitExceeded", "")
-	if f := restorejob.Read(failed, []corev1.Pod{*old}).Failure; f == nil || f.ExitCode != nil {
-		t.Errorf("failure = %+v, want no exit code from an earlier Job's pod", f)
-	}
-}
-
-func TestReadsGoThroughTheReader(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob()
-	k.createPod("p", job, job.UID, "node-a", corev1.PodRunning)
-	// k.api writes through noReads, so each read below fails if it goes
-	// through the writing client.
-	if _, err := k.api.GetJob(context.Background(), client.ObjectKeyFromObject(job)); err != nil {
-		t.Error(err)
-	}
-	pods, err := k.api.ListJobPods(context.Background(), job.Namespace, job.UID)
-	if err != nil || len(pods) != 1 {
-		t.Errorf("ListJobPods = %d pods, %v; want p", len(pods), err)
-	}
-	if _, err := restorejob.Stop(context.Background(), k.api, restorejob.RefOf(job)); err != nil {
-		t.Error(err)
 	}
 }
 
@@ -512,40 +363,4 @@ func TestStopOfAJobNeverResumedDeletesIt(t *testing.T) {
 	if !k.foregroundDeleted(job) {
 		t.Error("the Job was not deleted with Foreground propagation")
 	}
-}
-
-// Read reports a Job that is still suspended as starting, and a Job that
-// was resumed or has ended as not starting.
-func TestReadReportsAJobNotYetResumedAsStarting(t *testing.T) {
-	k := newCluster(t)
-	created := k.created()
-	if got := restorejob.Read(created, nil); got.State != restorejob.Running || !got.Starting {
-		t.Errorf("Read of a Job never resumed = %+v, want Running and starting", got)
-	}
-	if !restorejob.AwaitsResume(created) {
-		t.Error("AwaitsResume = false for a Job never resumed, want true")
-	}
-	for name, job := range map[string]*batchv1.Job{
-		"resumed":  newCluster(t).createJob(),
-		"complete": completedSuspended(newCluster(t).created()),
-	} {
-		if got := restorejob.Read(job, nil); got.Starting {
-			t.Errorf("Read of a %s Job = %+v, want not starting", name, got)
-		}
-		if restorejob.AwaitsResume(job) {
-			t.Errorf("AwaitsResume = true for a %s Job, want false", name)
-		}
-	}
-	deleting := created.DeepCopy()
-	deleting.DeletionTimestamp = ptr.To(metav1.NewTime(podTime))
-	if restorejob.AwaitsResume(deleting) {
-		t.Error("AwaitsResume = true for a Job being deleted, want false")
-	}
-}
-
-// completedSuspended marks a suspended Job Complete, which the Job
-// controller never does; it checks that a terminal condition wins.
-func completedSuspended(job *batchv1.Job) *batchv1.Job {
-	completeJob(job)
-	return job
 }

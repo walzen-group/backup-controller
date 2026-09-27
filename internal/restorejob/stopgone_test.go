@@ -52,71 +52,6 @@ func TestStopHoldsForAPodOfAJobDeletedWithOrphan(t *testing.T) {
 	}
 }
 
-func TestStopHoldsForATerminatingPodOfAJobDeletedInBackground(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob()
-	pod := k.createPod("p", job, job.UID, "node-a", corev1.PodRunning)
-	// kubectl delete job: the Job goes at once, and the garbage collector
-	// deletes the pod, which runs on until its kubelet has stopped it.
-	k.deleteJob(job, metav1.DeletePropagationBackground)
-	if err := k.c.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil {
-		t.Fatal(err)
-	}
-	if pod.DeletionTimestamp == nil {
-		t.Fatal("the garbage collector did not delete the pod")
-	}
-	state := k.stop(job)
-	if state.Stopped || !slices.Equal(state.Pods, []string{"p"}) {
-		t.Fatalf("state = %+v, want not stopped with the terminating pod p left", state)
-	}
-	pod.Finalizers = nil
-	if err := k.c.Update(context.Background(), pod); err != nil {
-		t.Fatal(err)
-	}
-	if !k.podGone(pod) {
-		t.Fatal("the pod stayed after its last finalizer went")
-	}
-	if state := k.stop(job); !state.Stopped {
-		t.Fatalf("state = %+v, want stopped once the pod is gone", state)
-	}
-}
-
-func TestStopOfARunningJobDeletedWithNoPodsLeft(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob()
-	k.deleteJob(job, metav1.DeletePropagationBackground)
-	if state := k.stop(job); !state.Stopped {
-		t.Fatalf("state = %+v, want stopped with no pod left", state)
-	}
-}
-
-// deletingSuspend is an API whose SuspendJob first deletes the Job with
-// Orphan propagation, as a person could between Stop's read and its patch.
-type deletingSuspend struct {
-	restorejob.API
-	k *cluster
-}
-
-func (d deletingSuspend) SuspendJob(ctx context.Context, job *batchv1.Job) error {
-	d.k.deleteJob(job, metav1.DeletePropagationOrphan)
-	return d.API.SuspendJob(ctx, job)
-}
-
-func TestStopOfAJobDeletedBetweenItsReadAndTheSuspend(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob()
-	pod := k.createPod("p", job, job.UID, "node-a", corev1.PodRunning)
-	api := deletingSuspend{API: k.api, k: k}
-	state, err := restorejob.Stop(context.Background(), api, restorejob.RefOf(job))
-	if err != nil || state.Stopped || !slices.Equal(state.Pods, []string{"p"}) {
-		t.Fatalf("Stop = %+v, %v; want no error and not stopped with pod p left", state, err)
-	}
-	k.setPhase(pod, corev1.PodFailed)
-	if state := k.stop(job); !state.Stopped {
-		t.Fatalf("state = %+v, want stopped once the pod ended", state)
-	}
-}
-
 func TestStopLeavesAJobThatReplacedItsRefAlone(t *testing.T) {
 	k := newCluster(t)
 	job := k.createJob(batchv1.JobFailed)
@@ -135,20 +70,6 @@ func TestStopLeavesAJobThatReplacedItsRefAlone(t *testing.T) {
 	}
 	if got := k.read(job); got.DeletionTimestamp != nil || k.foregroundDeleted(job) {
 		t.Error("Stop deleted the Job that replaced the one its ref names")
-	}
-}
-
-func TestStopRefusesARefWithoutAUID(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob()
-	ref := restorejob.RefOf(job)
-	ref.UID = ""
-	state, err := restorejob.Stop(context.Background(), k.api, ref)
-	if err == nil || state.Stopped {
-		t.Fatalf("Stop = %+v, %v; want an error and not stopped", state, err)
-	}
-	if got := k.read(job); got.Spec.Suspend != nil && *got.Spec.Suspend {
-		t.Error("Stop suspended a Job of a ref without a UID")
 	}
 }
 

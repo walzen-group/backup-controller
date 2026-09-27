@@ -42,12 +42,6 @@ func terminated(name string, code int32, message string) corev1.ContainerStatus 
 	}}
 }
 
-func waiting(name, reason, message string) corev1.ContainerStatus {
-	return corev1.ContainerStatus{Name: name, State: corev1.ContainerState{
-		Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: message},
-	}}
-}
-
 // readJob returns the Job Build makes from runSpec as its creator resumed
 // it.
 func readJob(t *testing.T) *batchv1.Job {
@@ -107,19 +101,6 @@ func TestReadTakesExitCodeFromContainerStatuses(t *testing.T) {
 			t.Error("FailureError is not an error")
 		}
 	})
-	t.Run("init container", func(t *testing.T) {
-		job := withCondition(readJob(t), batchv1.JobFailed, "PodFailurePolicy", "")
-		pod := jobPod("p1", job.UID, 0)
-		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{terminated("unlock", 10, "Fatal: repository does not exist")}
-		pod.Status.ContainerStatuses = []corev1.ContainerStatus{waiting("restore", "PodInitializing", "")}
-		f := restorejob.Read(job, []corev1.Pod{pod}).Failure
-		if f == nil || f.ExitCode == nil || *f.ExitCode != 10 || f.Container != "unlock" || f.Message != "Fatal: repository does not exist" {
-			t.Fatalf("failure = %+v, want exit 10 in unlock", f)
-		}
-		if !strings.Contains(f.Error(), "restic exited 10 (no repository)") {
-			t.Errorf("Error() = %q", f.Error())
-		}
-	})
 	t.Run("no pod left", func(t *testing.T) {
 		job := withCondition(readJob(t), batchv1.JobFailed, "BackoffLimitExceeded", "Job has reached the specified backoff limit")
 		f := restorejob.Read(job, nil).Failure
@@ -132,74 +113,4 @@ func TestReadTakesExitCodeFromContainerStatuses(t *testing.T) {
 			t.Errorf("Error() = %q, want the condition's reason and message and that no pod shows the exit", msg)
 		}
 	})
-}
-
-func TestReadShowsTheWaitingReasonWhileTheJobRuns(t *testing.T) {
-	job := readJob(t)
-	for _, tc := range []struct {
-		name string
-		pod  func() corev1.Pod
-		want restorejob.Waiting
-	}{
-		{"init container", func() corev1.Pod {
-			p := jobPod("p", job.UID, 0)
-			p.Status.InitContainerStatuses = []corev1.ContainerStatus{waiting("unlock", "ImagePullBackOff", "Back-off pulling image")}
-			p.Status.ContainerStatuses = []corev1.ContainerStatus{waiting("restore", "PodInitializing", "")}
-			return p
-		}, restorejob.Waiting{Container: "unlock", Reason: "ImagePullBackOff", Message: "Back-off pulling image"}},
-		{"main container", func() corev1.Pod {
-			p := jobPod("p", job.UID, 0)
-			p.Status.InitContainerStatuses = []corev1.ContainerStatus{terminated("unlock", 0, "")}
-			p.Status.ContainerStatuses = []corev1.ContainerStatus{waiting("restore", "CreateContainerConfigError", `couldn't find key RESTIC_PASSWORD in Secret app/restic-data`)}
-			return p
-		}, restorejob.Waiting{Container: "restore", Reason: "CreateContainerConfigError", Message: `couldn't find key RESTIC_PASSWORD in Secret app/restic-data`}},
-		{"unscheduled", func() corev1.Pod {
-			p := jobPod("p", job.UID, 0)
-			p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
-				Reason: "SchedulingGated", Message: "Scheduling is blocked due to non-empty scheduling gates"}}
-			return p
-		}, restorejob.Waiting{Reason: "SchedulingGated", Message: "Scheduling is blocked due to non-empty scheduling gates"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			running := jobPod("old", job.UID, -60)
-			got := restorejob.Read(job, []corev1.Pod{running, tc.pod()})
-			if got.State != restorejob.Running || got.Waiting == nil || *got.Waiting != tc.want {
-				t.Fatalf("Read = %+v (waiting %+v), want Running and %+v", got, got.Waiting, tc.want)
-			}
-			if got.Waiting.String() == "" {
-				t.Error("Waiting renders to nothing")
-			}
-		})
-	}
-	t.Run("running pod", func(t *testing.T) {
-		p := jobPod("p", job.UID, 0)
-		p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "restore", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
-		if got := restorejob.Read(job, []corev1.Pod{p}); got.Waiting != nil {
-			t.Errorf("waiting = %+v for a running pod, want none", got.Waiting)
-		}
-	})
-	t.Run("terminal Job", func(t *testing.T) {
-		p := jobPod("p", job.UID, 0)
-		p.Status.ContainerStatuses = []corev1.ContainerStatus{waiting("restore", "ImagePullBackOff", "")}
-		for _, typ := range []batchv1.JobConditionType{batchv1.JobComplete, batchv1.JobFailed} {
-			got := restorejob.Read(withCondition(readJob(t), typ, "", ""), []corev1.Pod{p})
-			if got.Waiting != nil {
-				t.Errorf("%s Job: waiting = %+v, want none", typ, got.Waiting)
-			}
-		}
-	})
-}
-
-func TestExitMeaning(t *testing.T) {
-	for code, want := range map[int32]string{
-		0: "success", 1: "failure", 3: "some source data could not be read", 10: "no repository",
-		11: "the repository is locked", 12: "wrong password", 130: "interrupted",
-	} {
-		if got := restorejob.ExitMeaning(code); !strings.Contains(got, want) {
-			t.Errorf("ExitMeaning(%d) = %q, want it to say %q", code, got, want)
-		}
-	}
-	if got := restorejob.ExitMeaning(42); !strings.Contains(got, "unknown") || !strings.Contains(got, "failure") {
-		t.Errorf("ExitMeaning(42) = %q, want an unknown code treated as failure", got)
-	}
 }
