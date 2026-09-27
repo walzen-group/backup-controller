@@ -202,7 +202,7 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 	// The stored status now shows the workloads back, so the quiesce Leases
 	// may go, before the finalizer: another run then takes the namespace over
 	// at once.
-	r.releaseQuiesce(ctx, run)
+	releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
 	return ctrl.Result{}, dropFinalizer(ctx, r.Client, run)
 }
 
@@ -244,7 +244,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	// restarts the app again. Released before that, the Lease would let
 	// another run stop the app in between, and the repeated restart would
 	// undo that stop.
-	r.releaseQuiesce(ctx, run)
+	releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
 	return ctrl.Result{}, nil
 }
 
@@ -288,17 +288,6 @@ func (r *RestoreRunReconciler) giveBack(ctx context.Context, run *backupv1alpha1
 		return false, ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err))
 	}
 	return true, ctrl.Result{}, nil
-}
-
-// releaseQuiesce releases the namespace's quiesce Lease the run holds, once
-// the stored status shows the workloads back. The release is best effort: a
-// failed one is logged, and a Lease left behind is stale under holderLive's
-// rule, so the next run takes it over.
-func (r *RestoreRunReconciler) releaseQuiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) {
-	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
-		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
-			"namespace", run.Namespace, "name", run.Name)
-	}
 }
 
 // announceLeftDeleted records a Warning event with reason

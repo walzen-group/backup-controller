@@ -11,7 +11,6 @@ import (
 	"github.com/walzen-group/backup-controller/internal/quiesce"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // abort ends a run early as Failed. It fails every Pending or Running item
@@ -174,10 +173,7 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 	// dropped while it still holds them keeps other runs out of the
 	// namespace until the Lease's holder reads as gone. Best effort, as in
 	// work: a Lease left behind is stale under holderLive's rule.
-	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
-		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
-			"namespace", run.Namespace, "name", run.Name)
-	}
+	releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
 	return dropFinalizer(ctx, r.Client, run)
 }
 
@@ -272,10 +268,7 @@ func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.
 	// release that happened while the drop still failed would let another run
 	// take the Lease and then watch this run repeat its restart on the retry.
 	// Best effort: a Lease left behind is stale under holderLive's rule.
-	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
-		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the deletion goes on",
-			"namespace", run.Namespace, "name", run.Name)
-	}
+	releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
 	return nil
 }
 

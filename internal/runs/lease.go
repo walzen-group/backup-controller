@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -406,21 +407,19 @@ func leaseReleaseError(run metav1.Object, err error) error {
 //   - run is the BackupRun or RestoreRun whose quiesce Lease goes, found by
 //     the UID label.
 //
-// It returns nil once the Lease is gone or left alone, and an error when the
-// list or the delete fails. A run calls it once its stored status shows the
-// workloads back, so another run may take the Lease over.
-//
-// The delete carries the UID and the resourceVersion of the Lease as read, so
-// a Lease another run has taken over since is left alone. A Lease that is
-// already gone, or changed since the read, is not an error: the next call
-// sees it as it is now. Any other failed call comes back as an error, and the
-// caller logs it and goes on; a Lease left behind is stale under holderLive's
-// rule and is taken over by the next run.
-func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object) error {
-	return deleteLeases(ctx, c, reader, run, client.MatchingLabels{
+// A run calls it once its stored status shows the workloads back, so
+// another run may take the Lease over. The release is best effort: a failed
+// list or delete is logged and the caller goes on. A Lease left behind is
+// stale under holderLive's rule, and the next run takes it over.
+func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object) {
+	err := deleteLeases(ctx, c, reader, run, client.MatchingLabels{
 		labelLeaseHolderUID: string(run.GetUID()),
 		labelLeaseScope:     scopeQuiesce,
 	}, func(*coordinationv1.Lease) bool { return true })
+	if err != nil {
+		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
+			"namespace", run.GetNamespace(), "name", run.GetName())
+	}
 }
 
 // leaseHeldElsewhere returns a hold that names the run that holds the Lease

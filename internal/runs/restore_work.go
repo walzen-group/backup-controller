@@ -165,7 +165,7 @@ func (r *RestoreRunReconciler) releaseFinished(ctx context.Context, run *backupv
 		return err
 	}
 	if durablyRestarted(run) {
-		r.releaseQuiesce(ctx, run)
+		releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
 	}
 	return nil
 }

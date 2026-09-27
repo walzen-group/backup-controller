@@ -121,7 +121,7 @@ func restoreItemAfter(t *testing.T, run *backupv1alpha1.RestoreRun, between func
 // before the reason existed. Each case goes through one of the start checks
 // that return a typed refusal: startItem's claimGone, precheckItem, startRefusal,
 // sourceSettingsFor, volumeAffinity, the quiesce pre-check's foreign
-// source, startItem's hibernated and missing Cluster, checkVolume's
+// source, startItem's hibernated and missing Cluster, checkVolumeItem's
 // repositoryFor, the in-place quiesce pre-check's Lease of a repository
 // Secret that is gone, the into start checks (repositoryFor and the Lease
 // of a repository Secret that is gone), and restoreDatabase's

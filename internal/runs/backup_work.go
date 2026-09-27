@@ -187,10 +187,7 @@ func (r *BackupRunReconciler) releaseFinished(ctx context.Context, run *backupv1
 	// Lease left behind is stale under holderLive's rule and the next run
 	// takes it over.
 	if durablyRestarted(run) {
-		if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
-			log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
-				"namespace", run.Namespace, "name", run.Name)
-		}
+		releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
 	}
 }
 
