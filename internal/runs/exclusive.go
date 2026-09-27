@@ -25,9 +25,10 @@ const (
 	restoreMover
 )
 
-// otherMover returns a message for the Ready condition naming the run whose
-// mover works on a claim or its repository, or "" when there is none. A
-// backup and a restore of the same claim or repository never run at once:
+// otherMover returns a hold of kind holdSourceBusy that names the run whose
+// mover works on a claim or its repository. It returns the zero hold when
+// there is no such run. A backup and a restore of the same claim or
+// repository never run at once:
 // a backup would cut its clone from a volume the restore is half way through
 // writing, and its restic forget needs the exclusive lock, which fails while
 // the restore holds its read lock. A restore that starts during a backup
@@ -68,7 +69,7 @@ const (
 //
 // A failed list comes back as an error, and the caller retries; nothing is
 // decided on it.
-func otherMover(ctx context.Context, reader client.Reader, namespace, claim, secret string, kind moverKind) (string, error) {
+func otherMover(ctx context.Context, reader client.Reader, namespace, claim, secret string, kind moverKind) (hold, error) {
 	if kind == backupMover {
 		return backupInProgress(ctx, reader, namespace, claim, secret)
 	}
@@ -76,36 +77,43 @@ func otherMover(ctx context.Context, reader client.Reader, namespace, claim, sec
 }
 
 // backupInProgress is otherMover for backupMover.
-func backupInProgress(ctx context.Context, reader client.Reader, namespace, claim, secret string) (string, error) {
+func backupInProgress(ctx context.Context, reader client.Reader, namespace, claim, secret string) (hold, error) {
 	sources := &volsyncv1alpha1.ReplicationSourceList{}
 	if err := reader.List(ctx, sources, client.InNamespace(namespace)); err != nil {
-		return "", fmt.Errorf("list ReplicationSources in %s: %w", namespace, err)
+		return hold{}, fmt.Errorf("list ReplicationSources in %s: %w", namespace, err)
 	}
 	var runs *backupv1alpha1.BackupRunList
 	for i := range sources.Items {
 		source := &sources.Items[i]
-		repository := ""
-		if source.Spec.Restic != nil {
-			repository = source.Spec.Restic.Repository
-		}
+		repository := sourceRepository(source)
 		if !matches(source.Spec.SourcePVC, claim) && !matches(repository, secret) {
 			continue
 		}
 		if runs == nil {
 			runs = &backupv1alpha1.BackupRunList{}
 			if err := reader.List(ctx, runs, client.InNamespace(namespace)); err != nil {
-				return "", fmt.Errorf("list BackupRuns in %s: %w", namespace, err)
+				return hold{}, fmt.Errorf("list BackupRuns in %s: %w", namespace, err)
 			}
 		}
 		if run := liveBackup(runs, source); run != "" {
-			return fmt.Sprintf("BackupRun %s is backing up claim %s to repository %s with ReplicationSource %s; this run starts once that backup has finished",
+			return sourceBusy("BackupRun %s is backing up claim %s to repository %s with ReplicationSource %s; this run starts once that backup has finished",
 				run, source.Spec.SourcePVC, repository, source.Name), nil
 		}
 		if inUse(source) {
-			return syncingMessage(source, repository), nil
+			return sourceBusy("%s", syncingMessage(source, repository)), nil
 		}
 	}
-	return "", nil
+	return hold{}, nil
+}
+
+// sourceRepository returns the name of the restic repository Secret of the
+// ReplicationSource, or an empty string when the source has no restic
+// section.
+func sourceRepository(source *volsyncv1alpha1.ReplicationSource) string {
+	if source.Spec.Restic == nil {
+		return ""
+	}
+	return source.Spec.Restic.Repository
 }
 
 // syncingMessage returns the Ready message of a restore that waits for a
@@ -155,7 +163,7 @@ func liveBackup(runs *backupv1alpha1.BackupRunList, source *volsyncv1alpha1.Repl
 			continue
 		}
 		for _, item := range run.Status.Items {
-			if item.Kind == "ReplicationSource" && item.Name == source.Name &&
+			if item.Kind == backupv1alpha1.ItemKindSource && item.Name == source.Name &&
 				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
 				return run.Name
 			}
@@ -165,10 +173,10 @@ func liveBackup(runs *backupv1alpha1.BackupRunList, source *volsyncv1alpha1.Repl
 }
 
 // restoreInProgress is otherMover for restoreMover.
-func restoreInProgress(ctx context.Context, reader client.Reader, namespace, claim, secret string) (string, error) {
+func restoreInProgress(ctx context.Context, reader client.Reader, namespace, claim, secret string) (hold, error) {
 	jobs := &batchv1.JobList{}
 	if err := reader.List(ctx, jobs, client.InNamespace(namespace), client.MatchingLabels(restorejob.ManagedLabels())); err != nil {
-		return "", fmt.Errorf("list restore Jobs in %s: %w", namespace, err)
+		return hold{}, fmt.Errorf("list restore Jobs in %s: %w", namespace, err)
 	}
 	var runs *backupv1alpha1.RestoreRunList
 	for i := range jobs.Items {
@@ -179,19 +187,20 @@ func restoreInProgress(ctx context.Context, reader client.Reader, namespace, cla
 		if runs == nil {
 			runs = &backupv1alpha1.RestoreRunList{}
 			if err := reader.List(ctx, runs, client.InNamespace(namespace)); err != nil {
-				return "", fmt.Errorf("list RestoreRuns in %s: %w", namespace, err)
+				return hold{}, fmt.Errorf("list RestoreRuns in %s: %w", namespace, err)
 			}
 		}
 		held, err := restoreJobHolds(ctx, reader, runs, job)
-		if err != nil || held != "" {
+		if err != nil || held.held() {
 			return held, err
 		}
 	}
-	return "", nil
+	return hold{}, nil
 }
 
-// restoreJobHolds returns a message for the Ready condition when a restore
-// Job holds the claim and the repository it names, or "" when it does not.
+// restoreJobHolds returns a hold of kind holdSourceBusy when a restore Job
+// holds the claim and the repository that it names. It returns the zero hold
+// when the Job does not hold them.
 //
 // Parameters:
 //   - ctx bounds the pod list.
@@ -211,19 +220,19 @@ func restoreInProgress(ctx context.Context, reader client.Reader, namespace, cla
 // controller may start a pod for it or one of its pods may still run restic
 // (see restorejob.MayStillWrite): a run records its item's end before it
 // stops the Job, and a stop takes until every pod has ended.
-func restoreJobHolds(ctx context.Context, reader client.Reader, runs *backupv1alpha1.RestoreRunList, job *batchv1.Job) (string, error) {
+func restoreJobHolds(ctx context.Context, reader client.Reader, runs *backupv1alpha1.RestoreRunList, job *batchv1.Job) (hold, error) {
 	claim, repository := job.Annotations[restorejob.AnnotationClaim], job.Annotations[restorejob.AnnotationRepository]
 	run := jobRun(runs, job)
 	if run != nil && run.DeletionTimestamp == nil && !run.Status.Phase.Finished() && !itemFinished(run, job.Name) {
-		return fmt.Sprintf("RestoreRun %s is restoring claim %s from repository %s with restore Job %s; this run starts once that restore has finished",
+		return sourceBusy("RestoreRun %s is restoring claim %s from repository %s with restore Job %s; this run starts once that restore has finished",
 			run.Name, claim, repository, job.Name), nil
 	}
 	pods := &corev1.PodList{}
 	if err := reader.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{batchv1.ControllerUidLabel: string(job.UID)}); err != nil {
-		return "", fmt.Errorf("list the pods of restore Job %s: %w", job.Name, err)
+		return hold{}, fmt.Errorf("list the pods of restore Job %s: %w", job.Name, err)
 	}
 	if !restorejob.MayStillWrite(job, pods.Items) {
-		return "", nil
+		return hold{}, nil
 	}
 	owner := "a RestoreRun that no longer exists"
 	switch {
@@ -232,7 +241,7 @@ func restoreJobHolds(ctx context.Context, reader client.Reader, runs *backupv1al
 	case job.Labels[restorejob.LabelRestoreClaim] != "":
 		owner = "the VolumeRestore populator"
 	}
-	return fmt.Sprintf("restore Job %s of %s may still write claim %s from repository %s; this run starts once the Job is stopped and its pods have ended",
+	return sourceBusy("restore Job %s of %s may still write claim %s from repository %s; this run starts once the Job is stopped and its pods have ended",
 		job.Name, owner, claim, repository), nil
 }
 

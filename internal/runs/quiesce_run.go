@@ -53,40 +53,51 @@ func durablyRestarted(run client.Object) bool {
 // status write still carries the old resourceVersion and fails with a
 // conflict, and the next pass works from the stored run.
 func readStop(ctx context.Context, reader client.Reader, run client.Object) (backupv1alpha1.RunPhase, error) {
-	var stored client.Object
-	kind := ""
-	switch run.(type) {
-	case *backupv1alpha1.BackupRun:
-		stored, kind = &backupv1alpha1.BackupRun{}, backupv1alpha1.KindBackupRun
-	case *backupv1alpha1.RestoreRun:
-		stored, kind = &backupv1alpha1.RestoreRun{}, backupv1alpha1.KindRestoreRun
-	default:
-		return "", fmt.Errorf("read the stop of %T: not a run", run)
-	}
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(run), stored); err != nil {
-		return "", fmt.Errorf("read %s %s/%s again before changing its workloads: %w", kind, run.GetNamespace(), run.GetName(), err)
-	}
-	if stored.GetUID() != run.GetUID() {
-		return "", fmt.Errorf("%s %s/%s is now another object (UID %s, was %s); no workload is changed for the old one",
-			kind, run.GetNamespace(), run.GetName(), stored.GetUID(), run.GetUID())
-	}
 	switch r := run.(type) {
 	case *backupv1alpha1.BackupRun:
-		s := stored.(*backupv1alpha1.BackupRun) //nolint:forcetypeassert // stored is built above as the run's own type; H1 rewrites readStop
-		if s.ResourceVersion != r.ResourceVersion {
-			r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
-			r.Status.RestartedAt, r.Status.RestartPending = s.Status.RestartedAt, s.Status.RestartPending
+		stored := &backupv1alpha1.BackupRun{}
+		if err := readStored(ctx, reader, r, stored, backupv1alpha1.KindBackupRun); err != nil {
+			return "", err
 		}
-		return s.Status.Phase, nil
+		if stored.ResourceVersion != r.ResourceVersion {
+			r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = stored.Status.QuiescedAt, stored.Status.Quiesced, stored.Status.SuspendedKustomizations
+			r.Status.RestartedAt, r.Status.RestartPending = stored.Status.RestartedAt, stored.Status.RestartPending
+		}
+		return stored.Status.Phase, nil
 	case *backupv1alpha1.RestoreRun:
-		s := stored.(*backupv1alpha1.RestoreRun) //nolint:forcetypeassert // stored is built above as the run's own type; H1 rewrites readStop
-		if s.ResourceVersion != r.ResourceVersion {
-			r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = s.Status.QuiescedAt, s.Status.Quiesced, s.Status.SuspendedKustomizations
-			r.Status.RestartedAt = s.Status.RestartedAt
+		stored := &backupv1alpha1.RestoreRun{}
+		if err := readStored(ctx, reader, r, stored, backupv1alpha1.KindRestoreRun); err != nil {
+			return "", err
 		}
-		return s.Status.Phase, nil
+		if stored.ResourceVersion != r.ResourceVersion {
+			r.Status.QuiescedAt, r.Status.Quiesced, r.Status.SuspendedKustomizations = stored.Status.QuiescedAt, stored.Status.Quiesced, stored.Status.SuspendedKustomizations
+			r.Status.RestartedAt = stored.Status.RestartedAt
+		}
+		return stored.Status.Phase, nil
 	}
-	return "", nil
+	return "", fmt.Errorf("read the stop of %T: not a run", run)
+}
+
+// readStored reads the stored copy of a run for readStop.
+//
+// Parameters:
+//   - reader is the uncached Reader that readStop got.
+//   - run is the run as the pass read it. Its namespace, name and UID are
+//     used.
+//   - stored receives the stored run. It has the same type as run.
+//   - kind is BackupRun or RestoreRun, for the error messages.
+//
+// It returns an error when the read fails, when the run is gone, or when
+// the stored run with that name has a different UID.
+func readStored(ctx context.Context, reader client.Reader, run, stored client.Object, kind string) error {
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(run), stored); err != nil {
+		return fmt.Errorf("read %s %s/%s again before changing its workloads: %w", kind, run.GetNamespace(), run.GetName(), err)
+	}
+	if stored.GetUID() != run.GetUID() {
+		return fmt.Errorf("%s %s/%s is now another object (UID %s, was %s); no workload is changed for the old one",
+			kind, run.GetNamespace(), run.GetName(), stored.GetUID(), run.GetUID())
+	}
+	return nil
 }
 
 // stopOwed reports whether a run whose cached copy shows a recorded plan
@@ -120,10 +131,11 @@ func stopOwed(ctx context.Context, reader client.Reader, run client.Object) (boo
 	return !phase.Finished() && plan > 0 && quiescedAt == nil && restartedAt == nil, nil
 }
 
-// waitingOn returns a message naming another run in the run's namespace that
-// this run must wait for before it stops the namespace's workloads, or ""
-// when there is none. A run calls it before it takes the namespace's quiesce
-// Lease, with nothing stopped.
+// waitingOn returns a hold of kind holdSourceBusy that names another run in
+// the namespace of the run. The run must wait for that other run before it
+// stops the workloads of the namespace. It returns the zero hold when there
+// is no such run. A run calls it before it takes the quiesce Lease of the
+// namespace, with nothing stopped.
 //
 // Parameters:
 //   - reader lists the namespace's RestoreRuns, uncached. A failed list comes
@@ -133,10 +145,10 @@ func stopOwed(ctx context.Context, reader client.Reader, run client.Object) (boo
 // The run it names is an unfinished RestoreRun with a Cluster item in phase
 // Deleted. That RestoreRun waits for its Cluster to be created again, and a
 // Kustomization this run suspends may be the one Flux needs to create it.
-func waitingOn(ctx context.Context, reader client.Reader, run metav1.Object) (string, error) {
+func waitingOn(ctx context.Context, reader client.Reader, run metav1.Object) (hold, error) {
 	restores := &backupv1alpha1.RestoreRunList{}
 	if err := reader.List(ctx, restores, client.InNamespace(run.GetNamespace())); err != nil {
-		return "", fmt.Errorf("list RestoreRuns in %s: %w", run.GetNamespace(), err)
+		return hold{}, fmt.Errorf("list RestoreRuns in %s: %w", run.GetNamespace(), err)
 	}
 	for i := range restores.Items {
 		other := &restores.Items[i]
@@ -144,18 +156,18 @@ func waitingOn(ctx context.Context, reader client.Reader, run metav1.Object) (st
 			continue
 		}
 		if cluster := deletedCluster(other); cluster != "" {
-			return fmt.Sprintf("RestoreRun %s has deleted Cluster %s and waits for it to be created again; this run stops the workloads once that Cluster is back",
+			return sourceBusy("RestoreRun %s has deleted Cluster %s and waits for it to be created again; this run stops the workloads once that Cluster is back",
 				other.Name, cluster), nil
 		}
 	}
-	return "", nil
+	return hold{}, nil
 }
 
 // deletedCluster returns the name of a Cluster the run deleted and waits for
 // its owner to create again, or "" when it has none.
 func deletedCluster(run *backupv1alpha1.RestoreRun) string {
 	for _, item := range run.Status.Items {
-		if item.Kind == "Cluster" && item.Phase == backupv1alpha1.ItemDeleted {
+		if item.Kind == backupv1alpha1.ItemKindCluster && item.Phase == backupv1alpha1.ItemDeleted {
 			return item.Name
 		}
 	}
@@ -171,17 +183,18 @@ func deletedCluster(run *backupv1alpha1.RestoreRun) string {
 //   - kind is BackupRun or RestoreRun.
 //   - run is the run that takes the Lease.
 //
-// It returns "" once the run holds the Lease, a message for the Ready
-// condition naming the run that holds it when another live run does, and an
-// error for a failed API call. The caller waits with reason SourceBusy and
-// tries again on a later pass, with nothing stopped.
+// It returns the zero hold once the run holds the Lease. It returns a hold
+// of kind holdSourceBusy that names the holder when another live run holds
+// the Lease. It returns an error for a failed API call. The caller waits
+// with reason SourceBusy and tries again on a later pass, with nothing
+// stopped.
 //
 // Runs of both kinds take the same Lease, so a backup and a restore of
 // different claims in one namespace wait for each other even when their
 // workloads do not overlap. The one Lease covers every overlap: a namespace
 // run stops every marked workload, and a restore's spec.quiesce usually
 // lists some of them.
-func acquireQuiesceLease(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object, kind string) (string, error) {
+func acquireQuiesceLease(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object, kind string) (hold, error) {
 	holder := leaseHolder{kind: kind, run: run, scope: scopeQuiesce}
 	return acquireLease(ctx, c, reader, holder, run.GetNamespace(), quiesceLeaseName)
 }

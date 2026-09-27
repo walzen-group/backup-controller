@@ -61,6 +61,21 @@ func claimLeaseName(uid types.UID) string { return "backup-controller-claim-" + 
 // repository whose Secret has the given UID.
 func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-" + string(uid) }
 
+// leaseRequest names the run and the objects that acquireLeases takes the
+// Leases for.
+type leaseRequest struct {
+	// holder is the run and the item that take the Leases.
+	holder leaseHolder
+	// namespace is the namespace of the run, where the Leases are.
+	namespace string
+	// claim is the name of the claim. If claim is empty, then the run takes
+	// no claim Lease, as for a restore into a claim that does not exist yet.
+	claim string
+	// secret is the name of the repository Secret. If secret is empty, then
+	// the run takes no repository Lease.
+	secret string
+}
+
 // acquireLeases takes the Leases that let only one run at a time start a
 // mover on a claim and on its restic repository.
 //
@@ -68,19 +83,15 @@ func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-
 //   - c creates and updates the Leases. The reads go through the reader.
 //   - reader reads the claim, the Secret, the Leases and the holder run,
 //     uncached, so a Lease another run took a moment ago is seen.
-//   - holder is the run and the item that take the Leases.
-//   - namespace is the run's namespace, where the Leases live.
-//   - claim is the name of the claim. With an empty name the run takes no
-//     claim Lease, as for a restore into a claim that does not exist yet.
-//   - secret is the name of the repository Secret. With an empty name the
-//     run takes no repository Lease.
+//   - req names the run, the item, the namespace, the claim and the
+//     repository Secret that the Leases are for.
 //
-// It returns "" once the run holds every Lease, and otherwise a message for
-// the Ready condition that names the run that holds one; the run then waits
-// with reason SourceBusy and tries again on a later pass. A repository Secret
-// that does not exist comes back as a refusal (see leaseNamesFor), and the
-// caller fails the item with nothing started. Any other failed API call comes
-// back as an error, and the caller retries.
+// It returns the zero hold once the run holds every Lease. Otherwise it
+// returns a hold of kind holdSourceBusy whose text names the run that holds
+// one. The run then waits with reason SourceBusy and tries again on a later
+// pass. A repository Secret that does not exist comes back as a refusal (see
+// leaseNamesFor), and the caller fails the item with nothing started. Any
+// other failed API call comes back as an error, and the caller retries.
 //
 // A backup and a restore of the same claim or repository call it right
 // before they create their mover object. otherMover's look at the objects
@@ -104,18 +115,18 @@ func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-
 // over the same Lease one gets a Conflict and waits. A live holder's Lease is
 // never taken over, and a run being deleted counts as live until its
 // finalizer has released its Leases.
-func acquireLeases(ctx context.Context, c client.Client, reader client.Reader, holder leaseHolder, namespace, claim, secret string) (string, error) {
-	names, err := leaseNamesFor(ctx, reader, namespace, claim, secret)
+func acquireLeases(ctx context.Context, c client.Client, reader client.Reader, req leaseRequest) (hold, error) {
+	names, err := leaseNamesFor(ctx, reader, req.namespace, req.claim, req.secret)
 	if err != nil {
-		return "", err
+		return hold{}, err
 	}
 	for _, name := range names {
-		busy, err := acquireLease(ctx, c, reader, holder, namespace, name)
-		if err != nil || busy != "" {
+		busy, err := acquireLease(ctx, c, reader, req.holder, req.namespace, name)
+		if err != nil || busy.held() {
 			return busy, err
 		}
 	}
-	return "", nil
+	return hold{}, nil
 }
 
 // leaseNamesFor returns the names of the Leases a run takes on a claim and on
@@ -172,36 +183,36 @@ func leaseNamesFor(ctx context.Context, reader client.Reader, namespace, claim, 
 //   - holder is the run and the item that take the Lease.
 //   - namespace and name place and name the Lease.
 //
-// It returns "" once the run holds the Lease, a message naming the holder
-// when another live run holds it (see leaseBusyMessage), and an error when
-// an API call fails.
-func acquireLease(ctx context.Context, c client.Client, reader client.Reader, holder leaseHolder, namespace, name string) (string, error) {
+// It returns the zero hold once the run holds the Lease. It returns a hold
+// of kind holdSourceBusy that names the holder when another live run holds
+// it (see leaseBusy). It returns an error when an API call fails.
+func acquireLease(ctx context.Context, c client.Client, reader client.Reader, holder leaseHolder, namespace, name string) (hold, error) {
 	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
 	stamp(lease, holder, []string{holder.item})
 	err := c.Create(ctx, lease)
 	if err == nil {
-		return "", nil
+		return hold{}, nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
-		return "", fmt.Errorf("create Lease %s/%s: %w", namespace, name, err)
+		return hold{}, fmt.Errorf("create Lease %s/%s: %w", namespace, name, err)
 	}
 
 	held := &coordinationv1.Lease{}
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, held); err != nil {
 		if apierrors.IsNotFound(err) {
-			return fmt.Sprintf("Lease %s was released while this run took it; this run tries again", name), nil
+			return sourceBusy("Lease %s was released while this run took it; this run tries again", name), nil
 		}
-		return "", fmt.Errorf("get Lease %s/%s: %w", namespace, name, err)
+		return hold{}, fmt.Errorf("get Lease %s/%s: %w", namespace, name, err)
 	}
 	items := leaseItems(held)
 	if holderUID(held) == string(holder.run.GetUID()) {
 		if holder.scope == scopeQuiesce {
 			// A quiesce Lease is held for the run, not for one of its items,
 			// so the run that holds it keeps it without a write.
-			return "", nil
+			return hold{}, nil
 		}
 		if slices.Contains(items, holder.item) {
-			return "", nil
+			return hold{}, nil
 		}
 		// The same run takes the Lease for another item, as a namespace
 		// run does for two claims that share a repository.
@@ -211,49 +222,49 @@ func acquireLease(ctx context.Context, c client.Client, reader client.Reader, ho
 
 	live, err := holderLive(ctx, reader, held)
 	if err != nil {
-		return "", err
+		return hold{}, err
 	}
 	if live {
-		return leaseBusyMessage(held), nil
+		return leaseBusy(held), nil
 	}
 	stamp(held, holder, []string{holder.item})
 	return updateLease(ctx, c, held)
 }
 
-// leaseBusyMessage returns the Ready message for a run that waits while
-// another live run holds a Lease it needs (see acquireLease).
+// leaseBusy returns the hold of a run that waits while another live run
+// holds a Lease that the run needs (see acquireLease).
 //
 // Parameters:
 //   - lease is the Lease as stored, whose labels and annotations name the
 //     holder.
 //
-// It returns the message. It names the holder's kind and name and the
-// Lease. For a claim or repository Lease it also names the items the Lease
-// is held for; for a quiesce Lease it says the holder has stopped the
-// namespace's workloads, without naming them, since the Lease records the
-// holder only.
-func leaseBusyMessage(lease *coordinationv1.Lease) string {
+// It returns a hold of kind holdSourceBusy. Its text names the kind and the
+// name of the holder and the Lease. For a claim or repository Lease, it also
+// names the items that the Lease is for. For a quiesce Lease, it says that
+// the holder stopped the workloads of the namespace. It does not name
+// the workloads, because the Lease records only the holder.
+func leaseBusy(lease *coordinationv1.Lease) hold {
 	kind := lease.Labels[labelLeaseHolderKind]
 	name := lease.Annotations[annotationLeaseHolderName]
 	if lease.Labels[labelLeaseScope] == scopeQuiesce {
-		return fmt.Sprintf("%s %s has stopped the workloads of this namespace (Lease %s); this run stops them once that run has given them back",
+		return sourceBusy("%s %s has stopped the workloads of this namespace (Lease %s); this run stops them once that run has given them back",
 			kind, name, lease.Name)
 	}
-	return fmt.Sprintf("%s %s holds Lease %s for %s; this run starts once that run has finished with it",
+	return sourceBusy("%s %s holds Lease %s for %s; this run starts once that run has finished with it",
 		kind, name, lease.Name, strings.Join(leaseItems(lease), ", "))
 }
 
 // updateLease writes a Lease this run took over or extended, based on the
 // resourceVersion it was read at. A Conflict means another run wrote it
-// first, and comes back as a message to wait with.
-func updateLease(ctx context.Context, c client.Client, lease *coordinationv1.Lease) (string, error) {
+// first, and comes back as a hold of kind holdSourceBusy.
+func updateLease(ctx context.Context, c client.Client, lease *coordinationv1.Lease) (hold, error) {
 	if err := c.Update(ctx, lease); err != nil {
 		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
-			return fmt.Sprintf("Lease %s changed while this run took it; this run tries again", lease.Name), nil
+			return sourceBusy("Lease %s changed while this run took it; this run tries again", lease.Name), nil
 		}
-		return "", fmt.Errorf("update Lease %s/%s: %w", lease.Namespace, lease.Name, err)
+		return hold{}, fmt.Errorf("update Lease %s/%s: %w", lease.Namespace, lease.Name, err)
 	}
-	return "", nil
+	return hold{}, nil
 }
 
 // stamp writes holder and the items onto the Lease: spec.holderIdentity and
@@ -294,84 +305,6 @@ func leaseItems(lease *coordinationv1.Lease) []string {
 		return nil
 	}
 	return strings.Split(value, ",")
-}
-
-// holderLive reports whether the run that holds a Lease still needs it.
-//
-// Parameters:
-//   - reader reads the holder run, uncached.
-//   - lease is the Lease as stored. It lives in its holder's namespace.
-//
-// It returns true while the holder needs the Lease, and an error when the
-// read of the holder fails.
-//
-// A claim or repository Lease is live while the run exists with the UID the
-// Lease names, has not finished, and has an item the Lease names that is
-// Pending or Running. A RestoreRun's item also keeps it live once it has
-// finished, for as long as it records the UID of its restore Job: the run
-// has stopped that Job and not yet seen that no pod of it can write (rule
-// X2, see stopJobs). Only an item of the kind that takes Leases counts, a
-// BackupRun's ReplicationSource item or a RestoreRun's PersistentVolumeClaim
-// item: a Lease names its items by name alone, and a Cluster item with the
-// claim's name does not keep the claim's Lease. A quiesce Lease is live
-// while the holder's stored status does not show the workloads given back
-// (see durablyRestarted): the holder exists with the UID the Lease names, has
-// not finished, and has no plan yet or has not recorded its restart as done.
-// A run being deleted counts as live until its finalizer has released the
-// Lease. A Lease that names no run kind this controller knows is left alone,
-// and counts as live.
-func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1.Lease) (bool, error) {
-	key := types.NamespacedName{Namespace: lease.Namespace, Name: lease.Annotations[annotationLeaseHolderName]}
-	items := leaseItems(lease)
-	quiesce := lease.Labels[labelLeaseScope] == scopeQuiesce
-	switch lease.Labels[labelLeaseHolderKind] {
-	case backupv1alpha1.KindBackupRun:
-		run := &backupv1alpha1.BackupRun{}
-		if err := reader.Get(ctx, key, run); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, fmt.Errorf("get BackupRun %s: %w", key, err)
-		}
-		if string(run.UID) != holderUID(lease) || run.Status.Phase.Finished() {
-			return false, nil
-		}
-		if quiesce {
-			return !durablyRestarted(run), nil
-		}
-		for _, item := range run.Status.Items {
-			if item.Kind == backupv1alpha1.ItemKindSource && slices.Contains(items, item.Name) &&
-				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
-				return true, nil
-			}
-		}
-		return false, nil
-	case backupv1alpha1.KindRestoreRun:
-		run := &backupv1alpha1.RestoreRun{}
-		if err := reader.Get(ctx, key, run); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, fmt.Errorf("get RestoreRun %s: %w", key, err)
-		}
-		if string(run.UID) != holderUID(lease) || run.Status.Phase.Finished() {
-			return false, nil
-		}
-		if quiesce {
-			return !durablyRestarted(run), nil
-		}
-		for _, item := range run.Status.Items {
-			// A finished item that still records its restore Job's UID has
-			// a Job the run has stopped and not yet seen stopped (rule X2),
-			// and a pod of that Job may still write.
-			if item.Kind == backupv1alpha1.ItemKindClaim && slices.Contains(items, item.Name) &&
-				(!finished(item) || item.JobUID != "") {
-				return true, nil
-			}
-		}
-		return false, nil
-	}
-	return true, nil
 }
 
 // releaseLeases deletes the claim and repository Leases a run holds in its
@@ -476,10 +409,11 @@ func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Re
 	return nil
 }
 
-// leaseHeldElsewhere returns a message naming the run that holds the Lease of
-// the given claim or restic repository, or "" when the asking run holds them,
-// no Lease exists, or the holder is stale (see holderLive). It is what a
-// pre-check calls before it stops anything: the run then waits with reason
+// leaseHeldElsewhere returns a hold that names the run that holds the Lease
+// of the given claim or restic repository. It returns the zero hold when the
+// asking run holds the Leases, when no Lease exists, or when the holder is
+// stale (see holderLive). A pre-check calls it before it stops anything. If
+// the hold is of kind holdSourceBusy, then the run waits with reason
 // SourceBusy and keeps the app running.
 //
 // Parameters:
@@ -496,10 +430,10 @@ func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Re
 // RestoreRun fails the item with it before anything is stopped. Any other
 // failed read comes back as an error, and the caller retries with nothing
 // stopped.
-func leaseHeldElsewhere(ctx context.Context, reader client.Reader, run metav1.Object, namespace, claim, secret string) (string, error) {
+func leaseHeldElsewhere(ctx context.Context, reader client.Reader, run metav1.Object, namespace, claim, secret string) (hold, error) {
 	names, err := leaseNamesFor(ctx, reader, namespace, claim, secret)
 	if err != nil {
-		return "", err
+		return hold{}, err
 	}
 	for _, name := range names {
 		held := &coordinationv1.Lease{}
@@ -508,20 +442,20 @@ func leaseHeldElsewhere(ctx context.Context, reader client.Reader, run metav1.Ob
 		case apierrors.IsNotFound(err):
 			continue
 		case err != nil:
-			return "", fmt.Errorf("get Lease %s/%s: %w", namespace, name, err)
+			return hold{}, fmt.Errorf("get Lease %s/%s: %w", namespace, name, err)
 		}
 		if holderUID(held) == string(run.GetUID()) {
 			continue
 		}
 		live, err := holderLive(ctx, reader, held)
 		if err != nil {
-			return "", err
+			return hold{}, err
 		}
 		if live {
-			return leaseBusyMessage(held), nil
+			return leaseBusy(held), nil
 		}
 	}
-	return "", nil
+	return hold{}, nil
 }
 
 // allDoneItems reports whether done accepts every item.

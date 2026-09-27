@@ -78,13 +78,15 @@ func (r *RestoreRunReconciler) startJob(ctx context.Context, run *backupv1alpha1
 	// The Leases make the restore and a backup of the claim or its
 	// repository exclusive: of two runs that get here in the same instant,
 	// only one creates each Lease.
-	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: backupv1alpha1.KindRestoreRun, run: run, item: item.Name},
-		run.Namespace, item.Name, settings.Secret)
+	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseRequest{
+		holder:    leaseHolder{kind: backupv1alpha1.KindRestoreRun, run: run, item: item.Name},
+		namespace: run.Namespace, claim: item.Name, secret: settings.Secret,
+	})
 	if done, err := settled(item, nothingWrittenTo(item.Name, err)); done {
 		return "", "", err
 	}
-	if busy != "" {
-		return backupv1alpha1.ReasonSourceBusy, busy, nil
+	if busy.held() {
+		return busy.readyReason(), busy.text, nil
 	}
 	// A backup that already has its trigger on a ReplicationSource goes
 	// first, as one started before the controller took Leases does.
@@ -92,8 +94,8 @@ func (r *RestoreRunReconciler) startJob(ctx context.Context, run *backupv1alpha1
 	if err != nil {
 		return "", "", err
 	}
-	if backing != "" {
-		return backupv1alpha1.ReasonSourceBusy, backing, nil
+	if backing.held() {
+		return backing.readyReason(), backing.text, nil
 	}
 	err = nothingWrittenTo(item.Name, r.recheckJobSnapshot(ctx, run, *item, settings.Secret))
 	if done, err := settled(item, err); done {

@@ -631,8 +631,8 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			if restoring != "" {
-				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, restoring))
+			if restoring.held() {
+				return after(pollInterval, r.waitFor(ctx, run, restoring.readyReason(), restoring.text))
 			}
 			source := &volsyncv1alpha1.ReplicationSource{}
 			err = r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
@@ -677,8 +677,8 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if waiting != "" {
-			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, waiting))
+		if waiting.held() {
+			return after(pollInterval, r.waitFor(ctx, run, waiting.readyReason(), waiting.text))
 		}
 		// The namespace's quiesce Lease lets one run at a time stop its
 		// workloads. It is taken before the plan and held until the stored
@@ -689,8 +689,8 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if busy != "" {
-			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy))
+		if busy.held() {
+			return after(pollInterval, r.waitFor(ctx, run, busy.readyReason(), busy.text))
 		}
 		// A Kustomization that also applies workloads of another namespace
 		// is refused before anything is stopped (see quiesce.Plan).
@@ -769,18 +769,20 @@ func claimGone(claimName string) error {
 	return refuse(backupv1alpha1.ItemReasonClaimMissing, "the claim %s no longer exists", claimName)
 }
 
-// heldElsewhere returns a message naming the run that holds the claim or its
-// repository, or "" when neither is held. A backup calls it before it stops
-// any workload, so that it waits with the app running where startItem would
-// wait with the app down.
+// heldElsewhere returns a hold of kind holdSourceBusy that names the run
+// that holds the claim or its repository. It returns the zero hold when
+// no run holds either. A backup calls it before it stops any workload, so
+// that it waits with the app running where startItem would wait with the
+// app down.
 //
 // Parameters:
 //   - run is the asking run; its namespace and UID are read.
 //   - claimName names the claim the run is about to back up.
 //
 // A claim that does not exist and a VolumeRestore the claim does not have
-// give "": quiesce has failed such an item through startRefusal before it
-// asks, and ensureSource checks again right before it writes the trigger.
+// give the zero hold. quiesce already failed such an item through startRefusal
+// before it asks, and ensureSource checks again right before it writes the
+// trigger.
 // A repository Secret that does not exist comes back as the refusal
 // leaseNamesFor gives, and quiesce fails the item with it (see
 // failBackupItem) before anything is stopped. Any other failed read comes
@@ -789,26 +791,26 @@ func claimGone(claimName string) error {
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right
 // before the mover object is written.
-func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) (string, error) {
+func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) (hold, error) {
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", nil
+			return hold{}, nil
 		}
-		return "", fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
+		return hold{}, fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
 	}
 	vr, err := volumeRestoreFor(ctx, r.Reader, claim)
 	if err != nil {
 		if _, refused := asItemFailure(err); refused {
-			return "", nil
+			return hold{}, nil
 		}
-		return "", err
+		return hold{}, err
 	}
 	restoring, err := otherMover(ctx, r.Reader, run.Namespace, claimName, vr.Spec.Repository, restoreMover)
 	if err != nil {
-		return "", err
+		return hold{}, err
 	}
-	if restoring != "" {
+	if restoring.held() {
 		return restoring, nil
 	}
 	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, vr.Spec.Repository)

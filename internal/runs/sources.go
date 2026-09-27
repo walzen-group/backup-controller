@@ -515,12 +515,12 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 		// The Leases make the backup and a restore of the claim or its
 		// repository exclusive: of two runs that get here in the same
 		// instant, only one creates each Lease.
-		busy, err := acquireLeases(ctx, c, reader, lock, claim.Namespace, claim.Name, vr.Spec.Repository)
+		busy, err := acquireLeases(ctx, c, reader, leaseRequest{holder: lock, namespace: claim.Namespace, claim: claim.Name, secret: vr.Spec.Repository})
 		if err != nil {
 			return err
 		}
-		if busy != "" {
-			return &sourceHeldError{message: busy}
+		if busy.held() {
+			return &sourceHeldError{message: busy.text}
 		}
 		// A restore of the claim or its repository that already has its
 		// restore Job goes first, and so does a Job whose pods may still
@@ -531,8 +531,8 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 		if err != nil {
 			return err
 		}
-		if restoring != "" {
-			return &sourceHeldError{message: restoring}
+		if restoring.held() {
+			return &sourceHeldError{message: restoring.text}
 		}
 		if source.Labels == nil {
 			source.Labels = map[string]string{}

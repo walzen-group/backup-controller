@@ -127,7 +127,7 @@ linters:
       - path: '^internal/runs/backuprun\.go$'
         linters: [nestif]
         source: '^\s*if (queue != "" |run\.Spec\.All && run\.Status\.RestartedAt == nil && len\(run\.Status\.Quiesced\) > 0 |len\(run\.Status\.Quiesced\) == 0 )\{$'
-      - path: '^internal/runs/(backuprun|clusterwebhook|exclusive|lease|objects|quiesce_run|release_report|restorerun|sources)\.go$'
+      - path: '^internal/runs/(backuprun|clusterwebhook|objects|release_report|restorerun|sources)\.go$'
         linters: [goconst]
       - path: '^internal/runs/(backuprun|restorerun|sources)\.go$'
         linters: [revive]
@@ -135,16 +135,6 @@ linters:
       - path: '^internal/runs/crdcheck\.go$'
         linters: [funlen, gocognit]
         source: '^func walkFields\('
-      - path: '^internal/runs/exclusive\.go$'
-        linters: [funlen, gocognit]
-        source: '^func backupInProgress\('
-      - path: '^internal/runs/lease\.go$'
-        linters: [funlen, gocognit]
-        source: '^func holderLive\('
-      - path: '^internal/runs/lease\.go$'
-        linters: [revive]
-        text: '^argument-limit:'
-        source: '^func acquireLeases\('
       - path: '^internal/runs/release_report\.go$'
         linters: [revive]
         text: '^confusing-results:'

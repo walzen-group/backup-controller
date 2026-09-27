@@ -304,8 +304,8 @@ func (r *RestoreRunReconciler) writeChangedStatus(ctx context.Context, run *back
 // finished, so after the backup's restic forget and its retime.
 //
 // Parameters:
-//   - busy is otherMover's message naming the backup, which becomes the
-//     Ready message.
+//   - busy is the hold from otherMover that names the backup. Its text
+//     becomes the Ready message.
 //
 // The run keeps its empty phase, because Reconcile plans a run whose phase
 // is empty. waitAtChecks sets Ready to False with reason SourceBusy and the
@@ -314,11 +314,11 @@ func (r *RestoreRunReconciler) writeChangedStatus(ctx context.Context, run *back
 // from checksOverdue has passed, it ends the run as Failed with reason
 // TimedOut and the message instead. A failed read or write of the status
 // comes back as an error.
-func (r *RestoreRunReconciler) waitAtChecks(ctx context.Context, run *backupv1alpha1.RestoreRun, busy string) (ctrl.Result, error) {
+func (r *RestoreRunReconciler) waitAtChecks(ctx context.Context, run *backupv1alpha1.RestoreRun, busy hold) (ctrl.Result, error) {
 	if deadline, over := r.checksOverdue(run); over {
-		return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, checksTimedOut(deadline, busy))
+		return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, checksTimedOut(deadline, busy.text))
 	}
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonSourceBusy, busy)
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, busy.readyReason(), busy.text)
 	return after(pollInterval, r.writeChangedStatus(ctx, run))
 }
 
@@ -443,7 +443,7 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 			if busyErr != nil {
 				return ctrl.Result{}, busyErr
 			}
-			if busy != "" {
+			if busy.held() {
 				return r.waitAtChecks(ctx, run, busy)
 			}
 			var snapshot restic.Snapshot
@@ -672,21 +672,21 @@ func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alp
 	return r.selectSnapshot(ctx, run, settings.Secret, at, quiescedOnly)
 }
 
-// volumeBackedUp returns otherMover's message naming a backup of the claim
-// named claimName, or of the repository it restores from, that is in
-// progress, and "" when there is none.
+// volumeBackedUp returns the hold from otherMover that names a backup in
+// progress of the claim named claimName, or of the repository it restores
+// from. It returns the zero hold when there is no such backup.
 //
 // It reads the repository the way checkVolume does. When repositoryFor
-// refuses the claim, it returns "", so that checkVolume returns the refusal
-// and plan fails the item with it. Any other failed read comes back as an
-// error.
-func (r *RestoreRunReconciler) volumeBackedUp(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (string, error) {
+// refuses the claim, it returns the zero hold, so that checkVolume returns
+// the refusal and plan fails the item with it. Any other failed read comes
+// back as an error.
+func (r *RestoreRunReconciler) volumeBackedUp(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (hold, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
 		if _, refused := asItemFailure(err); refused {
-			return "", nil
+			return hold{}, nil
 		}
-		return "", err
+		return hold{}, err
 	}
 	return otherMover(ctx, r.Reader, run.Namespace, claimName, settings.Secret, backupMover)
 }
@@ -1557,7 +1557,7 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if busy != "" {
+	if busy.held() {
 		return r.waitAtChecks(ctx, run, busy)
 	}
 	snapshot, reason, err := r.selectSnapshot(ctx, run, settings.Secret, at, false)
@@ -1900,8 +1900,8 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			if held != "" {
-				return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, held))
+			if held.held() {
+				return after(pollInterval, r.waitFor(ctx, run, held.readyReason(), held.text))
 			}
 		}
 		// With no item left to restore once the checks above failed the
@@ -1919,8 +1919,8 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if waiting != "" {
-			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, waiting))
+		if waiting.held() {
+			return after(pollInterval, r.waitFor(ctx, run, waiting.readyReason(), waiting.text))
 		}
 		// The namespace's quiesce Lease lets one run at a time stop its
 		// workloads. It is taken before the plan and held until the stored
@@ -1931,8 +1931,8 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if busy != "" {
-			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy))
+		if busy.held() {
+			return after(pollInterval, r.waitFor(ctx, run, busy.readyReason(), busy.text))
 		}
 
 		// A Kustomization that also applies workloads of another namespace
@@ -1976,10 +1976,11 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 }
 
-// backupHeldElsewhere returns a message naming the run that holds the claim
-// or its repository, or "" when neither is held. A restore calls it before it
-// stops any workload, so that it waits with the app running where
-// restoreVolume would wait with the app down.
+// backupHeldElsewhere returns a hold of kind holdSourceBusy that names the
+// run that holds the claim or its repository. It returns the zero hold when
+// no run holds either. A restore calls it before it stops any workload, so
+// that it waits with the app running where restoreVolume would wait with
+// the app down.
 //
 // Parameters:
 //   - run is the asking run; its namespace and UID are read. spec.repository
@@ -1987,29 +1988,29 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 //   - claimName names the claim the item restores.
 //
 // A refusal from repositoryFor, for a claim or a VolumeRestore that is gone,
-// gives "": quiesce has failed such an item with startRefusal just before,
-// and restoreVolume fails an item that became one since. A repository
-// Secret that does not exist comes back as the refusal leaseNamesFor gives,
-// and quiesce fails the item with it (see failRestoreItem) before anything is
-// stopped. Any other failed read comes back as an error, and the pass
-// retries with nothing stopped.
+// gives the zero hold. quiesce already failed such an item with startRefusal
+// just before, and restoreVolume fails an item that became one since. A
+// repository Secret that does not exist comes back as the refusal that
+// leaseNamesFor gives, and quiesce fails the item with it (see
+// failRestoreItem) before it stops anything. Any other failed read comes
+// back as an error, and the pass retries with nothing stopped.
 //
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right
 // before the mover object is written.
-func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (string, error) {
+func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (hold, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
 		if _, refused := asItemFailure(err); refused {
-			return "", nil
+			return hold{}, nil
 		}
-		return "", err
+		return hold{}, err
 	}
 	backing, err := otherMover(ctx, r.Reader, run.Namespace, claimName, settings.Secret, backupMover)
 	if err != nil {
-		return "", err
+		return hold{}, err
 	}
-	if backing != "" {
+	if backing.held() {
 		return backing, nil
 	}
 	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, settings.Secret)
@@ -2310,19 +2311,21 @@ func (r *RestoreRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.
 // read, write or status write comes back as an error, which the caller
 // retries.
 func (r *RestoreRunReconciler) waitForBackup(ctx context.Context, run *backupv1alpha1.RestoreRun, claim, secret string) (bool, error) {
-	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: "RestoreRun", run: run, item: run.Status.Items[0].Name},
-		run.Namespace, claim, secret)
+	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseRequest{
+		holder:    leaseHolder{kind: "RestoreRun", run: run, item: run.Status.Items[0].Name},
+		namespace: run.Namespace, claim: claim, secret: secret,
+	})
 	if err != nil {
 		return false, err
 	}
-	if busy != "" {
-		return true, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy)
+	if busy.held() {
+		return true, r.waitFor(ctx, run, busy.readyReason(), busy.text)
 	}
 	backing, err := otherMover(ctx, r.Reader, run.Namespace, claim, secret, backupMover)
-	if err != nil || backing == "" {
+	if err != nil || !backing.held() {
 		return false, err
 	}
-	return true, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, backing)
+	return true, r.waitFor(ctx, run, backing.readyReason(), backing.text)
 }
 
 // writeStatus writes the run's status subresource.

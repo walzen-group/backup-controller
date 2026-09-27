@@ -464,7 +464,7 @@ func restoreJobHold(t *testing.T, tc restoreJobCase) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return busy
+	return busy.text
 }
 
 // deleteKept gives the stored RestoreRun of the given name a finalizer and
@@ -500,14 +500,14 @@ func TestARestoreJobHoldsOnlyItsClaimAndRepository(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if held := busy != ""; held != tc.holds {
-			t.Errorf("claim %q, repository %q: restoreInProgress = %q, want held = %t", tc.claim, tc.repository, busy, tc.holds)
+		if held := busy.held(); held != tc.holds {
+			t.Errorf("claim %q, repository %q: restoreInProgress = %q, want held = %t", tc.claim, tc.repository, busy.text, tc.holds)
 		}
 	}
 	job.Labels = nil
 	c = newClient(t, run, job)
-	if busy, err := restoreInProgress(context.Background(), c, ns, claimN, repoN); err != nil || busy != "" {
-		t.Errorf("restoreInProgress = %q, %v; want a Job without the controller's labels to hold nothing", busy, err)
+	if busy, err := restoreInProgress(context.Background(), c, ns, claimN, repoN); err != nil || busy.held() {
+		t.Errorf("restoreInProgress = %q, %v; want a Job without the controller's labels to hold nothing", busy.text, err)
 	}
 }
 
