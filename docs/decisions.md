@@ -393,26 +393,14 @@ controller logs. The object carries kstatus-compatible conditions and a list of
 the claims it fills. Thus `kubectl get` answers the question, and a Flux
 Kustomization with `wait: true` can gate on it.
 
-## Read the installed CRD before a run changes anything
+## No check of the installed CRD
 
-From v0.9.0 a run reads the CustomResourceDefinition of its kind directly from
-the API server before it stops a workload, creates a mover or deletes a
-Cluster. The run ends with reason CRDOutdated when the schema lacks a field the
-controller writes. The API server drops an undeclared field from every write.
-Thus a run under an old CRD could stop an app, record nothing to start it
-again, and report Succeeded.
-
-The check walks the fields that the controller writes, as the Go types give
-them, and finds each one in the installed schema. Thus an install that applied
-the CRDs of the current release passes the check, whatever the previous release
-was. The CRDs carry no release number, and the API version `v1alpha1` stays the
-same from one release to the next. Thus neither says which fields the installed
-schema declares.
-
-A failed read of another kind is retried. But the run fails closed when it may
-not read the CRD at all, because it then cannot tell whether its writes
-survive. Helm upgrades no CRD on its own. That is why every release ships the
-CRDs in the same asset and the message names the fix.
+v0.9.0 read the CustomResourceDefinition of the run's kind before a run
+changed anything, and ended the run with reason CRDOutdated when the schema
+did not have a field that the controller writes. v0.10.0 removes this check.
+The CRDs and the Deployment come from one release asset, and one terragrunt
+unit applies that asset. An outdated CRD is thus a broken declared setup, and
+the controller does not check for a broken declared setup.
 
 ## Write every trigger into spec.restic.unlock too
 

@@ -117,10 +117,8 @@ appends it to the args of the `controller` container
 ([Restore image](#restore-image)).
 
 The CRDs are part of every install of a release. This includes upgrades.
-Before a run changes anything, it reads the installed CRD of its kind. The run
-ends with reason CRDOutdated when the schema does not have a field that the
-controller writes, because the API server would drop that field from every
-write. A server-side apply of this file updates the CRDs. Helm does not
+The API server drops a field that the installed CRD does not declare. A
+server-side apply of this file updates the CRDs. Helm does not
 upgrade a CRD on its own. If you install only with `helm upgrade`, the CRDs
 stay at their first version.
 
@@ -237,7 +235,6 @@ controller:
 | `restoreruns` | get, list, watch, update, delete | the runs and their finalizer |
 | `backupruns/status`, `restoreruns/status` | patch, update | report phase, items and conditions |
 | `backupruns/finalizers`, `restoreruns/finalizers` | update | a run creates the Workload, the scratch claim and the restore Job. They name the run as their controller with `blockOwnerDeletion`. OwnerReferencesPermissionEnforcement allows this only with this verb |
-| `customresourcedefinitions` (apiextensions.k8s.io), named `backupruns.backup.wlz.li` and `restoreruns.backup.wlz.li` | get | before a run changes anything, it reads the installed CRD of its kind. It ends with reason CRDOutdated when the schema does not have a field that the controller writes, because the API server would drop that field |
 | `replicationsources.volsync.backube` | get, list, watch, create, update, patch | write the source of each enabled claim and its manual trigger. v0.8.2 dropped delete, which v0.8.0 and v0.8.1 used after a failed mover |
 | `leases` (coordination.k8s.io) | get, list, create, update, delete | a BackupRun or RestoreRun acquires a Lease on a claim and on its repository Secret immediately before it starts a mover or a restore Job. Thus, a backup and a restore of the claim or the repository never run at the same time. A run also acquires the Lease `backup-controller-quiesce` in its namespace before it stops the workloads of that namespace (internal/runs/lease.go). Runs are in every namespace, so the rule is cluster-wide. `update` takes the Lease of a run that has finished |
 | `jobs` (batch) | get, list, create, patch, delete | the restore Job of a RestoreRun item or a populated claim. The controller creates it suspended, reads it by name, resumes and suspends it with a merge patch, and deletes it with Foreground propagation. A backup lists the restore Jobs by label, to wait for one on its claim or repository. Reads go through the uncached reader, so there is no watch. The [admission policy](#admission-policy-on-the-restore-jobs) limits this grant to Jobs with the shape of the restore Job |

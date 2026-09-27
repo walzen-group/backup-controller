@@ -342,9 +342,7 @@ terragrunt run --all apply --queue-include-external
 
 The apply replaces these objects from the release asset, in one change:
 
-- The CRDs. A v0.10.0 run reads the installed CRD of its kind before it
-  changes anything. It ends with reason CRDOutdated when the schema does not
-  have a field that the controller writes.
+- The CRDs.
 - The ClusterRole
   ([packaging.md](packaging.md#rbac-the-controller-needs)). It gets `list` on
   objectstores, `update` on volumerestores, and `update` on the finalizers of
@@ -542,7 +540,7 @@ Expected result: the phase column shows Succeeded.
 - A backup and a restore of one claim or repository never run at the same
   time. Two runs never stop the workloads of one namespace at the same time.
   A run that cannot start for this reason waits with reason `SourceBusy`.
-- New Ready reasons: `Paused`, `CRDOutdated`, `RestartFailed`,
+- New Ready reasons: `Paused`, `RestartFailed`,
   `ReleaseFailed`, and `Evicted` on a BackupRun. A VolumeRestore has the new
   reason `RestoreJobRefused`. Items have a new field, `status.items[].reason`.
   api.md has the full tables for a [BackupRun](api.md#ready-reasons), a

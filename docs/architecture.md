@@ -63,20 +63,6 @@ On objects the controller does not own:
 | a claim with a deletion in progress, whose VolumeRestore is gone | the orphan reconciler removes the library's finalizer `backup.wlz.li/populate-target-protection`, and writes its WaitingForMover and DataSourceGone events | once no pod of the claim's restore Jobs can still write, and its Secret copy and prime claim are gone |
 | the VolumeRestore a claim fills from | the finalizer `backup.wlz.li/volume-populator` | while its `status.claims` lists a claim. The populator adds the finalizer on its first call for a claim. The library makes that call after the claim's prime claim is bound |
 
-Before a run changes anything, the run manager reads the installed CRD of the
-run's kind directly from the API server. It compares the CRD schema with the
-fields that the Go type writes. If the CRD does not have one of those fields,
-the run ends Failed with reason CRDOutdated before it stops or creates
-anything. The reason is that the API server would drop that field from every
-write. For example, a run that lost `status.quiesced` would stop an app and
-record nothing to start it again.
-
-The same reason covers a controller that may not read the CRD, and a
-controller whose CRD is not installed. To fix each case, apply the CRDs of the
-controller's release. Helm upgrades no CRD on its own.
-[packaging.md](packaging.md#rbac-the-controller-needs) lists the rule that
-this read needs.
-
 A backup and a restore of one claim or repository never run at the same
 time. Each run acquires a `coordination.k8s.io` Lease for the claim and one for
 the repository. The run does this before it triggers its backup mover or

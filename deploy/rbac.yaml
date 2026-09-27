@@ -82,15 +82,6 @@ rules:
   - apiGroups: ["backup.wlz.li"]
     resources: ["backupruns/finalizers", "restoreruns/finalizers"]
     verbs: ["update"]
-  # A run reads the installed CRD of its kind before it changes anything, and
-  # refuses to start (reason CRDOutdated) when the schema lacks a field the
-  # controller writes. An API server with an older CRD drops such a field, so
-  # a quiesced run could lose track of the workloads it stopped. Only get,
-  # and only on the BackupRun and RestoreRun CRDs, the two a run checks.
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    resourceNames: ["backupruns.backup.wlz.li", "restoreruns.backup.wlz.li"]
-    verbs: ["get"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims/finalizers"]
     verbs: ["update"]

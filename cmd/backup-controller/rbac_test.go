@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -94,7 +93,6 @@ var grants = []grant{
 	{"backup.wlz.li", "backupruns/finalizers", []string{"update"}, "owner references to a BackupRun, under OwnerReferencesPermissionEnforcement"},
 	{"backup.wlz.li", "restoreruns/finalizers", []string{"update"}, "owner references to a RestoreRun, under OwnerReferencesPermissionEnforcement"},
 	{"", "persistentvolumeclaims/finalizers", []string{"update"}, "owner references to a claim, under OwnerReferencesPermissionEnforcement"},
-
 }
 
 // TestTheClusterRoleCoversEverythingTheControllerDoes checks that the

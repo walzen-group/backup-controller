@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/yaml"
 )
 
 // frozen is the time the tests' clocks stand at. A test reaches a deadline by
@@ -58,7 +60,7 @@ var unstructuredKinds = []schema.GroupVersionKind{
 	{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueue"},
 	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "LocalQueue"},
 	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "Workload"},
-	bootstrap.ObjectStoreGVK, crdGVK,
+	bootstrap.ObjectStoreGVK,
 	// The CloudNativePG and barman-cloud kinds at the version the version
 	// tests serve them at alone (see crdsServedAtNext).
 	{Group: "postgresql.cnpg.io", Version: "v2", Kind: "Cluster"},
@@ -128,15 +130,13 @@ func newClient(t *testing.T, objects ...client.Object) client.Client {
 }
 
 // newClientWithCRDs builds a strict fake client as newClient does, pruning
-// against the CRD files in crdFiles. The client also holds this project's
-// CustomResourceDefinitions from those files as objects, so a run's schema
-// check reads the same CRDs the client prunes against. Its RESTMapper is a
+// against the CRD files in crdFiles. Its RESTMapper is a
 // *servedKinds that serves the scheme's built-in kinds and the versions the
 // CRD files serve, as the API server's discovery would.
 func newClientWithCRDs(t *testing.T, crdFiles []string, objects ...client.Object) client.Client {
 	t.Helper()
 	now := frozen
-	objects = append(withNamespace(objects), ownCRDObjects(t, crdFiles)...)
+	objects = withNamespace(objects)
 	s := scheme(t)
 	c := strictclient.Build(fake.NewClientBuilder().WithObjects(objects...).WithRESTMapper(newServedKinds(t, s, crdFiles)), s, strictclient.Options{
 		Clock: func() time.Time { return now },
@@ -440,22 +440,6 @@ func deploymentScale(sub string, obj client.Object, opts []client.SubResourceUpd
 	return scale.Spec.Replicas, true
 }
 
-// ownCRDObjects reads this project's CustomResourceDefinitions, the files in
-// files whose name starts with backup.wlz.li_, as unstructured objects a fake
-// client can hold. Each object is a new deep copy from readCRD, so a client
-// can change its objects and the next test still gets the file's content.
-func ownCRDObjects(t *testing.T, files []string) []client.Object {
-	t.Helper()
-	var objects []client.Object
-	for _, path := range files {
-		if !strings.HasPrefix(filepath.Base(path), backupv1alpha1.GroupVersion.Group+"_") {
-			continue
-		}
-		objects = append(objects, readCRD(t, path))
-	}
-	return objects
-}
-
 // fullID returns a full, 64-character snapshot ID that starts with short
 // and is padded with zeros, the form a restore Job restores by.
 func fullID(short string) string {
@@ -542,4 +526,31 @@ func loseFailedRunWrite(c client.Client) client.Client {
 			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
+}
+
+// crdObjectCache holds the CRD files that readCRD decoded so far, keyed by
+// the path as the test gives it. Each file is then decoded one time per test
+// binary. An entry does not change after readCRD stores it.
+var crdObjectCache sync.Map // string -> *unstructured.Unstructured
+
+// readCRD decodes the CRD file at path.
+//
+// It returns a deep copy of the decoded object, so the caller can change it.
+// The first call for a path decodes the file, and later calls copy the
+// cached object. A file that can't be read or decoded fails the test.
+func readCRD(t *testing.T, path string) *unstructured.Unstructured {
+	t.Helper()
+	if crd, ok := crdObjectCache.Load(path); ok {
+		return crd.(*unstructured.Unstructured).DeepCopy()
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	crd := &unstructured.Unstructured{}
+	if err := yaml.Unmarshal(data, &crd.Object); err != nil {
+		t.Fatalf("decode %s: %v", path, err)
+	}
+	cached, _ := crdObjectCache.LoadOrStore(path, crd)
+	return cached.(*unstructured.Unstructured).DeepCopy()
 }

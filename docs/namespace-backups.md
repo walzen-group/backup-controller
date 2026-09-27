@@ -600,9 +600,6 @@ A BackupRun ends with reason Invalid only for a spec that no retry can fix:
 - A named claim or Cluster is missing or has no mark.
 - Nothing in the namespace has the mark.
 
-If the installed CRD does not have a field that the controller writes, the run
-ends with reason CRDOutdated before it changes anything.
-[architecture.md](architecture.md#objects-the-controller-writes) has the check.
 After the run has its items, an item fails only because of what the item itself
 holds:
 

@@ -93,9 +93,6 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // finalize, and a finished run is deleted once spec.ttlSecondsAfterFinished
 // has passed.
 //
-// A new run is first checked against the installed RestoreRun CRD (see
-// crdOutdated), and a run whose CRD lacks a field the controller
-// writes ends with reason CRDOutdated before anything is planned.
 // Whenever the Ready reason changes during a reconcile, Reconcile records an
 // event on the run.
 //
@@ -178,30 +175,10 @@ func (r *RestoreRunReconciler) restore(ctx context.Context, run *backupv1alpha1.
 	return result, errors.Join(err, r.showVolSyncWait(ctx, run, kind, err))
 }
 
-// start makes the first pass over a new run: it checks the installed
-// RestoreRun CRD, then plans the run.
-//
-// Parameters:
-//   - run is the RestoreRun with an empty phase and its finalizer in place.
-//
-// It returns what plan or planIntoNewClaim returns, or what finish returns
-// for a run whose CRD lacks a field the controller writes. An error that
-// either check returns for a retry goes through planFailed.
-//
-// The CRD check comes first for both plans: the old RestoreRun CRD drops the
-// items' clusterUID and snapshotTime, which the restore relies on. A run
-// with spec.into set is planned by planIntoNewClaim, and any other run by
-// plan.
+// start plans a new run: through planIntoNewClaim when spec.into is set,
+// and through plan otherwise. An error that the plan returns for a retry
+// goes through planFailed.
 func (r *RestoreRunReconciler) start(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	err := crdOutdated(ctx, r.Reader, restoreRunsCRD, backupv1alpha1.KindRestoreRun, backupv1alpha1.RestoreRun{},
-		"the run would lose the Cluster UIDs and snapshot times it records to check its own work")
-	var outdated *crdOutdatedError
-	if errors.As(err, &outdated) {
-		return r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, outdated.Error())
-	}
-	if err != nil {
-		return ctrl.Result{}, r.planFailed(ctx, run, err)
-	}
 	plan := r.plan
 	if run.Spec.Into != "" {
 		plan = r.planIntoNewClaim

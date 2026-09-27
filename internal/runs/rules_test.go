@@ -24,7 +24,6 @@ var ruleScope = []string{".", "../populator", "../restorejob", "../quiesce", "..
 // entry needs a reviewer's eye like any rule exception.
 var textMatcherAllowlist = map[string]string{
 	"runs.RestoreRunReconciler.inPlaceClaimLost": "strings.HasPrefix and TrimPrefix on a Lease name, to find the claim Leases by the prefix the controller gives them",
-	"runs.fieldName":           "strings.Cut on a Go struct field's json tag, to get the field name the CRD schema must declare",
 	"runs.leaseItems":          "strings.Split on the Lease's items annotation, the comma-separated item names acquireLeases wrote",
 	"quiesce.parseInventoryID": "strings.Cut and strings.LastIndex on a Kustomization inventory entry id, <namespace>_<name>_<group>_<kind> as fluxcd/cli-utils ObjMetadata.String writes it",
 	"quiesce.Apply":            "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built",

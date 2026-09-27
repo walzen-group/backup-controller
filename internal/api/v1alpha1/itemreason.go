@@ -135,12 +135,6 @@ const (
 	// run's status.ending says why the run ended.
 	ItemReasonRunEnded ItemReason = "RunEnded"
 
-	// ItemReasonCRDOutdated is an item the run failed because the installed
-	// CRD of the run's kind lacks a field the controller writes, or the
-	// controller may not read that CRD. The run ended with the Ready reason
-	// CRDOutdated before it changed anything.
-	ItemReasonCRDOutdated ItemReason = "CRDOutdated"
-
 	// ItemReasonBackupFailed is a database backup whose CloudNativePG
 	// Backup ended in the phase failed.
 	ItemReasonBackupFailed ItemReason = "BackupFailed"
