@@ -60,7 +60,7 @@ func (r *BackupRunReconciler) schemaOutdated(ctx context.Context, run *backupv1a
 	}
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
-		if item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning {
+		if backupItemOpen(*item) {
 			item.Phase, item.Reason, item.Message = backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonCRDOutdated, outdated.Error()
 		}
 	}

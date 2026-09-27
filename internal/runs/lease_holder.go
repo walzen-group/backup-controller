@@ -73,8 +73,7 @@ func needsLease(run client.Object, lease *coordinationv1.Lease) bool {
 			kind = backupv1alpha1.ItemKindCluster
 		}
 		return slices.ContainsFunc(r.Status.Items, func(item backupv1alpha1.BackupItem) bool {
-			return item.Kind == kind && slices.Contains(items, item.Name) &&
-				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning)
+			return item.Kind == kind && slices.Contains(items, item.Name) && backupItemOpen(item)
 		})
 	case *backupv1alpha1.RestoreRun:
 		if r.Status.Phase.Finished() || quiesceLease {

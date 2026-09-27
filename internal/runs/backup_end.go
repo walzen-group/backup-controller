@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -248,12 +249,9 @@ func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.B
 // finishes at the latest. Another run can still take that Lease over (see
 // holderLive).
 func backupItemDone(run *backupv1alpha1.BackupRun, name string) bool {
-	for _, item := range run.Status.Items {
-		if item.Name == name && (item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
-			return false
-		}
-	}
-	return true
+	return !slices.ContainsFunc(run.Status.Items, func(item backupv1alpha1.BackupItem) bool {
+		return item.Name == name && backupItemOpen(item)
+	})
 }
 
 // finalize puts back what a run changed when the run is deleted before it

@@ -158,8 +158,7 @@ func liveBackup(runs *backupv1alpha1.BackupRunList, source *volsyncv1alpha1.Repl
 		return ""
 	}
 	for _, item := range run.Status.Items {
-		if item.Kind == backupv1alpha1.ItemKindSource && item.Name == source.Name &&
-			(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
+		if item.Kind == backupv1alpha1.ItemKindSource && item.Name == source.Name && backupItemOpen(item) {
 			return run.Name
 		}
 	}
