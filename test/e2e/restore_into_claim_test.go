@@ -4,51 +4,58 @@ package e2e
 
 import (
 	"fmt"
-	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+
+	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 )
 
-// TestAnIntoRestoreFromAClaimFillsAPlainClaimOnTheSourcesNode checks what an
-// into restore from a claim relies on, with the real CSI driver, scheduler,
-// Kueue and VolSync 0.16.0: a plain claim with the source claim's size, class
-// and volume.kubernetes.io/selected-node and no data source, and a
-// ReplicationDestination in the app's namespace with copyMethod Direct that
-// writes into it. The class binds WaitForFirstConsumer and no pod but the
-// mover ever uses the new claim.
+// TestAnIntoRestoreFromAClaimFillsAPlainClaimOnTheSourcesNode checks a
+// RestoreRun with spec.into against the real CSI driver, scheduler, Kueue and
+// restic. The run creates a plain claim with the source claim's size, class
+// and volume.kubernetes.io/selected-node and no data source, and fills it
+// with its own restore Job, which mounts the claim as its first consumer.
+// The class binds WaitForFirstConsumer.
 //
-// No controller runs here. The test builds every object by hand, the backup
-// included: a ReplicationSource with a manual trigger stands in for a
-// BackupRun, and there is no RestoreRun and no VolumeRestore. The claim
-// carries the spec fields scratchClaim writes, and has no ownerReference to
-// a run. The destination, under the fixed name restore-copy-0 and trigger
-// restore-1, stands in for the controller's restore Job: that Job mounts the
-// claim by name as its first consumer in the same way. So the test shows
-// what the scheduler and the CSI driver do with such a claim. The run's own
-// steps for an into restore (its checks, Leases, restore Job and cleanup)
-// are covered by the unit tests only: the e2e tests that create a
-// RestoreRun restore in place.
-//
-// The test backs up a claim a running writer mounts, then restores the
-// snapshot into the new claim while the writer keeps running. The mover must
-// complete the trigger with a log naming the snapshot, the new claim must be
-// Bound on the source claim's node, and a pod reading it must find the file
-// the writer wrote.
+// The test backs up a claim a running writer mounts with a BackupRun, then
+// restores that snapshot into a new claim while the writer keeps running.
+// The run must succeed with the snapshot's full ID; its Job must restore that
+// ID into the new claim; the namespace must hold no ReplicationDestination;
+// the new claim must be Bound on the source claim's node; and a pod reading
+// it must find the file the writer wrote, while the writer's claim is left
+// as it was.
 func TestAnIntoRestoreFromAClaimFillsAPlainClaimOnTheSourcesNode(t *testing.T) {
 	ns := newTestNamespace(t, "e2e-restore-into")
 	repo := newResticRepo(t, "e2e/"+ns.Name+"/data")
 	evidence := func() string { return runEvidence(ns.Name) }
+	image := pinnedResticImage(t)
 
 	apply(t, repo.secretManifest(ns.Name, "restic-data")+fmt.Sprintf(`---
+apiVersion: backup.wlz.li/v1alpha1
+kind: VolumeRestore
+metadata:
+  name: data
+  namespace: %[1]s
+spec:
+  repository: restic-data
+  cacheStorageClassName: e2e-hostpath
+  cacheCapacity: 100Mi
+  moverPodLabels:
+    kueue.x-k8s.io/queue-name: %[2]s
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: data
   namespace: %[1]s
+  annotations:
+    backup.wlz.li/enabled: "true"
+    backup.wlz.li/retain-last: "3"
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: e2e-hostpath
@@ -72,7 +79,7 @@ spec:
       terminationGracePeriodSeconds: 1
       containers:
         - name: writer
-          image: quay.io/backube/volsync:0.16.0
+          image: %[3]s
           imagePullPolicy: IfNotPresent
           command: [/bin/sh, -ec]
           args:
@@ -84,7 +91,7 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim: {claimName: data}
-`, ns.Name))
+`, ns.Name, ns.Queue, image))
 
 	waitFor(t, "the writer to write known.txt", 3*time.Minute, 2*time.Second, func() (bool, string, error) {
 		out, err := kubectlQuick(ns.Name, "exec", "deploy/writer", "--", "cat", "/data/known.txt")
@@ -104,107 +111,90 @@ spec:
 	}
 	t.Logf("claim data is on node %s", node)
 
-	apply(t, fmt.Sprintf(`apiVersion: volsync.backube/v1alpha1
-kind: ReplicationSource
+	apply(t, fmt.Sprintf(`apiVersion: backup.wlz.li/v1alpha1
+kind: BackupRun
 metadata:
-  name: data
-  namespace: %[1]s
+  name: backup
+  namespace: %s
 spec:
-  sourcePVC: data
-  trigger:
-    manual: backup-1
-  restic:
-    repository: restic-data
-    copyMethod: Direct
-    cacheStorageClassName: e2e-hostpath
-    cacheCapacity: 100Mi
-    retain:
-      last: "3"
-    moverPodLabels:
-      kueue.x-k8s.io/queue-name: %[2]s
-`, ns.Name, ns.Queue))
-	waitFor(t, "the backup", 6*time.Minute, 3*time.Second, func() (bool, string, error) {
-		var source volsyncv1alpha1.ReplicationSource
-		if err := getJSON(ns.Name, "replicationsource", "data", &source); err != nil {
+  source: data
+  timeout: 8m
+`, ns.Name))
+	waitFor(t, "BackupRun backup to end", 10*time.Minute, 3*time.Second, func() (bool, string, error) {
+		run, err := readBackupRun(t, ns.Name, "backup")
+		if err != nil {
 			return false, firstLine(err.Error()), nil
 		}
-		if source.Status == nil {
-			return false, "no status", nil
+		if run == nil {
+			return false, "not created yet", nil
 		}
-		return source.Status.LastManualSync == "backup-1", "lastManualSync=" + source.Status.LastManualSync, nil
+		return run.Status.Phase.Finished(), fmt.Sprintf("phase=%s %s", run.Status.Phase, readyMessage(run.Status.Conditions)), nil
 	}, evidence)
+	if run, _ := readBackupRun(t, ns.Name, "backup"); run == nil || run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+		t.Fatalf("BackupRun backup did not succeed\n%s", evidence())
+	}
 
 	snaps := repo.snapshots(t)
 	if len(snaps) != 1 {
 		t.Fatalf("repository holds %d snapshots, want 1: %+v", len(snaps), snaps)
 	}
 	snap := snaps[0]
-	pin := snap.Time.UTC().Format(time.RFC3339)
-	t.Logf("snapshot %s at %s", snap.ShortID, snap.Time.Format(time.RFC3339Nano))
+	t.Logf("snapshot %s at %s", snap.ID, snap.Time.Format(time.RFC3339Nano))
 
-	// The claim with the spec fields scratchClaim writes for spec.claim:
-	// data, spec.into: copy, and the destination that fills it in place of
-	// the restore Job, built by hand under a fixed name and trigger (see the
-	// test's comment).
-	apply(t, fmt.Sprintf(`apiVersion: v1
-kind: PersistentVolumeClaim
+	jobs := watchObjects[batchv1.Job](t, ns.Name, "jobs", "app.kubernetes.io/component=restore")
+	apply(t, fmt.Sprintf(`apiVersion: backup.wlz.li/v1alpha1
+kind: RestoreRun
 metadata:
-  name: copy
-  namespace: %[1]s
-  annotations:
-    volume.kubernetes.io/selected-node: %[2]s
+  name: into
+  namespace: %s
 spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: e2e-hostpath
-  resources:
-    requests:
-      storage: 100Mi
----
-apiVersion: volsync.backube/v1alpha1
-kind: ReplicationDestination
-metadata:
-  name: restore-copy-0
-  namespace: %[1]s
-spec:
-  trigger:
-    manual: restore-1
-  restic:
-    repository: restic-data
-    copyMethod: Direct
-    destinationPVC: copy
-    restoreAsOf: %[3]q
-    cacheStorageClassName: e2e-hostpath
-    cacheCapacity: 100Mi
-    enableFileDeletion: true
-    cleanupCachePVC: true
-    moverPodLabels:
-      kueue.x-k8s.io/queue-name: %[4]s
-`, ns.Name, node, pin, ns.Queue))
-
-	var destination volsyncv1alpha1.ReplicationDestination
-	waitFor(t, "the restore into claim copy", 6*time.Minute, 3*time.Second, func() (bool, string, error) {
-		destination = volsyncv1alpha1.ReplicationDestination{}
-		if err := getJSON(ns.Name, "replicationdestination", "restore-copy-0", &destination); err != nil {
+  claim: data
+  into: copy
+  timeout: 8m
+`, ns.Name))
+	var run *backupv1alpha1.RestoreRun
+	waitFor(t, "RestoreRun into to finish", 10*time.Minute, 2*time.Second, func() (bool, string, error) {
+		var err error
+		run, err = readRestoreRun(t, ns.Name, "into")
+		if err != nil {
 			return false, firstLine(err.Error()), nil
 		}
-		if destination.Status == nil {
-			return false, "no status", nil
+		if run == nil {
+			return false, "not created yet", nil
 		}
-		return destination.Status.LastManualSync == "restore-1", "lastManualSync=" + destination.Status.LastManualSync, nil
+		return run.Status.Phase.Finished(), fmt.Sprintf("phase=%s %s items=%s", run.Status.Phase, readyMessage(run.Status.Conditions), itemStates(run.Status.Items)), nil
 	}, evidence)
-	mover := destination.Status.LatestMoverStatus
-	want := regexp.MustCompile(`(?m)^restoring snapshot ` + regexp.QuoteMeta(snap.ShortID) + ` of \[/data\] at `)
-	if mover == nil || mover.Result != volsyncv1alpha1.MoverResultSuccessful || !want.MatchString(mover.Logs) {
-		t.Fatalf("mover status %+v, want Successful with a log naming %s\n%s", mover, snap.ShortID, evidence())
+	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+		t.Fatalf("RestoreRun into ended %s: %s; items %s\n%s", run.Status.Phase, readyMessage(run.Status.Conditions), itemStates(run.Status.Items), evidence())
 	}
-	t.Logf("mover logs:\n%s", mover.Logs)
+	item := oneVolumeItem(t, run, evidence)
+	if item.SnapshotID != snap.ID {
+		t.Errorf("item snapshotID = %s, want %s", item.SnapshotID, snap.ID)
+	}
+	wantJob := fmt.Sprintf("restore-%s-0", run.UID)
+	if item.Job != wantJob {
+		t.Errorf("item job = %q, want %q", item.Job, wantJob)
+	}
+	job, seen := jobs.latest()[wantJob]
+	if !seen {
+		t.Fatalf("no restore Job %s was seen in the namespace; seen %v\n%s", wantJob, jobs.latest(), evidence())
+	}
+	args := job.Spec.Template.Spec.Containers[0].Args
+	if job.Annotations["backup.wlz.li/snapshot-id"] != snap.ID || job.Annotations["backup.wlz.li/claim"] != "copy" ||
+		!slices.Contains(args, snap.ID) || !slices.Contains(args, "--delete") {
+		t.Errorf("Job %s annotations %v, args %v; want snapshot %s restored into claim copy with --delete", wantJob, job.Annotations, args, snap.ID)
+	}
+	if out, err := kubectlQuick(ns.Name, "get", "replicationdestinations", "-o", "name"); err != nil || strings.TrimSpace(out) != "" {
+		t.Errorf("the namespace holds ReplicationDestinations %q (%v), want none", out, err)
+	}
 
 	var copyClaim corev1.PersistentVolumeClaim
 	if err := getJSON(ns.Name, "pvc", "copy", &copyClaim); err != nil {
 		t.Fatal(err)
 	}
-	if copyClaim.Status.Phase != corev1.ClaimBound || copyClaim.Annotations["volume.kubernetes.io/selected-node"] != node {
-		t.Fatalf("claim copy phase %s, annotations %v; want Bound on %s\n%s", copyClaim.Status.Phase, copyClaim.Annotations, node, evidence())
+	if copyClaim.Status.Phase != corev1.ClaimBound || copyClaim.Annotations["volume.kubernetes.io/selected-node"] != node || copyClaim.Spec.DataSourceRef != nil {
+		t.Fatalf("claim copy phase %s, annotations %v, dataSourceRef %v; want Bound on %s with no data source\n%s",
+			copyClaim.Status.Phase, copyClaim.Annotations, copyClaim.Spec.DataSourceRef, node, evidence())
 	}
 	var volume corev1.PersistentVolume
 	if err := getJSON("", "pv", copyClaim.Spec.VolumeName, &volume); err != nil {
@@ -224,7 +214,7 @@ spec:
   terminationGracePeriodSeconds: 1
   containers:
     - name: reader
-      image: quay.io/backube/volsync:0.16.0
+      image: %[2]s
       imagePullPolicy: IfNotPresent
       command: [/bin/sh, -ec, "cat /data/known.txt"]
       volumeMounts:
@@ -234,7 +224,7 @@ spec:
   volumes:
     - name: copy
       persistentVolumeClaim: {claimName: copy}
-`, ns.Name))
+`, ns.Name, image))
 	waitFor(t, "the reader to read claim copy", 3*time.Minute, 2*time.Second, func() (bool, string, error) {
 		var pod corev1.Pod
 		if err := getJSON(ns.Name, "pod", "reader", &pod); err != nil {
