@@ -32,6 +32,7 @@
         actionlint
         hadolint
         git
+        python3 # runs the asd-ste100 skill's ste-lint.py on comments and docs
       ];
     in
     {
