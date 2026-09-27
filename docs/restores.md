@@ -603,7 +603,7 @@ object store through which the Cluster archives:
 | no base backup finished by the moment a run or the annotation asks for | refuses the Cluster, naming the oldest base backup |
 | the Cluster declares a bootstrap method other than `initdb`, such as `recovery` or `pg_basebackup` | nothing, unless a RestoreRun waits for this Cluster. Then it refuses the Cluster with `declares its own spec.bootstrap.<method>. Remove the declared bootstrap ..., or delete the RestoreRun.`, so two sources cannot race |
 | `backup.wlz.li/bootstrap: initdb`, and no WAL file under `<prefix>/wals/` | nothing. The annotation asks for an empty database on purpose. The ObjectStore status check of the second row applies here too |
-| `backup.wlz.li/bootstrap: initdb`, and a WAL file under `<prefix>/wals/` | refuses the Cluster: `The Cluster asks for an empty database (backup.wlz.li/bootstrap: initdb), and s3://<bucket>/<prefix>/ still holds the archive of an earlier one. ...` ([Starting a database empty](#starting-a-database-empty) has the full text) |
+| `backup.wlz.li/bootstrap: initdb`, and a WAL file under `<prefix>/wals/` | refuses the Cluster: `The Cluster asks for an empty database (backup.wlz.li/bootstrap: initdb), and the listing found WAL of an earlier database under s3://<bucket>/<prefix>/wals/. ...` ([Starting a database empty](#starting-a-database-empty) has the full text) |
 | the store takes longer than the webhook's 10-second budget to answer | refuses the Cluster with what it read so far ([How long the webhook reads](#how-long-the-webhook-reads)) |
 
 A completed base backup is one whose backup.info sets `begin_time` and
@@ -960,15 +960,15 @@ database.
 An empty database can archive only into an empty prefix, for the reason in
 [A database that could never archive](#a-database-that-could-never-archive).
 Thus the webhook also reads the store for an opted-out Cluster. It admits the
-Cluster unchanged when nothing exists under its prefix and the ObjectStore
+Cluster unchanged when the listing finds no WAL under `<prefix>/wals/` and the ObjectStore
 status records no completed backup for its server name
 ([When the store status disagrees with the listing](#when-the-store-status-disagrees-with-the-listing)).
 It refuses the Cluster
-when anything exists there:
+when the listing finds WAL there:
 
 ```text
 The Cluster asks for an empty database (backup.wlz.li/bootstrap: initdb), and
-s3://backups/app/app-pg/ still holds the archive of an earlier one.
+the listing found WAL of an earlier database under s3://backups/app/app-pg/wals/.
 CloudNativePG will not archive a new database into a prefix that holds WAL, so
 this one would never be backed up. To discard the old archive, delete
 everything under s3://backups/app/app-pg/ and create the Cluster again. To keep

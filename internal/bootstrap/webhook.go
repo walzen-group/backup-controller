@@ -279,7 +279,7 @@ func (d *Decider) create(ctx context.Context, c creation) admission.Response {
 // database overwrite the segments of the old one. So optOut allows the create
 // when <server>/wals/ holds no WAL file and refuses it otherwise (see
 // walsEmpty).
-// It also refuses an empty prefix when the status of the ObjectStore
+// It also refuses the create when wals/ holds no WAL and the status of the ObjectStore
 // records a completed backup for the server name (see contradicted).
 func (d *Decider) optOut(ctx context.Context, c creation) admission.Response {
 	archive, err := d.Prober.Survey(ctx, c.at, nil)
@@ -287,16 +287,16 @@ func (d *Decider) optOut(ctx context.Context, c creation) admission.Response {
 		return surveyFailed(c.logger, c.at, err)
 	}
 	if !archive.Empty {
-		c.logger.Info("refusing the Cluster", "reason", "opted out over an old archive", "prefix", c.at.ServerPrefix())
+		c.logger.Info("refusing the Cluster", "reason", "opted out, and the listing found WAL under wals/", "prefix", c.at.ServerPrefix())
 		return admission.Denied(fmt.Sprintf(
-			"The Cluster asks for an empty database (%s: %s), and s3://%s/%s still holds the archive of an earlier one. CloudNativePG will not archive a new database into a prefix that holds WAL, so this one would never be backed up. To discard the old archive, delete everything under s3://%s/%s and create the Cluster again. To keep it, give this Cluster a serverName that is not %q.",
+			"The Cluster asks for an empty database (%s: %s), and the listing found WAL of an earlier database under s3://%s/%swals/. CloudNativePG will not archive a new database into a prefix that holds WAL, so this one would never be backed up. To discard the old archive, delete everything under s3://%s/%s and create the Cluster again. To keep it, give this Cluster a serverName that is not %q.",
 			OptOutAnnotation, OptOutValue, c.at.Bucket, c.at.ServerPrefix(), c.at.Bucket, c.at.ServerPrefix(), c.serverName,
 		))
 	}
 	if refusal, refused := contradicted(c); refused {
 		return refusal
 	}
-	c.logger.Info("leaving the Cluster to initdb", "reason", "opted out by annotation, and the prefix is empty")
+	c.logger.Info("leaving the Cluster to initdb", "reason", "opted out by annotation, and the listing found no WAL under wals/")
 	return admission.Allowed("opted out")
 }
 
