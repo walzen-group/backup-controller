@@ -186,7 +186,9 @@ has the full mechanism, the scheduler and the measured runs.
 
 Both restore shapes use one object. The VolumeRestore of the claim gives the
 repository, the cache class and the queue label of the restore Job's pod. Thus
-a run states only which volume to restore and how far back:
+a run states only which volume to restore and how far back. While the
+controller runs with `--pause`, a new RestoreRun and a new VolumeRestore claim
+wait and change nothing ([upgrading.md](upgrading.md#pause-the-controller)):
 
 ```yaml
 apiVersion: backup.wlz.li/v1alpha1

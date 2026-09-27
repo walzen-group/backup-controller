@@ -101,6 +101,8 @@ At each tick of the schedule of a Namespace, the controller creates a
 BackupRun named `scheduled-<yyyymmdd-hhmm>` with `all: true`. The run has a
 label with the tick, and the controller keeps the run for 30 days. If the
 controller was down at a tick, that tick runs once when the controller is back.
+While the controller runs with `--pause`, it creates no run, and a new run
+waits with reason `Paused` ([upgrading.md](upgrading.md#pause-the-controller)).
 While another run with `all: true` in the namespace is unfinished, the tick
 waits for it.
 

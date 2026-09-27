@@ -4,6 +4,31 @@ Each section lists what to check before you move a cluster to that release.
 It also lists what to do during and after the upgrade. The Releases table in
 the [README](../README.md#releases) lists what each release changed.
 
+## Pause the controller
+
+From v0.9.0, the controller has a `--pause` flag. While the controller runs
+with the flag, each run that started work goes on to its end. New BackupRuns and RestoreRuns
+wait with Ready reason `Paused` and touch nothing. The scheduler creates no
+BackupRun, and the populator starts no restore for a new VolumeRestore claim.
+Use the flag to upgrade the controller or a dependency while no run is active.
+
+1. Set `pause: true` in the backup-controller inputs of the infra repository.
+   The chart passes it to the container as `--pause`. The change restarts the
+   pod.
+2. Make sure that the pod logs `paused: new runs wait, runs in progress finish`.
+3. List the runs that are active. A run that waits with reason `Paused` has
+   started nothing, so the listing leaves it out:
+
+   ```
+   kubectl get backupruns,restoreruns -A -o json | jq -r '.items[] | select(.status.phase != "Succeeded" and .status.phase != "Failed") | select(([.status.conditions[]? | select(.type == "Ready") | .reason] | first) != "Paused") | "\(.kind)\t\(.metadata.namespace)/\(.metadata.name)\t\(.status.phase // "not planned")"'
+   ```
+
+   Expected result: no output. Run the listing again until it prints nothing.
+4. Upgrade the controller or the dependency.
+5. Set `pause: false` in the backup-controller inputs. The runs that waited
+   then start. A namespace schedule creates one run for the newest tick that
+   it missed.
+
 ## v0.9.0
 
 ### Step 1: Upgrade only while no run is active
@@ -12,6 +37,10 @@ Move the image only while no BackupRun or RestoreRun is active
 ([decisions.md](decisions.md#upgrade-only-while-no-run-is-active)). A backup
 lasts minutes. A restore that recovers a Cluster or writes a large volume can
 last hours. Wait for the runs that are active to finish.
+
+The v0.8.x controller has no `--pause` flag, so this upgrade uses the listing
+below. For an upgrade from v0.9.0 or later, use
+[Pause the controller](#pause-the-controller) in place of this step.
 
 List the runs that have not finished:
 
