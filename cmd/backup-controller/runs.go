@@ -152,46 +152,93 @@ type RunOptions struct {
 // fails to register, or the manager or one of its controllers can't be set
 // up. An error from a manager stopped by the context is only logged.
 func startRunControllers(ctx context.Context, options RunOptions, fail func(error)) error {
-	kubeconfig, namespace, hook := options.Kubeconfig, options.Namespace, options.Hook
-	config, err := restConfig(kubeconfig)
+	manager, err := newRunManager(options)
 	if err != nil {
-		return fmt.Errorf("build client configuration: %w", err)
+		return err
+	}
+	if options.Hook.CertDir != "" {
+		registerBootstrapWebhook(manager, options.Hook.Port)
+	}
+	if err := addProbes(manager, options.Hook); err != nil {
+		return err
+	}
+	if err := addRunControllers(manager, options); err != nil {
+		return err
+	}
+	go runManager(ctx, manager, fail)
+	klog.Infof("starting backup-controller: reconciling %s BackupRun and RestoreRun, scheduling namespaces", backupv1alpha1.GroupVersion.String())
+	return nil
+}
+
+// newRunManager builds the controller-runtime manager of the run controllers.
+//
+// Parameters:
+//   - options holds the settings from the command line. newRunManager uses
+//     the kubeconfig, the metrics and health addresses and the webhook.
+//
+// It returns the manager. It returns an error when the client configuration
+// cannot be built, a scheme fails to register, or the manager cannot be made.
+//
+// It sends the log of controller-runtime to klog before it makes the manager.
+func newRunManager(options RunOptions) (ctrl.Manager, error) {
+	config, err := restConfig(options.Kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("build client configuration: %w", err)
 	}
 
 	configureLogging()
 
 	scheme, err := runScheme()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	manager, err := ctrl.NewManager(config, managerOptions(scheme, options.MetricsAddr, options.HealthAddr, hook))
+	manager, err := ctrl.NewManager(config, managerOptions(scheme, options.MetricsAddr, options.HealthAddr, options.Hook))
 	if err != nil {
-		return fmt.Errorf("create the manager: %w", err)
+		return nil, fmt.Errorf("create the manager: %w", err)
 	}
+	return manager, nil
+}
 
-	if hook.CertDir != "" {
-		// The webhook reads through the uncached API reader, so its reads of
-		// Secrets and ObjectStores need only the get verb. The manager's
-		// cached client would need list and watch on every Secret in the
-		// cluster, and would hold all of them in memory for the life of the
-		// process.
-		decider := &bootstrap.Decider{
-			Client: manager.GetAPIReader(),
-			Mapper: manager.GetRESTMapper(),
-			Prober: bootstrap.S3Prober{},
-		}
-		manager.GetWebhookServer().Register(
-			bootstrap.WebhookPath,
-			&admission.Webhook{Handler: decider},
-		)
-		klog.Infof("serving the bootstrap webhook on :%d%s", hook.Port, bootstrap.WebhookPath)
+// registerBootstrapWebhook registers the bootstrap webhook on the webhook
+// server of the manager.
+//
+// Parameters:
+//   - manager is the run manager. Its options must have a webhook server.
+//   - port is the port of the webhook server, for the log line.
+//
+// The webhook reads through the uncached API reader, so its reads of
+// Secrets and ObjectStores need only the get verb. The manager's
+// cached client would need list and watch on every Secret in the
+// cluster, and would hold all of them in memory for the life of the
+// process.
+func registerBootstrapWebhook(manager ctrl.Manager, port int) {
+	decider := &bootstrap.Decider{
+		Client: manager.GetAPIReader(),
+		Mapper: manager.GetRESTMapper(),
+		Prober: bootstrap.S3Prober{},
 	}
+	manager.GetWebhookServer().Register(
+		bootstrap.WebhookPath,
+		&admission.Webhook{Handler: decider},
+	)
+	klog.Infof("serving the bootstrap webhook on :%d%s", port, bootstrap.WebhookPath)
+}
 
-	// /healthz answers while the process runs. /readyz waits for the webhook
-	// server to accept TLS connections, so the webhook's Service sends the
-	// API server to a pod only once it can answer. Without a webhook there is
-	// nothing to wait for.
+// addProbes adds the /healthz and /readyz checks to the manager.
+//
+// Parameters:
+//   - manager is the run manager.
+//   - hook says where the bootstrap webhook listens. An empty hook.CertDir
+//     means that the manager has no webhook server.
+//
+// It returns an error when the manager does not accept a check.
+//
+// /healthz answers while the process runs. /readyz waits for the webhook
+// server to accept TLS connections, so the webhook's Service sends the
+// API server to a pod only once it can answer. Without a webhook there is
+// nothing to wait for.
+func addProbes(manager ctrl.Manager, hook BootstrapWebhook) error {
 	if err := manager.AddHealthzCheck("ping", healthz.Ping); err != nil {
 		return fmt.Errorf("add the health check: %w", err)
 	}
@@ -202,15 +249,30 @@ func startRunControllers(ctx context.Context, options RunOptions, fail func(erro
 	if err := manager.AddReadyzCheck("webhook", ready); err != nil {
 		return fmt.Errorf("add the readiness check: %w", err)
 	}
+	return nil
+}
 
-	// An incompatible VolSync ends every BackupRun that touches VolSync
-	// objects with reason VolSyncUnsupported; a RestoreRun's VolSync
-	// requests then fail, and the run retries them. A Cluster the bootstrap
-	// webhook would not see created again ends or holds every restore of a
-	// database with reason ClusterVersionUnsupported. Both checks also run
-	// once when the manager starts, so the log says it before any run does,
-	// and the startup warms the mapper for the bootstrap webhook (see
-	// bootstrap.Warm).
+// addRunControllers adds the served version checks, the BackupRun and
+// RestoreRun reconcilers, the scheduler and the populator's orphan
+// reconciler to the manager.
+//
+// Parameters:
+//   - manager is the run manager.
+//   - options holds the settings from the command line. addRunControllers
+//     uses the namespace and the restore image.
+//
+// It returns an error when the manager does not accept a runnable or a
+// controller.
+//
+// An incompatible VolSync ends every BackupRun that touches VolSync
+// objects with reason VolSyncUnsupported. The VolSync requests of a RestoreRun
+// then fail, and the run retries them. A Cluster the bootstrap
+// webhook would not see created again ends or holds every restore of a
+// database with reason ClusterVersionUnsupported. Both checks also run
+// once when the manager starts, so the log says it before any run does,
+// and the startup warms the mapper for the bootstrap webhook (see
+// bootstrap.Warm).
+func addRunControllers(manager ctrl.Manager, options RunOptions) error {
 	if err := manager.Add(ctrlmanager.RunnableFunc(func(context.Context) error {
 		checkServedVersions(manager.GetRESTMapper())
 		return nil
@@ -232,29 +294,35 @@ func startRunControllers(ctx context.Context, options RunOptions, fail func(erro
 		return fmt.Errorf("register the scheduler: %w", err)
 	}
 
-	orphans := orphanReconciler(manager.GetClient(), reader, recorder, namespace)
+	orphans := orphanReconciler(manager.GetClient(), reader, recorder, options.Namespace)
 	if err := orphans.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the populator orphan controller: %w", err)
 	}
-
-	go func() {
-		err := manager.Start(ctx)
-		if ctx.Err() != nil {
-			// main cancelled the context, so the process is shutting down
-			// and the manager stopping is expected.
-			if err != nil {
-				klog.Errorf("the run controllers stopped: %v", err)
-			}
-			return
-		}
-		if err == nil {
-			err = errors.New("the manager returned while its context was live")
-		}
-		fail(err)
-	}()
-
-	klog.Infof("starting backup-controller: reconciling %s BackupRun and RestoreRun, scheduling namespaces", backupv1alpha1.GroupVersion.String())
 	return nil
+}
+
+// runManager runs the manager until main cancels ctx or the manager stops.
+//
+// Parameters:
+//   - ctx stops the manager when main cancels it.
+//   - manager is the run manager.
+//   - fail gets the error when the manager stops while ctx is still live.
+//
+// If main cancelled ctx, then the process shuts down and runManager only
+// logs an error from the manager. A manager that returns no error while ctx
+// is live still gets an error for fail.
+func runManager(ctx context.Context, manager ctrl.Manager, fail func(error)) {
+	err := manager.Start(ctx)
+	if ctx.Err() != nil {
+		if err != nil {
+			klog.Errorf("the run controllers stopped: %v", err)
+		}
+		return
+	}
+	if err == nil {
+		err = errors.New("the manager returned while its context was live")
+	}
+	fail(err)
 }
 
 // managerOptions returns the options of the controller-runtime manager

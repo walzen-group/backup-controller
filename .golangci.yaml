@@ -113,9 +113,6 @@ linters:
       # under the thresholds deletes its name here; a step that changes a
       # listed function's signature or a listed line either brings it under
       # the thresholds or updates the entry in the same change. Empty at v0.9.0.
-      - path: '^cmd/backup-controller/runs\.go$'
-        linters: [funlen, gocognit]
-        source: '^func startRunControllers\('
       - path: '^internal/quiesce/plan\.go$'
         linters: [funlen, gocognit]
         source: '^func Plan\('
