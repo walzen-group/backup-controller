@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // The tests in this file check what a run does when VolSync, in the middle
@@ -304,5 +305,53 @@ func TestAnIntoRestoreTimedOutOnAnUnservedVolSyncNamesTheWait(t *testing.T) {
 	}
 	if wait := readyMessage(waiting.Status.Conditions); !strings.Contains(message, "; it was waiting: "+wait) {
 		t.Errorf("Ready message = %q, want it to name the VolSync wait %q", message, wait)
+	}
+}
+
+// A pass whose VolSync wait meets a Conflict on the status write, because
+// another writer changed the run between the read and the write, records no
+// VolSyncUnsupported event: the stored run never held that condition, and
+// the pass's copy keeps the Ready condition it had. The pass returns the
+// Conflict with the VolSync error, so the run is reconciled again, and the
+// next pass shows the wait and announces it once.
+func TestAVolSyncWaitThatMeetsAConflictRecordsNoEventAndRetries(t *testing.T) {
+	run := checkedRestore(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" })
+	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository())
+	recorder := events.NewFakeRecorder(10)
+	r.Recorder = recorder
+	serving := r.Client
+	interfered := false
+	r.Client = interceptor.NewClient(serving.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			written, ok := obj.(*backupv1alpha1.RestoreRun)
+			if ok && !interfered && readyReason(written.Status.Conditions) == backupv1alpha1.ReasonVolSyncUnsupported {
+				interfered = true
+				other := readRestoreRun(t, c)
+				other.Labels = map[string]string{"example.com/touched": "yes"}
+				if err := c.Update(ctx, other); err != nil {
+					t.Fatalf("another writer's update: %v", err)
+				}
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+
+	err := tryRestoreStep(r)
+	checkVolSyncRefused(t, err, "ReplicationSource")
+	if !interfered || !apierrors.IsConflict(err) {
+		t.Fatalf("interfered = %t, error = %v; want the wait's status write to meet a Conflict", interfered, err)
+	}
+	if got := recorded(recorder); len(got) != 0 {
+		t.Errorf("events = %q, want none for a wait the status never held", got)
+	}
+	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason == backupv1alpha1.ReasonVolSyncUnsupported {
+		t.Errorf("stored Ready reason = %q, want the write that met the Conflict to have changed nothing", reason)
+	}
+
+	checkVolSyncRefused(t, tryRestoreStep(r), "ReplicationSource")
+	checkVolSyncUnsupported(t, readRestoreRun(t, c).Status.Conditions, "ReplicationSource")
+	got := recorded(recorder)
+	if len(got) != 1 || !strings.Contains(got[0], backupv1alpha1.ReasonVolSyncUnsupported) {
+		t.Errorf("events = %q, want one VolSyncUnsupported event from the pass that showed the wait", got)
 	}
 }
