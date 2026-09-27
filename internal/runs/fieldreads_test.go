@@ -283,4 +283,14 @@ func TestAnInvalidBackupDefinitionKeepsTheItemWaiting(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseRunning {
 		t.Errorf("run phase = %q, want Running", run.Status.Phase)
 	}
+	if item := run.Status.Items[0]; !strings.Contains(item.Message, "no plugin configured") {
+		t.Errorf("item message = %q, want it to carry status.error while the item waits", item.Message)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(48 * time.Hour) }
+	step(t, r)
+	item := readBackupRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "no plugin configured") {
+		t.Errorf("item = %+v, want it Failed at the timeout with status.error in its message", item)
+	}
 }

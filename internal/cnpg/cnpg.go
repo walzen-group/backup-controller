@@ -254,7 +254,9 @@ type BackupOutcome struct {
 	// Phase is the state of the Backup.
 	Phase BackupPhase
 	// Message is the error from CloudNativePG for BackupFailed, and the
-	// sentence of unknownBackupPhase for BackupUnknownPhase. It is empty for
+	// sentence of unknownBackupPhase for BackupUnknownPhase. For a
+	// BackupWaiting in the phase "invalid backup definition", it is the
+	// sentence of invalidDefinition, which quotes status.error. It is empty for
 	// the other phases.
 	Message string
 }
@@ -278,7 +280,10 @@ type BackupOutcome struct {
 //     "walArchivingFailing" and "invalid backup definition" give
 //     BackupWaiting. In these phases, CloudNativePG has not reconciled the
 //     Backup yet, makes it, or tries it again. The run waits up to its
-//     timeout.
+//     timeout. For "invalid backup definition", the message is the sentence
+//     of invalidDefinition, which quotes status.error, so the run can show
+//     why it waits and why it timed out. For the other phases, the message
+//     is empty.
 //
 // Only "failed" and "completed" are terminal in CloudNativePG 1.30.0
 // (internal/controller/backup_controller.go:155-158). CloudNativePG checks a
@@ -306,7 +311,10 @@ func BackupResult(ctx context.Context, c client.Reader, mapper meta.RESTMapper, 
 			message = fmt.Sprintf("the Backup %s/%s reports status.phase %q", namespace, name, phase)
 		}
 		return BackupOutcome{Phase: BackupFailed, Message: message}, nil
-	case "", "pending", "started", "running", "finalizing", "walArchivingFailing", "invalid backup definition":
+	case "invalid backup definition":
+		reason, _, _ := unstructured.NestedString(backup.Object, "status", "error")
+		return BackupOutcome{Phase: BackupWaiting, Message: invalidDefinition(namespace, name, reason)}, nil
+	case "", "pending", "started", "running", "finalizing", "walArchivingFailing":
 		return BackupOutcome{Phase: BackupWaiting}, nil
 	}
 	return BackupOutcome{Phase: BackupUnknownPhase, Message: unknownBackupPhase(namespace, name, phase)}, nil
@@ -324,4 +332,19 @@ func BackupResult(ctx context.Context, c client.Reader, mapper meta.RESTMapper, 
 func unknownBackupPhase(namespace, name, phase string) string {
 	return fmt.Sprintf("CloudNativePG reports status.phase %q on Backup %s/%s, which is not a phase of CloudNativePG 1.30; "+
 		"the run waits for completed or failed up to its timeout (see docs/compatibility.md)", phase, namespace, name)
+}
+
+// invalidDefinition returns the sentence for a Backup in the phase "invalid
+// backup definition".
+//
+// Parameters:
+//   - namespace and name name the Backup.
+//   - reason is its status.error, which the sentence quotes. It can be empty.
+//
+// The sentence says why CloudNativePG does not make the Backup and that the
+// run waits, so the Ready message and the message of a timed-out item tell
+// a person what to repair.
+func invalidDefinition(namespace, name, reason string) string {
+	return fmt.Sprintf("CloudNativePG reports an invalid backup definition on Backup %s/%s (status.error %q); "+
+		"the run waits for CloudNativePG to check the Backup again up to its timeout", namespace, name, reason)
 }

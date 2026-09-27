@@ -95,10 +95,12 @@ func (r *BackupRunReconciler) collectDatabase(ctx context.Context, run *backupv1
 // For a volume item that recorded its snapshot and has not moved it yet,
 // it returns the sentence of unmovedNote. For any other volume item it
 // returns what syncGoesOn says of the sync VolSync goes on with. A database
-// item can have a Backup in the phase cnpg.BackupUnknownPhase. For that item,
-// it returns the message of cnpg.BackupResult. Thus a run that gets to its
-// timeout shows the phase that it waited in. A failed read gives "", since the
-// sentence only explains the item's failure.
+// item can have a Backup in the phase cnpg.BackupUnknownPhase, or a waiting
+// Backup whose outcome has a message (an invalid backup definition). For that
+// item, it returns the message of cnpg.BackupResult. Thus a run that gets to
+// its timeout shows the phase that it waited in, or the status.error of the
+// invalid definition. A failed read gives "", since the sentence only explains
+// the item's failure.
 func (r *BackupRunReconciler) runningNote(ctx context.Context, run *backupv1alpha1.BackupRun, item backupv1alpha1.BackupItem) string {
 	if item.Kind != backupv1alpha1.ItemKindCluster {
 		if item.SnapshotID != "" {
@@ -107,7 +109,7 @@ func (r *BackupRunReconciler) runningNote(ctx context.Context, run *backupv1alph
 		return r.syncGoesOn(ctx, run, item, nil)
 	}
 	outcome, err := cnpg.BackupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
-	if err != nil || outcome.Phase != cnpg.BackupUnknownPhase {
+	if err != nil || (outcome.Phase != cnpg.BackupUnknownPhase && outcome.Phase != cnpg.BackupWaiting) {
 		return ""
 	}
 	return outcome.Message
