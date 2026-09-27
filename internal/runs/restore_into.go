@@ -19,6 +19,15 @@ import (
 // that fills it, and follows the Job to its end, through the same restore
 // Job code as an in-place item (restore_jobs.go and restore_volume.go).
 
+// The kinds of the objects named spec.into, as the refusals of an into
+// restore name them (see notCreatedByRun).
+const (
+	// kindClaim is the kind word of a PersistentVolumeClaim.
+	kindClaim = "claim"
+	// kindVolumeRestore is the kind word of a VolumeRestore.
+	kindVolumeRestore = "VolumeRestore"
+)
+
 // restoreIntoEmptyClaim makes one pass over an into restore that
 // planIntoNewClaim has checked.
 //
@@ -77,7 +86,7 @@ func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1al
 		return r.endInto(ctx, run, err)
 	}
 	if taken {
-		return after(pollInterval, r.recordJob(ctx, run))
+		return r.takeOverInto(ctx, run, item)
 	}
 	if deadline, over := r.overdue(run); over {
 		return r.timeOut(ctx, run, intoTimedOut(run.Spec.Into, deadline, run.Status.Conditions))
@@ -90,6 +99,28 @@ func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1al
 		return after(pollInterval, nil)
 	}
 	return r.createInto(ctx, run, item, settings)
+}
+
+// takeOverInto records the restore Job that an into restore took over from
+// a pass that lost its status write.
+//
+// Parameters:
+//   - run is the RestoreRun.
+//   - item is its single item, which now records the Job's name and UID.
+//     takeOverInto updates it in place.
+//
+// It returns what the pass returns (see restoreIntoEmptyClaim).
+//
+// The Job is still suspended, because only a pass that recorded its UID
+// resumes it. A claim of the spec.into name that the run did not create
+// can be there in place of the claim of the lost pass. Then the item fails
+// with reason IntoClaimTaken (see intoTaken), and the run stops the Job
+// before it writes. Otherwise the status write records the Job.
+func (r *RestoreRunReconciler) takeOverInto(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (ctrl.Result, error) {
+	if done, err := settled(item, r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, kindClaim)); done {
+		return r.endInto(ctx, run, err)
+	}
+	return after(pollInterval, r.recordJob(ctx, run))
 }
 
 // intoChecks runs the checks an into restore makes right before it creates
@@ -121,7 +152,7 @@ func (r *RestoreRunReconciler) intoChecks(ctx context.Context, run *backupv1alph
 	}
 	// A claim that appeared since the checks ends the run before it waits
 	// for anything: it is not the run's to write into.
-	if err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim"); err != nil {
+	if err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, kindClaim); err != nil {
 		return settings, false, err
 	}
 	leased := run.Spec.Claim
@@ -162,7 +193,7 @@ func (r *RestoreRunReconciler) createInto(ctx context.Context, run *backupv1alph
 	if done, err := settled(item, err); done {
 		return r.endInto(ctx, run, err)
 	}
-	if done, err := settled(item, r.createOwned(ctx, run, scratchClaim(run, settings), &corev1.PersistentVolumeClaim{}, "claim")); done {
+	if done, err := settled(item, r.createOwned(ctx, run, scratchClaim(run, settings), &corev1.PersistentVolumeClaim{}, kindClaim)); done {
 		return r.endInto(ctx, run, err)
 	}
 	if done, err := settled(item, r.createJob(ctx, run, 0, item, settings)); done {
@@ -263,13 +294,6 @@ func (r *RestoreRunReconciler) recordJob(ctx context.Context, run *backupv1alpha
 	return r.writeStatus(ctx, run)
 }
 
-// nothingWritten returns the end of the message of a restore that failed
-// before its mover existed: nothing was written to the claim named claim,
-// and a new RestoreRun selects again.
-func nothingWritten(claim string) string {
-	return fmt.Sprintf(". Nothing was written to claim %s. Create a new RestoreRun to select again", claim)
-}
-
 // planIntoNewClaim checks an into restore before it creates anything, and
 // starts the run when the check passes.
 //
@@ -302,9 +326,9 @@ func nothingWritten(claim string) string {
 // selectSnapshot refuses, ends with reason NoBackupInReach.
 func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	run.Status.Target = run.Spec.Into
-	err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim")
+	err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, kindClaim)
 	if err == nil && run.Spec.Claim != "" {
-		err = r.intoTaken(ctx, run, &backupv1alpha1.VolumeRestore{}, "VolumeRestore")
+		err = r.intoTaken(ctx, run, &backupv1alpha1.VolumeRestore{}, kindVolumeRestore)
 	}
 	if asRunRefusal(err) {
 		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
@@ -380,7 +404,7 @@ func intoTimedOut(into string, deadline time.Time, conditions []metav1.Condition
 //
 // Parameters:
 //   - object is an empty claim or VolumeRestore, of the kind to read.
-//   - kind is "claim" or "VolumeRestore", for the message.
+//   - kind is kindClaim or kindVolumeRestore, for the message.
 //
 // It returns nil when the object does not exist or the run controls it, and
 // the *refusalError from notCreatedByRun, with reason IntoClaimTaken,
@@ -405,7 +429,7 @@ func (r *RestoreRunReconciler) intoTaken(ctx context.Context, run *backupv1alpha
 //   - object is the claim to create.
 //   - existing is an empty object of the same kind, which the stored object
 //     is read into when the create finds one.
-//   - kind is "claim", for the message.
+//   - kind is kindClaim, for the message.
 //
 // It returns nil once an object of that name exists that the run controls,
 // and the *refusalError from notCreatedByRun, with reason IntoClaimTaken,
@@ -436,11 +460,12 @@ func (r *RestoreRunReconciler) createOwned(ctx context.Context, run *backupv1alp
 //   - run is the RestoreRun. spec.into names the claim, and the claim is the
 //     run's own when the run is its controller (see notCreatedByRun).
 //
-// It returns nil while the run's own claim is there, and a *refusalError
-// with reason ClaimLost when the claim is gone, is being deleted, or is
-// controlled by something other than the run. A failed read that is not
-// NotFound comes back as a plain error, and the caller leaves the item as it
-// was.
+// It returns nil while the run's own claim is there, and a *claimLostError
+// for an into item when the claim is gone (lossGone), is being deleted
+// (lossDeleting), or is controlled by something other than the run
+// (lossNotOwned). asItemFailure fails the item with it, with reason
+// ClaimLost. A failed read that is not NotFound comes back as a plain
+// error, and the caller leaves the item as it was.
 //
 // An into restore checks it on every pass once its restore Job exists (see
 // claimLostError), so a Job that finished never counts as a restore into a
@@ -452,13 +477,15 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 	err := r.Reader.Get(ctx, key, claim)
 	switch {
 	case apierrors.IsNotFound(err):
-		// A claim that is gone is lost.
+		return &claimLostError{claim: run.Spec.Into, loss: lossGone, into: true}
 	case err != nil:
 		return fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
-	case claim.DeletionTimestamp == nil && metav1.IsControlledBy(claim, run):
-		return nil
+	case claim.DeletionTimestamp != nil:
+		return &claimLostError{claim: run.Spec.Into, loss: lossDeleting, into: true}
+	case !metav1.IsControlledBy(claim, run):
+		return &claimLostError{claim: run.Spec.Into, loss: lossNotOwned, into: true}
 	}
-	return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted (or replaced) while its restore Job wrote into it", run.Spec.Into)
+	return nil
 }
 
 // waitForBackup keeps an into restore from creating anything while a backup
@@ -482,7 +509,7 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 // retries.
 func (r *RestoreRunReconciler) waitForBackup(ctx context.Context, run *backupv1alpha1.RestoreRun, claim, secret string) (bool, error) {
 	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseRequest{
-		holder:    leaseHolder{kind: "RestoreRun", run: run, item: run.Status.Items[0].Name},
+		holder:    leaseHolder{kind: backupv1alpha1.KindRestoreRun, run: run, item: run.Status.Items[0].Name},
 		namespace: run.Namespace, claim: claim, secret: secret,
 	})
 	if err != nil {
@@ -505,7 +532,7 @@ func (r *RestoreRunReconciler) waitForBackup(ctx context.Context, run *backupv1a
 //   - run is the RestoreRun. It controls an object whose controller
 //     reference carries its UID, as scratchClaim sets it; a run created
 //     again under the same name does not.
-//   - kind is "claim" or "VolumeRestore", for the message.
+//   - kind is kindClaim or kindVolumeRestore, for the message.
 //   - object is the object as read from the API server.
 //
 // It returns nil when the run controls the object, and otherwise a
@@ -522,11 +549,11 @@ func notCreatedByRun(run *backupv1alpha1.RestoreRun, kind string, object metav1.
 		return nil
 	}
 	owner := ""
-	if ref := metav1.GetControllerOf(object); ref != nil && ref.Kind == "RestoreRun" &&
+	if ref := metav1.GetControllerOf(object); ref != nil && ref.Kind == backupv1alpha1.KindRestoreRun &&
 		ref.APIVersion == backupv1alpha1.GroupVersion.String() {
 		owner = fmt.Sprintf("; it belongs to RestoreRun %s, which deletes it when it is deleted", ref.Name)
 	}
-	if kind == "claim" {
+	if kind == kindClaim {
 		return refuse(backupv1alpha1.ItemReasonIntoClaimTaken, "claim %s already exists and this run did not create it%s. "+
 			"spec.into names a new claim for the run to create, and a restore never writes into a claim it did not create. "+
 			"Choose a name no claim in this namespace has. To overwrite an existing claim, restore it in place with spec.claim.",
@@ -580,7 +607,7 @@ func scratchClaim(run *backupv1alpha1.RestoreRun, settings restoreSettings) *cor
 			Namespace:   run.Namespace,
 			Annotations: annotations,
 			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(run, backupv1alpha1.GroupVersion.WithKind("RestoreRun")),
+				*metav1.NewControllerRef(run, backupv1alpha1.GroupVersion.WithKind(backupv1alpha1.KindRestoreRun)),
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{

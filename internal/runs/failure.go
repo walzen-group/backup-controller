@@ -68,6 +68,13 @@ func (e *sparedError) Error() string {
 // Unwrap returns the marked error.
 func (e *sparedError) Unwrap() error { return e.err }
 
+// nothingWritten returns the end of the message of a restore that failed
+// before its mover existed: nothing was written to the claim named claim,
+// and a new RestoreRun selects again.
+func nothingWritten(claim string) string {
+	return fmt.Sprintf(". Nothing was written to claim %s. Create a new RestoreRun to select again", claim)
+}
+
 // refuse builds a refusal of an item.
 //
 // Parameters:
@@ -293,8 +300,8 @@ func asRunRefusal(err error) bool {
 		errors.As(err, &quiesceSpec) || errors.As(err, &crossNamespace) || errors.As(err, &inventory)
 }
 
-// claimLoss is how the claim of an in-place item stopped being the claim
-// the run checked.
+// claimLoss is how the claim of a volume item stopped being the claim the
+// run checked.
 type claimLoss int
 
 const (
@@ -308,9 +315,11 @@ const (
 	// lossReplaced is a claim whose UID is not the UID of a claim Lease of
 	// the run for the item.
 	lossReplaced
+	// lossNotOwned is a claim of an into item that the run does not control.
+	lossNotOwned
 )
 
-// claimLostError says that the claim an in-place item restored is no longer
+// claimLostError says that the claim a volume item restored is no longer
 // the claim the run checked, so the item can not succeed. asItemFailure
 // fails the item with reason ClaimLost.
 type claimLostError struct {
@@ -318,6 +327,9 @@ type claimLostError struct {
 	claim string
 	// loss is how the run lost the claim.
 	loss claimLoss
+	// into is true for the claim of an into item, which the run created.
+	// Error then gives the same sentence for each loss.
+	into bool
 	// found is the UID of the claim there now, for lossReplaced.
 	found string
 	// leased are the claim UIDs of the run's claim Leases for the item, for
@@ -328,6 +340,9 @@ type claimLostError struct {
 // Error returns the sentence for a person that says how the run lost the
 // claim and what to do next.
 func (e *claimLostError) Error() string {
+	if e.into {
+		return fmt.Sprintf("claim %s was deleted (or replaced) while its restore Job wrote into it", e.claim)
+	}
 	switch e.loss {
 	case lossUnleased:
 		return fmt.Sprintf("the run holds no claim Lease for claim %s, so it can't tell whether its restore Job wrote into the claim that is there now. "+
@@ -340,6 +355,9 @@ func (e *claimLostError) Error() string {
 		return fmt.Sprintf("claim %[1]s was replaced while its restore Job wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
 			"and took its Lease on (UID %[3]s). The restore Job mounts claim %[1]s by name, so it may have written into it; check its data, "+
 			"and create a new RestoreRun to restore it", e.claim, e.found, strings.Join(e.leased, ", "))
+	case lossNotOwned:
+		// Only an into item loses its claim this way, and Error returns
+		// above for an into item.
 	}
 	return fmt.Sprintf("claim %s is no longer the claim the run checked", e.claim)
 }
