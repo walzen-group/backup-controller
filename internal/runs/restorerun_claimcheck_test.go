@@ -129,17 +129,29 @@ func TestARestoreDestinationGetsTheCacheCapacity(t *testing.T) {
 				expectJobCache(t, job, capacity)
 				return
 			}
-			for _, v := range job.Spec.Template.Spec.Volumes {
-				if v.Ephemeral == nil {
-					continue
-				}
-				spec := v.Ephemeral.VolumeClaimTemplate.Spec
-				if got := spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(resource.MustParse("1Gi")) != 0 || spec.StorageClassName != nil {
-					t.Errorf("cache volume = %+v, want the default 1Gi and no class with no VolumeRestore", spec)
-				}
+			spec := jobCache(t, job)
+			if got := spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(resource.MustParse("1Gi")) != 0 || spec.StorageClassName != nil {
+				t.Errorf("cache volume = %+v, want the default 1Gi and no class with no VolumeRestore", spec)
 			}
 		})
 	}
+}
+
+// jobCache returns the claim template of a restore Job's cache volume. It
+// fails the test unless the Job's pod has exactly one ephemeral volume,
+// which is the cache.
+func jobCache(t *testing.T, job *batchv1.Job) corev1.PersistentVolumeClaimSpec {
+	t.Helper()
+	var caches []corev1.PersistentVolumeClaimSpec
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Ephemeral != nil {
+			caches = append(caches, v.Ephemeral.VolumeClaimTemplate.Spec)
+		}
+	}
+	if len(caches) != 1 {
+		t.Fatalf("restore Job %s has %d ephemeral volumes, want exactly one cache volume", job.Name, len(caches))
+	}
+	return caches[0]
 }
 
 // expectJobCache checks that a restore Job's pod carries what the claim's
@@ -147,15 +159,10 @@ func TestARestoreDestinationGetsTheCacheCapacity(t *testing.T) {
 // capacity, and the Kueue queue label on the pod only.
 func expectJobCache(t *testing.T, job *batchv1.Job, capacity resource.Quantity) {
 	t.Helper()
-	for _, v := range job.Spec.Template.Spec.Volumes {
-		if v.Ephemeral == nil {
-			continue
-		}
-		spec := v.Ephemeral.VolumeClaimTemplate.Spec
-		if got := spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(capacity) != 0 ||
-			spec.StorageClassName == nil || *spec.StorageClassName != "zfs-ephemeral" {
-			t.Errorf("cache volume = %+v, want %s of class zfs-ephemeral", spec, capacity.String())
-		}
+	spec := jobCache(t, job)
+	if got := spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(capacity) != 0 ||
+		spec.StorageClassName == nil || *spec.StorageClassName != "zfs-ephemeral" {
+		t.Errorf("cache volume = %+v, want %s of class zfs-ephemeral", spec, capacity.String())
 	}
 	if got := job.Spec.Template.Labels["kueue.x-k8s.io/queue-name"]; got != "backups" || job.Labels["kueue.x-k8s.io/queue-name"] != "" {
 		t.Errorf("pod queue label = %q, Job labels = %v; want backups on the pod only", got, job.Labels)
