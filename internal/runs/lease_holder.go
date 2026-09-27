@@ -39,87 +39,54 @@ import (
 // Lease. A Lease that names no run kind this controller knows is left alone,
 // and counts as live.
 func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1.Lease) (bool, error) {
-	key := types.NamespacedName{Namespace: lease.Namespace, Name: lease.Annotations[annotationLeaseHolderName]}
+	var run client.Object
 	switch lease.Labels[labelLeaseHolderKind] {
 	case backupv1alpha1.KindBackupRun:
-		return backupHolderLive(ctx, reader, key, lease)
+		run = &backupv1alpha1.BackupRun{}
 	case backupv1alpha1.KindRestoreRun:
-		return restoreHolderLive(ctx, reader, key, lease)
+		run = &backupv1alpha1.RestoreRun{}
+	default:
+		return true, nil
 	}
-	return true, nil
-}
-
-// backupHolderLive is holderLive for a Lease that a BackupRun holds.
-//
-// Parameters:
-//   - reader reads the BackupRun, uncached.
-//   - key is the namespace and the name of the BackupRun that the Lease
-//     names.
-//   - lease is the Lease as stored.
-//
-// It returns true while the BackupRun needs the Lease, and an error when
-// the read of the BackupRun fails for a reason other than NotFound.
-func backupHolderLive(ctx context.Context, reader client.Reader, key types.NamespacedName, lease *coordinationv1.Lease) (bool, error) {
-	run := &backupv1alpha1.BackupRun{}
+	key := types.NamespacedName{Namespace: lease.Namespace, Name: lease.Annotations[annotationLeaseHolderName]}
 	if err := reader.Get(ctx, key, run); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
-		return false, fmt.Errorf("get BackupRun %s: %w", key, err)
+		return false, fmt.Errorf("get %s %s: %w", lease.Labels[labelLeaseHolderKind], key, err)
 	}
-	if string(run.UID) != holderUID(lease) || run.Status.Phase.Finished() {
-		return false, nil
-	}
-	if lease.Labels[labelLeaseScope] == scopeQuiesce {
-		return !durablyRestarted(run), nil
-	}
-	kind := backupv1alpha1.ItemKindSource
-	if lease.Labels[labelLeaseScope] == scopeCluster {
-		kind = backupv1alpha1.ItemKindCluster
-	}
-	items := leaseItems(lease)
-	for _, item := range run.Status.Items {
-		if item.Kind == kind && slices.Contains(items, item.Name) &&
-			(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
-			return true, nil
-		}
-	}
-	return false, nil
+	return string(run.GetUID()) == holderUID(lease) && needsLease(run, lease), nil
 }
 
-// restoreHolderLive is holderLive for a Lease that a RestoreRun holds.
-//
-// Parameters:
-//   - reader reads the RestoreRun, uncached.
-//   - key is the namespace and the name of the RestoreRun that the Lease
-//     names.
-//   - lease is the Lease as stored.
-//
-// It returns true while the RestoreRun needs the Lease, and an error when
-// the read of the RestoreRun fails for a reason other than NotFound.
-func restoreHolderLive(ctx context.Context, reader client.Reader, key types.NamespacedName, lease *coordinationv1.Lease) (bool, error) {
-	run := &backupv1alpha1.RestoreRun{}
-	if err := reader.Get(ctx, key, run); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("get RestoreRun %s: %w", key, err)
-	}
-	if string(run.UID) != holderUID(lease) || run.Status.Phase.Finished() {
-		return false, nil
-	}
-	if lease.Labels[labelLeaseScope] == scopeQuiesce {
-		return !durablyRestarted(run), nil
-	}
+// needsLease reports whether a run, read with the UID the Lease names,
+// still needs the Lease (see holderLive).
+func needsLease(run client.Object, lease *coordinationv1.Lease) bool {
+	quiesceLease := lease.Labels[labelLeaseScope] == scopeQuiesce
 	items := leaseItems(lease)
-	for _, item := range run.Status.Items {
-		// A finished item that still records its restore Job's UID has
-		// a Job the run has stopped and not yet seen stopped (rule X2),
-		// and a pod of that Job may still write.
-		if item.Kind == backupv1alpha1.ItemKindClaim && slices.Contains(items, item.Name) &&
-			(!finished(item) || item.JobUID != "") {
-			return true, nil
+	switch r := run.(type) {
+	case *backupv1alpha1.BackupRun:
+		if r.Status.Phase.Finished() || quiesceLease {
+			return !r.Status.Phase.Finished() && !durablyRestarted(r)
 		}
+		kind := backupv1alpha1.ItemKindSource
+		if lease.Labels[labelLeaseScope] == scopeCluster {
+			kind = backupv1alpha1.ItemKindCluster
+		}
+		return slices.ContainsFunc(r.Status.Items, func(item backupv1alpha1.BackupItem) bool {
+			return item.Kind == kind && slices.Contains(items, item.Name) &&
+				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning)
+		})
+	case *backupv1alpha1.RestoreRun:
+		if r.Status.Phase.Finished() || quiesceLease {
+			return !r.Status.Phase.Finished() && !durablyRestarted(r)
+		}
+		// A finished item that still records its restore Job's UID has a
+		// Job the run has stopped and not yet seen stopped (rule X2), and a
+		// pod of that Job may still write.
+		return slices.ContainsFunc(r.Status.Items, func(item backupv1alpha1.RestoreItem) bool {
+			return item.Kind == backupv1alpha1.ItemKindClaim && slices.Contains(items, item.Name) &&
+				(!finished(item) || item.JobUID != "")
+		})
 	}
-	return false, nil
+	return true
 }

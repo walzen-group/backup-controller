@@ -201,18 +201,31 @@ func (r *BackupRunReconciler) precheckItems(ctx context.Context, run *backupv1al
 // It returns a hold when the item has to wait for another run, and the zero
 // hold otherwise. It returns the error of a failed read.
 //
-// A volume still busy with another run's backup would keep the stopped
-// workloads down for as long as that backup takes. The run waits with the
-// workloads still running. A volume busy with a backup no run waits for
+// A volume still busy with another run's backup or restore would keep the
+// stopped workloads down for as long as that run takes. The run waits with
+// the workloads still running. A volume busy with a backup no run waits for
 // fails its item here, before anything is stopped, and the rest of the
-// namespace goes on; the status write records it. An item startVolume would
-// refuse (see startRefusal) and one whose ReplicationSource the controller
-// didn't write fail here as well, with the message startVolume gives, so
+// namespace goes on; the status write records it. An item whose claim is
+// gone, whose settings ensureSource refuses (see sourceSettingsFor), whose
+// repository Secret is gone, or whose ReplicationSource the controller
+// didn't write fails here as well, with the message startVolume gives, so
 // the app is not stopped for a backup that cannot start. A read that fails
 // is not evidence that the volume is idle, so it comes back as an error and
 // nothing is stopped.
+//
+// The check is advisory. A run that starts its mover between this read and
+// the stop still goes first under the Leases and otherMover, which run right
+// before the mover object is written.
 func (r *BackupRunReconciler) precheckItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) (hold, error) {
-	err := r.startRefusal(ctx, run, item.Name)
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, claim); err != nil {
+		if apierrors.IsNotFound(err) {
+			failBackupItem(item, claimGone(item.Name))
+			return hold{}, nil
+		}
+		return hold{}, fmt.Errorf("get claim %s/%s: %w", run.Namespace, item.Name, err)
+	}
+	settings, err := sourceSettingsFor(ctx, r.Reader, claim)
 	if failBackupItem(item, err) {
 		return hold{}, nil
 	}
@@ -221,14 +234,18 @@ func (r *BackupRunReconciler) precheckItem(ctx context.Context, run *backupv1alp
 	}
 	// A restore of the claim or its repository holds the item the
 	// same way, and startVolume would wait for it with the app down.
-	restoring, err := r.heldElsewhere(ctx, run, item.Name)
-	if failBackupItem(item, err) {
-		// A repository Secret that is gone fails the item now, so the
-		// app is not stopped for a backup that cannot start.
-		return hold{}, nil
-	}
+	repository := settings.vr.Spec.Repository
+	restoring, err := otherMover(ctx, r.Reader, run.Namespace, item.Name, repository, restoreMover)
 	if err != nil || restoring.held() {
 		return restoring, err
+	}
+	leased, err := leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, item.Name, repository)
+	if failBackupItem(item, err) {
+		// A repository Secret that is gone fails the item now.
+		return hold{}, nil
+	}
+	if err != nil || leased.held() {
+		return leased, err
 	}
 	source := &volsyncv1alpha1.ReplicationSource{}
 	err = r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source)
@@ -253,31 +270,6 @@ func (r *BackupRunReconciler) precheckItem(ctx context.Context, run *backupv1alp
 	return held, err
 }
 
-// startRefusal checks, before anything is written, whether startVolume would
-// refuse a volume item. A namespace run calls it in its quiesce pre-check,
-// so an item that cannot start fails before the app is stopped for it.
-//
-// Parameters:
-//   - run is the asking run; its namespace is read.
-//   - claimName names the item's claim.
-//
-// It returns nil when startVolume would go on, and the refusal startVolume
-// would fail the item with otherwise: the claim is gone (see claimGone), or
-// ensureSource refuses the claim's settings (see sourceSettingsFor). The
-// caller fails the item with it through failBackupItem. A failed read comes
-// back as a plain error, and the pass retries with nothing stopped.
-func (r *BackupRunReconciler) startRefusal(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) error {
-	claim := &corev1.PersistentVolumeClaim{}
-	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
-		if apierrors.IsNotFound(err) {
-			return claimGone(claimName)
-		}
-		return fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
-	}
-	_, err := sourceSettingsFor(ctx, r.Reader, claim)
-	return err
-}
-
 // claimGone returns the refusal of a volume item whose claim no longer
 // exists.
 //
@@ -287,51 +279,4 @@ func (r *BackupRunReconciler) startRefusal(ctx context.Context, run *backupv1alp
 // It returns a *refusalError with reason ClaimMissing.
 func claimGone(claimName string) error {
 	return refuse(backupv1alpha1.ItemReasonClaimMissing, "the claim %s no longer exists", claimName)
-}
-
-// heldElsewhere returns a hold of kind holdSourceBusy that names the run
-// that holds the claim or its repository. It returns the zero hold when
-// no run holds either. A backup calls it before it stops any workload, so
-// that it waits with the app running where startVolume would wait with the
-// app down.
-//
-// Parameters:
-//   - run is the asking run; its namespace and UID are read.
-//   - claimName names the claim the run is about to back up.
-//
-// A claim that does not exist and a VolumeRestore the claim does not have
-// give the zero hold. quiesce already failed such an item through startRefusal
-// before it asks, and ensureSource checks again right before it writes the
-// trigger.
-// A repository Secret that does not exist comes back as the refusal
-// leaseNamesFor gives, and quiesce fails the item with it (see
-// failBackupItem) before anything is stopped. Any other failed read comes
-// back as an error, and the pass retries with nothing stopped.
-//
-// The check is advisory. A run that starts its mover between this read and
-// the stop still goes first under the Leases and otherMover, which run right
-// before the mover object is written.
-func (r *BackupRunReconciler) heldElsewhere(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) (hold, error) {
-	claim := &corev1.PersistentVolumeClaim{}
-	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
-		if apierrors.IsNotFound(err) {
-			return hold{}, nil
-		}
-		return hold{}, fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
-	}
-	vr, err := volumeRestoreFor(ctx, r.Reader, claim)
-	if err != nil {
-		if _, refused := asItemFailure(err); refused {
-			return hold{}, nil
-		}
-		return hold{}, err
-	}
-	restoring, err := otherMover(ctx, r.Reader, run.Namespace, claimName, vr.Spec.Repository, restoreMover)
-	if err != nil {
-		return hold{}, err
-	}
-	if restoring.held() {
-		return restoring, nil
-	}
-	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, vr.Spec.Repository)
 }

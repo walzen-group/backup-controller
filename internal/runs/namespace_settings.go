@@ -59,19 +59,7 @@ func timeoutFor(ctx context.Context, reader client.Reader, run *backupv1alpha1.B
 	if run.Spec.Timeout != nil {
 		return run.Spec.Timeout.Duration, nil
 	}
-	annotations, err := namespaceAnnotations(ctx, reader, run.Namespace)
-	if err != nil {
-		return 0, err
-	}
-	value := annotations[backupv1alpha1.AnnotationTimeout]
-	if value == "" {
-		return defaultTimeout, nil
-	}
-	d, err := time.ParseDuration(value)
-	if err != nil || d <= 0 {
-		return 0, invalidSettingError{fmt.Sprintf("namespace %s has %s %q, which is not a duration such as 10h", run.Namespace, backupv1alpha1.AnnotationTimeout, value)}
-	}
-	return d, nil
+	return namespaceDuration(ctx, reader, run.Namespace, backupv1alpha1.AnnotationTimeout, defaultTimeout, "10h")
 }
 
 // maxQuiesceFor returns how long a BackupRun with spec.all set may keep the
@@ -82,17 +70,30 @@ func timeoutFor(ctx context.Context, reader client.Reader, run *backupv1alpha1.B
 // It returns an invalidSettingError error when the annotation isn't a positive Go
 // duration such as 20m, and any error from reading the Namespace.
 func maxQuiesceFor(ctx context.Context, reader client.Reader, namespace string) (time.Duration, error) {
+	return namespaceDuration(ctx, reader, namespace, backupv1alpha1.AnnotationMaxQuiesce, defaultMaxQuiesce, "20m")
+}
+
+// namespaceDuration returns the duration that a namespace annotation sets.
+//
+// Parameters:
+//   - annotation is the annotation to read.
+//   - fallback is the duration when the annotation is not set or is empty.
+//   - example is a valid value that the error message shows.
+//
+// It returns an invalidSettingError when the value is not a positive Go
+// duration, and any error from reading the Namespace.
+func namespaceDuration(ctx context.Context, reader client.Reader, namespace, annotation string, fallback time.Duration, example string) (time.Duration, error) {
 	annotations, err := namespaceAnnotations(ctx, reader, namespace)
 	if err != nil {
 		return 0, err
 	}
-	value := annotations[backupv1alpha1.AnnotationMaxQuiesce]
+	value := annotations[annotation]
 	if value == "" {
-		return defaultMaxQuiesce, nil
+		return fallback, nil
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil || d <= 0 {
-		return 0, invalidSettingError{fmt.Sprintf("namespace %s has %s %q, which is not a duration such as 20m", namespace, backupv1alpha1.AnnotationMaxQuiesce, value)}
+		return 0, invalidSettingError{fmt.Sprintf("namespace %s has %s %q, which is not a duration such as %s", namespace, annotation, value, example)}
 	}
 	return d, nil
 }

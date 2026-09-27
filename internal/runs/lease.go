@@ -341,17 +341,34 @@ func leaseItems(lease *coordinationv1.Lease) []string {
 // caller retries; a Lease left behind is taken over under acquireLeases'
 // rule once its run has finished.
 func releaseLeases(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object, done func(item string) bool) error {
+	return deleteLeases(ctx, c, reader, run, client.MatchingLabels{labelLeaseHolderUID: string(run.GetUID())},
+		func(lease *coordinationv1.Lease) bool {
+			return lease.Labels[labelLeaseScope] != scopeQuiesce && allDoneItems(leaseItems(lease), done)
+		})
+}
+
+// deleteLeases deletes the Leases of a run that match labels, that still
+// name the run as their holder, and that release accepts.
+//
+// Parameters:
+//   - run is the BackupRun or RestoreRun whose Leases go.
+//   - labels select the Leases to list.
+//   - release tells whether a listed Lease goes now.
+//
+// It returns nil once every such Lease is gone or left alone, and an error
+// when the list or a delete fails. The delete carries the UID and the
+// resourceVersion of the Lease as read, so a Lease another run has taken
+// over since is left alone. A Lease that is already gone, or changed since
+// the read, is not an error.
+func deleteLeases(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object,
+	labels client.MatchingLabels, release func(*coordinationv1.Lease) bool) error {
 	leases := &coordinationv1.LeaseList{}
-	if err := reader.List(ctx, leases, client.InNamespace(run.GetNamespace()),
-		client.MatchingLabels{labelLeaseHolderUID: string(run.GetUID())}); err != nil {
+	if err := reader.List(ctx, leases, client.InNamespace(run.GetNamespace()), labels); err != nil {
 		return fmt.Errorf("list the Leases of %s: %w", run.GetName(), err)
 	}
 	for i := range leases.Items {
 		lease := &leases.Items[i]
-		if lease.Labels[labelLeaseScope] == scopeQuiesce {
-			continue
-		}
-		if holderUID(lease) != string(run.GetUID()) || !allDoneItems(leaseItems(lease), done) {
+		if holderUID(lease) != string(run.GetUID()) || !release(lease) {
 			continue
 		}
 		uid, version := lease.UID, lease.ResourceVersion
@@ -400,25 +417,10 @@ func leaseReleaseError(run metav1.Object, err error) error {
 // caller logs it and goes on; a Lease left behind is stale under holderLive's
 // rule and is taken over by the next run.
 func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Reader, run metav1.Object) error {
-	leases := &coordinationv1.LeaseList{}
-	if err := reader.List(ctx, leases, client.InNamespace(run.GetNamespace()), client.MatchingLabels{
+	return deleteLeases(ctx, c, reader, run, client.MatchingLabels{
 		labelLeaseHolderUID: string(run.GetUID()),
 		labelLeaseScope:     scopeQuiesce,
-	}); err != nil {
-		return fmt.Errorf("list the quiesce Leases of %s: %w", run.GetName(), err)
-	}
-	for i := range leases.Items {
-		lease := &leases.Items[i]
-		if holderUID(lease) != string(run.GetUID()) {
-			continue
-		}
-		uid, version := lease.UID, lease.ResourceVersion
-		err := c.Delete(ctx, lease, client.Preconditions{UID: &uid, ResourceVersion: &version})
-		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
-			return fmt.Errorf("delete Lease %s/%s: %w", lease.Namespace, lease.Name, err)
-		}
-	}
-	return nil
+	}, func(*coordinationv1.Lease) bool { return true })
 }
 
 // leaseHeldElsewhere returns a hold that names the run that holds the Lease

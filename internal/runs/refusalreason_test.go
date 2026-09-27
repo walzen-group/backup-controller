@@ -119,7 +119,7 @@ func restoreItemAfter(t *testing.T, run *backupv1alpha1.RestoreRun, between func
 // An item a run refuses records why in its reason, a typed value that no
 // one has to read from the message, and its message is the sentence it was
 // before the reason existed. Each case goes through one of the start checks
-// that return a typed refusal: startItem's claimGone, both startRefusals,
+// that return a typed refusal: startItem's claimGone, precheckItem, startRefusal,
 // sourceSettingsFor, volumeAffinity, the quiesce pre-check's foreign
 // source, startItem's hibernated and missing Cluster, checkVolume's
 // repositoryFor, the in-place quiesce pre-check's Lease of a repository

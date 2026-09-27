@@ -118,28 +118,16 @@ func holder(ctx context.Context, reader client.Reader, source *volsyncv1alpha1.R
 	if !busy(source) {
 		return sourceBusy("ReplicationSource %s is still syncing; VolSync has not recorded the end of its last sync", source.Name), nil
 	}
-	open := manualTag(source)
 	runs := &backupv1alpha1.BackupRunList{}
 	if err := reader.List(ctx, runs, client.InNamespace(source.Namespace)); err != nil {
 		return hold{}, fmt.Errorf("list BackupRuns in %s: %w", source.Namespace, err)
 	}
+	if run := liveBackup(runs, source); run != "" {
+		return sourceBusy("ReplicationSource %s is still completing the backup of BackupRun %s", source.Name, run), nil
+	}
 	owner := ""
-	for i := range runs.Items {
-		run := &runs.Items[i]
-		if TriggerFor(run.UID) != open {
-			continue
-		}
+	if run := taggedRun(runs, manualTag(source)); run != nil {
 		owner = run.Name
-		if run.DeletionTimestamp != nil || run.Status.Phase.Finished() {
-			break
-		}
-		for _, item := range run.Status.Items {
-			if item.Kind == backupv1alpha1.ItemKindSource && item.Name == source.Name &&
-				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
-				return sourceBusy("ReplicationSource %s is still completing the backup of BackupRun %s", source.Name, run.Name), nil
-			}
-		}
-		break
 	}
 	return hold{}, &sourceHeldError{message: abandonedMessage(source, owner)}
 }

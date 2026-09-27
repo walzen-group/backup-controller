@@ -153,23 +153,28 @@ func syncingMessage(source *volsyncv1alpha1.ReplicationSource, repository string
 // source's manual tag, or "" when no run does. The run must not be finished
 // or being deleted, and its item for the source must be Pending or Running.
 func liveBackup(runs *backupv1alpha1.BackupRunList, source *volsyncv1alpha1.ReplicationSource) string {
-	tag := manualTag(source)
-	if tag == "" {
+	run := taggedRun(runs, manualTag(source))
+	if run == nil || run.DeletionTimestamp != nil || run.Status.Phase.Finished() {
 		return ""
 	}
-	for i := range runs.Items {
-		run := &runs.Items[i]
-		if TriggerFor(run.UID) != tag || run.DeletionTimestamp != nil || run.Status.Phase.Finished() {
-			continue
-		}
-		for _, item := range run.Status.Items {
-			if item.Kind == backupv1alpha1.ItemKindSource && item.Name == source.Name &&
-				(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
-				return run.Name
-			}
+	for _, item := range run.Status.Items {
+		if item.Kind == backupv1alpha1.ItemKindSource && item.Name == source.Name &&
+			(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
+			return run.Name
 		}
 	}
 	return ""
+}
+
+// taggedRun returns the BackupRun whose trigger is tag (see TriggerFor), or
+// nil when tag is empty or no run in runs has it.
+func taggedRun(runs *backupv1alpha1.BackupRunList, tag string) *backupv1alpha1.BackupRun {
+	for i := range runs.Items {
+		if tag != "" && TriggerFor(runs.Items[i].UID) == tag {
+			return &runs.Items[i]
+		}
+	}
+	return nil
 }
 
 // restoreInProgress is otherMover for restoreMover.
