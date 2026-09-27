@@ -227,7 +227,7 @@ item that ended by a path that records none leaves it empty
 | NoNodeAffinity | BackupRun | the PersistentVolume declares no node affinity to place the mover by |
 | VolumeRestoreMissing | both | the claim has no VolumeRestore to name its repository |
 | RepositorySecretMissing | both | the repository Secret does not exist |
-| SettingsInvalid | both | a retention annotation on the claim, or a setting on the namespace, does not parse |
+| SettingsInvalid | BackupRun | a retention annotation on the claim, or a setting on the namespace, does not parse |
 | SourceNotManaged | BackupRun | the claim has a ReplicationSource the controller did not write |
 | SourceRefused | BackupRun | the API server refused the ReplicationSource as invalid |
 | SourceAbandoned | BackupRun | the ReplicationSource is still retrying a backup no run waits for |

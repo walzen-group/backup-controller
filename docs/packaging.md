@@ -163,7 +163,9 @@ The policy matches only requests whose user is the controller's ServiceAccount:
 chart the release namespace and the chart's ServiceAccount. Other users' Jobs,
 the Job controller and the garbage collector are never matched. For that user
 the policy checks every create, update and delete of a batch/v1 Job, and
-refuses with 403 Forbidden and the message of the check that failed:
+refuses with 403 Forbidden and the message of the first check that failed, in
+the order of the table below. The API server reports no other failing check,
+so a Job that fails several checks may need more than one fix:
 
 | Check | Message |
 | --- | --- |
@@ -217,7 +219,7 @@ caller in the controller:
 | `backupruns/finalizers`, `restoreruns/finalizers` | update | the Workload, the scratch claim and the restore Job a run creates name the run as their controller with `blockOwnerDeletion`, which OwnerReferencesPermissionEnforcement allows only with this verb |
 | `customresourcedefinitions` (apiextensions.k8s.io), named `backupruns.backup.wlz.li` and `restoreruns.backup.wlz.li` | get | a run reads the installed CRD of its kind before it changes anything, and ends with reason CRDOutdated when the schema lacks a field the controller writes, which the API server would drop |
 | `replicationsources.volsync.backube` | get, list, watch, create, update, patch | writing each enabled claim's source and its manual trigger; v0.8.2 dropped delete, which v0.8.0 and v0.8.1 used after a failed mover |
-| `leases` (coordination.k8s.io) | get, list, create, update, delete | the Lease a BackupRun or RestoreRun acquires on a claim and on its repository Secret right before it starts a mover, so a backup and a restore of either never run at once, and the Lease `backup-controller-quiesce` a run acquires in its namespace before it stops that namespace's workloads (internal/runs/lease.go). Runs live in every namespace, so the rule is cluster-wide, and `update` takes over the Lease of a run that has finished |
+| `leases` (coordination.k8s.io) | get, list, create, update, delete | the Lease a BackupRun or RestoreRun acquires on a claim and on its repository Secret right before it starts a mover or a restore Job, so a backup and a restore of either never run at once, and the Lease `backup-controller-quiesce` a run acquires in its namespace before it stops that namespace's workloads (internal/runs/lease.go). Runs live in every namespace, so the rule is cluster-wide, and `update` takes over the Lease of a run that has finished |
 | `jobs` (batch) | get, list, create, patch, delete | the restore Job of a RestoreRun item or a populated claim: created suspended, read by name, resumed and suspended with a merge patch, and deleted with Foreground propagation; a backup lists the restore Jobs by label to wait for one on its claim or repository. Reads go through the uncached reader, so no watch. The [admission policy](#admission-policy-on-the-restore-jobs) narrows this grant to Jobs of the restore Job's shape |
 | `namespaces` | get, list, watch | the schedule, timeout and prune interval annotations |
 | `backups.postgresql.cnpg.io` | get, create | a base backup per enabled Cluster per run |

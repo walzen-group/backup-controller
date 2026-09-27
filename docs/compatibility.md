@@ -163,7 +163,7 @@ The mover script, mover-restic/entry.sh in the same module:
 | A backup mover runs restic forget with the source's retention after every backup, and prune on its interval. | entry.sh:154-167, 371-379 |
 | Its unlock step runs plain restic unlock (--remove-all is commented out), which removes only stale locks. | entry.sh:173-174 |
 | The backup mover runs restic backup --host volsync --exclude='lost+found' . in /data, so every snapshot a mover writes has host volsync and the one path /data. restic.MoverLayout accepts exactly those as restore candidates. | entry.sh:62, 154-158; internal/restic/repository.go:201-219 in this repository |
-| A mover whose /data holds nothing but lost+found exits 0 without a backup, and VolSync reports the sync as successful. A backup that finds no snapshot in its sync's window on two listings a poll interval apart counts the claim as empty. | entry.sh:81-87 |
+| A mover whose /data holds nothing but lost+found exits 0 without a backup, and VolSync reports the sync as successful. A backup that finds no snapshot in its sync's window on two listings at least 11 seconds apart counts the claim as empty. | entry.sh:81-87 |
 
 ### restic
 
