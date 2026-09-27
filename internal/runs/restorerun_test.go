@@ -386,7 +386,9 @@ func oldInstance() (*corev1.Pod, *corev1.PersistentVolumeClaim) {
 			}},
 		}
 	}
-	return &corev1.Pod{ObjectMeta: meta()}, &corev1.PersistentVolumeClaim{ObjectMeta: meta()}
+	pod := &corev1.Pod{ObjectMeta: meta()}
+	pod.Labels[cnpg.PodRoleLabel] = cnpg.PodRoleInstance
+	return pod, &corev1.PersistentVolumeClaim{ObjectMeta: meta()}
 }
 
 // A Cluster's instance pod keeps running through its shutdown after the

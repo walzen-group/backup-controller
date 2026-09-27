@@ -45,6 +45,19 @@ const HealthyPhase = "Cluster in healthy state"
 // creates for a Cluster. Its value is the Cluster's name.
 const ClusterLabel = "cnpg.io/cluster"
 
+// PodRoleLabel and PodRoleInstance are the label and value that CloudNativePG
+// puts on each instance pod (CloudNativePG v1.30.0 pkg/specs/pods.go:548). A
+// Pooler pod carries ClusterLabel too, with PodRoleLabel set to pooler
+// (pkg/specs/pgbouncer/deployments.go:55-58). CloudNativePG itself selects the
+// instance pods of a Cluster by both labels
+// (internal/controller/cluster_restore.go:367-374), and it adds PodRoleLabel
+// to an older instance pod that has no such label
+// (pkg/reconciler/instance/metadata.go:241-244).
+const (
+	PodRoleLabel    = "cnpg.io/podRole"
+	PodRoleInstance = "instance"
+)
+
 // InstanceLeft looks for an instance pod or PVC of a Cluster that is still in
 // the namespace. A RestoreRun calls it after it deletes a Cluster. Until
 // nothing is left, the run waits with reason WaitingForShutdown, and it
@@ -56,6 +69,8 @@ const ClusterLabel = "cnpg.io/cluster"
 //     instance gone and let the app back onto the old Postgres.
 //   - namespace is the Cluster's namespace.
 //   - name is the Cluster's name, matched against the cnpg.io/cluster label.
+//     Pods must also carry cnpg.io/podRole=instance, so a Pooler pod does not
+//     count (see PodRoleLabel).
 //
 // It returns a description of the first one it finds, pods before PVCs, such
 // as "pod notes-pg-1" or "PVC notes-pg-1", and an empty string once none is
@@ -70,8 +85,9 @@ const ClusterLabel = "cnpg.io/cluster"
 // names.
 func InstanceLeft(ctx context.Context, c client.Reader, namespace, name string) (string, error) {
 	selector := client.MatchingLabels{ClusterLabel: name}
+	instances := client.MatchingLabels{ClusterLabel: name, PodRoleLabel: PodRoleInstance}
 	pods := &corev1.PodList{}
-	if err := c.List(ctx, pods, client.InNamespace(namespace), selector); err != nil {
+	if err := c.List(ctx, pods, client.InNamespace(namespace), instances); err != nil {
 		return "", fmt.Errorf("list the pods of Cluster %s/%s: %w", namespace, name, err)
 	}
 	for _, pod := range pods.Items {
