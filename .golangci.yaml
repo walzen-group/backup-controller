@@ -119,12 +119,15 @@ linters:
       - path: '^internal/bootstrap/survey\.go$'
         linters: [funlen, gocognit]
         source: '^func (\(p S3Prober\) Survey|readInfos)\('
+      - path: '^internal/bootstrap/collision\.go$'
+        linters: [funlen, gocognit]
+        source: '^func archiveHolder\('
+      - path: '^internal/bootstrap/recovery\.go$'
+        linters: [funlen, gocognit]
+        source: '^func setRecovery\('
       - path: '^internal/bootstrap/webhook\.go$'
         linters: [funlen, gocognit]
-        source: '^func (\(d \*Decider\) Handle|archiveHolder|setRecovery)\('
-      - path: '^internal/bootstrap/webhook\.go$'
-        linters: [revive]
-        text: '^file-length-limit:'
+        source: '^func \(d \*Decider\) Handle\('
       - path: '^internal/runs/backuprun\.go$'
         linters: [funlen, gocognit]
         source: '^func \(r \*BackupRunReconciler\) (items|admit|work|quiesce|startItem)\('
