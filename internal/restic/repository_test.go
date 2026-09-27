@@ -19,17 +19,6 @@ import (
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
 )
 
-// fixture is testdata/repo, a version 2 repository that restic 0.19.1 wrote
-// with the password "backup". It holds two snapshots of one file, made with
-// these commands:
-//
-//	restic init --repository-version 2
-//	restic backup --host volsync --time "2026-09-20 05:00:00" data
-//	restic backup --host volsync --time "2026-09-21 05:00:00" data
-//
-// restic snapshots listed them as 49319ee8 and 88dc3648.
-const fixture = DirStore("testdata/repo")
-
 // masterKeys caches the master key of each test repository, keyed by the
 // directory the repository's key files come from. Open derives the key from
 // the password with restic's scrypt parameters, which takes seconds under the
@@ -65,7 +54,8 @@ func openCached(t *testing.T, source string, store Store) *Repository {
 // TestAWrongPasswordOpensNothing checks that Open fails when no key file opens
 // with the password.
 func TestAWrongPasswordOpensNothing(t *testing.T) {
-	_, err := Open(context.Background(), fixture, "not-the-password")
+	repo := DirStore(filepath.Join(fixtures(t, "timed")[0].dir, "repo"))
+	_, err := Open(context.Background(), repo, "not-the-password")
 	if err == nil {
 		t.Fatal("a wrong password opened the repository")
 	}

@@ -6,59 +6,36 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io/fs"
 	"os"
 	"path"
-	"path/filepath"
 	"slices"
 	"testing"
 	"time"
 )
 
-// sundayID and mondayID are the full IDs of the fixture's two snapshots, taken
-// on Sunday 20 and Monday 21 September 2026.
-const (
-	sundayID = "49319ee865f4a00a86a35af5edf18730836cb27e770aba03ceca2de36a37be0f"
-	mondayID = "88dc3648f06c94f727f601cb69653191e7e79602d36965a8e7892388d7875b81"
-)
-
-// quiescedAt is a moment inside a quiesce window, three seconds before the time
-// restic stamped on the Monday snapshot.
+// quiescedAt is a moment inside a quiesce window. Retime takes any moment,
+// so the tests use one moment for every fixture.
 var quiescedAt = time.Date(2026, 9, 21, 4, 59, 57, 0, time.UTC)
 
-// writableFixture copies the fixture repository into a temporary directory that
-// the test may write to, opens it with the fixture's cached master key, and
-// turns off the lock protocol's pause for the test.
-func writableFixture(t *testing.T) (DirStore, *Repository) {
+// writableFixture copies the recorded timed repository of the first restic
+// version into a temporary directory that the test may write to, and opens it
+// with the master key the conformance tests derive for it.
+//
+// It returns the copy's store, the opened repository, and the full IDs of the
+// repository's snapshots as restic listed them. The tests retime the middle
+// one, as the recorder did.
+func writableFixture(t *testing.T) (DirStore, *Repository, []string) {
 	t.Helper()
-	dir := t.TempDir()
-	err := filepath.WalkDir(string(fixture), func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(string(fixture), p)
-		if d.IsDir() {
-			return os.MkdirAll(filepath.Join(dir, rel), 0o700)
-		}
-		raw, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(filepath.Join(dir, rel), raw, 0o600)
-	})
-	if err != nil {
-		t.Fatalf("copy the fixture: %v", err)
+	f := fixtures(t, "timed")[0]
+	store, repo := f.writable(t)
+	var ids []string
+	for _, s := range f.snapshots(t) {
+		ids = append(ids, s.ID)
 	}
-	// A fresh clone has no locks/, because git keeps no empty directory.
-	// Removing it here makes every run start the way a fresh clone does.
-	if err := os.RemoveAll(filepath.Join(dir, "locks")); err != nil {
-		t.Fatal(err)
+	if len(ids) != 3 {
+		t.Fatalf("%s holds %d snapshots, the tests need 3", f.name, len(ids))
 	}
-
-	store := DirStore(dir)
-	repo := openCached(t, string(fixture), store)
-	withoutLockWait(t)
-	return store, repo
+	return store, repo, ids
 }
 
 // withoutLockWait sets lockCheckDelay and unlockRetryDelay to zero for the
@@ -140,31 +117,31 @@ func lockFiles(t *testing.T, store DirStore) []string {
 // a quiesced backup's snapshot with a new snapshot file. The new file carries
 // the quiesce moment as its time, the quiesced tag, and the old ID in its
 // original field, as restic rewrite --forget --new-time would write it. The
-// other snapshot stays as it was, and no lock is left behind.
+// other snapshots stay as they were, and no lock is left behind.
 func TestRetimeReplacesTheSnapshotWithOneAtTheNewTime(t *testing.T) {
-	store, repo := writableFixture(t)
+	store, repo, ids := writableFixture(t)
 
-	got, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	got, err := repo.Retime(context.Background(), ids[1][:8], quiescedAt, QuiescedTag)
 	if err != nil {
 		t.Fatalf("retime: %v", err)
 	}
-	if got.ID == mondayID {
+	if got.ID == ids[1] {
 		t.Fatal("the snapshot kept its ID, so nothing was written")
 	}
-	if !got.Time.Equal(quiescedAt) || !slices.Contains(got.Tags, QuiescedTag) || got.Original != mondayID {
-		t.Errorf("retimed = %+v, want time %s, tag %q and original %s", got, quiescedAt, QuiescedTag, mondayID)
+	if !got.Time.Equal(quiescedAt) || !slices.Contains(got.Tags, QuiescedTag) || got.Original != ids[1] {
+		t.Errorf("retimed = %+v, want time %s, tag %q and original %s", got, quiescedAt, QuiescedTag, ids[1])
 	}
 
 	snapshots, err := repo.Snapshots(context.Background())
 	if err != nil {
 		t.Fatalf("snapshots: %v", err)
 	}
-	var ids []string
+	var after []string
 	for _, s := range snapshots {
-		ids = append(ids, s.ID)
+		after = append(after, s.ID)
 	}
-	if !slices.Equal(ids, []string{sundayID, got.ID}) {
-		t.Errorf("snapshots = %v, want sunday's untouched and monday's replaced by %s", ids, got.ID)
+	if want := []string{got.ID, ids[0], ids[2]}; !slices.Equal(after, want) {
+		t.Errorf("snapshots = %v, want the others untouched and the middle one replaced by %s", after, got.ID)
 	}
 	if left := lockFiles(t, store); len(left) != 0 {
 		t.Errorf("locks left behind: %v", left)
@@ -177,13 +154,13 @@ func TestRetimeReplacesTheSnapshotWithOneAtTheNewTime(t *testing.T) {
 // controller restarts after the rewrite and before it records the new ID
 // makes exactly that second call.
 func TestRetimeAgainReturnsTheFirstRewrite(t *testing.T) {
-	_, repo := writableFixture(t)
+	_, repo, ids := writableFixture(t)
 
-	first, err := repo.Retime(context.Background(), mondayID, quiescedAt, QuiescedTag)
+	first, err := repo.Retime(context.Background(), ids[1], quiescedAt, QuiescedTag)
 	if err != nil {
 		t.Fatalf("first retime: %v", err)
 	}
-	second, err := repo.Retime(context.Background(), mondayID, quiescedAt, QuiescedTag)
+	second, err := repo.Retime(context.Background(), ids[1], quiescedAt, QuiescedTag)
 	if err != nil {
 		t.Fatalf("second retime: %v", err)
 	}
@@ -194,8 +171,8 @@ func TestRetimeAgainReturnsTheFirstRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshots) != 2 {
-		t.Errorf("got %d snapshots after two retimes, want 2", len(snapshots))
+	if len(snapshots) != 3 {
+		t.Errorf("got %d snapshots after two retimes, want 3", len(snapshots))
 	}
 }
 
@@ -205,14 +182,14 @@ func TestRetimeAgainReturnsTheFirstRewrite(t *testing.T) {
 // stale ones, so a lock like that would stop every prune until someone ran
 // restic unlock.
 func TestRetimeRemovesALockThisProcessLeftBehind(t *testing.T) {
-	store, repo := writableFixture(t)
+	store, repo, ids := writableFixture(t)
 	host, err := os.Hostname()
 	if err != nil {
 		t.Fatal(err)
 	}
 	placeLock(t, store, repo, time.Now().Add(-time.Minute), true, host, os.Getpid())
 
-	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err != nil {
+	if _, err := repo.Retime(context.Background(), ids[1][:8], quiescedAt, QuiescedTag); err != nil {
 		t.Fatalf("retime past this process's own lock: %v", err)
 	}
 	if left := lockFiles(t, store); len(left) != 0 {
@@ -228,11 +205,11 @@ func TestRetimeRemovesALockThisProcessLeftBehind(t *testing.T) {
 // when spec.restic.unlock changes, so the lock would stop every prune. A stale
 // lock a mover left stays, because it isn't the controller's to remove.
 func TestRetimeRemovesAStaleLockAnEarlierControllerLeft(t *testing.T) {
-	store, repo := writableFixture(t)
+	store, repo, ids := writableFixture(t)
 	placeUserLock(t, store, repo, time.Now().Add(-31*time.Minute), true, "backup-controller-7c9f-old", 1, lockUser)
 	placeLock(t, store, repo, time.Now().Add(-31*time.Minute), false, moverHost, 12)
 
-	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err != nil {
+	if _, err := repo.Retime(context.Background(), ids[1][:8], quiescedAt, QuiescedTag); err != nil {
 		t.Fatalf("retime: %v", err)
 	}
 	left := lockFiles(t, store)
@@ -265,14 +242,14 @@ func (s *failFirstRemove) Remove(ctx context.Context, name string) error {
 // the old file and returns the copy it already wrote. Encryption uses a random
 // IV, so writing the copy again would add a second snapshot with another ID.
 func TestRetimeAfterAFailedRemoveWritesNoSecondCopy(t *testing.T) {
-	dir, _ := writableFixture(t)
-	store := &failFirstRemove{DirStore: dir, name: path.Join("snapshots", mondayID)}
-	repo := openCached(t, string(fixture), store)
+	dir, opened, ids := writableFixture(t)
+	store := &failFirstRemove{DirStore: dir, name: path.Join("snapshots", ids[1])}
+	repo := &Repository{store: store, master: opened.master}
 
-	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err == nil {
+	if _, err := repo.Retime(context.Background(), ids[1][:8], quiescedAt, QuiescedTag); err == nil {
 		t.Fatal("first retime succeeded, want the refused delete")
 	}
-	got, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	got, err := repo.Retime(context.Background(), ids[1][:8], quiescedAt, QuiescedTag)
 	if err != nil {
 		t.Fatalf("second retime: %v", err)
 	}
@@ -281,18 +258,18 @@ func TestRetimeAfterAFailedRemoveWritesNoSecondCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var ids []string
+	var after []string
 	for _, s := range snapshots {
-		ids = append(ids, s.ID)
+		after = append(after, s.ID)
 	}
-	if len(snapshots) != 2 {
-		t.Fatalf("snapshots after the retry = %v, want Sunday's and one copy of Monday's", ids)
+	if len(snapshots) != 3 {
+		t.Fatalf("snapshots after the retry = %v, want the two others and one copy of the middle one", after)
 	}
-	if slices.Contains(ids, mondayID) {
-		t.Errorf("the old Monday snapshot %s is still there", mondayID)
+	if slices.Contains(after, ids[1]) {
+		t.Errorf("the old snapshot %s is still there", ids[1])
 	}
-	if !slices.Contains(ids, got.ID) {
-		t.Errorf("the retry returned %s, which the repository doesn't hold: %v", got.ID, ids)
+	if !slices.Contains(after, got.ID) {
+		t.Errorf("the retry returned %s, which the repository doesn't hold: %v", got.ID, after)
 	}
 }
 
@@ -303,14 +280,14 @@ func TestRetimeAfterAFailedRemoveWritesNoSecondCopy(t *testing.T) {
 // copy stamped T.123456789 would miss the check that reuses it, and a second
 // copy would land in the repository.
 func TestRetimeStampsWholeSeconds(t *testing.T) {
-	dir, _ := writableFixture(t)
-	store := &failFirstRemove{DirStore: dir, name: path.Join("snapshots", mondayID)}
-	repo := openCached(t, string(fixture), store)
+	dir, opened, ids := writableFixture(t)
+	store := &failFirstRemove{DirStore: dir, name: path.Join("snapshots", ids[1])}
+	repo := &Repository{store: store, master: opened.master}
 
-	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt.Add(123456789), QuiescedTag); err == nil {
+	if _, err := repo.Retime(context.Background(), ids[1][:8], quiescedAt.Add(123456789), QuiescedTag); err == nil {
 		t.Fatal("first retime succeeded, want the refused delete")
 	}
-	got, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	got, err := repo.Retime(context.Background(), ids[1][:8], quiescedAt, QuiescedTag)
 	if err != nil {
 		t.Fatalf("second retime: %v", err)
 	}
@@ -321,7 +298,7 @@ func TestRetimeStampsWholeSeconds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshots) != 2 {
-		t.Errorf("got %d snapshots after the retry, want Sunday's and one copy of Monday's", len(snapshots))
+	if len(snapshots) != 3 {
+		t.Errorf("got %d snapshots after the retry, want the two others and one copy of the middle one", len(snapshots))
 	}
 }
