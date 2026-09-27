@@ -24,6 +24,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // Store reads and writes the files of one repository. In the cluster it's an
@@ -156,6 +158,13 @@ func (r *Repository) Snapshots(ctx context.Context) ([]Snapshot, error) {
 // snapshots/, and returns them sorted by time with the oldest first, and by ID
 // among documents with the same time. It skips files whose names aren't
 // storage IDs.
+//
+// It skips, with a log entry, a file that it reads but cannot decrypt,
+// unpack or decode. restic snapshots does the same: it warns "Ignoring" and
+// goes on (restic v0.18.1 cmd/restic/find.go:51-55). It returns an error when
+// the listing fails or when a listed file cannot be read, such as a file
+// that a concurrent restic forget deleted after the listing. The caller then
+// tries again.
 func (r *Repository) snapshotFiles(ctx context.Context) ([]snapshotFile, error) {
 	names, err := r.store.List(ctx, "snapshots")
 	if err != nil {
@@ -167,13 +176,14 @@ func (r *Repository) snapshotFiles(ctx context.Context) ([]snapshotFile, error) 
 		if !isID(name) {
 			continue
 		}
-		document, err := r.load(ctx, path.Join("snapshots", name))
+		sealed, err := r.store.Get(ctx, path.Join("snapshots", name))
 		if err != nil {
 			return nil, fmt.Errorf("snapshot %s: %w", name, err)
 		}
-		f, err := parseSnapshot(name, document)
+		f, err := r.openSnapshot(name, sealed)
 		if err != nil {
-			return nil, fmt.Errorf("decode snapshot %s: %w", name, err)
+			log.FromContext(ctx).Info("Ignoring an unreadable snapshot file, as restic snapshots does", "snapshot", name, "error", err.Error())
+			continue
 		}
 		files = append(files, f)
 	}
@@ -248,6 +258,29 @@ func parseSnapshot(id string, document []byte) (snapshotFile, error) {
 		snapshot: Snapshot{ID: id, Time: doc.Time, Hostname: doc.Hostname, Paths: doc.Paths, Tags: doc.Tags, Original: doc.Original},
 		fields:   fields,
 	}, nil
+}
+
+// openSnapshot decrypts, unpacks and decodes one snapshot file.
+//
+// Parameters:
+//   - name is the file name under snapshots/, the ID of the snapshot.
+//   - sealed is the file as the store holds it.
+//
+// It returns an error, which names the step, when a step fails.
+func (r *Repository) openSnapshot(name string, sealed []byte) (snapshotFile, error) {
+	plain, err := r.master.decrypt(sealed)
+	if err != nil {
+		return snapshotFile{}, fmt.Errorf("decrypt: %w", err)
+	}
+	document, err := unpack(plain)
+	if err != nil {
+		return snapshotFile{}, err
+	}
+	f, err := parseSnapshot(name, document)
+	if err != nil {
+		return snapshotFile{}, fmt.Errorf("decode: %w", err)
+	}
+	return f, nil
 }
 
 // load reads one file of the repository, decrypts it with the master key, and
