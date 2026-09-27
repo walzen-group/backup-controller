@@ -67,6 +67,13 @@ var grants = []grant{
 	{"events.k8s.io", "events", []string{"create", "patch"}, "an event on a run each time its Ready reason changes"},
 	{"", "pods", []string{"list"}, "a RestoreRun: the pods of a mover it stopped, which it waits for before it gives the app back"},
 	{"batch", "jobs", []string{"get"}, "a RestoreRun and the orphan reconciler: the Job of a mover they stopped, which they wait for"},
+	// The restore Job (internal/restorejob): the controller creates it, reads
+	// it by name through the uncached reader, suspends it with a merge patch
+	// and deletes it with Foreground propagation (api.go). A RestoreRun lists
+	// its own restore Jobs by label for the exclusion check (restic-jobs step
+	// 7c). Stop lists the Job's pods by their controller-uid label.
+	{"batch", "jobs", []string{"get", "list", "create", "patch", "delete"}, "the restore Job a RestoreRun or the populator runs restic in, and the exclusion check over restore Jobs"},
+	{"", "pods", []string{"list"}, "restorejob.Stop: the pods of a restore Job, listed by controller-uid, which it waits for"},
 
 	{"", "namespaces", []string{"get", "list", "watch"}, "the scheduler reads each namespace's backup.wlz.li/schedule"},
 	{"postgresql.cnpg.io", "clusters", []string{"get", "list", "delete"}, "a database run reads its Cluster, and a restore deletes it"},
