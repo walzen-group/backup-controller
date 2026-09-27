@@ -194,6 +194,15 @@ func podsThatMayWrite(ctx context.Context, api API, ref Ref) ([]string, error) {
 // the pods (kubernetes v1.36.3 pkg/controller/job/job_controller.go:1137-1190),
 // so a pod list in the same pass could miss a new pod. Only a later read that
 // shows the suspend and the condition together lets the gate go on.
+//
+// That narrows the gap after a resume by someone other than the controller
+// without closing it. When Stop's patch lands between the Job controller's
+// pod create and its JobResumed write, that write conflicts, and the Job
+// keeps the old Suspended=True beside spec.suspend true. A later read then
+// passes, and the pod list sees every pod created before the patch. A pod
+// the Job controller creates from a cache that still shows the Job resumed
+// can come after that list, within the Job controller's cache lag. The
+// declared setup has no one who resumes the controller's Jobs.
 func suspend(ctx context.Context, api API, job *batchv1.Job) (bool, error) {
 	if !ptr.Deref(job.Spec.Suspend, false) {
 		if err := api.SuspendJob(ctx, job); err != nil {

@@ -97,9 +97,10 @@ func TestEveryItemReasonIsAnAPIConstant(t *testing.T) {
 // its fixture: an untyped string passed to refuse, to another function
 // with a reason parameter, or assigned, a conversion, a parameter or
 // variable, a constant of another type, an operator assignment, a var
-// declaration and struct literals with and without keys. A listed value in a listed declaration is let through, a
-// literal beside it in the same declaration is still reported, and a
-// listed value that matches nothing is reported.
+// declaration and struct literals with and without keys. A listed value
+// in a listed declaration is let through, a literal beside it in the same
+// declaration is still reported, and a listed value that matches nothing
+// is reported.
 func TestTheReasonRuleCatchesEveryShape(t *testing.T) {
 	findings := scanReasonRule(t, "./testdata/reasonrule")
 	left, unused := applyReasonList(findings, []reasonRuleEntry{
