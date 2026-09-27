@@ -125,9 +125,6 @@ linters:
       - path: '^internal/bootstrap/webhook\.go$'
         linters: [revive]
         text: '^file-length-limit:'
-      - path: '^internal/restic/retime\.go$'
-        linters: [funlen, gocognit]
-        source: '^func \(r \*Repository\) (retime|checkLocks)\('
       - path: '^internal/runs/backuprun\.go$'
         linters: [funlen, gocognit]
         source: '^func \(r \*BackupRunReconciler\) (items|admit|work|quiesce|startItem)\('

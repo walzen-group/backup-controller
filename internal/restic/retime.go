@@ -158,58 +158,20 @@ func (r *Repository) retime(ctx context.Context, id string, at time.Time, tag st
 	if err != nil {
 		return Snapshot{}, err
 	}
-
-	var old *snapshotFile
-	for i := range files {
-		if strings.HasPrefix(files[i].snapshot.ID, id) {
-			old = &files[i]
-			break
-		}
-	}
+	old := snapshotWithID(files, id)
 	if old == nil {
-		for _, f := range files {
-			if strings.HasPrefix(f.snapshot.Original, id) && slices.Contains(f.snapshot.Tags, tag) {
-				return f.snapshot, nil
-			}
+		if written, ok := retimedCopy(files, id, tag); ok {
+			return written, nil
 		}
 		return Snapshot{}, fmt.Errorf("the repository holds no snapshot %s", id)
 	}
-
-	origin := old.snapshot.Original
-	if origin == "" {
-		origin = old.snapshot.ID
-	}
-	for _, f := range files {
-		s := f.snapshot
-		if s.ID != old.snapshot.ID && s.Original == origin && s.Time.Unix() == at.Unix() && slices.Contains(s.Tags, tag) {
-			if err := r.store.Remove(ctx, path.Join("snapshots", old.snapshot.ID)); err != nil {
-				return Snapshot{}, fmt.Errorf("remove snapshot %s, already written as %s: %w", old.snapshot.ID, s.ID, err)
-			}
-			return s, nil
+	if written, ok := earlierCopy(files, old.snapshot, at, tag); ok {
+		if err := r.store.Remove(ctx, path.Join("snapshots", old.snapshot.ID)); err != nil {
+			return Snapshot{}, fmt.Errorf("remove snapshot %s, already written as %s: %w", old.snapshot.ID, written.ID, err)
 		}
+		return written, nil
 	}
-
-	fields := make(map[string]json.RawMessage, len(old.fields)+2)
-	for k, v := range old.fields {
-		fields[k] = v
-	}
-	if fields["time"], err = json.Marshal(at); err != nil {
-		return Snapshot{}, err
-	}
-	tags := old.snapshot.Tags
-	if !slices.Contains(tags, tag) {
-		tags = append(slices.Clone(tags), tag)
-	}
-	if fields["tags"], err = json.Marshal(tags); err != nil {
-		return Snapshot{}, err
-	}
-	if old.snapshot.Original == "" {
-		if fields["original"], err = json.Marshal(old.snapshot.ID); err != nil {
-			return Snapshot{}, err
-		}
-	}
-
-	document, err := json.Marshal(fields)
+	document, err := retimedDocument(old, at, tag)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -225,6 +187,96 @@ func (r *Repository) retime(ctx context.Context, id string, at time.Time, tag st
 		return Snapshot{}, err
 	}
 	return written.snapshot, nil
+}
+
+// snapshotWithID returns the first snapshot file whose ID starts with id, or
+// nil when no snapshot ID starts with it.
+func snapshotWithID(files []snapshotFile, id string) *snapshotFile {
+	for i := range files {
+		if strings.HasPrefix(files[i].snapshot.ID, id) {
+			return &files[i]
+		}
+	}
+	return nil
+}
+
+// retimedCopy finds a copy that an earlier retime wrote and whose old
+// snapshot is gone.
+//
+// Parameters:
+//   - id is the old snapshot's ID, or its start, as Retime got it.
+//   - tag is the tag that the copy carries.
+//
+// It returns the first snapshot whose original field starts with id and that
+// carries tag, and true. It returns false when no snapshot is such a copy.
+func retimedCopy(files []snapshotFile, id, tag string) (Snapshot, bool) {
+	for _, f := range files {
+		if strings.HasPrefix(f.snapshot.Original, id) && slices.Contains(f.snapshot.Tags, tag) {
+			return f.snapshot, true
+		}
+	}
+	return Snapshot{}, false
+}
+
+// earlierCopy finds a copy of old that an earlier retime wrote but did not
+// remove old after.
+//
+// Parameters:
+//   - old is the snapshot that retime rewrites.
+//   - at is the time that the copy carries.
+//   - tag is the tag that the copy carries.
+//
+// It returns the copy and true, or false when the repository holds no such
+// copy. A copy has another ID, the same origin as old, the time at to the
+// second, and the tag.
+func earlierCopy(files []snapshotFile, old Snapshot, at time.Time, tag string) (Snapshot, bool) {
+	origin := old.Original
+	if origin == "" {
+		origin = old.ID
+	}
+	for _, f := range files {
+		s := f.snapshot
+		if s.ID != old.ID && s.Original == origin && s.Time.Unix() == at.Unix() && slices.Contains(s.Tags, tag) {
+			return s, true
+		}
+	}
+	return Snapshot{}, false
+}
+
+// retimedDocument makes the snapshot document of the copy that retime writes.
+//
+// Parameters:
+//   - old is the snapshot file that retime rewrites.
+//   - at is the time that the copy carries.
+//   - tag is the tag that the copy carries.
+//
+// It returns the JSON document, or an error when a field does not encode.
+//
+// It copies every field of old, sets the time field to at, and adds tag to
+// the tags when it is not there yet. It records the ID of old in the original
+// field, unless old already has an original field.
+func retimedDocument(old *snapshotFile, at time.Time, tag string) ([]byte, error) {
+	fields := make(map[string]json.RawMessage, len(old.fields)+2)
+	for k, v := range old.fields {
+		fields[k] = v
+	}
+	var err error
+	if fields["time"], err = json.Marshal(at); err != nil {
+		return nil, err
+	}
+	tags := old.snapshot.Tags
+	if !slices.Contains(tags, tag) {
+		tags = append(slices.Clone(tags), tag)
+	}
+	if fields["tags"], err = json.Marshal(tags); err != nil {
+		return nil, err
+	}
+	if old.snapshot.Original == "" {
+		if fields["original"], err = json.Marshal(old.snapshot.ID); err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(fields)
 }
 
 // lockExclusive takes restic's exclusive lock on the repository, with the same
@@ -315,27 +367,55 @@ func (r *Repository) checkLocks(ctx context.Context, own, host string, pid int) 
 		if !isID(name) || name == own {
 			continue
 		}
-		document, err := r.load(ctx, path.Join("locks", name))
+		lock, err := r.readLock(ctx, name)
 		if err != nil {
-			return fmt.Errorf("lock %s: %w", name, err)
+			return err
 		}
-		var lock lockJSON
-		if err := json.Unmarshal(document, &lock); err != nil {
-			return fmt.Errorf("decode lock %s: %w", name, err)
+		if err := r.checkLock(ctx, name, lock, host, pid); err != nil {
+			return err
 		}
-		switch {
-		case lock.Hostname == host && lock.PID == pid:
-			if err := r.store.Remove(ctx, path.Join("locks", name)); err != nil {
-				return fmt.Errorf("remove the controller's earlier lock %s: %w", name, err)
-			}
-		case lock.Username == lockUser && time.Since(lock.Time) > staleLockAge:
-			if err := r.store.Remove(ctx, path.Join("locks", name)); err != nil {
-				return fmt.Errorf("remove the stale controller lock %s from %s: %w", name, lock.Hostname, err)
-			}
-		case time.Since(lock.Time) > staleLockAge:
-		default:
-			return &LockedError{Hostname: lock.Hostname, Time: lock.Time, Exclusive: lock.Exclusive}
+	}
+	return nil
+}
+
+// readLock reads and decodes the lock file with the given name under locks/.
+// It returns an error that names the lock when the read or the decode fails.
+func (r *Repository) readLock(ctx context.Context, name string) (lockJSON, error) {
+	document, err := r.load(ctx, path.Join("locks", name))
+	if err != nil {
+		return lockJSON{}, fmt.Errorf("lock %s: %w", name, err)
+	}
+	var lock lockJSON
+	if err := json.Unmarshal(document, &lock); err != nil {
+		return lockJSON{}, fmt.Errorf("decode lock %s: %w", name, err)
+	}
+	return lock, nil
+}
+
+// checkLock is checkLocks for one lock file.
+//
+// Parameters:
+//   - name is the name of the lock file under locks/.
+//   - lock is the content of that file.
+//   - host and pid are this process's hostname and process ID, as checkLocks
+//     got them.
+//
+// It removes a lock that this process left behind and a stale lock that
+// carries lockUser. It skips any other stale lock. It returns a *LockedError
+// for a lock that blocks an exclusive lock, and an error when a removal fails.
+func (r *Repository) checkLock(ctx context.Context, name string, lock lockJSON, host string, pid int) error {
+	switch {
+	case lock.Hostname == host && lock.PID == pid:
+		if err := r.store.Remove(ctx, path.Join("locks", name)); err != nil {
+			return fmt.Errorf("remove the controller's earlier lock %s: %w", name, err)
 		}
+	case lock.Username == lockUser && time.Since(lock.Time) > staleLockAge:
+		if err := r.store.Remove(ctx, path.Join("locks", name)); err != nil {
+			return fmt.Errorf("remove the stale controller lock %s from %s: %w", name, lock.Hostname, err)
+		}
+	case time.Since(lock.Time) > staleLockAge:
+	default:
+		return &LockedError{Hostname: lock.Hostname, Time: lock.Time, Exclusive: lock.Exclusive}
 	}
 	return nil
 }
