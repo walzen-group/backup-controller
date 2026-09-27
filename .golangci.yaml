@@ -159,9 +159,6 @@ linters:
         linters: [revive]
         text: '^argument-limit:'
         source: '^func acquireLeases\('
-      - path: '^internal/runs/moverpick\.go$'
-        linters: [funlen, gocognit]
-        source: '^func unpinnable\('
       - path: '^internal/runs/quiesce\.go$'
         linters: [funlen, gocognit]
         source: '^func (planStop|restartWorkloads)\('

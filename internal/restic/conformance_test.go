@@ -230,57 +230,6 @@ func TestAtOrBeforePicksWhatTheMoverPicks(t *testing.T) {
 	}
 }
 
-// TestPinningASnapshotsSecondMakesTheMoverRestoreIt checks the assumption a
-// RestoreRun makes when it hands the mover a snapshot's whole-second time as
-// restoreAsOf: that the mover then restores that snapshot whenever MoverPick
-// says it does. For each snapshot of each recorded repository, the recorded
-// entry.sh run with RESTORE_AS_OF at the snapshot's second must have selected
-// the snapshot MoverPick picks for that second, and at least one recorded
-// repository must hold a snapshot the mover can't be pinned to that way.
-//
-// The mover maps each second to the last snapshot listed in it, so a
-// snapshot followed by another in the same second can't be reached through
-// its second (finding R5). MoverPick names the later one, and a RestoreRun's
-// checks refuse the earlier one.
-func TestPinningASnapshotsSecondMakesTheMoverRestoreIt(t *testing.T) {
-	shadowed := 0
-	for _, kind := range []string{"timed", "same-second"} {
-		for _, f := range fixtures(t, kind) {
-			t.Run(f.name, func(t *testing.T) {
-				snapshots, err := f.open(t).Snapshots(context.Background())
-				if err != nil {
-					t.Fatal(err)
-				}
-				var rows []selectionRow
-				f.readJSON(t, "selection.json", &rows)
-				selected := map[string]string{}
-				for _, row := range rows {
-					if row.SelectPrevious == 0 {
-						selected[row.RestoreAsOf] = row.Selected
-					}
-				}
-				for _, s := range snapshots {
-					pin := s.Time.UTC().Truncate(time.Second)
-					got, ok := selected[pin.Format(time.RFC3339)]
-					if !ok {
-						t.Fatalf("no recorded restore at %s", pin.Format(time.RFC3339))
-					}
-					picked, ok := MoverPick(snapshots, pin)
-					if !ok || picked.ShortID() != got {
-						t.Errorf("RESTORE_AS_OF %s restored %q; MoverPick picks %q (%v)", pin.Format(time.RFC3339), got, picked.ShortID(), ok)
-					}
-					if got != s.ShortID() {
-						shadowed++
-					}
-				}
-			})
-		}
-	}
-	if shadowed == 0 {
-		t.Error("no recorded snapshot is shadowed by a later one in its second; the same-second fixture should hold one")
-	}
-}
-
 // TestRetimeWritesWhatResticRewriteWrites checks that Retime makes the same
 // change to a snapshot that restic makes with rewrite --forget --new-time
 // followed by tag --add: the recorder ran both on the middle snapshot of the

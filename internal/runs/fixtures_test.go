@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
+	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -439,4 +441,86 @@ func ownCRDObjects(t *testing.T, files []string) []client.Object {
 // and is padded with zeros, the form a restore Job restores by.
 func fullID(short string) string {
 	return short + strings.Repeat("0", 64-len(short))
+}
+
+// recordedSnapshots caches the snapshot lists read from the recorded
+// repositories, keyed by directory, so each repository's key is derived once.
+var recordedSnapshots sync.Map
+
+// recordedRepository returns the snapshots of one repository that
+// hack/fixtures/restic.sh recorded with the restic version VolSync's mover
+// ships, read through the restic package as the controller reads a real
+// repository.
+//
+// Parameters:
+//   - kind names the fixture, such as same-second.
+//
+// It fails the test when the repository can't be opened or listed.
+func recordedRepository(t *testing.T, kind string) snapshots {
+	t.Helper()
+	dir := filepath.Join("..", "restic", "testdata", "recorded", "restic-"+versions.Of(t, "restic-mover"), kind, "repo")
+	if list, ok := recordedSnapshots.Load(dir); ok {
+		return list.(snapshots)
+	}
+	repo, err := restic.Open(context.Background(), restic.DirStore(dir), "backup")
+	if err != nil {
+		t.Fatalf("open %s: %v", dir, err)
+	}
+	list, err := repo.Snapshots(context.Background())
+	if err != nil {
+		t.Fatalf("list %s: %v", dir, err)
+	}
+	recordedSnapshots.Store(dir, snapshots(list))
+	return list
+}
+
+// moverSnapshot returns a snapshot the way a VolSync mover writes one: host
+// volsync and the one path /data, at the given time, with the given tags.
+func moverSnapshot(short string, at time.Time, tags ...string) restic.Snapshot {
+	return restic.Snapshot{ID: fullID(short), Time: at, Hostname: "volsync", Paths: []string{"/data"}, Tags: tags}
+}
+
+// expectRefused checks that the run back-to-monday ended at its checks as
+// Failed with reason NoBackupInReach, that the item's message holds every
+// string in want, and that the run created no mover and no claim named
+// scratch.
+func expectRefused(t *testing.T, r *RestoreRunReconciler, want ...string) {
+	t.Helper()
+	c := r.Client
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonNoBackupInReach {
+		t.Fatalf("phase = %q, reason = %q (%s); want Failed, NoBackupInReach", run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
+	}
+	message := readyMessage(run.Status.Conditions)
+	if len(run.Status.Items) > 0 {
+		message = run.Status.Items[0].Message
+	}
+	for _, w := range want {
+		if !strings.Contains(message, w) {
+			t.Errorf("message = %q, want it to hold %q", message, w)
+		}
+	}
+	if names := movers(t, c); len(names) != 0 {
+		t.Errorf("movers = %v, want none", names)
+	}
+	scratch := &corev1.PersistentVolumeClaim{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "scratch"}, scratch); !apierrors.IsNotFound(err) {
+		t.Errorf("claim scratch: %v, want it never created", err)
+	}
+}
+
+// loseFailedRunWrite returns a client over c that fails, with a conflict,
+// the first status write that ends a RestoreRun Failed: finish's write,
+// which comes after it stopped the run's restore Jobs.
+func loseFailedRunWrite(c client.Client) client.Client {
+	lost := false
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if run, ok := obj.(*backupv1alpha1.RestoreRun); ok && !lost && run.Status.Phase == backupv1alpha1.RunPhaseFailed {
+				lost = true
+				return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("restoreruns").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
 }

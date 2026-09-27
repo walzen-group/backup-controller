@@ -10,6 +10,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // inPlace is a mutate function for restoreRun that makes it an in-place
@@ -114,7 +115,7 @@ func TestAnInPlaceRestoreIntoItsOwnClaimSucceeds(t *testing.T) {
 // which a large repository outgrows. A restore from a repository alone has
 // no VolumeRestore to copy from, and its Job's cache keeps the default size
 // and no class.
-func TestARestoreDestinationGetsTheCacheCapacity(t *testing.T) {
+func TestARestoreJobGetsTheCacheCapacity(t *testing.T) {
 	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			vr := volumeRestore()
@@ -167,4 +168,18 @@ func expectJobCache(t *testing.T, job *batchv1.Job, capacity resource.Quantity) 
 	if got := job.Spec.Template.Labels["kueue.x-k8s.io/queue-name"]; got != "backups" || job.Labels["kueue.x-k8s.io/queue-name"] != "" {
 		t.Errorf("pod queue label = %q, Job labels = %v; want backups on the pod only", got, job.Labels)
 	}
+}
+
+// startedRestore returns a reconciler whose run of the given shape selected
+// monday and created its restore Job, and the client.
+func startedRestore(t *testing.T, mutate func(*backupv1alpha1.RestoreRun)) (*RestoreRunReconciler, client.Client) {
+	t.Helper()
+	r, c := restoreReconciler(t, nil, restoreRun(mutate), claim(), volumeRestore(), repository())
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // create
+	item := readRestoreRun(t, c).Status.Items[0]
+	if item.Phase != backupv1alpha1.ItemRunning || item.Snapshot != monday.ShortID() {
+		t.Fatalf("item = %+v; want Running on monday's snapshot", item)
+	}
+	return r, c
 }

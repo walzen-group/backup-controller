@@ -688,19 +688,16 @@ func (r *RestoreRunReconciler) volumeBackedUp(ctx context.Context, run *backupv1
 // resolves the same way on every pass and previous reaches each snapshot of
 // it.
 //
-// Every restore restores the selected snapshot by its full ID. An into
-// restore still refuses, with unpinnable, a snapshot that VolSync's mover
-// pinned to its time in whole seconds would not restore, which refuses more
-// than the restore Job needs.
+// Every restore restores the selected snapshot by its full ID, so two
+// snapshots in one second, or with the same time, are each restored as
+// selected.
 //
 // It returns a reason, and no error, when the Secret doesn't exist, when no
 // snapshot is a candidate (naming the snapshots it passed over, see
-// noCandidate), when none is at or before the moment, when spec.previous
-// reaches past the oldest candidate, and, for an into restore, when the
-// mover pinned to the selected snapshot's second would restore another
-// snapshot, or one the run can't predict. It returns an error when the
-// Secret can't be read for another reason and when listing the repository
-// fails.
+// noCandidate), when none is at or before the moment, and when
+// spec.previous reaches past the oldest candidate. It returns an error when
+// the Secret can't be read for another reason and when listing the
+// repository fails.
 func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
 	all, reason, err := r.listRepository(ctx, run, secretName)
 	if reason != "" || err != nil {
@@ -726,11 +723,6 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 		index -= int(*run.Spec.Previous)
 		if index < 0 {
 			return restic.Snapshot{}, fmt.Sprintf("previous %d reaches past the oldest snapshot", *run.Spec.Previous), nil
-		}
-	}
-	if run.Spec.Into != "" {
-		if why := unpinnable(all, snapshots[index], quiescedOnly); why != "" {
-			return restic.Snapshot{}, why, nil
 		}
 	}
 	return snapshots[index], "", nil
@@ -838,7 +830,7 @@ func (r *RestoreRunReconciler) repositorySnapshots(ctx context.Context, run *bac
 // fails.
 //
 // It turns the typed refusal of repositorySnapshots back into a string,
-// which selectSnapshot and recheckSnapshot still return as their reason.
+// which selectSnapshot still returns as its reason.
 func (r *RestoreRunReconciler) listRepository(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string) ([]restic.Snapshot, string, error) {
 	snapshots, err := r.repositorySnapshots(ctx, run, secretName)
 	var refused *refusalError
@@ -846,41 +838,6 @@ func (r *RestoreRunReconciler) listRepository(ctx context.Context, run *backupv1
 		return nil, refused.Error(), nil
 	}
 	return snapshots, "", err
-}
-
-// recheckSnapshot lists the repository again right before an into restore
-// creates the ReplicationDestination whose mover restores item, and returns
-// why that mover would not restore the snapshot the checks recorded, or ""
-// when it would. An in-place restore rechecks its full ID instead (see
-// recheckJobSnapshot).
-//
-// Parameters:
-//   - item is the volume item. item.Snapshot is the short ID the checks
-//     recorded, and item.SnapshotTime the time the object pins the mover to.
-//     An item without either gets a reason (see changedSince), so no mover
-//     is ever left to choose a snapshot by itself.
-//   - secretName names the repository Secret in the run's namespace.
-//
-// Time passes between the checks and the create: a pod may hold the claim,
-// or a backup may run first. In that time a backup's restic forget may
-// remove the snapshot, a quiesced BackupRun may retime it under another ID
-// and time, or another snapshot may join it in its second. The reason says
-// which (see changedSince), and names no claim; the caller adds what was left
-// untouched. A Secret that is gone is a reason too.
-//
-// It returns an error, and leaves the item as it was, when the Secret can't
-// be read for another reason or listing the repository fails; the caller
-// retries.
-func (r *RestoreRunReconciler) recheckSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, secretName string) (string, error) { //nolint:unused // deleted in restic-jobs step 7b
-	snapshots, reason, err := r.listRepository(ctx, run, secretName)
-	if reason != "" || err != nil {
-		return reason, err
-	}
-	// Only an in-place synced run picks among quiesced snapshots; the advice
-	// in the reason keeps to them then.
-	quiescedOnly := run.Spec.SyncDatabaseToVolume && run.Spec.Into == ""
-	_, why := changedSince(snapshots, *item, quiescedOnly)
-	return why, nil
 }
 
 // nothingWritten returns the end of the message of a restore that failed

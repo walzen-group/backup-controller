@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -526,4 +527,60 @@ func refuseLeaseDeletes(c client.Client) client.Client {
 			return cl.Delete(ctx, obj, opts...)
 		},
 	})
+}
+
+// Two snapshots in one second restore by their full IDs, in place and into
+// a new claim of either shape: with restoreAsOf at their second, previous 0
+// records the later snapshot and previous 1 the earlier one, and the
+// restore Job each run creates restores exactly the ID its item records.
+// The first repository is the recorded same-second one, whose two snapshots
+// differ in the nanoseconds; the second holds two snapshots with the same
+// time to the nanosecond, which the lister orders by ID. Before, an into
+// restore refused every one of them but the recorded later snapshot, since
+// VolSync's mover pinned to their second could restore another.
+func TestTwoSnapshotsInOneSecondRestoreByID(t *testing.T) {
+	twin := time.Date(2026, 9, 25, 21, 22, 16, 500e6, time.UTC)
+	repositories := []struct {
+		name  string
+		list  func(t *testing.T) snapshots
+		wants []string
+	}{
+		{"recorded", func(t *testing.T) snapshots { return recordedRepository(t, "same-second") }, []string{"2d35d9a8", "763f53b1"}},
+		{"twins", func(*testing.T) snapshots {
+			return snapshots{sunday, moverSnapshot("aaaaaaaa", twin), moverSnapshot("bbbbbbbb", twin)}
+		}, []string{"bbbbbbbb", "aaaaaaaa"}},
+	}
+	shapes := append([]struct {
+		name   string
+		mutate func(*backupv1alpha1.RestoreRun)
+		into   string
+	}{{"in place", inPlace, claimN}}, intoShapesOnJob...)
+	for _, repo := range repositories {
+		for _, shape := range shapes {
+			for previous, want := range repo.wants {
+				t.Run(fmt.Sprintf("%s/%s/previous %d", repo.name, shape.name, previous), func(t *testing.T) {
+					back := int32(previous)
+					r, c := restoreReconciler(t, nil, restoreRun(shape.mutate, asOf("2026-09-25T21:22:16Z"),
+						func(r *backupv1alpha1.RestoreRun) { r.Spec.Previous = &back }), sourceOnNode(), volumeRestore(), repository())
+					r.Snapshots = repo.list(t)
+					restoreStep(t, r) // plan
+					restoreStep(t, r) // create the restore Job
+
+					run := readRestoreRun(t, c)
+					if len(run.Status.Items) == 0 {
+						t.Fatalf("phase = %q with no items (%s); want Running on %s", run.Status.Phase, readyMessage(run.Status.Conditions), want)
+					}
+					item := run.Status.Items[0]
+					if item.Phase != backupv1alpha1.ItemRunning || !strings.HasPrefix(item.SnapshotID, want) {
+						t.Fatalf("item = %+v (%s); want Running on %s", item, readyMessage(run.Status.Conditions), want)
+					}
+					job := itemJob(t, c)
+					if job.Annotations[restorejob.AnnotationSnapshotID] != item.SnapshotID || jobClaim(job) != shape.into {
+						t.Errorf("restore Job restores %s into %s, want %s into %s",
+							job.Annotations[restorejob.AnnotationSnapshotID], jobClaim(job), item.SnapshotID, shape.into)
+					}
+				})
+			}
+		}
+	}
 }

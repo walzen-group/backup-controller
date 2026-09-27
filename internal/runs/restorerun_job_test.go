@@ -502,3 +502,23 @@ func TestTheNoMoverSnapshotMessageNamesTheFiveNewest(t *testing.T) {
 		t.Errorf("message = %q, want the two oldest snapshots left out", message)
 	}
 }
+
+// A synced in-place restore takes a quiesced snapshot even when an untagged
+// one was taken later in the same second. Its restore Job restores the
+// quiesced snapshot by its full ID, so the untagged one can't take its
+// place, as it could when VolSync's mover picked by the second.
+func TestASyncedRestoreRestoresAQuiescedSnapshotAnUntaggedOneShares(t *testing.T) {
+	quiesced := moverSnapshot("c0ffee00", time.Date(2026, 9, 21, 3, 0, 5, 200e6, time.UTC), restic.QuiescedTag)
+	untagged := moverSnapshot("7a11ce00", time.Date(2026, 9, 21, 3, 0, 5, 800e6, time.UTC))
+	r, c := restoreReconciler(t, prober{saturday},
+		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true }),
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
+	r.Snapshots = snapshots{moverSnapshot("2edf5bab", sunday.Time), quiesced, untagged}
+
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // restore the volume
+
+	if got := itemJob(t, c).Annotations[restorejob.AnnotationSnapshotID]; got != quiesced.ID {
+		t.Errorf("restore Job snapshot = %s, want the quiesced %s", got, quiesced.ID)
+	}
+}
