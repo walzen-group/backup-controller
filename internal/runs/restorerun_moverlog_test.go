@@ -9,17 +9,17 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// The tests in this file check that a RestoreRun reports a volume restored
-// only when the mover's log names the snapshot the checks recorded
+// The tests in this file check that an into restore reports a volume
+// restored only when the mover's log names the snapshot the checks recorded
 // (designs/restorerun.md C5). VolSync marks the run's trigger complete
-// whatever the mover restored, including nothing at all.
+// whatever the mover restored, including nothing at all. An in-place restore
+// reads its own restore Job's result instead.
 
 // recordedRestoreLog and recordedNoEligibleLog are the status.latestMoverStatus.logs
 // VolSync 0.16.0 wrote on two ReplicationDestinations built like
@@ -127,7 +127,7 @@ func TestTheRecordedMoverLogsSayWhatTheMoverRestored(t *testing.T) {
 // A restore whose mover's log names the snapshot the checks recorded
 // succeeds.
 func TestARestoreConfirmsTheSnapshotFromTheMoversLog(t *testing.T) {
-	for _, shape := range restoreShapes {
+	for _, shape := range intoShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			r, c := startedRestore(t, shape.mutate)
 			finishMover(t, c, restoreLogFor(monday.ShortID()))
@@ -146,7 +146,7 @@ func TestARestoreConfirmsTheSnapshotFromTheMoversLog(t *testing.T) {
 // snapshots found", restores nothing and exits 0, and VolSync completes the
 // trigger. The item fails and says what the claim holds.
 func TestARestoreThatRestoredNothingFails(t *testing.T) {
-	for _, shape := range restoreShapes {
+	for _, shape := range intoShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			r, c := startedRestore(t, shape.mutate)
 			finishMover(t, c, recordedNoEligibleLog)
@@ -168,7 +168,7 @@ func TestARestoreThatRestoredNothingFails(t *testing.T) {
 // A mover that restored another snapshot than the one the checks recorded
 // fails the item, naming both.
 func TestARestoreThatRestoredAnotherSnapshotFails(t *testing.T) {
-	for _, shape := range restoreShapes {
+	for _, shape := range intoShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			r, c := startedRestore(t, shape.mutate)
 			finishMover(t, c, restoreLogFor(sunday.ShortID()))
@@ -190,7 +190,7 @@ func TestARestoreWithoutLogsFails(t *testing.T) {
 		"empty":     "",
 		"truncated": truncatedLog(restoreLogFor(monday.ShortID()), 64),
 	}
-	for _, shape := range restoreShapes {
+	for _, shape := range intoShapes {
 		for name, log := range logs {
 			t.Run(shape.name+"/"+name, func(t *testing.T) {
 				r, c := startedRestore(t, shape.mutate)
@@ -209,7 +209,7 @@ func TestARestoreWithoutLogsFails(t *testing.T) {
 // leaves the item Running and the destination in place. The next pass reads
 // the same log, fails the item again, and only then deletes the destination.
 func TestAMoverLogFailureSurvivesALostStatusWrite(t *testing.T) {
-	for _, shape := range restoreShapes {
+	for _, shape := range intoShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			r, c := startedRestore(t, shape.mutate)
 			finishMover(t, c, recordedNoEligibleLog)
@@ -271,35 +271,4 @@ func TestAnIntoRestoreFailedOnItsLogIsNotStartedAgain(t *testing.T) {
 	if names := destinations(t, c); len(names) != 0 {
 		t.Errorf("destinations = %v, want no new mover", names)
 	}
-}
-
-// runningRun returns the RestoreRun back-to-monday with a Running volume item
-// recording the snapshot given in snapshot and no snapshotTime, and the
-// item's destination. The checks never record an item like it; it stands for
-// a status the run can't confirm anything from.
-func runningRun(snapshot string) (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.ReplicationDestination) {
-	started := metav1.NewTime(frozen)
-	name := destinationName(restoreUID, 0)
-	run := restoreRun(asOf("2026-09-21T06:00:00Z"), func(r *backupv1alpha1.RestoreRun) {
-		one := int32(1)
-		r.Spec.Claim, r.Spec.Previous = claimN, &one
-		r.Status.Phase = backupv1alpha1.RunPhaseRunning
-		r.Status.StartedAt = &started
-		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN,
-			Phase: backupv1alpha1.ItemRunning, Snapshot: snapshot, Destination: name}}
-	})
-	destination := directDestination(run, run.Status.Items[0], restoreSettings{Secret: repoN}, name)
-	return run, destination
-}
-
-// A Running item that records no snapshot can't be confirmed from any log,
-// so it fails whatever the mover restored.
-func TestARunningItemWithoutASnapshotFails(t *testing.T) {
-	run, destination := runningRun("")
-	r, c := restoreReconciler(t, nil, run, destination, claim(), volumeRestore(), repository())
-	finishMover(t, c, restoreLogFor(monday.ShortID()))
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	expectItemFailed(t, c, "records no snapshot", "cannot confirm what claim "+claimN+" holds")
 }

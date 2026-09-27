@@ -7,6 +7,7 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -106,9 +107,11 @@ func TestAnInPlaceRestoreIntoItsOwnClaimSucceeds(t *testing.T) {
 	}
 }
 
-// A restore's ReplicationDestination gets the cache capacity of the claim's
-// VolumeRestore, as a backup's ReplicationSource and the populator's
-// destination do. Without it VolSync sizes the mover's cache at its default
+// A restore's mover gets the cache capacity of the claim's VolumeRestore,
+// as a backup's ReplicationSource and the populator's destination do: an
+// in-place restore's Job sizes its cache volume with it, together with the
+// VolumeRestore's cache class and pod labels, and an into restore's
+// ReplicationDestination carries it. Without it VolSync sizes the mover's cache at its default
 // of 1Gi, which a large repository outgrows. A restore from a repository
 // alone has no VolumeRestore to copy from and leaves the field unset.
 func TestARestoreDestinationGetsTheCacheCapacity(t *testing.T) {
@@ -121,6 +124,10 @@ func TestARestoreDestinationGetsTheCacheCapacity(t *testing.T) {
 			restoreStep(t, r) // plan
 			restoreStep(t, r) // create
 
+			if shape.into == "" {
+				expectJobCache(t, itemJob(t, c), capacity)
+				return
+			}
 			rd := &volsyncv1alpha1.ReplicationDestination{}
 			get(t, c, ns, readRestoreRun(t, c).Status.Items[0].Destination, rd)
 			got := rd.Spec.Restic.CacheCapacity
@@ -134,5 +141,25 @@ func TestARestoreDestinationGetsTheCacheCapacity(t *testing.T) {
 				t.Errorf("cacheCapacity = %v, want %s", got, capacity.String())
 			}
 		})
+	}
+}
+
+// expectJobCache checks that a restore Job's pod carries what the claim's
+// VolumeRestore declares for its mover: the cache volume's class and
+// capacity, and the Kueue queue label on the pod only.
+func expectJobCache(t *testing.T, job *batchv1.Job, capacity resource.Quantity) {
+	t.Helper()
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Ephemeral == nil {
+			continue
+		}
+		spec := v.Ephemeral.VolumeClaimTemplate.Spec
+		if got := spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(capacity) != 0 ||
+			spec.StorageClassName == nil || *spec.StorageClassName != "zfs-ephemeral" {
+			t.Errorf("cache volume = %+v, want %s of class zfs-ephemeral", spec, capacity.String())
+		}
+	}
+	if got := job.Spec.Template.Labels["kueue.x-k8s.io/queue-name"]; got != "backups" || job.Labels["kueue.x-k8s.io/queue-name"] != "" {
+		t.Errorf("pod queue label = %q, Job labels = %v; want backups on the pod only", got, job.Labels)
 	}
 }

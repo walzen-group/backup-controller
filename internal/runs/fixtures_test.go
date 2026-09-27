@@ -113,7 +113,9 @@ var crds = []string{
 // newClient builds a strict fake client that holds the given objects. It sets
 // the server-owned metadata as kube-apiserver does, prunes custom resources
 // against the pinned CRDs in crds, and gives every kind the package uses the
-// status subresource its CRD declares. The server clock stands at frozen.
+// status subresource its CRD declares. It also holds the Namespace notes
+// unless the objects hold one (see withNamespace). The server clock stands
+// at frozen.
 func newClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
 	return newClientWithCRDs(t, crds, objects...)
@@ -128,7 +130,7 @@ func newClient(t *testing.T, objects ...client.Object) client.Client {
 func newClientWithCRDs(t *testing.T, crdFiles []string, objects ...client.Object) client.Client {
 	t.Helper()
 	now := frozen
-	objects = append(objects, ownCRDObjects(t, crdFiles)...)
+	objects = append(withNamespace(objects), ownCRDObjects(t, crdFiles)...)
 	s := scheme(t)
 	c := strictclient.Build(fake.NewClientBuilder().WithObjects(objects...).WithRESTMapper(newServedKinds(t, s, crdFiles)), s, strictclient.Options{
 		Clock: func() time.Time { return now },
@@ -169,8 +171,8 @@ func (s snapshots) Snapshots(context.Context, *corev1.Secret) ([]restic.Snapshot
 // sunday and monday are two snapshots a VolSync mover took a day apart, each
 // of /data from host volsync at 05:00:02 UTC.
 var (
-	sunday = restic.Snapshot{ID: "2edf5bab" + "00000000", Time: time.Date(2026, 9, 20, 5, 0, 2, 0, time.UTC), Hostname: "volsync", Paths: []string{"/data"}}
-	monday = restic.Snapshot{ID: "6e473100" + "00000000", Time: time.Date(2026, 9, 21, 5, 0, 2, 0, time.UTC), Hostname: "volsync", Paths: []string{"/data"}}
+	sunday = restic.Snapshot{ID: fullID("2edf5bab"), Time: time.Date(2026, 9, 20, 5, 0, 2, 0, time.UTC), Hostname: "volsync", Paths: []string{"/data"}}
+	monday = restic.Snapshot{ID: fullID("6e473100"), Time: time.Date(2026, 9, 21, 5, 0, 2, 0, time.UTC), Hostname: "volsync", Paths: []string{"/data"}}
 )
 
 // retimeCall holds the arguments of one call to retimer.Retime.
@@ -195,7 +197,7 @@ func (r *retimer) Retime(_ context.Context, _ *corev1.Secret, short string, at t
 	if r.err != nil {
 		return restic.Snapshot{}, r.err
 	}
-	return restic.Snapshot{ID: "c0ffee00" + "00000000", Time: at, Tags: []string{tag}, Original: short}, nil
+	return restic.Snapshot{ID: fullID("c0ffee00"), Time: at, Tags: []string{tag}, Original: short}, nil
 }
 
 // prober answers the questions about a Cluster's base backups from a fixed
@@ -431,4 +433,10 @@ func ownCRDObjects(t *testing.T, files []string) []client.Object {
 		objects = append(objects, crd)
 	}
 	return objects
+}
+
+// fullID returns a full, 64-character snapshot ID that starts with short
+// and is padded with zeros, the form a restore Job restores by.
+func fullID(short string) string {
+	return short + strings.Repeat("0", 64-len(short))
 }

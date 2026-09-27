@@ -15,28 +15,16 @@ import (
 )
 
 // The tests in this file cover an in-place restore whose pass created the
-// item's ReplicationDestination and lost the status write that recorded it
-// (UFR1). The item stays Pending and names no destination, while the mover
-// of that destination mounts the claim.
+// item's restore Job and lost the status write that recorded it (UFR1). The
+// item stays Pending and names no Job, while the Job's pod mounts the claim.
 
-// mountingMoverPod returns the running pod of the mover that writes through
-// the ReplicationDestination named destination, mounting the claim the way a
-// Direct restic mover does. claimHolder sees it as a pod holding the claim.
-func mountingMoverPod(destination string) *corev1.Pod {
-	pod := moverPod(destination, corev1.PodRunning)
-	pod.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
-		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimN},
-	}}}
-	return pod
-}
-
-// A quiesced in-place restore whose destination create went through and
-// whose status write was lost stops that destination's mover when it is
-// deleted or times out. It deletes the destination, keeps the app down, its
-// finalizer and the claim Lease while the mover's pod is there, and gives the
-// app back only once the pod is gone (rule X2). That holds when a pass ran
-// between the lost write and the end, which saw the run's own mover pod on
-// the claim, and when the end came on the very next pass.
+// A quiesced in-place restore whose Job create went through and whose status
+// write was lost stops that Job when it is deleted or times out. It suspends
+// the Job, keeps the app down, its finalizer and the claim Lease while the
+// Job's pod may still write, and gives the app back only once the pod has
+// ended (rule X2). That holds when a pass ran between the lost write and the
+// end, which took the Job over, and when the end came on the very next pass,
+// which finds the Job under the item's name.
 func TestALostDestinationCreateIsStoppedAtTheEnd(t *testing.T) {
 	for name, tc := range map[string]struct {
 		passBetween bool
@@ -58,24 +46,23 @@ func TestALostDestinationCreateIsStoppedAtTheEnd(t *testing.T) {
 				t.Fatal("the pass whose status write was lost succeeded, want the error returned")
 			}
 			r.Client = c
-			name := destinationName(restoreUID, 0)
-			if names := destinations(t, c); len(names) != 1 || names[0] != name {
-				t.Fatalf("destinations = %v after the lost write, want %s", names, name)
+			jobs := restoreJobs(t, c)
+			if len(jobs) != 1 || jobs[0].Name != jobName(restoreUID, 0) {
+				t.Fatalf("restore Jobs = %v after the lost write, want %s", jobs, jobName(restoreUID, 0))
 			}
-			if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemPending || item.Destination != "" {
-				t.Fatalf("item = %+v after the lost write, want Pending with no destination", item)
+			job := &jobs[0]
+			if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemPending || item.JobUID != "" {
+				t.Fatalf("item = %+v after the lost write, want Pending with no Job", item)
 			}
-			pod := mountingMoverPod(name)
-			if err := c.Create(context.Background(), pod); err != nil {
-				t.Fatal(err)
-			}
+			pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
+			createPod(t, c, pod)
 
 			if tc.passBetween {
 				restoreStep(t, r)
 				between := readRestoreRun(t, c)
-				if item := between.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Destination != name {
-					t.Errorf("item = %+v, reason = %q; want Running naming %s, the destination the lost pass created",
-						item, readyReason(between.Status.Conditions), name)
+				if item := between.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.JobUID != job.UID {
+					t.Errorf("item = %+v, reason = %q; want Running naming %s, the Job the lost pass created",
+						item, readyReason(between.Status.Conditions), job.Name)
 				}
 			}
 
@@ -84,18 +71,19 @@ func TestALostDestinationCreateIsStoppedAtTheEnd(t *testing.T) {
 			} else if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
 				t.Fatal(err)
 			}
-			restoreStep(t, r)
-			restoreStep(t, r) // the pass after the delete looks for the mover
-
-			if names := destinations(t, c); len(names) != 0 {
-				t.Fatalf("destinations = %v, want the lost pass's deleted", names)
+			restoreStep(t, r) // suspends the Job
+			if !suspendedJob(t, c, job.Name) {
+				t.Fatalf("restore Job %s is not suspended, want the lost pass's stopped", job.Name)
 			}
+			markSuspended(t, c, job)
+			restoreStep(t, r) // the gate finds the pod
+
 			if got := replicasOf(t, c); got != 0 {
-				t.Fatalf("replicas = %d while mover pod %s was still there, want the app still down", got, pod.Name)
+				t.Fatalf("replicas = %d while pod %s was still there, want the app still down", got, pod.Name)
 			}
 			waiting := readRestoreRun(t, c)
 			if waiting.Status.Phase.Finished() || len(waiting.Finalizers) == 0 {
-				t.Errorf("phase = %q, finalizers = %v with the mover pod still there; want the run unfinished and holding its finalizer",
+				t.Errorf("phase = %q, finalizers = %v with the pod still there; want the run unfinished and holding its finalizer",
 					waiting.Status.Phase, waiting.Finalizers)
 			}
 			if !strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
@@ -103,19 +91,17 @@ func TestALostDestinationCreateIsStoppedAtTheEnd(t *testing.T) {
 			}
 			lease := types.NamespacedName{Namespace: ns, Name: claimLeaseName("claim-uid")}
 			if err := c.Get(context.Background(), lease, &coordinationv1.Lease{}); err != nil {
-				t.Errorf("get the claim Lease = %v, want it held while the mover pod was still there", err)
+				t.Errorf("get the claim Lease = %v, want it held while the pod was still there", err)
 			}
 
-			if err := c.Delete(context.Background(), pod); err != nil {
-				t.Fatal(err)
-			}
+			setPodPhase(t, c, pod, corev1.PodFailed)
 			restoreStep(t, r)
 
 			if got := replicasOf(t, c); got != 2 {
-				t.Errorf("replicas = %d once the mover pod was gone, want the 2 the app had", got)
+				t.Errorf("replicas = %d once the pod had ended, want the 2 the app had", got)
 			}
 			if err := c.Get(context.Background(), lease, &coordinationv1.Lease{}); !apierrors.IsNotFound(err) {
-				t.Errorf("get the claim Lease = %v, want it released once the mover pod was gone", err)
+				t.Errorf("get the claim Lease = %v, want it released once the pod had ended", err)
 			}
 			if tc.timeout {
 				done := readRestoreRun(t, c)

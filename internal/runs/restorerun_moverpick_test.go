@@ -11,17 +11,19 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	"github.com/walzen-group/backup-controller/internal/restorejob"
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// The tests in this file check that a RestoreRun's checks refuse a snapshot
-// that VolSync's mover can't be pinned to. The run hands the mover the
-// snapshot's time in whole seconds as restoreAsOf, and the mover restores the
-// snapshot it picks for that second (restic.MoverPick), which is not always
-// the one the checks selected.
+// The tests in this file check that an into restore's checks refuse a
+// snapshot that VolSync's mover can't be pinned to. The run hands the mover
+// the snapshot's time in whole seconds as restoreAsOf, and the mover restores
+// the snapshot it picks for that second (restic.MoverPick), which is not
+// always the one the checks selected. An in-place restore restores by full ID
+// through its own restore Job and refuses none of these.
 
 // recordedSnapshots caches the snapshot lists read from the recorded
 // repositories, keyed by directory, so each repository's key is derived once.
@@ -57,13 +59,13 @@ func recordedRepository(t *testing.T, kind string) snapshots {
 // moverSnapshot returns a snapshot the way a VolSync mover writes one: host
 // volsync and the one path /data, at the given time, with the given tags.
 func moverSnapshot(short string, at time.Time, tags ...string) restic.Snapshot {
-	return restic.Snapshot{ID: short + "00000000", Time: at, Hostname: "volsync", Paths: []string{"/data"}, Tags: tags}
+	return restic.Snapshot{ID: fullID(short), Time: at, Hostname: "volsync", Paths: []string{"/data"}, Tags: tags}
 }
 
 // expectRefused checks that the run back-to-monday ended at its checks as
 // Failed with reason NoBackupInReach, that the item's message holds every
-// string in want, and that the run created no ReplicationDestination and no
-// claim named scratch.
+// string in want, and that the run created no mover and no claim named
+// scratch.
 func expectRefused(t *testing.T, r *RestoreRunReconciler, want ...string) {
 	t.Helper()
 	c := r.Client
@@ -80,9 +82,8 @@ func expectRefused(t *testing.T, r *RestoreRunReconciler, want ...string) {
 			t.Errorf("message = %q, want it to hold %q", message, w)
 		}
 	}
-	destinations := &volsyncv1alpha1.ReplicationDestinationList{}
-	if err := c.List(context.Background(), destinations); err != nil || len(destinations.Items) != 0 {
-		t.Errorf("destinations = %v (%v), want none", destinations.Items, err)
+	if names := movers(t, c); len(names) != 0 {
+		t.Errorf("movers = %v, want none", names)
 	}
 	scratch := &corev1.PersistentVolumeClaim{}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "scratch"}, scratch); !apierrors.IsNotFound(err) {
@@ -90,35 +91,34 @@ func expectRefused(t *testing.T, r *RestoreRunReconciler, want ...string) {
 	}
 }
 
-// A restore whose previous lands on the earlier of two snapshots in one
+// An into restore whose previous lands on the earlier of two snapshots in one
 // second fails at its checks and names the snapshot the mover would restore
 // instead. The snapshots are the recorded same-second repository, where
-// VolSync's mover, given 21:22:16, restored 2d35d9a8, the later one.
+// VolSync's mover, given 21:22:16, restored 2d35d9a8, the later one. An
+// in-place restore of the same snapshot goes ahead: its restore Job restores
+// 763f53b1 by its full ID.
 func TestARestoreRefusesASnapshotSharingItsSecond(t *testing.T) {
-	for _, into := range []bool{false, true} {
-		name := "in place"
-		if into {
-			name = "into from a repository"
-		}
-		t.Run(name, func(t *testing.T) {
-			shape := func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }
-			if into {
-				shape = fromRepository
-			}
-			r, _ := restoreReconciler(t, nil, restoreRun(shape, asOf("2026-09-25T21:22:16Z"), previousOne),
-				claim(), volumeRestore(), repository())
-			r.Snapshots = recordedRepository(t, "same-second")
+	r, _ := restoreReconciler(t, nil, restoreRun(fromRepository, asOf("2026-09-25T21:22:16Z"), previousOne),
+		claim(), volumeRestore(), repository())
+	r.Snapshots = recordedRepository(t, "same-second")
 
-			restoreStep(t, r)
+	restoreStep(t, r)
 
-			expectRefused(t, r, "snapshot 763f53b1 (2026-09-25T21:22:16Z) shares its second with snapshot 2d35d9a8",
-				"so it would restore 2d35d9a8", "Choose 2d35d9a8 or a snapshot in another second")
-		})
+	expectRefused(t, r, "snapshot 763f53b1 (2026-09-25T21:22:16Z) shares its second with snapshot 2d35d9a8",
+		"so it would restore 2d35d9a8", "Choose 2d35d9a8 or a snapshot in another second")
+
+	inPlace, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN },
+		asOf("2026-09-25T21:22:16Z"), previousOne), claim(), volumeRestore(), repository())
+	inPlace.Snapshots = recordedRepository(t, "same-second")
+	restoreStep(t, inPlace) // plan
+	restoreStep(t, inPlace) // restore
+	if job := itemJob(t, c); !strings.HasPrefix(job.Annotations[restorejob.AnnotationSnapshotID], "763f53b1") {
+		t.Errorf("in place: restore Job snapshot = %s, want 763f53b1's full ID", job.Annotations[restorejob.AnnotationSnapshotID])
 	}
 }
 
-// A restore of a snapshot that is alone in its second, or the last in it,
-// passes the checks and pins the mover to that second, from the same
+// An into restore of a snapshot that is alone in its second, or the last in
+// it, passes the checks and pins the mover to that second, from the same
 // recorded repository.
 func TestARestoreOfTheLastSnapshotInItsSecondGoesAhead(t *testing.T) {
 	for _, c := range []struct {
@@ -132,8 +132,7 @@ func TestARestoreOfTheLastSnapshotInItsSecondGoesAhead(t *testing.T) {
 		{"the newest", nil, "2d35d9a8", "2026-09-25T21:22:16Z"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			mutate := append([]func(*backupv1alpha1.RestoreRun){func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }}, c.mutate...)
-			r, cl := restoreReconciler(t, nil, restoreRun(mutate...), claim(), volumeRestore(), repository())
+			r, cl := restoreReconciler(t, nil, restoreRun(append([]func(*backupv1alpha1.RestoreRun){fromRepository}, c.mutate...)...), repository())
 			r.Snapshots = recordedRepository(t, "same-second")
 			restoreStep(t, r) // plan
 			restoreStep(t, r) // restore
@@ -151,11 +150,11 @@ func TestARestoreOfTheLastSnapshotInItsSecondGoesAhead(t *testing.T) {
 	}
 }
 
-// A synced restore refuses a quiesced snapshot when an untagged one was taken
-// later in the same second. The run picks among quiesced snapshots, and the
-// mover among all of them, so the mover would restore the untagged one. The
-// Cluster is left alone.
-func TestASyncedRestoreRefusesAQuiescedSnapshotAnUntaggedOneShadows(t *testing.T) {
+// A synced in-place restore takes a quiesced snapshot even when an untagged
+// one was taken later in the same second. Its restore Job restores the
+// quiesced snapshot by its full ID, so the untagged one can't take its
+// place, as it could when VolSync's mover picked by the second.
+func TestASyncedRestoreRestoresAQuiescedSnapshotAnUntaggedOneShares(t *testing.T) {
 	quiesced := moverSnapshot("c0ffee00", time.Date(2026, 9, 21, 3, 0, 5, 200e6, time.UTC), restic.QuiescedTag)
 	untagged := moverSnapshot("7a11ce00", time.Date(2026, 9, 21, 3, 0, 5, 800e6, time.UTC))
 	r, c := restoreReconciler(t, prober{saturday},
@@ -163,22 +162,20 @@ func TestASyncedRestoreRefusesAQuiescedSnapshotAnUntaggedOneShadows(t *testing.T
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
 	r.Snapshots = snapshots{moverSnapshot("2edf5bab", sunday.Time), quiesced, untagged}
 
-	restoreStep(t, r)
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // restore the volume
 
-	expectRefused(t, r, "snapshot c0ffee00 (2026-09-21T03:00:05Z) shares its second with snapshot 7a11ce00, which is not tagged quiesced",
-		"so it would restore 7a11ce00", "restoreAsOf before 2026-09-21T03:00:05Z")
-	if _, ok := getUnstructured(t, c, ClusterGVK, ns, pgN); !ok {
-		t.Error("the Cluster was deleted by a run that refused its volume")
+	if got := itemJob(t, c).Annotations[restorejob.AnnotationSnapshotID]; got != quiesced.ID {
+		t.Errorf("restore Job snapshot = %s, want the quiesced %s", got, quiesced.ID)
 	}
 }
 
-// A restore refuses a snapshot whose time another snapshot shares to the
-// nanosecond. restic lists such snapshots in no set order, so the mover may
-// restore either.
+// An into restore refuses a snapshot whose time another snapshot shares to
+// the nanosecond. restic lists such snapshots in no set order, so the mover
+// may restore either.
 func TestARestoreRefusesASnapshotWithATwin(t *testing.T) {
 	at := time.Date(2026, 9, 21, 5, 0, 2, 123456789, time.UTC)
-	r, _ := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-		claim(), volumeRestore(), repository())
+	r, _ := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
 	r.Snapshots = snapshots{moverSnapshot("2edf5bab", sunday.Time), moverSnapshot("aaaaaaaa", at), moverSnapshot("bbbbbbbb", at)}
 
 	restoreStep(t, r)
@@ -187,13 +184,13 @@ func TestARestoreRefusesASnapshotWithATwin(t *testing.T) {
 		"Choose a snapshot in another second")
 }
 
-// A restore refuses a snapshot shadowed by two later ones in its second that
-// share a time: the mover restores one of those two, and which is not set.
+// An into restore refuses a snapshot shadowed by two later ones in its
+// second that share a time: the mover restores one of those two, and which
+// is not set.
 func TestARestoreRefusesASnapshotShadowedByTwins(t *testing.T) {
 	second := time.Date(2026, 9, 21, 5, 0, 2, 0, time.UTC)
 	two := int32(2)
-	r, _ := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Previous = claimN, &two }),
-		claim(), volumeRestore(), repository())
+	r, _ := restoreReconciler(t, nil, restoreRun(fromRepository, func(r *backupv1alpha1.RestoreRun) { r.Spec.Previous = &two }), repository())
 	r.Snapshots = snapshots{moverSnapshot("11111111", second.Add(100e6)), moverSnapshot("aaaaaaaa", second.Add(900e6)), moverSnapshot("bbbbbbbb", second.Add(900e6))}
 
 	restoreStep(t, r)
@@ -202,31 +199,14 @@ func TestARestoreRefusesASnapshotShadowedByTwins(t *testing.T) {
 		"may restore either", "Choose a snapshot in another second")
 }
 
-// A restore refuses a snapshot with no path containing /data, which the
-// mover's listing passes over. The mover would restore an older snapshot, or
-// nothing.
-func TestARestoreRefusesASnapshotTheMoverDoesNotList(t *testing.T) {
-	other := moverSnapshot("5e1f0000", monday.Time)
-	other.Paths = []string{"/srv/notes"}
-	r, _ := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-		claim(), volumeRestore(), repository())
-	r.Snapshots = snapshots{moverSnapshot("2edf5bab", sunday.Time), other}
-
-	restoreStep(t, r)
-
-	expectRefused(t, r, "snapshot 5e1f0000 (2026-09-21T05:00:02Z) has no path containing /data (its paths: /srv/notes)",
-		"cannot restore 5e1f0000", "Choose a snapshot a VolSync mover took")
-}
-
-// A restore from a repository that holds a snapshot with /data after its
-// first path is refused. The mover's listing reads that line as a snapshot
-// of its own, whose time depends on the day the mover runs, so no pick can be
-// predicted.
+// An into restore from a repository that holds a snapshot with /data after
+// its first path is refused. The mover's listing reads that line as a
+// snapshot of its own, whose time depends on the day the mover runs, so no
+// pick can be predicted.
 func TestARestoreRefusesARepositoryTheMoverMisreads(t *testing.T) {
 	odd := moverSnapshot("0dd00000", sunday.Time.Add(-time.Hour))
 	odd.Paths = []string{"/srv", "/data"}
-	r, _ := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-		claim(), volumeRestore(), repository())
+	r, _ := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
 	r.Snapshots = snapshots{odd, moverSnapshot("2edf5bab", sunday.Time), moverSnapshot("6e473100", monday.Time)}
 
 	restoreStep(t, r)

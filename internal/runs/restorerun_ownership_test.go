@@ -269,8 +269,10 @@ func TestAnIntoRestoreWhoseClaimCreateWasLostContinues(t *testing.T) {
 }
 
 // A ReplicationDestination with the name the run would give its own, whose
-// trigger is another run's UID, ends the item Failed at once, in place and
-// into a new claim. The run never deletes it: it did not create it.
+// trigger is another run's UID, ends an into restore's item Failed at
+// once. The run never deletes it: it did not create it. An in-place restore
+// writes through a restore Job (see
+// TestARestoreRefusesAJobItDidNotCreate).
 // Before, the run adopted it and waited for it until its timeout, and then
 // deleted it.
 func TestARestoreRefusesADestinationItDidNotCreate(t *testing.T) {
@@ -278,7 +280,6 @@ func TestARestoreRefusesADestinationItDidNotCreate(t *testing.T) {
 		mutate func(*backupv1alpha1.RestoreRun)
 		claim  string
 	}{
-		"in place":          {func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, claimN},
 		"from a repository": {fromRepository, "scratch"},
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	"github.com/walzen-group/backup-controller/internal/restorejob"
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -30,8 +31,9 @@ import (
 
 // restoreShapes are the three shapes of a volume restore: in place, into a
 // new claim from a repository, and into a new claim from a claim's backups.
-// into is the claim an into restore creates. Each writes through a
-// ReplicationDestination the run creates.
+// into is the claim an into restore creates. An in-place restore writes
+// through a restore Job the run creates, an into restore through a
+// ReplicationDestination.
 var restoreShapes = []struct {
 	name   string
 	mutate func(*backupv1alpha1.RestoreRun)
@@ -41,6 +43,11 @@ var restoreShapes = []struct {
 	{"into from a repository", fromRepository, "scratch"},
 	{"into from a claim", func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" }, "scratch"},
 }
+
+// intoShapes are the shapes of restoreShapes that restore into a new claim,
+// which still write through a ReplicationDestination and confirm the
+// snapshot from its mover's log.
+var intoShapes = restoreShapes[1:]
 
 // repositoryCopy is a restic.Lister over a copy of a recorded restic
 // repository in a test's temporary directory. A test changes the copy the
@@ -93,12 +100,13 @@ func copyRecorded(t *testing.T, kind string) *repositoryCopy {
 // each alone in its second; newestTimed is the newest.
 const newestTimed = "f11fce99"
 
-// expectNothingCreated checks that the run created no ReplicationDestination
-// and, for an into restore, neither the claim nor a VolumeRestore named into.
+// expectNothingCreated checks that the run created no mover, neither a
+// restore Job nor a ReplicationDestination, and, for an into restore,
+// neither the claim nor a VolumeRestore named into.
 func expectNothingCreated(t *testing.T, c client.Client, into string) {
 	t.Helper()
-	if names := destinations(t, c); len(names) != 0 {
-		t.Errorf("destinations = %v, want none", names)
+	if names := movers(t, c); len(names) != 0 {
+		t.Errorf("movers = %v, want none", names)
 	}
 	if into == "" {
 		return
@@ -149,6 +157,7 @@ func TestARestoreWhoseSnapshotWasPrunedFailsBeforeWriting(t *testing.T) {
 			expectItemFailed(t, c, "snapshot "+newestTimed+" (2026-09-25T21:21:02Z), which the checks selected, is no longer in the repository",
 				"restic forget", "Create a new RestoreRun")
 			expectNothingCreated(t, c, shape.into)
+			expectInPlaceReason(t, c, shape.into, backupv1alpha1.ItemReasonSnapshotChanged)
 		})
 	}
 }
@@ -175,20 +184,23 @@ func TestARestoreWhoseSnapshotWasRetimedFailsBeforeWriting(t *testing.T) {
 			expectItemFailed(t, c, "snapshot "+newestTimed+", which the checks selected, was rewritten as "+rewritten.ShortID()+
 				" at 2026-09-25T21:21:40Z by a quiesced backup after the checks", "Create a new RestoreRun")
 			expectNothingCreated(t, c, shape.into)
+			expectInPlaceReason(t, c, shape.into, backupv1alpha1.ItemReasonSnapshotChanged)
 		})
 	}
 }
 
-// A restore whose selected snapshot another one joined in its second after
-// the checks fails the item: pinned to that second, the mover would restore
-// the later one.
+// An into restore whose selected snapshot another one joined in its second
+// after the checks fails the item: pinned to that second, the mover would
+// restore the later one. An in-place restore goes ahead: its restore Job
+// restores the recorded snapshot by its full ID, which the later one can't
+// shadow.
 func TestARestoreWhoseSnapshotWasShadowedFailsBeforeWriting(t *testing.T) {
-	for _, shape := range restoreShapes {
+	later := moverSnapshot("7a11ce00", monday.Time.Add(500*time.Millisecond))
+	for _, shape := range intoShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			r, c := restoreReconciler(t, nil, restoreRun(shape.mutate), claim(), volumeRestore(), repository())
 			restoreStep(t, r) // plan, which selects monday
 
-			later := moverSnapshot("7a11ce00", monday.Time.Add(500*time.Millisecond))
 			r.Snapshots = snapshots{sunday, monday, later}
 			restoreStep(t, r)
 			restoreStep(t, r) // an into restore looks for the mover of the destination it named a poll interval later
@@ -199,11 +211,23 @@ func TestARestoreWhoseSnapshotWasShadowedFailsBeforeWriting(t *testing.T) {
 			expectNothingCreated(t, c, shape.into)
 		})
 	}
+	t.Run("in place", func(t *testing.T) {
+		r, c := restoreReconciler(t, nil, restoreRun(restoreShapes[0].mutate), claim(), volumeRestore(), repository())
+		restoreStep(t, r) // plan, which selects monday
+
+		r.Snapshots = snapshots{sunday, monday, later}
+		restoreStep(t, r)
+
+		if got := itemJob(t, c).Annotations[restorejob.AnnotationSnapshotID]; got != monday.ID {
+			t.Errorf("restore Job snapshot = %s, want monday's %s", got, monday.ID)
+		}
+	})
 }
 
-// A restore whose repository did not change since the checks creates its
-// destination pinned to the selected snapshot, from the recorded repository.
-// An into restore creates no VolumeRestore.
+// A restore whose repository did not change since the checks starts its
+// mover, from the recorded repository: an in-place restore's Job restores
+// the selected snapshot by its full ID, and an into restore's destination is
+// pinned to its second. An into restore creates no VolumeRestore.
 func TestARestoreWhoseSnapshotIsStillThereGoesAhead(t *testing.T) {
 	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
@@ -216,32 +240,35 @@ func TestARestoreWhoseSnapshotIsStillThereGoesAhead(t *testing.T) {
 			if run.Status.Phase != backupv1alpha1.RunPhaseRunning || run.Status.Items[0].Phase != backupv1alpha1.ItemRunning {
 				t.Fatalf("phase = %q, item = %+v; want Running", run.Status.Phase, run.Status.Items[0])
 			}
-			want := "2026-09-25T21:21:02Z"
-			if shape.into != "" {
-				key := types.NamespacedName{Namespace: ns, Name: shape.into}
-				if err := c.Get(context.Background(), key, &backupv1alpha1.VolumeRestore{}); !apierrors.IsNotFound(err) {
-					t.Errorf("VolumeRestore %s: %v, want none created", shape.into, err)
+			if shape.into == "" {
+				item := run.Status.Items[0]
+				if job := itemJob(t, c); job.Annotations[restorejob.AnnotationSnapshotID] != item.SnapshotID || item.Snapshot != newestTimed {
+					t.Errorf("restore Job snapshot = %s, item = %+v; want the Job to restore %s by the recorded full ID",
+						job.Annotations[restorejob.AnnotationSnapshotID], item, newestTimed)
 				}
+				return
+			}
+			key := types.NamespacedName{Namespace: ns, Name: shape.into}
+			if err := c.Get(context.Background(), key, &backupv1alpha1.VolumeRestore{}); !apierrors.IsNotFound(err) {
+				t.Errorf("VolumeRestore %s: %v, want none created", shape.into, err)
 			}
 			rd := &volsyncv1alpha1.ReplicationDestination{}
 			get(t, c, ns, run.Status.Items[0].Destination, rd)
-			if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != want {
+			if want := "2026-09-25T21:21:02Z"; rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != want {
 				t.Errorf("destination restoreAsOf = %v, want %s", rd.Spec.Restic.RestoreAsOf, want)
 			}
 		})
 	}
 }
 
-// A pass that created the item's destination and lost the status write
-// leaves the item Pending. The next pass takes that destination over: the
-// item goes Running and names it, even when the snapshot is gone from the
-// repository or the repository Secret or the claim's VolumeRestore is gone by
-// then. The lost pass ran every check before the create, as a pass whose
-// write went through does, and the destination's mover may already write.
-// From then on the item is followed like any other Running item, and the run
-// stops that mover when it ends (UFR1). Before, the next pass failed the item
-// and deleted the destination (UF1), and a pod of its mover on the claim kept
-// the item waiting with nothing naming the destination.
+// A pass that created the item's restore Job and lost the status write
+// leaves the item Pending. The next pass takes that Job over: the item goes
+// Running and names the Job and its UID, even when the snapshot is gone from
+// the repository or the repository Secret or the claim's VolumeRestore is
+// gone by then. The lost pass ran every check before the create, as a pass
+// whose write went through does, and the Job's pod may already write. From
+// then on the item is followed like any other Running item, and the run
+// stops that Job when it ends (UFR1). No second Job is created.
 func TestAPassAfterALostWriteTakesTheDestinationOver(t *testing.T) {
 	for name, tc := range map[string]struct {
 		forget bool
@@ -262,8 +289,9 @@ func TestAPassAfterALostWriteTakesTheDestinationOver(t *testing.T) {
 				t.Fatal("the pass whose status write was lost succeeded, want the error returned")
 			}
 			r.Client = c
-			if names := destinations(t, c); len(names) != 1 {
-				t.Fatalf("destinations = %v, want the one the lost pass created", names)
+			jobs := restoreJobs(t, c)
+			if len(jobs) != 1 {
+				t.Fatalf("restore Jobs = %v, want the one the lost pass created", jobs)
 			}
 			if tc.forget {
 				repo.forget(t, newestTimed)
@@ -276,11 +304,11 @@ func TestAPassAfterALostWriteTakesTheDestinationOver(t *testing.T) {
 			restoreStep(t, r)
 
 			run := readRestoreRun(t, c)
-			if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Destination != destinationName(restoreUID, 0) {
-				t.Errorf("item = %+v (%s), want Running naming %s", item, readyMessage(run.Status.Conditions), destinationName(restoreUID, 0))
+			if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Job != jobs[0].Name || item.JobUID != jobs[0].UID {
+				t.Errorf("item = %+v (%s), want Running naming %s with UID %s", item, readyMessage(run.Status.Conditions), jobs[0].Name, jobs[0].UID)
 			}
-			if names := destinations(t, c); len(names) != 1 {
-				t.Errorf("destinations = %v, want the lost pass's left to its mover", names)
+			if again := restoreJobs(t, c); len(again) != 1 || again[0].UID != jobs[0].UID {
+				t.Errorf("restore Jobs = %v, want only the lost pass's", again)
 			}
 		})
 	}
@@ -381,22 +409,34 @@ func TestARestoreWaitingForABackupAtItsChecksTimesOut(t *testing.T) {
 	}
 }
 
-// An item that records a snapshot and no snapshotTime fails before its
-// destination exists: the run has no second to pin the mover to, and a mover
-// left to choose by spec.restoreAsOf could restore another snapshot. The run
-// records both with its plan, so only a status the run did not write holds
-// such an item. Before, the item took the time of the listed snapshot with
-// its short ID.
-func TestAnItemWithoutASnapshotTimeFailsBeforeItStarts(t *testing.T) {
+// An in-place item that records a short snapshot ID and no full one fails
+// before its restore Job exists, with reason RestoreJobRefused: the Job
+// restores only a full ID, and a shorter one would let restic pick a
+// snapshot of its own. The run records the full ID with its plan, so only a
+// status the run did not write holds such an item.
+func TestAnItemWithoutAFullSnapshotIDFailsBeforeItStarts(t *testing.T) {
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) {
 		r.Spec.Claim = claimN
 		r.Status.Phase = backupv1alpha1.RunPhaseRunning
 		r.Status.StartedAt = atFrozen(0)
 		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN,
-			Phase: backupv1alpha1.ItemPending, Snapshot: sunday.ShortID()}}
+			Phase: backupv1alpha1.ItemPending, Snapshot: sunday.ShortID(), SnapshotTime: &metav1.Time{Time: sunday.Time}}}
 	}), claim(), volumeRestore(), repository())
 	restoreStep(t, r)
 
-	expectItemFailed(t, c, "records no snapshot time")
+	expectItemFailed(t, c, "records no full snapshot ID", "Nothing was written to claim "+claimN)
+	expectInPlaceReason(t, c, "", backupv1alpha1.ItemReasonRestoreJobRefused)
 	expectNothingCreated(t, c, "")
+}
+
+// expectInPlaceReason checks, for an in-place restore (into empty), that
+// the run's first item records the reason given.
+func expectInPlaceReason(t *testing.T, c client.Client, into string, want backupv1alpha1.ItemReason) {
+	t.Helper()
+	if into != "" {
+		return
+	}
+	if item := readRestoreRun(t, c).Status.Items[0]; item.Reason != want {
+		t.Errorf("item reason = %q, want %s", item.Reason, want)
+	}
 }

@@ -195,7 +195,7 @@ func checkVolSyncRefused(t *testing.T, err error, kind string) {
 // run stays unfinished with the app down and the destination left alone,
 // however far past its timeout, until v1alpha1 is served again.
 func TestARestoreFailsLoudlyAndKeepsTheAppDownWhenVolSyncDropsV1alpha1(t *testing.T) {
-	run, _ := quiescedMidRestore()
+	run, _ := quiescedDestinationRestore()
 	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true),
 		destinationAt(t, run, claimN, "v1beta1"))
 	r.Now = func() time.Time { return frozen.Add(48 * time.Hour) }
@@ -216,7 +216,7 @@ func TestARestoreFailsLoudlyAndKeepsTheAppDownWhenVolSyncDropsV1alpha1(t *testin
 // its finalizer and the app down, and each pass fails with an error naming
 // ReplicationDestination: its mover may still write into the claim.
 func TestADeletedRestoreKeepsItsFinalizerWhenVolSyncDropsV1alpha1(t *testing.T) {
-	run, _ := quiescedMidRestore()
+	run, _ := quiescedDestinationRestore()
 	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true),
 		destinationAt(t, run, claimN, "v1beta1"))
 	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {

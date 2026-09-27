@@ -150,7 +150,7 @@ func TestARestoreWaitsWhileABackupRuns(t *testing.T) {
 	if msg := readyMessage(run.Status.Conditions); !strings.Contains(msg, "BackupRun manual-notes") {
 		t.Errorf("message = %q, want it to name the BackupRun manual-notes", msg)
 	}
-	if names := destinations(t, c); len(names) != 0 {
+	if names := movers(t, c); len(names) != 0 {
 		t.Errorf("destinations = %v, want none while the backup runs", names)
 	}
 }
@@ -187,9 +187,9 @@ func TestABackupAndARestoreStartedTogetherNeverDeadlock(t *testing.T) {
 			if backupWaits == restoreWaits {
 				t.Fatalf("backup waits = %v, restore waits = %v; want exactly one to wait", backupWaits, restoreWaits)
 			}
-			triggered, restoring := ownSourceTag(t, c) == TriggerFor(runUID), len(destinations(t, c)) == 1
+			triggered, restoring := ownSourceTag(t, c) == TriggerFor(runUID), len(movers(t, c)) == 1
 			if triggered == restoring {
-				t.Fatalf("trigger written = %v, destination created = %v; want exactly one mover object", triggered, restoring)
+				t.Fatalf("trigger written = %v, mover created = %v; want exactly one mover object", triggered, restoring)
 			}
 			if restoring {
 				if !backupWaits || !strings.Contains(readyMessage(backup.Status.Conditions), "RestoreRun back-to-monday") {
@@ -248,8 +248,8 @@ func TestAFinishedOrDeletedRunDoesNotBlock(t *testing.T) {
 			restoreStep(t, r)
 			restoreStep(t, r)
 			run := readRestoreRun(t, c)
-			if run.Status.Items[0].Phase != backupv1alpha1.ItemRunning || len(destinations(t, c)) != 1 {
-				t.Fatalf("item = %+v, reason = %q; want Running with its destination", run.Status.Items[0], readyReason(run.Status.Conditions))
+			if run.Status.Items[0].Phase != backupv1alpha1.ItemRunning || len(movers(t, c)) != 1 {
+				t.Fatalf("item = %+v, reason = %q; want Running with its restore Job", run.Status.Items[0], readyReason(run.Status.Conditions))
 			}
 		})
 	}
@@ -413,7 +413,7 @@ func TestARestoreWaitsWhileVolSyncRetriesTheSyncOfAFinishedBackup(t *testing.T) 
 	if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
 		t.Fatalf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
-	if names := destinations(t, c); len(names) != 0 {
+	if names := movers(t, c); len(names) != 0 {
 		t.Errorf("destinations = %v, want none while VolSync retries the sync", names)
 	}
 	msg := readyMessage(run.Status.Conditions)

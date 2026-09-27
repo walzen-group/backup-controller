@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -67,7 +66,7 @@ func checkedRestore(mutate ...func(*backupv1alpha1.RestoreRun)) *backupv1alpha1.
 			r.Status.Phase = backupv1alpha1.RunPhaseRunning
 			r.Status.StartedAt = atFrozen(0)
 			r.Status.Items = []backupv1alpha1.RestoreItem{
-				{Kind: "PersistentVolumeClaim", Name: claimN, Phase: backupv1alpha1.ItemPending, Snapshot: monday.ShortID(), SnapshotTime: &metav1.Time{Time: monday.Time}},
+				{Kind: "PersistentVolumeClaim", Name: claimN, Phase: backupv1alpha1.ItemPending, Snapshot: monday.ShortID(), SnapshotID: monday.ID, SnapshotTime: &metav1.Time{Time: monday.Time}},
 			}
 		},
 	}, mutate...)...)
@@ -154,15 +153,9 @@ func TestARestoreAndANamespaceBackupNeverStopTheAppTogether(t *testing.T) {
 	// Drive the restore to its restart: its mover finishes, so the run gives
 	// the app back and ends.
 	restoreStep(t, rr)
-	restore = readRestoreRun(t, c)
-	destination := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, restore.Status.Items[0].Destination, destination)
-	destination.Status = restoredStatus(restore.Status.Items[0].Snapshot)
-	if err := c.Status().Update(context.Background(), destination); err != nil {
-		t.Fatal(err)
-	}
+	completeVolume(t, c)
 	restoreStep(t, rr)
-	restoreStep(t, rr) // the pass after the destination's delete finds its mover gone
+	restoreStep(t, rr) // the pass after the stop finds the restore Job stopped
 	restore = readRestoreRun(t, c)
 	if restore.Status.Phase != backupv1alpha1.RunPhaseSucceeded || restore.Status.RestartedAt == nil {
 		t.Fatalf("the restore ended %+v; want it Succeeded after giving the app back", restore.Status)

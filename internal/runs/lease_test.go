@@ -88,9 +88,9 @@ func TestTwoRunsWhoseChecksPassTogetherStartOneMover(t *testing.T) {
 			}
 
 			backup, restore := readBackupRun(t, c), readRestoreRun(t, c)
-			triggered, restoring := ownSourceTag(t, c) == TriggerFor(runUID), len(destinations(t, c)) == 1
+			triggered, restoring := ownSourceTag(t, c) == TriggerFor(runUID), len(movers(t, c)) == 1
 			if triggered == restoring {
-				t.Fatalf("trigger written = %v, destination created = %v; want exactly one mover object", triggered, restoring)
+				t.Fatalf("trigger written = %v, mover created = %v; want exactly one mover object", triggered, restoring)
 			}
 			claimLease, repoLease := leaseNames(t, c)
 			winner, loser, loserConditions, holderName := string(runUID), string(restoreUID), restore.Status.Conditions, "BackupRun before-upgrade"
@@ -278,15 +278,9 @@ func TestARestoreReleasesItsLeasesWhenItFinishes(t *testing.T) {
 		t.Fatalf("claim Lease holder = %q, repository Lease holder = %q; want the restore to hold both before its destination",
 			leaseHolderOf(t, c, claimLease), leaseHolderOf(t, c, repoLease))
 	}
-	run := readRestoreRun(t, c)
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	rd.Status = restoredStatus(run.Status.Items[0].Snapshot)
-	if err := c.Status().Update(context.Background(), rd); err != nil {
-		t.Fatal(err)
-	}
+	completeVolume(t, c)
 	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
+	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 
 	if run := readRestoreRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q, want Succeeded", run.Status.Phase)
@@ -430,7 +424,7 @@ func TestARestoreWhoseRepositorySecretIsGoneStartsNoMover(t *testing.T) {
 	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "repository Secret "+repoN) {
 		t.Fatalf("item = %+v; want Failed naming repository Secret %s", item, repoN)
 	}
-	if names := destinations(t, c); len(names) != 0 {
-		t.Errorf("destinations = %v, want none", names)
+	if names := movers(t, c); len(names) != 0 {
+		t.Errorf("movers = %v, want none", names)
 	}
 }

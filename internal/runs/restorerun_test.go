@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +12,9 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	"github.com/walzen-group/backup-controller/internal/restorejob"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -49,15 +52,16 @@ func asOf(value string) func(*backupv1alpha1.RestoreRun) {
 }
 
 // restoreReconciler returns a RestoreRunReconciler over a fake client that
-// holds the given objects, and the client itself. The reconciler runs on the
-// frozen clock, its lister holds sunday's and monday's snapshots, and its
-// Prober returns the base backups passed in backups.
+// holds the given objects and the run's namespace, and the client itself.
+// The reconciler runs on the frozen clock, its lister holds sunday's and
+// monday's snapshots, its Prober returns the base backups passed in backups,
+// and its restore Jobs run testImage.
 func restoreReconciler(t *testing.T, backups prober, objects ...client.Object) (*RestoreRunReconciler, client.Client) {
 	t.Helper()
 	c := newClient(t, objects...)
 	return &RestoreRunReconciler{
 		Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Prober: backups,
-		Now: func() time.Time { return frozen },
+		RestoreImage: testImage, Now: func() time.Time { return frozen },
 	}, c
 }
 
@@ -98,9 +102,7 @@ func readRestoreRun(t *testing.T, c client.Client) *backupv1alpha1.RestoreRun {
 }
 
 // A restore to a moment before the oldest snapshot fails with reason
-// NoBackupInReach, names the oldest snapshot, and creates no
-// ReplicationDestination. VolSync itself would restore nothing and report
-// success.
+// NoBackupInReach, names the oldest snapshot, and creates no restore Job.
 func TestARestoreBeforeEverySnapshotFailsBeforeTouchingAnything(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-01T00:00:00Z")),
@@ -115,15 +117,15 @@ func TestARestoreBeforeEverySnapshotFailsBeforeTouchingAnything(t *testing.T) {
 	if !strings.Contains(run.Status.Items[0].Message, "2edf5bab") {
 		t.Errorf("message = %q, want it to name the oldest snapshot", run.Status.Items[0].Message)
 	}
-	destinations := &volsyncv1alpha1.ReplicationDestinationList{}
-	if err := c.List(context.Background(), destinations); err != nil || len(destinations.Items) != 0 {
-		t.Fatalf("destinations = %v, want none", destinations.Items)
+	if names := movers(t, c); len(names) != 0 {
+		t.Fatalf("movers = %v, want none", names)
 	}
 }
 
 // A claim restore to a time between two snapshots selects the earlier one,
-// hands that snapshot's time to its ReplicationDestination, and deletes the
-// destination once the restore succeeds.
+// records its full ID, and creates a restore Job that restores exactly that
+// ID into the claim. Once the Job is Complete the run succeeds, and the Job
+// does not outlive it.
 func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
@@ -132,42 +134,37 @@ func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // restore
 
-	run := readRestoreRun(t, c)
-	item := run.Status.Items[0]
-	if item.Snapshot != "2edf5bab" {
-		t.Errorf("snapshot = %q, want 2edf5bab, the one before 04:00", item.Snapshot)
+	item := readRestoreRun(t, c).Status.Items[0]
+	if item.Snapshot != "2edf5bab" || item.SnapshotID != sunday.ID {
+		t.Errorf("snapshot = %q (%s), want 2edf5bab, the one before 04:00, with its full ID", item.Snapshot, item.SnapshotID)
 	}
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, item.Destination, rd)
-	if *rd.Spec.Restic.DestinationPVC != claimN || *rd.Spec.Restic.RestoreAsOf != "2026-09-20T05:00:02Z" {
-		t.Errorf("destination = %+v", rd.Spec.Restic)
+	job := itemJob(t, c)
+	if args := job.Spec.Template.Spec.Containers[0].Args; !slices.Contains(args, sunday.ID) {
+		t.Errorf("restore args = %v, want them to name %s", args, sunday.ID)
 	}
 
-	rd.Status = restoredStatus(item.Snapshot)
-	if err := c.Status().Update(context.Background(), rd); err != nil {
-		t.Fatal(err)
-	}
+	completeJob(t, c)
 	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
+	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 
-	run = readRestoreRun(t, c)
+	run := readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q, want Succeeded", run.Status.Phase)
 	}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: item.Destination}, rd); err == nil {
-		t.Error("the destination outlived the run")
+	if jobs := restoreJobs(t, c); len(jobs) != 0 {
+		t.Errorf("restore Jobs = %v, want none once the run has ended", jobs)
 	}
 }
 
 // quiet is a snapshot tagged quiesced, as a quiesced BackupRun leaves it after
 // moving it to its restart moment. Its time falls between sunday's and
 // monday's.
-var quiet = restic.Snapshot{ID: "c0ffee00" + "00000000", Time: time.Date(2026, 9, 21, 3, 0, 5, 0, time.UTC), Hostname: "volsync", Paths: []string{"/data"}, Tags: []string{restic.QuiescedTag}}
+var quiet = restic.Snapshot{ID: fullID("c0ffee00"), Time: time.Date(2026, 9, 21, 3, 0, 5, 0, time.UTC), Hostname: "volsync", Paths: []string{"/data"}, Tags: []string{restic.QuiescedTag}}
 
 // A synced restore selects the newest quiesced snapshot and passes over
-// monday's newer untagged one. It records that snapshot's time in syncedTo and
-// hands the same time to the volume's ReplicationDestination, with no
-// previous, so the mover selects the quiesced snapshot too.
+// monday's newer untagged one. It records that snapshot's time in syncedTo,
+// and the volume's restore Job restores exactly that snapshot by its full
+// ID.
 func TestASyncedRestoreRestoresEverythingToTheQuiescedMoment(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true }),
@@ -184,12 +181,9 @@ func TestASyncedRestoreRestoresEverythingToTheQuiescedMoment(t *testing.T) {
 	}
 
 	restoreStep(t, r) // restore the volume
-	run = readRestoreRun(t, c)
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-21T03:00:05Z" || rd.Spec.Restic.Previous != nil {
-		t.Errorf("destination restoreAsOf = %v, previous = %v; want 2026-09-21T03:00:05Z and none, so the mover selects the quiesced snapshot",
-			rd.Spec.Restic.RestoreAsOf, rd.Spec.Restic.Previous)
+	job := itemJob(t, c)
+	if got := job.Annotations[restorejob.AnnotationSnapshotID]; got != quiet.ID {
+		t.Errorf("restore Job snapshot = %s, want the quiesced %s", got, quiet.ID)
 	}
 }
 
@@ -357,13 +351,7 @@ func TestAQuiescedRestoreStopsTheAppUntilTheDatabaseIsDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoreStep(t, r) // restore the volume
-	run = readRestoreRun(t, c)
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	rd.Status = restoredStatus(run.Status.Items[0].Snapshot)
-	if err := c.Status().Update(context.Background(), rd); err != nil {
-		t.Fatal(err)
-	}
+	completeVolume(t, c)
 	if got := replicasOf(t, c); got != 0 {
 		t.Fatalf("replicas = %d while the volume restored, want 0", got)
 	}
@@ -413,17 +401,11 @@ func TestAQuiescedRestoreWaitsForTheOldInstanceToShutDown(t *testing.T) {
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // quiesce
 	restoreStep(t, r) // restore the volume
-	run := readRestoreRun(t, c)
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	rd.Status = restoredStatus(run.Status.Items[0].Snapshot)
-	if err := c.Status().Update(context.Background(), rd); err != nil {
-		t.Fatal(err)
-	}
+	completeVolume(t, c)
 
 	restoreStep(t, r) // volume done, database deleted
 	restoreStep(t, r) // the old instance is still shutting down
-	run = readRestoreRun(t, c)
+	run := readRestoreRun(t, c)
 	if run.Status.Items[1].Phase != backupv1alpha1.ItemDeleted {
 		t.Fatalf("database item = %+v, want Deleted", run.Status.Items[1])
 	}
@@ -543,22 +525,15 @@ func TestANamespaceRestoreLeavesTheDatabasesWhenAVolumeFails(t *testing.T) {
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
 
 	restoreStep(t, r) // plan
-	restoreStep(t, r) // volume destination
+	restoreStep(t, r) // volume restore Job
 	run := readRestoreRun(t, c)
 	if run.Status.Items[1].Phase != backupv1alpha1.ItemPending {
 		t.Fatalf("the Cluster was handled before its volumes finished: %+v", run.Status.Items[1])
 	}
 
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{LatestMoverStatus: &volsyncv1alpha1.MoverStatus{
-		Result: volsyncv1alpha1.MoverResultFailed, Logs: "Fatal: unable to open repository",
-	}}
-	if err := c.Status().Update(context.Background(), rd); err != nil {
-		t.Fatal(err)
-	}
+	endJob(t, c, itemJob(t, c).Name, batchv1.JobFailed, "PodFailurePolicy", "Container restore for pod notes/restore-x exited with code 10 matching FailJob rule at index 0")
 	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
+	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 
 	run = readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.Items[1].Phase != backupv1alpha1.ItemSkipped {
@@ -756,13 +731,7 @@ func TestADatabaseRestoreSeesAnInstanceTheCacheHasNotSeenYet(t *testing.T) {
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // quiesce
 	restoreStep(t, r) // restore the volume
-	run := readRestoreRun(t, c)
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	rd.Status = restoredStatus(run.Status.Items[0].Snapshot)
-	if err := c.Status().Update(context.Background(), rd); err != nil {
-		t.Fatal(err)
-	}
+	completeVolume(t, c)
 	restoreStep(t, r) // volume done, database deleted
 
 	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonShutdown {
@@ -960,12 +929,17 @@ func optedOut(u *unstructured.Unstructured) {
 	u.SetAnnotations(annotations)
 }
 
-// completeVolume marks the ReplicationDestination of the run's first item as
-// having completed the run's trigger, with a mover log that names the
-// item's snapshot (see restoredStatus).
+// completeVolume ends the restore of the run's first item: it marks the
+// item's restore Job Complete, or, for an into restore, its
+// ReplicationDestination as having completed the run's trigger with a mover
+// log that names the item's snapshot (see restoredStatus).
 func completeVolume(t *testing.T, c client.Client) {
 	t.Helper()
 	item := readRestoreRun(t, c).Status.Items[0]
+	if item.Job != "" {
+		completeJob(t, c)
+		return
+	}
 	rd := &volsyncv1alpha1.ReplicationDestination{}
 	get(t, c, ns, item.Destination, rd)
 	rd.Status = restoredStatus(item.Snapshot)
@@ -995,7 +969,7 @@ func TestANamespaceRestoreLeavesAnOptedOutClusterAlone(t *testing.T) {
 			restoreStep(t, r) // restore the volume
 			completeVolume(t, c)
 			restoreStep(t, r)
-			restoreStep(t, r) // the pass after the destination's delete finds its mover gone
+			restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 
 			run = readRestoreRun(t, c)
 			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
@@ -1114,17 +1088,16 @@ func loseNextStatusWrite(c client.Client) client.Client {
 	})
 }
 
-// A volume restore whose mover finished, but whose pass lost the status write
+// A volume restore whose Job completed, but whose pass lost the status write
 // that recorded it, finishes on the next pass. The run records the item's
-// success before it deletes the ReplicationDestination, so the next pass still
-// finds the destination, and the run does not wait on a destination that is
-// gone until its timeout.
+// success before it stops the restore Job, so the next pass still reads the
+// Job's Complete condition, and the item does not fail as a Job deleted
+// before it finished.
 func TestAVolumeRestoreWhoseSuccessWasNotRecordedFinishes(t *testing.T) {
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
 		claim(), volumeRestore(), repository())
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // restore
-	destination := readRestoreRun(t, c).Status.Items[0].Destination
 	completeVolume(t, c)
 
 	r.Client = loseNextStatusWrite(c)
@@ -1132,15 +1105,14 @@ func TestAVolumeRestoreWhoseSuccessWasNotRecordedFinishes(t *testing.T) {
 		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
 	}
 	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
+	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 
 	run := readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
 		t.Fatalf("phase = %q, item = %+v; want Succeeded", run.Status.Phase, run.Status.Items[0])
 	}
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: destination}, rd); err == nil {
-		t.Error("the destination outlived the run")
+	if jobs := restoreJobs(t, c); len(jobs) != 0 {
+		t.Errorf("restore Jobs = %v, want none once the run has ended", jobs)
 	}
 }
 
@@ -1173,10 +1145,9 @@ func TestAnIntoRestoreWithPreviousRestoresTheSnapshotItRecorded(t *testing.T) {
 	}
 }
 
-// An in-place restore hands the mover the time of the snapshot its checks
-// selected, in whole seconds, and no previous. The mover's own rule would pick
-// again when it starts, and a backup taken between the checks and the start
-// would shift what "newest" or previous means.
+// An in-place restore hands its restore Job the full ID of the snapshot its
+// checks selected. A backup taken between the checks and the start would
+// shift what "newest" or previous means, and the Job does not pick again.
 func TestAClaimRestoreHandsTheMoverTheSnapshotItSelected(t *testing.T) {
 	early := sunday
 	early.Time = sunday.Time.Add(700 * time.Millisecond)
@@ -1185,15 +1156,16 @@ func TestAClaimRestoreHandsTheMoverTheSnapshotItSelected(t *testing.T) {
 	r.Snapshots = snapshots{early, monday}
 	restoreStep(t, r) // plan
 
-	tuesday := restic.Snapshot{ID: "7a11ce00" + "00000000", Time: monday.Time.Add(24 * time.Hour), Hostname: "volsync", Paths: []string{"/data"}}
+	tuesday := restic.Snapshot{ID: fullID("7a11ce00"), Time: monday.Time.Add(24 * time.Hour), Hostname: "volsync", Paths: []string{"/data"}}
 	r.Snapshots = snapshots{early, monday, tuesday}
 	restoreStep(t, r) // restore
 
-	run := readRestoreRun(t, c)
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-20T05:00:02Z" || rd.Spec.Restic.Previous != nil {
-		t.Errorf("destination restoreAsOf = %v, previous = %v; want 2026-09-20T05:00:02Z and none", rd.Spec.Restic.RestoreAsOf, rd.Spec.Restic.Previous)
+	job := itemJob(t, c)
+	if got := job.Annotations[restorejob.AnnotationSnapshotID]; got != early.ID {
+		t.Errorf("restore Job snapshot = %s, want %s, the one the checks selected", got, early.ID)
+	}
+	if args := job.Spec.Template.Spec.Containers[0].Args; !slices.Contains(args, early.ID) {
+		t.Errorf("restore args = %v, want them to name %s", args, early.ID)
 	}
 }
 
@@ -1231,7 +1203,7 @@ func TestAnIntoRestoreFromARepositoryFillsAClaimTheMoverPlaces(t *testing.T) {
 
 	completeVolume(t, c)
 	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
+	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 	run = readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
 		t.Fatalf("phase = %q, item = %+v; want Succeeded", run.Status.Phase, run.Status.Items[0])
@@ -1318,7 +1290,7 @@ func TestANamespaceRestoreLeavesAClusterWithADeclaredBootstrapAlone(t *testing.T
 			restoreStep(t, r) // restore the volume
 			completeVolume(t, c)
 			restoreStep(t, r)
-			restoreStep(t, r) // the pass after the destination's delete finds its mover gone
+			restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 
 			run = readRestoreRun(t, c)
 			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {

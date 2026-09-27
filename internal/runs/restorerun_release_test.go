@@ -28,7 +28,7 @@ import (
 // The app is back by then, so RestartFailed would say it is down, and the
 // advice names the Leases rather than the workloads.
 func TestADeletedRestoreThatCannotReleaseItsLeasesSaysWhatFailed(t *testing.T) {
-	run, destination := quiescedMidRestore()
+	run, destination := quiescedDestinationRestore()
 	lease := heldClaimLease(run, claimN)
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
 		stoppedDeployment(), kustomization(true), destination, lease)
@@ -90,7 +90,7 @@ func TestADeletedRestoreThatCannotReleaseItsLeasesSaysWhatFailed(t *testing.T) {
 // Warning event, and the workload with the replicas a person can set by hand.
 // Nothing is released: the app is still down.
 func TestARestoreThatCannotGiveTheAppBackSaysWhatFailed(t *testing.T) {
-	run, destination := quiescedMidRestore()
+	run, destination := quiescedDestinationRestore()
 	lease := heldClaimLease(run, claimN)
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
 		stoppedDeployment(), kustomization(true), destination, lease)
@@ -133,7 +133,7 @@ func TestARestoreThatCannotGiveTheAppBackSaysWhatFailed(t *testing.T) {
 // back, so the reason is RestartFailed and the message names the workload
 // with the replicas a person can set and the Kustomization to resume.
 func TestARestoreThatCannotDeleteItsDestinationSaysWhatFailed(t *testing.T) {
-	run, destination := quiescedMidRestore()
+	run, destination := quiescedDestinationRestore()
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
 		stoppedDeployment(), kustomization(true), destination)
 	refused := errors.New("a policy refuses the delete")

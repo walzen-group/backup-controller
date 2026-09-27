@@ -151,13 +151,13 @@ func destinationGone(c client.Client) client.Client {
 	})
 }
 
-// A ReplicationDestination read at a version the API server has stopped
-// serving never reads as a destination someone deleted: the run keeps its
-// item Running and retries, since the mover may still be writing.
+// An into restore's ReplicationDestination read at a version the API
+// server has stopped serving never reads as a destination someone deleted:
+// the run keeps its item Running and retries, since the mover may still be
+// writing.
 func TestARestoreNeverTakesAVersionGoneForADeletedDestination(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
-		claim(), volumeRestore(), repository())
+		restoreRun(fromRepository, asOf("2026-09-21T04:00:00Z")), repository())
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // restore: the destination exists, the item runs
 	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
@@ -176,14 +176,13 @@ func TestARestoreNeverTakesAVersionGoneForADeletedDestination(t *testing.T) {
 	}
 }
 
-// A RestoreRun deleted while the API server answers its
+// An into RestoreRun deleted while the API server answers its
 // ReplicationDestination read with the 404 of a version it no longer serves
 // keeps its finalizer and its destination: finalize never counts the mover
 // gone on that answer, and retries.
 func TestADeletedRestoreNeverTakesAVersionGoneForADeletedDestination(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
-		claim(), volumeRestore(), repository())
+		restoreRun(fromRepository, asOf("2026-09-21T04:00:00Z")), repository())
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // restore: the destination exists, the item runs
 	run := readRestoreRun(t, c)

@@ -120,15 +120,9 @@ func TestANamespaceBackupAndARestoreNeverStopTheAppTogether(t *testing.T) {
 
 	// The restore gives the app back when its volume is restored.
 	restoreStep(t, rr)
-	restore = readRestoreRun(t, c)
-	destination := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, restore.Status.Items[0].Destination, destination)
-	destination.Status = restoredStatus(restore.Status.Items[0].Snapshot)
-	if err := c.Status().Update(context.Background(), destination); err != nil {
-		t.Fatal(err)
-	}
+	completeVolume(t, c)
 	restoreStep(t, rr)
-	restoreStep(t, rr) // the pass after the destination's delete finds its mover gone
+	restoreStep(t, rr) // the pass after the stop finds the restore Job stopped
 	if restore := readRestoreRun(t, c); restore.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("the restore ended %s: %s", restore.Status.Phase, readyMessage(restore.Status.Conditions))
 	}
@@ -497,7 +491,7 @@ func TestAnItemRestoreVolumeWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
 			restoreStep(t, r)
 
 			run := readRestoreRun(t, c)
-			if want := failBeforeStart(claimN, tc.want); run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
+			if want := tc.want + nothingWritten(claimN); run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
 				run.Status.Items[0].Phase != backupv1alpha1.ItemFailed || run.Status.Items[0].Message != want {
 				t.Fatalf("phase = %q, items = %+v; want Failed with the item message %q", run.Status.Phase, run.Status.Items, want)
 			}
@@ -530,7 +524,7 @@ func TestARestoreIntoAClaimBeingDeletedFailsBeforeTheMoverStarts(t *testing.T) {
 	restoreStep(t, r)
 
 	run := readRestoreRun(t, c)
-	want := failBeforeStart(claimN, "claim "+claimN+" is being deleted")
+	want := "claim " + claimN + " is being deleted" + nothingWritten(claimN)
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.Items[0].Phase != backupv1alpha1.ItemFailed ||
 		run.Status.Items[0].Message != want || run.Status.Items[0].Destination != "" {
 		t.Fatalf("phase = %q, items = %+v; want Failed with the item message %q and no destination", run.Status.Phase, run.Status.Items, want)

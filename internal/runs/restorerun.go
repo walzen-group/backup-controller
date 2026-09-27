@@ -32,22 +32,24 @@ import (
 // RestoreRunReconciler runs RestoreRuns. A RestoreRun puts volumes and
 // databases back to the state they were in at a chosen moment.
 //
-// A volume restores in place. Once no pod mounts the claim, the run creates a
-// ReplicationDestination in Direct mode, whose mover mounts the claim and
-// writes the selected snapshot into it. A database restores by being created
+// A volume restores in place. Once no pod mounts the claim, the run creates
+// its own restore Job (internal/restorejob), which mounts the claim and runs
+// restic restore of the selected snapshot by its full ID, and the Job's
+// terminal conditions say how it ended. A database restores by being created
 // again. The run deletes the Cluster, and when Flux or tofu creates it again,
 // the bootstrap webhook makes the new Cluster recover to the run's moment.
 // With spec.into set, a volume restores into a new claim the run creates, and
 // the app's own claims and databases are left alone. A ReplicationDestination
 // in Direct mode writes the selected snapshot into that claim, from the
-// backups of spec.claim or from spec.repository, so its mover's log confirms
-// the snapshot the same way as in place.
+// backups of spec.claim or from spec.repository, and its mover's log confirms
+// the snapshot.
 //
 // The run stops a mover once the item's end is in its status, when the run
-// ends and when it is deleted. It deletes the mover's ReplicationDestination
-// and waits until that mover's Job and pods are gone before it gives the app
-// back, releases the item's Leases or finishes (rule X2, see
-// removeDestinations).
+// ends and when it is deleted. It suspends a restore Job and waits until no
+// pod of it can still write, or deletes an into restore's
+// ReplicationDestination and waits until that mover's Job and pods are gone,
+// before it gives the app back, releases the item's Leases or finishes (rule
+// X2, see stopMovers).
 type RestoreRunReconciler struct {
 	client.Client
 
@@ -330,11 +332,11 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 // server; Reconcile hands such an error to planFailed.
 //
 // For a volume, the check selects the snapshot the restore would use and
-// records its ID and time on the item (see checkVolume). For a database, it
-// selects the base backup the recovery would start from and records its ID
-// (see checkDatabase). An item with nothing in reach, or whose snapshot
-// VolSync's mover would not restore when pinned to its second (see
-// selectSnapshot), is marked Failed with the reason. If any item fails, plan
+// records its full ID, its short ID and its time on the item (see
+// checkVolume and recordSnapshot). For a database, it selects the base
+// backup the recovery would start from and records its ID (see
+// checkDatabase). An item with nothing in reach (see selectSnapshot) is
+// marked Failed with the reason. If any item fails, plan
 // marks every other Pending item Skipped and ends the run as Failed with
 // reason NoBackupInReach, naming each item it cannot reach. Nothing has been
 // deleted or overwritten at that point.
@@ -425,10 +427,7 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 			}
 			var snapshot restic.Snapshot
 			snapshot, reason, err = r.checkVolume(ctx, run, item.Name, at, sync)
-			item.Snapshot = snapshot.ShortID()
-			if !snapshot.Time.IsZero() {
-				item.SnapshotTime = &metav1.Time{Time: snapshot.Time}
-			}
+			recordSnapshot(item, snapshot)
 			if sync && reason == "" && err == nil {
 				switch {
 				case synced == nil:
@@ -671,8 +670,8 @@ func (r *RestoreRunReconciler) volumeBackedUp(ctx context.Context, run *backupv1
 	return otherMover(ctx, r.Reader, run.Namespace, claimName, settings.Secret, backupMover)
 }
 
-// selectSnapshot returns the snapshot the run would restore, picked the way
-// the VolSync mover picks it from restoreAsOf and previous.
+// selectSnapshot returns the snapshot the run would restore, picked from
+// restoreAsOf and previous.
 //
 // Parameters:
 //   - secretName names the restic repository Secret in the run's namespace.
@@ -680,35 +679,41 @@ func (r *RestoreRunReconciler) volumeBackedUp(ctx context.Context, run *backupv1
 //     snapshot at or before it, or the newest of all when it is nil.
 //   - quiescedOnly passes over every snapshot not tagged quiesced.
 //
-// When spec.previous is set, selectSnapshot then steps that many snapshots
-// further back. It relies on the lister returning the snapshots oldest first.
+// Only a snapshot with the layout VolSync's backup mover gives one, host
+// volsync and paths exactly /data, is a candidate (see restic.MoverLayout):
+// the restore writes a snapshot's files at the root of the claim, and a
+// snapshot of another layout would put them in another directory. When
+// spec.previous is set, selectSnapshot then steps that many candidates
+// further back. It relies on the lister returning the snapshots oldest
+// first, and snapshots of one time in the order of their IDs, so a tie
+// resolves the same way on every pass and previous reaches each snapshot of
+// it.
 //
-// The run later pins the mover to the selected snapshot's time in whole
-// seconds, and the mover picks again from that second among every snapshot in
-// the repository. So selectSnapshot also checks, with unpinnable, that the
-// mover's pick for that second is the selected snapshot.
+// An in-place restore restores the selected snapshot by its full ID. An
+// into restore still pins VolSync's mover to the snapshot's time in whole
+// seconds, and the mover picks again from that second among every snapshot
+// in the repository, so for an into restore selectSnapshot also checks,
+// with unpinnable, that the mover's pick for that second is the selected
+// snapshot.
 //
 // It returns a reason, and no error, when the Secret doesn't exist, when no
-// snapshot qualifies, when none is at or before the moment, when
-// spec.previous reaches past the oldest snapshot, and when the mover pinned
-// to the selected snapshot's second would restore another snapshot, or one
-// the run can't predict. It returns an error when
-// the Secret can't be read for another reason and when listing the repository
+// snapshot is a candidate (naming the snapshots it passed over, see
+// noCandidate), when none is at or before the moment, when spec.previous
+// reaches past the oldest candidate, and, for an into restore, when the
+// mover pinned to the selected snapshot's second would restore another
+// snapshot, or one the run can't predict. It returns an error when the
+// Secret can't be read for another reason and when listing the repository
 // fails.
 func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, string, error) {
-	snapshots, reason, err := r.listRepository(ctx, run, secretName)
+	all, reason, err := r.listRepository(ctx, run, secretName)
 	if reason != "" || err != nil {
 		return restic.Snapshot{}, reason, err
 	}
-	all := snapshots
-	if quiescedOnly {
-		snapshots = slices.DeleteFunc(slices.Clone(snapshots), func(s restic.Snapshot) bool { return !slices.Contains(s.Tags, restic.QuiescedTag) })
-		if len(snapshots) == 0 {
-			return restic.Snapshot{}, fmt.Sprintf("the repository holds no snapshot tagged %s; only a BackupRun that stopped the workloads writes one", restic.QuiescedTag), nil
-		}
-	}
+	snapshots := slices.DeleteFunc(slices.Clone(all), func(s restic.Snapshot) bool {
+		return !restic.MoverLayout(s) || quiescedOnly && !slices.Contains(s.Tags, restic.QuiescedTag)
+	})
 	if len(snapshots) == 0 {
-		return restic.Snapshot{}, "the repository holds no snapshot", nil
+		return restic.Snapshot{}, noCandidate(all, quiescedOnly), nil
 	}
 
 	index := len(snapshots) - 1
@@ -718,11 +723,7 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 			return restic.Snapshot{}, fmt.Sprintf("no snapshot at or before %s; the oldest, %s, is from %s",
 				at.UTC().Format(time.RFC3339), snapshots[0].ShortID(), snapshots[0].Time.UTC().Format(time.RFC3339)), nil
 		}
-		for i, s := range snapshots {
-			if s.ID == found.ID {
-				index = i
-			}
-		}
+		index = slices.IndexFunc(snapshots, func(s restic.Snapshot) bool { return s.ID == found.ID })
 	}
 	if run.Spec.Previous != nil {
 		index -= int(*run.Spec.Previous)
@@ -730,10 +731,53 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 			return restic.Snapshot{}, fmt.Sprintf("previous %d reaches past the oldest snapshot", *run.Spec.Previous), nil
 		}
 	}
-	if why := unpinnable(all, snapshots[index], quiescedOnly); why != "" {
-		return restic.Snapshot{}, why, nil
+	if run.Spec.Into != "" {
+		if why := unpinnable(all, snapshots[index], quiescedOnly); why != "" {
+			return restic.Snapshot{}, why, nil
+		}
 	}
 	return snapshots[index], "", nil
+}
+
+// noCandidate returns the reason of a run whose repository holds no
+// snapshot selectSnapshot may restore.
+//
+// Parameters:
+//   - all is every snapshot in the repository, oldest first.
+//   - quiescedOnly is selectSnapshot's: the run takes only snapshots tagged
+//     quiesced.
+//
+// It says the repository is empty; or that none of its snapshots has the
+// mover's layout, naming each snapshot with its host and paths; or that
+// none of those is tagged quiesced.
+func noCandidate(all []restic.Snapshot, quiescedOnly bool) string {
+	if len(all) == 0 {
+		return "the repository holds no snapshot"
+	}
+	if slices.ContainsFunc(all, restic.MoverLayout) && quiescedOnly {
+		return fmt.Sprintf("the repository holds no snapshot tagged %s; only a BackupRun that stopped the workloads writes one", restic.QuiescedTag)
+	}
+	passed := make([]string, 0, len(all))
+	for _, s := range all {
+		passed = append(passed, fmt.Sprintf("%s (host %s, paths %v)", s.ShortID(), s.Hostname, s.Paths))
+	}
+	return fmt.Sprintf("the repository holds %d snapshots, none written by a VolSync mover (host volsync, paths [/data]): %s",
+		len(all), strings.Join(passed, ", "))
+}
+
+// recordSnapshot records on a volume item the snapshot the checks selected:
+// its full ID, which the restore Job restores, its short ID for display,
+// and its time.
+//
+// Parameters:
+//   - item is the volume item, updated in place.
+//   - snapshot is the selected snapshot, or the zero Snapshot when the
+//     checks selected none, which records nothing but an empty short ID.
+func recordSnapshot(item *backupv1alpha1.RestoreItem, snapshot restic.Snapshot) {
+	item.Snapshot, item.SnapshotID = snapshot.ShortID(), snapshot.ID
+	if !snapshot.Time.IsZero() {
+		item.SnapshotTime = &metav1.Time{Time: snapshot.Time}
+	}
 }
 
 // listRepository returns every snapshot in the restic repository whose
@@ -757,9 +801,11 @@ func (r *RestoreRunReconciler) listRepository(ctx context.Context, run *backupv1
 	return snapshots, "", nil
 }
 
-// recheckSnapshot lists the repository again right before the run creates
-// the object whose mover restores item, and returns why that mover would not
-// restore the snapshot the checks recorded, or "" when it would.
+// recheckSnapshot lists the repository again right before an into restore
+// creates the ReplicationDestination whose mover restores item, and returns
+// why that mover would not restore the snapshot the checks recorded, or ""
+// when it would. An in-place restore rechecks its full ID instead (see
+// recheckJobSnapshot).
 //
 // Parameters:
 //   - item is the volume item. item.Snapshot is the short ID the checks
@@ -790,33 +836,9 @@ func (r *RestoreRunReconciler) recheckSnapshot(ctx context.Context, run *backupv
 	return why, nil
 }
 
-// failBeforeStart returns the message of a Pending volume item that fails
-// before the run created its ReplicationDestination.
-//
-// Parameters:
-//   - claim is the name of the claim the item restores, which the message
-//     names.
-//   - why says why the item fails: a snapshot that changed since the checks,
-//     from recheckSnapshot. The start checks' refusals get the same ending
-//     from nothingWrittenTo instead.
-//
-// It returns why followed by nothingWritten's end: nothing was written to
-// the claim, and a new RestoreRun selects again.
-//
-// No mover of the item can have run at that point. restoreVolume calls it,
-// and marks the start checks' refusals with nothingWrittenTo, only after
-// lostDestination found no destination the run owns under the item's name:
-// a pass that created one and lost the status write that recorded it leaves
-// the item Pending, and restoreVolume takes that destination over and moves
-// the item to Running before any of the checks that fail an item. quiesce
-// marks its refusals before any destination exists.
-func failBeforeStart(claim, why string) string {
-	return why + nothingWritten(claim)
-}
-
-// nothingWritten returns the end of the message of an item that
-// recheckSnapshot failed before its mover's object existed: nothing was
-// written to the claim named claim, and a new RestoreRun selects again.
+// nothingWritten returns the end of the message of a restore that failed
+// before its mover existed: nothing was written to the claim named claim,
+// and a new RestoreRun selects again.
 func nothingWritten(claim string) string {
 	return fmt.Sprintf(". Nothing was written to claim %s. Create a new RestoreRun to select again", claim)
 }
@@ -886,12 +908,11 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // was in. A run whose items have all finished only waits for its stopped
 // movers to go before it gives the app back, so a deadline that passes
 // during that wait leaves it waiting, and it ends as its items say. With
-// spec.quiesce set,
-// the first passes call quiesce to stop the listed workloads, and later
-// passes restore nothing until every pod of those workloads is gone. work
-// then moves each volume item a step further (see restoreVolume), and
-// deletes the ReplicationDestination of each item that has finished once
-// its end is in the status (see removeDestinations). The databases wait
+// spec.quiesce set, the first passes call quiesce to stop the listed
+// workloads, and later passes restore nothing until every pod of those
+// workloads is gone. work then moves each volume item a step further (see
+// restoreVolume), and stops the restore Job of each item that has finished
+// once its end is in the status (see stopMovers). The databases wait
 // until every volume item is done; when a volume restore failed, the
 // databases still Pending are skipped and left running, and otherwise each
 // is moved a step further (see restoreDatabase).
@@ -906,7 +927,9 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 // Succeeded, Failed or Skipped: Failed when an item failed, Failed with
 // reason NoBackupInReach when every item was Skipped (see nothingRestored),
 // and Succeeded otherwise. At the start of each pass work releases the Leases
-// of the items that finished in an earlier pass and whose movers are gone.
+// of the items that finished in an earlier pass and whose movers are gone:
+// an item that still names a restore Job has one Stop has not reported
+// stopped (see restoreItemDone).
 //
 // While clusterWebhookBlind reports that the bootstrap webhook would not see
 // a Cluster created again, work deletes no Cluster: it fails every Pending
@@ -991,19 +1014,18 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 		}
 	}
 
-	// A finished volume item's phase goes into the status before its
-	// ReplicationDestination is deleted. The destination's lastManualSync is
-	// the only record that the mover completed the run's trigger. Deleted
-	// first, a lost status write or a crash would leave a Running item whose
-	// destination is gone, and no later pass could tell how it ended. A later
-	// pass deletes the destination of any finished item that still names one,
-	// and a destination that is already gone counts as deleted.
-	var stopping moverList
-	if finishedWithDestination(run.Status.Items) {
+	// A finished volume item's phase goes into the status before its restore
+	// Job is stopped. The Job's conditions are the only record of how the
+	// restore ended. Deleted first, a lost status write or a crash would
+	// leave a Running item whose Job is gone, and no later pass could tell
+	// how it ended. A later pass stops the Job of any finished item that
+	// still names one (see stopJobs).
+	var stopping moverStops
+	if finishedWithMover(run.Status.Items) {
 		if err := r.writeStatus(ctx, run); err != nil {
 			return ctrl.Result{}, err
 		}
-		if stopping, err = r.removeDestinations(ctx, run, finished); err != nil {
+		if stopping, err = r.stopMovers(ctx, run, finished); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1047,11 +1069,11 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 
 	// A mover the run stopped may still write into a claim or the
 	// repository, so the run gives nothing back and releases no Lease it
-	// still holds until that mover is gone (rule X2, see removeDestinations).
+	// still holds until that mover is gone (rule X2, see stopMovers).
 	// Only a finished item counts here: the mover of an item that is still
 	// Pending or Running is doing the restore, and belongs there.
-	if message := stopping.message(); message != "" {
-		return r.waitForStopped(ctx, run, message)
+	if stopping.waiting() {
+		return r.waitForStopped(ctx, run, stopping.message())
 	}
 
 	// A database comes back only when its owner creates it again, and a
@@ -1094,172 +1116,35 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	return after(pollInterval, r.writeStatus(ctx, run))
 }
 
-// restoreVolume moves one in-place volume restore a step further.
+// restoreVolume moves one in-place volume restore a step further, through
+// the item's restore Job.
 //
 // Parameters:
 //   - run is the RestoreRun the item belongs to.
 //   - index is the item's position in status.items. It goes into the name of
-//     the item's ReplicationDestination (see destinationName).
+//     the item's restore Job (see jobName).
 //   - item is the volume item, which restoreVolume updates in place.
 //
 // It returns a Ready reason and message while a Pending item waits, and
-// empty strings otherwise. The reason is ClaimInUse with a message naming
-// the pod while a pod mounts the claim, ClaimInUse with a message naming the
-// destination while another ReplicationDestination writes into the claim
-// (see claimWriter), and SourceBusy with a message naming the other run
-// while another run holds the Lease of the claim or its repository (see
-// acquireLeases) or a backup of either is in progress (see otherMover). The
-// item stays Pending in each of these waits. It returns an error, and leaves
-// the item as it was, when an API call fails for any other reason.
+// empty strings otherwise, and an error, which leaves the item as it was,
+// when an API call fails for a reason a retry may fix.
 //
-// A Pending item whose destination the run already owns (see
-// lostDestination) goes to Running with it before anything else: an earlier
-// pass ran the checks, created the destination, and lost the status write
-// that recorded it, and a pod of its mover may be the one that mounts the
-// claim. Any other Pending item waits until no pod mounts the claim.
-// restoreVolume then takes the Leases, lists the repository again (see
-// recheckSnapshot), creates the item's destination and moves the item to
-// Running. A claim that is gone or being deleted (see startRefusal), a
-// VolumeRestore or repository Secret that is missing, or a snapshot the
-// mover would no longer restore, because it was forgotten, retimed or
-// shadowed in its second since the checks, fails the item before the
-// destination exists, with a message that says nothing was written (see
-// nothingWrittenTo and failBeforeStart). A destination with the item's name
-// that the run did not create (see ownsDestination), found at the create or
-// on a later pass, fails the item too; the item then names no destination,
-// so nothing the run does afterwards touches it.
-//
-// A Running item fails with the mover's logs when the mover failed, and
-// fails when its destination is gone. Once the destination has completed the
-// run's trigger, the item succeeds only when the mover's log names the
-// snapshot the checks recorded (see unconfirmedRestore) and the claim is
-// still there, not being deleted, and the one the mover wrote into (see
-// inPlaceClaimLost); it fails otherwise. restoreVolume leaves the
-// destination in place, and work deletes it once the item's end is in the
-// status.
-func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (string, string, error) {
+// A Pending item starts its restore Job once nothing holds it back (see
+// startJob). A Running item follows its Job to its end (see followJob). The
+// run stops the Job once the item's end is in the status (see stopJobs).
+func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (reason, message string, err error) {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
-		// A destination the run owns under the item's name means an earlier
-		// pass ran every check below, created it, and lost the status write
-		// that recorded it. Its mover may already mount the claim, and
-		// claimHolder would then keep the item waiting on it, unnamed and so
-		// never stopped at the run's end.
-		lost, err := r.lostDestination(ctx, run, index)
-		if err != nil {
-			return "", "", err
-		}
-		if lost != "" {
-			item.Phase, item.Destination = backupv1alpha1.ItemRunning, lost
-			return "", "", nil
-		}
-		holder, err := claimHolder(ctx, r.Reader, run.Namespace, item.Name)
-		if err != nil {
-			return "", "", fmt.Errorf("look for a pod holding claim %s: %w", item.Name, err)
-		}
-		if holder != "" {
-			return backupv1alpha1.ReasonClaimInUse,
-				fmt.Sprintf("claim %s is mounted by pod %s; stop the workload and this restore starts on its own", item.Name, holder), nil
-		}
-		writer, err := r.claimWriter(ctx, run, item.Name, destinationName(run.UID, index))
-		if err != nil {
-			return "", "", err
-		}
-		if writer != "" {
-			return backupv1alpha1.ReasonClaimInUse,
-				fmt.Sprintf("ReplicationDestination %s is restoring into claim %s", writer, item.Name), nil
-		}
-		settings, err := r.startRefusal(ctx, run, item.Name)
-		if failRestoreItem(item, err) {
-			return "", "", nil
-		}
-		if err != nil {
-			return "", "", err
-		}
-		// The Leases make the restore and a backup of the claim or its
-		// repository exclusive: of two runs that get here in the same
-		// instant, only one creates each Lease.
-		busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseHolder{kind: "RestoreRun", run: run, item: item.Name},
-			run.Namespace, item.Name, settings.Secret)
-		if failRestoreItem(item, nothingWrittenTo(item.Name, err)) {
-			return "", "", nil
-		}
-		if err != nil {
-			return "", "", err
-		}
-		if busy != "" {
-			return backupv1alpha1.ReasonSourceBusy, busy, nil
-		}
-		// A backup of the claim or its repository that already has its
-		// trigger on a ReplicationSource goes first, as one started before
-		// the controller took Leases does. The check runs right before the
-		// create, so a backup that wrote its trigger after the checks is
-		// still seen.
-		backing, err := otherMover(ctx, r.Reader, run.Namespace, item.Name, settings.Secret, backupMover)
-		if err != nil {
-			return "", "", err
-		}
-		if backing != "" {
-			return backupv1alpha1.ReasonSourceBusy, backing, nil
-		}
-		name := destinationName(run.UID, index)
-		why, err := r.recheckSnapshot(ctx, run, item, settings.Secret)
-		if err != nil {
-			return "", "", err
-		}
-		if why != "" {
-			message := failBeforeStart(item.Name, why)
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, message
-			return "", "", nil
-		}
-		refusal, err := r.createDestination(ctx, run, directDestination(run, *item, settings, name))
-		if err != nil {
-			return "", "", err
-		}
-		if refusal != "" {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, refusal
-			return "", "", nil
-		}
-		item.Phase, item.Destination = backupv1alpha1.ItemRunning, name
-
+		return r.startJob(ctx, run, index, item)
 	case backupv1alpha1.ItemRunning:
-		destination := &volsyncv1alpha1.ReplicationDestination{}
-		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Destination}, destination); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return "", "", fmt.Errorf("get ReplicationDestination %s: %w", item.Destination, err)
-			}
-			// The run records an item's end before it deletes the
-			// destination, so something else deleted this one.
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, fmt.Sprintf("the ReplicationDestination %s was deleted before its mover finished", item.Destination)
-			return "", "", nil
-		}
-		if !ownsDestination(run, destination) {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, replacedDestination(item.Destination)
-			item.Destination = ""
-			return "", "", nil
-		}
-		if reason, failed := failedMover(destination); failed {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, reason
-		} else if destination.Status != nil && destination.Status.LastManualSync == string(run.UID) {
-			// A completed trigger says only that the mover exited 0; its
-			// log says which snapshot, if any, it restored, and the claim
-			// must still be the one it wrote into.
-			lost, err := r.inPlaceClaimLost(ctx, run, item.Name)
-			if err != nil {
-				return "", "", err
-			}
-			item.Phase = backupv1alpha1.ItemSucceeded
-			if why := unconfirmedRestore(destination, item.Snapshot, item.Name, false); why != "" {
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, why
-			} else if lost != "" {
-				item.Phase, item.Message = backupv1alpha1.ItemFailed, lost
-			}
-		}
+		_, err = r.followJob(ctx, run, item)
+		_, err = settled(item, err)
+		return "", "", err
 	default:
 		// An item in any other phase has finished, so there is nothing
 		// left to restore.
+		return "", "", nil
 	}
-	return "", "", nil
 }
 
 // startRefusal checks whether the item's claim or repository settings refuse
@@ -1308,14 +1193,14 @@ func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1al
 //     UID.
 //   - claimName names the claim, which is also the item's name.
 //
-// The claim the run checked is the one it took its claim Lease on
-// right before it created the item's ReplicationDestination: the Lease is
-// named after that claim's UID (see claimLeaseName) and lists the item. A
-// claim whose UID is not among the run's claim Leases for the item was
-// created after that create, so it replaced the claim the run checked. The
-// mover mounts the claim by name, so a mover pod that started after the
-// replacement may have written into the new claim, and the message asks for
-// that claim's data to be checked.
+// The claim the run checked is the one it took its claim Lease on right
+// before it created the item's restore Job: the Lease is named after that
+// claim's UID (see claimLeaseName) and lists the item. A claim whose UID is
+// not among the run's claim Leases for the item was created after that
+// create, so it replaced the claim the run checked. The Job mounts the claim
+// by name, so a pod of it that started after the replacement may have
+// written into the new claim, and the message asks for that claim's data to
+// be checked.
 //
 // A run that holds no claim Lease for the item can't tell which claim the
 // mover wrote into, and gets a message too, since the item must not succeed
@@ -1356,42 +1241,6 @@ func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backup
 		return fmt.Sprintf("claim %[1]s was replaced while the mover wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
 			"and took its Lease on (UID %[3]s). The mover mounts claim %[1]s by name, so it may have written into it; check its data, "+
 			"and create a new RestoreRun to restore it", claimName, claim.UID, strings.Join(leased, ", ")), nil
-	}
-	return "", nil
-}
-
-// claimWriter returns the name of a ReplicationDestination, other than the
-// item's own, whose mover writes into the claim, or "" when there is none.
-//
-// Parameters:
-//   - claimName names the claim an in-place restore is about to write into.
-//   - own is the name the item's ReplicationDestination has (see
-//     destinationName). That destination is left out: an earlier pass may
-//     have created it and lost the status write that recorded it.
-//
-// It lists the ReplicationDestinations in the run's namespace through the
-// uncached Reader, and returns the first one, in the order the list gives,
-// whose restic mover's destinationPVC is the claim. A destination being
-// deleted counts too, since its mover may still write. A destination of
-// another mover type has no restic spec and is ignored; the walzen cluster
-// runs only restic movers. A failed list comes back as an error, and the
-// caller retries with nothing created.
-//
-// The Leases keep the movers of two runs of this controller apart. A
-// destination that something else created takes no Lease, so the
-// destination itself is what shows that the claim is being written.
-func (r *RestoreRunReconciler) claimWriter(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName, own string) (string, error) {
-	list := &volsyncv1alpha1.ReplicationDestinationList{}
-	if err := r.Reader.List(ctx, list, client.InNamespace(run.Namespace)); err != nil {
-		return "", fmt.Errorf("list the ReplicationDestinations in %s: %w", run.Namespace, err)
-	}
-	for _, destination := range list.Items {
-		if destination.Name == own || destination.Spec.Restic == nil || destination.Spec.Restic.DestinationPVC == nil {
-			continue
-		}
-		if *destination.Spec.Restic.DestinationPVC == claimName {
-			return destination.Name, nil
-		}
 	}
 	return "", nil
 }
@@ -1989,7 +1838,7 @@ func takenDestination(name string) string {
 // replacedDestination returns the message for an item whose
 // ReplicationDestination was replaced, while the item ran, by one the run
 // did not create.
-func replacedDestination(name string) string {
+func replacedDestination(name string) string { //nolint:unused // deleted in restic-jobs step 7b
 	return fmt.Sprintf("ReplicationDestination %s was replaced by one that does not carry this run's trigger; the run leaves it alone", name)
 }
 
@@ -2040,11 +1889,20 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 // It returns what finish returns: an empty result once the run has ended, or
 // the wait for a stopped mover, which finish reports (rule X2).
 //
-// The items it fails record no reason; the run's ending says why. The Ready
-// message also carries the note of each Cluster the run left deleted (see
+// Before it fails anything, abort reads the restore Job of each Running
+// in-place item (see settleJobs), so an item whose Job has ended records
+// how, and an item whose Job still waits for its pod adds why to its
+// message. A failed read comes back as an error for a retry. The items it
+// fails record no reason; the run's ending says why. The Ready message also
+// carries the note of each Cluster the run left deleted (see
 // leftDeletedNotes). A run past its deadline ends through timeOut instead.
 func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
+	waits, err := r.settleJobs(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	failRemainingItems(run, message, "")
+	addWaits(run, waits)
 	return r.finish(ctx, run, reason, leftDeletedNotes(run.Status.Items, message))
 }
 
@@ -2058,16 +1916,23 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 //
 // It returns what finish returns: an empty result once the run has ended,
 // the wait for a stopped mover, or the error of a release that failed, for
-// a retry.
+// a retry. A failed read of a restore Job comes back as an error too.
 //
-// Every unfinished item fails with reason TimedOut (see
-// failRemainingItems), and finish records the Ready message, with the note
+// First the restore Job of each Running in-place item is read (see
+// settleJobs), so a restore that completed just as the deadline passed
+// records Succeeded. Every item still unfinished then fails with reason
+// TimedOut (see failRemainingItems), and finish records the Ready message, with the note
 // of each Cluster the run left deleted, in status.ending. Every status
 // write from then on carries the ending, and a later pass, such as one
 // after the wait for a stopped mover replaced the SourceBusy condition,
 // ends with it as recorded.
 func (r *RestoreRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
+	waits, err := r.settleJobs(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	failRemainingItems(run, message, backupv1alpha1.ItemReasonTimedOut)
+	addWaits(run, waits)
 	return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, leftDeletedNotes(run.Status.Items, message))
 }
 
@@ -2411,9 +2276,10 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // The steps run in this order, and each one runs only once the one before it
 // went through:
 //
-//  1. It stops the run's movers (see removeDestinations) and waits until
-//     each one is gone (rule X2), so no mover still writes into a claim or
-//     the repository once the app is back or another run takes over.
+//  1. It stops the run's movers (see stopMovers): it suspends each restore
+//     Job and waits until no pod of it can still write (rule X2), so no
+//     mover writes into a claim or the repository once the app is back or
+//     another run takes over.
 //  2. It gives back the workloads the run stopped and resumes the
 //     Kustomizations it suspended, and records status.restartedAt.
 //  3. It releases the run's claim and repository Leases (see releaseLeases).
@@ -2432,12 +2298,12 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 		run.Status.Ending = &backupv1alpha1.RunEnding{Reason: reason, Message: message}
 	}
 	ending := *run.Status.Ending
-	left, err := r.removeDestinations(ctx, run, anyItem)
+	left, err := r.stopMovers(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err)
 	}
-	if waiting := left.message(); waiting != "" {
-		return r.waitForStopped(ctx, run, waiting)
+	if left.waiting() {
+		return r.waitForStopped(ctx, run, left.message())
 	}
 	// The app is given back before the Leases go: a run that could not start
 	// the workloads keeps the claim and the repository to itself until it
@@ -2482,10 +2348,11 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 // whose error it returns for a retry.
 //
 // The steps run in this order, and each one runs only once the one before it
-// went through: it stops the run's movers and waits until each is gone (rule
-// X2), gives the stopped workloads back and resumes the suspended
-// Kustomizations, releases the claim and repository Leases, drops the
-// finalizer, and last releases the namespace's quiesce Lease. Without
+// went through: it stops the run's movers and waits until none can still
+// write (rule X2, see stopMovers), gives the stopped workloads back and
+// resumes the suspended Kustomizations, releases the claim and repository
+// Leases, drops the finalizer, and last releases the namespace's quiesce
+// Lease. Without
 // finalize, a run deleted while its mover writes would leave a restore
 // running against a claim with nothing tracking it. The run keeps its
 // finalizer and its Leases while it waits or retries: a Lease released
@@ -2506,12 +2373,12 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
 	}
-	left, err := r.removeDestinations(ctx, run, anyItem)
+	left, err := r.stopMovers(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err)
 	}
-	if waiting := left.message(); waiting != "" {
-		return r.waitForStopped(ctx, run, waiting)
+	if left.waiting() {
+		return r.waitForStopped(ctx, run, left.message())
 	}
 	// The app is given back before the Leases go, as in finish.
 	if stopped(run) {
@@ -3068,21 +2935,23 @@ func finished(item backupv1alpha1.RestoreItem) bool {
 }
 
 // restoreItemDone reports whether the run's item named name has finished (see
-// finished), or the run has no such item.
+// finished) and names no restore Job, or the run has no such item. An item
+// keeps its Job's UID until Stop reports the Job stopped (see stopJobs), so
+// until then the Job may still write, and the item keeps its Leases.
 func restoreItemDone(run *backupv1alpha1.RestoreRun, name string) bool {
 	for _, item := range run.Status.Items {
 		if item.Name == name {
-			return finished(item)
+			return finished(item) && item.JobUID == ""
 		}
 	}
 	return true
 }
 
-// finishedWithDestination reports whether any finished item still names a
-// ReplicationDestination.
-func finishedWithDestination(items []backupv1alpha1.RestoreItem) bool {
+// finishedWithMover reports whether any finished item still names a
+// ReplicationDestination or a restore Job, so its mover is not stopped yet.
+func finishedWithMover(items []backupv1alpha1.RestoreItem) bool {
 	for _, item := range items {
-		if finished(item) && item.Destination != "" {
+		if finished(item) && (item.Destination != "" || item.JobUID != "") {
 			return true
 		}
 	}
