@@ -10,6 +10,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -340,6 +341,19 @@ func TestSuspendRefusesAReplacedJob(t *testing.T) {
 	}
 	if got := k.read(job); got.Spec.Suspend != nil && *got.Spec.Suspend {
 		t.Error("the Job that replaced the one given was suspended")
+	}
+}
+
+func TestDeleteRefusesAReplacedJob(t *testing.T) {
+	k := newCluster(t)
+	job := k.createJob()
+	stale := job.DeepCopy()
+	stale.UID = "an-earlier-job"
+	if err := k.api.DeleteJob(context.Background(), stale); !apierrors.IsConflict(err) {
+		t.Fatalf("DeleteJob = %v, want a Conflict for a Job other than the one it was given", err)
+	}
+	if got := k.read(job); got.DeletionTimestamp != nil || k.foregroundDeleted(job) {
+		t.Error("the Job that replaced the one given was deleted")
 	}
 }
 
