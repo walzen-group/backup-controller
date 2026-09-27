@@ -22,7 +22,6 @@ import (
 // gone.
 var volsyncKinds = []schema.GroupVersionKind{
 	volsyncv1alpha1.GroupVersion.WithKind("ReplicationSource"),
-	volsyncv1alpha1.GroupVersion.WithKind("ReplicationDestination"),
 }
 
 // volsyncUnsupported reports whether the API server serves a VolSync kind
