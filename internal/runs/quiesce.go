@@ -247,17 +247,27 @@ func acquireQuiesceLease(ctx context.Context, c client.Client, reader client.Rea
 //     gives.
 //   - conditions are the run's status.conditions before it ends.
 //
+// The message ends with the wait the run was in, if any (see waitedFor).
+func timedOutMessage(deadline time.Time, conditions []metav1.Condition) string {
+	return fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339)) + waitedFor(conditions)
+}
+
+// waitedFor returns the end of a timed-out run's message that says what the
+// run was waiting for.
+//
+// Parameters:
+//   - conditions are the run's status.conditions before it ends.
+//
 // When the run was waiting, for another run (reason SourceBusy) or for the
 // API server to serve VolSync's version again (reason VolSyncUnsupported),
-// the message adds that wait's own message, so it says what the run waited
-// for.
-func timedOutMessage(deadline time.Time, conditions []metav1.Condition) string {
-	message := fmt.Sprintf("the run had not finished by %s", deadline.Format(time.RFC3339))
+// it returns "; it was waiting: " followed by that wait's own message.
+// Otherwise it returns an empty string.
+func waitedFor(conditions []metav1.Condition) string {
 	ready := meta.FindStatusCondition(conditions, backupv1alpha1.ConditionReady)
-	if ready != nil && (ready.Reason == backupv1alpha1.ReasonSourceBusy || ready.Reason == backupv1alpha1.ReasonVolSyncUnsupported) {
-		message += "; it was waiting: " + ready.Message
+	if ready == nil || (ready.Reason != backupv1alpha1.ReasonSourceBusy && ready.Reason != backupv1alpha1.ReasonVolSyncUnsupported) {
+		return ""
 	}
-	return message
+	return "; it was waiting: " + ready.Message
 }
 
 // workload is one Deployment or StatefulSet that a run stops while it works.

@@ -76,7 +76,7 @@ func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1al
 		return after(pollInterval, r.recordJob(ctx, run))
 	}
 	if deadline, over := r.overdue(run); over {
-		return r.timeOut(ctx, run, intoTimedOut(run.Spec.Into, deadline))
+		return r.timeOut(ctx, run, intoTimedOut(run.Spec.Into, deadline, run.Status.Conditions))
 	}
 	settings, waiting, err := r.intoChecks(ctx, run)
 	if done, err := settled(item, err); done {
@@ -197,7 +197,7 @@ func (r *RestoreRunReconciler) followIntoJob(ctx context.Context, run *backupv1a
 		return r.endInto(ctx, run, err)
 	}
 	if deadline, over := r.overdue(run); over {
-		return r.timeOut(ctx, run, intoTimedOut(run.Spec.Into, deadline))
+		return r.timeOut(ctx, run, intoTimedOut(run.Spec.Into, deadline, run.Status.Conditions))
 	}
 	if seen.unresumed != nil {
 		if done, err := settled(item, r.resumeJob(ctx, run, 0, *item, seen.unresumed)); done {

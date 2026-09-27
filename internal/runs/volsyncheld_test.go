@@ -274,3 +274,35 @@ func TestAVolSyncWaitOnAnEndedRunRecordsNoEvent(t *testing.T) {
 		t.Errorf("stored Ready reason = %q, want the ending's %s kept", reason, backupv1alpha1.ReasonTimedOut)
 	}
 }
+
+// An into restore that meets a VolSync no longer serving v1alpha1 before it
+// creates its restore Job waits with reason VolSyncUnsupported, and once it
+// passes spec.timeout it ends TimedOut with a Ready message that names the
+// claim, the deadline and the VolSync wait it was in.
+func TestAnIntoRestoreTimedOutOnAnUnservedVolSyncNamesTheWait(t *testing.T) {
+	run := checkedRestore(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" })
+	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository())
+
+	checkVolSyncRefused(t, tryRestoreStep(r), "ReplicationSource")
+	waiting := readRestoreRun(t, c)
+	checkVolSyncUnsupported(t, waiting.Status.Conditions, "ReplicationSource")
+
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	for range 2 {
+		if err := tryRestoreStep(r); err != nil {
+			t.Fatalf("reconcile past the deadline: %v", err)
+		}
+	}
+
+	done := readRestoreRun(t, c)
+	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+		t.Fatalf("phase = %q, reason = %q; want Failed, TimedOut", done.Status.Phase, readyReason(done.Status.Conditions))
+	}
+	message := readyMessage(done.Status.Conditions)
+	if !strings.HasPrefix(message, "claim scratch had not been restored by ") {
+		t.Errorf("Ready message = %q, want it to name the claim and the deadline", message)
+	}
+	if wait := readyMessage(waiting.Status.Conditions); !strings.Contains(message, "; it was waiting: "+wait) {
+		t.Errorf("Ready message = %q, want it to name the VolSync wait %q", message, wait)
+	}
+}

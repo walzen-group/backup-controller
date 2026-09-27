@@ -1583,11 +1583,15 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 //     names.
 //   - deadline is the run's deadline as overdue returns it, which the
 //     message gives.
+//   - conditions are the run's status.conditions before it ends, which
+//     show the wait the run was in, if any.
 //
-// timeOut puts the message on the run and on its item, and records it in
-// status.ending, which a later pass ends the run with.
-func intoTimedOut(into string, deadline time.Time) string {
-	return fmt.Sprintf("claim %s had not been restored by %s", into, deadline.Format(time.RFC3339))
+// The message ends with the SourceBusy or VolSyncUnsupported wait the run
+// was in, as timedOutMessage's does (see waitedFor). timeOut puts the
+// message on the run and on its item, and records it in status.ending,
+// which a later pass ends the run with.
+func intoTimedOut(into string, deadline time.Time, conditions []metav1.Condition) string {
+	return fmt.Sprintf("claim %s had not been restored by %s", into, deadline.Format(time.RFC3339)) + waitedFor(conditions)
 }
 
 // intoTaken reads the object named spec.into into object, and refuses it
@@ -1715,8 +1719,8 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 // Parameters:
 //   - run is the RestoreRun past its deadline, with no ending recorded yet.
 //   - message is the Ready message: timedOutMessage's for an in-place run,
-//     which names the SourceBusy or VolSyncUnsupported wait the run was in,
-//     and intoTimedOut's for an into restore.
+//     and intoTimedOut's for an into restore, each naming the SourceBusy or
+//     VolSyncUnsupported wait the run was in.
 //
 // It returns what finish returns: an empty result once the run has ended,
 // the wait for a stopped mover, or the error of a release that failed, for
