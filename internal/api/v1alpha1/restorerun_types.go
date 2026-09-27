@@ -224,11 +224,6 @@ type RestoreItem struct {
 	// Message says why the item failed or was skipped.
 	// +optional
 	Message string `json:"message,omitempty"`
-	// Destination is the name of the ReplicationDestination restoring a
-	// volume. It is cleared once the restore ends and the destination is
-	// deleted.
-	// +optional
-	Destination string `json:"destination,omitempty"`
 	// Snapshot is the short ID of the restic snapshot the run's checks
 	// selected for a volume. The item succeeds only when the mover's log
 	// names this snapshot as the one it restored.

@@ -569,12 +569,6 @@ spec:
                         one, which the delete has not reached yet. Only a Cluster with another
                         UID can be the recovery.
                       type: string
-                    destination:
-                      description: |-
-                        Destination is the name of the ReplicationDestination restoring a
-                        volume. It is cleared once the restore ends and the destination is
-                        deleted.
-                      type: string
                     job:
                       description: |-
                         Job is the name of the restore Job the run created for a volume, in the
