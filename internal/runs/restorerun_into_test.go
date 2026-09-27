@@ -341,6 +341,53 @@ func TestADeletedIntoRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
 	}
 }
 
+// An into restore whose Job name now holds a Job with another UID fails
+// its item with reason RestoreJobDeleted, also when that Job is Complete,
+// and one whose Job the run no longer controls fails it with reason
+// RestoreJobFailed. The run never creates a second Job, and Stop gates on
+// the recorded UID: a Job with another UID is neither suspended nor
+// deleted, and the pod of the recorded UID holds the run and its Lease
+// until it has ended.
+func TestAReplacedOrUncontrolledIntoRestoreJobFailsTheItem(t *testing.T) {
+	for _, tc := range swappedJobs {
+		t.Run(tc.name, func(t *testing.T) {
+			run, job := intoOnJob(t)
+			pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
+			tc.swap(job)
+			lease := heldClaimLease(run, run.Spec.Into)
+			r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), job, pod, lease)
+			var creates *int
+			r.Client, creates = countJobCreates(c)
+			restoreStep(t, r)
+			if tc.stopped {
+				markSuspended(t, c, job)
+			}
+			restoreStep(t, r)
+
+			waiting := readRestoreRun(t, c)
+			if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != tc.reason || item.JobUID != jobUID {
+				t.Errorf("item = %+v, want Failed with reason %s, still naming UID %s", item, tc.reason, jobUID)
+			}
+			if *creates != 0 || suspendedJob(t, c, job.Name) != tc.stopped {
+				t.Errorf("Job creates = %d, Job suspended = %t; want no second Job and suspended %t", *creates, suspendedJob(t, c, job.Name), tc.stopped)
+			}
+			if waiting.Status.Phase.Finished() || !strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
+				t.Fatalf("phase = %q, message = %q while pod %s runs; want the run waiting and naming the pod",
+					waiting.Status.Phase, readyMessage(waiting.Status.Conditions), pod.Name)
+			}
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, lease); err != nil {
+				t.Errorf("get the claim Lease = %v, want it held while the pod runs", err)
+			}
+
+			setPodPhase(t, c, pod, corev1.PodFailed)
+			if done := stepUntilFinished(t, r, c, 2); done.Status.Phase != backupv1alpha1.RunPhaseFailed {
+				t.Errorf("phase = %q once the pod had ended, want Failed", done.Status.Phase)
+			}
+			expectSwappedJobLeft(t, c, tc, job)
+		})
+	}
+}
+
 // An into restore deleted while its Job restores stops the Job through the
 // recorded UID and keeps its finalizer until the Job's pod has ended.
 func TestADeletedIntoRestoreStopsItsJob(t *testing.T) {

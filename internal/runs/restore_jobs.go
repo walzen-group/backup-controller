@@ -289,13 +289,14 @@ func (l jobList) message() string {
 // read, the suspend, the pod list or the delete fails. The caller keeps
 // waiting on an error, and the next pass tries again.
 //
-// A chosen volume item that names no Job gets the one the run controls
-// under the item's name, if there is one (see lostJob): a pass that created
-// it and lost the status write left it unnamed. Each Job is stopped through
-// restorejob.Stop by the recorded Ref: suspended, then deleted once no pod of
-// its UID can still write. An item keeps its Job's name and UID until Stop
-// reports it stopped, so every pass can stop it again, and holderLive keeps
-// the item's Leases while it names one.
+// A chosen volume item that has not finished and names no Job gets the one
+// the run controls under the item's name, if there is one (see
+// nameLostJob): a pass that created it and lost the status write left it
+// unnamed. Each Job is stopped through restorejob.Stop by the recorded Ref:
+// suspended, then deleted once no pod of its UID can still write. An item
+// keeps its Job's name and UID until Stop reports it stopped, so every pass
+// can stop it again, and holderLive keeps the item's Leases while it names
+// one.
 func (r *RestoreRunReconciler) stopJobs(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) (jobList, error) {
 	var left jobList
 	for i := range run.Status.Items {
@@ -322,8 +323,8 @@ func (r *RestoreRunReconciler) stopJobs(ctx context.Context, run *backupv1alpha1
 	return left, nil
 }
 
-// nameLostJob records on an item that names no restore Job the Job the run
-// controls under the item's name, so the run stops it.
+// nameLostJob records on an unfinished item that names no restore Job the
+// Job the run controls under the item's name, so the run stops it.
 //
 // Parameters:
 //   - run is the RestoreRun.
@@ -331,8 +332,15 @@ func (r *RestoreRunReconciler) stopJobs(ctx context.Context, run *backupv1alpha1
 //   - item is the volume item, updated in place.
 //
 // It returns an error from a failed read, and changes nothing then.
+//
+// Only an item that has not finished can have a Job it lost: a pass takes a
+// lost Job over before it starts anything for the item (see takeOverJob),
+// and a run that ends early takes it over before it fails the item (see
+// settleJobs). A finished item that names no Job either never had one or
+// had it stopped, and a Job under its name now is one the run never
+// recorded, which the run leaves alone.
 func (r *RestoreRunReconciler) nameLostJob(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) error {
-	if item.JobUID != "" {
+	if item.JobUID != "" || finished(*item) {
 		return nil
 	}
 	job, err := r.lostJob(ctx, run, index)

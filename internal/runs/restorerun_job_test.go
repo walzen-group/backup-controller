@@ -295,6 +295,50 @@ func TestADeletedRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
 	}
 }
 
+// A Running item whose Job name now holds a Job with another UID fails with
+// reason RestoreJobDeleted, also when that Job is Complete, and one whose
+// Job the run no longer controls fails with reason RestoreJobFailed. The run
+// never creates a second Job, and Stop gates on the recorded UID: a Job with
+// another UID is neither suspended nor deleted, and the pod of the recorded
+// UID holds the app down until it has ended.
+func TestAReplacedOrUncontrolledRestoreJobFailsTheItem(t *testing.T) {
+	for _, tc := range swappedJobs {
+		t.Run(tc.name, func(t *testing.T) {
+			run, job := quiescedMidRestore(t)
+			pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
+			tc.swap(job)
+			r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+				stoppedDeployment(), kustomization(true), job, pod)
+			var creates *int
+			r.Client, creates = countJobCreates(c)
+			restoreStep(t, r)
+			if tc.stopped {
+				markSuspended(t, c, job)
+			}
+			restoreStep(t, r)
+
+			waiting := readRestoreRun(t, c)
+			if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != tc.reason || item.JobUID != jobUID {
+				t.Errorf("item = %+v, want Failed with reason %s, still naming UID %s", item, tc.reason, jobUID)
+			}
+			if *creates != 0 || suspendedJob(t, c, job.Name) != tc.stopped {
+				t.Errorf("Job creates = %d, Job suspended = %t; want no second Job and suspended %t", *creates, suspendedJob(t, c, job.Name), tc.stopped)
+			}
+			if got := replicasOf(t, c); got != 0 || !strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
+				t.Fatalf("replicas = %d, message = %q while pod %s runs; want the app down and the wait naming the pod",
+					got, readyMessage(waiting.Status.Conditions), pod.Name)
+			}
+
+			setPodPhase(t, c, pod, corev1.PodFailed)
+			restoreStep(t, r)
+			if got := replicasOf(t, c); got != 2 {
+				t.Errorf("replicas = %d once the pod had ended, want the 2 the app had", got)
+			}
+			expectSwappedJobLeft(t, c, tc, job)
+		})
+	}
+}
+
 // A run that times out just as its restore Job completed records the item
 // Succeeded, and one whose Job failed records restic's exit code: the
 // timeout reads each Running item's Job before it fails what is left (P11).
