@@ -87,46 +87,75 @@ func (p S3Prober) Survey(ctx context.Context, at Location, target *time.Time) (A
 		return Archive{}, outOfTime(ctx, err, 0, 0)
 	}
 
-	out := Archive{Backups: len(ids)}
 	if len(ids) == 0 {
-		out.Empty = true
-		for object := range client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.ServerPrefix(), Recursive: true, MaxKeys: 1}) {
-			if object.Err != nil {
-				return Archive{}, outOfTime(ctx, fmt.Errorf("list %s/%s: %w", at.Bucket, at.ServerPrefix(), s3Answer(object.Err)), 0, 0)
-			}
-			out.Empty = false
-			break
+		empty, err := prefixEmpty(ctx, client, at)
+		if err != nil {
+			return Archive{}, err
 		}
-		// minio-go ends the listing with no error item when ctx is done, so
-		// finding nothing proves the prefix empty only while ctx is live.
-		if out.Empty && ctx.Err() != nil {
-			return Archive{}, outOfTime(ctx, ctx.Err(), 0, 0)
-		}
-		return out, nil
+		return Archive{Empty: empty}, nil
 	}
 
-	var oldest *BaseBackup
-	read, err := readInfos(ctx, client, at, ids, func(b BaseBackup) bool {
-		if target == nil || !b.End.After(*target) {
-			found := b
-			out.Found = &found
-			return true
-		}
-		if oldest == nil || b.End.Before(oldest.End) {
-			first := b
-			oldest = &first
-		}
-		return false
-	})
-	out.Read = read
+	q := &qualifier{target: target}
+	read, err := readInfos(ctx, client, at, ids, q.visit)
+	out := Archive{Backups: len(ids), Read: read, Found: q.found}
 	if out.Found != nil {
 		return out, nil
 	}
 	if err != nil {
 		return Archive{}, outOfTime(ctx, err, len(ids), read)
 	}
-	out.Oldest = oldest
+	out.Oldest = q.oldest
 	return out, nil
+}
+
+// prefixEmpty tells Survey if nothing exists under the server prefix of a
+// Location. It asks for one key under the prefix.
+//
+// It returns true when the store lists no key there. It returns an
+// *OutOfTimeError when ctx ends before the answer, and an error when the
+// listing fails.
+func prefixEmpty(ctx context.Context, client *minio.Client, at Location) (bool, error) {
+	for object := range client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.ServerPrefix(), Recursive: true, MaxKeys: 1}) {
+		if object.Err != nil {
+			return false, outOfTime(ctx, fmt.Errorf("list %s/%s: %w", at.Bucket, at.ServerPrefix(), s3Answer(object.Err)), 0, 0)
+		}
+		return false, nil
+	}
+	// minio-go ends the listing with no error item when ctx ends, so
+	// finding nothing proves the prefix empty only while ctx is live.
+	if ctx.Err() != nil {
+		return false, outOfTime(ctx, ctx.Err(), 0, 0)
+	}
+	return true, nil
+}
+
+// qualifier keeps what Survey finds in the DONE backups that readInfos
+// gives to visit.
+type qualifier struct {
+	// target is the moment that a backup must finish by, or nil for any
+	// DONE backup.
+	target *time.Time
+	// found is the first DONE backup that finished by target.
+	found *BaseBackup
+	// oldest is the DONE backup with the earliest end among those that
+	// finished after target.
+	oldest *BaseBackup
+}
+
+// visit keeps b as found and returns true when b finished by the target.
+// Otherwise it keeps b as oldest when b ended before the oldest so far, and
+// returns false.
+func (q *qualifier) visit(b BaseBackup) bool {
+	if q.target == nil || !b.End.After(*q.target) {
+		found := b
+		q.found = &found
+		return true
+	}
+	if q.oldest == nil || b.End.Before(q.oldest.End) {
+		first := b
+		q.oldest = &first
+	}
+	return false
 }
 
 // BaseBackups lists the completed base backups of one database, oldest
@@ -223,7 +252,6 @@ type infoResult struct {
 // returns, every worker has stopped.
 func readInfos(ctx context.Context, client *minio.Client, at Location, ids []string, visit func(BaseBackup) bool) (int, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	jobs := make(chan string)
 	results := make(chan infoResult, len(ids))
 	var workers sync.WaitGroup
 	defer func() {
@@ -231,6 +259,21 @@ func readInfos(ctx context.Context, client *minio.Client, at Location, ids []str
 		workers.Wait()
 	}()
 
+	jobs := feedIDs(ctx, ids)
+	for range min(surveyParallel, len(ids)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			readInfoJobs(ctx, client, at, jobs, results)
+		}()
+	}
+	return collectInfos(ctx, results, len(ids), visit)
+}
+
+// feedIDs sends each ID on the channel that it returns, in the order given,
+// and closes the channel after the last ID. It stops early when ctx ends.
+func feedIDs(ctx context.Context, ids []string) <-chan string {
+	jobs := make(chan string)
 	go func() {
 		defer close(jobs)
 		for _, id := range ids {
@@ -241,44 +284,71 @@ func readInfos(ctx context.Context, client *minio.Client, at Location, ids []str
 			}
 		}
 	}()
-	for range min(surveyParallel, len(ids)) {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for id := range jobs {
-				key := at.BasePrefix() + id + "/backup.info"
-				backup, done, err := readBaseBackup(ctx, client, at.Bucket, key)
-				if s3Code(err) == "NoSuchKey" {
-					err = nil
-				}
-				results <- infoResult{backup: backup, done: done, err: err}
-			}
-		}()
-	}
+	return jobs
+}
 
+// readInfoJobs is one readInfos worker. It reads the backup.info of each ID
+// from jobs and sends the result to results. A missing backup.info is a
+// result with no error that is not DONE.
+func readInfoJobs(ctx context.Context, client *minio.Client, at Location, jobs <-chan string, results chan<- infoResult) {
+	for id := range jobs {
+		key := at.BasePrefix() + id + "/backup.info"
+		backup, done, err := readBaseBackup(ctx, client, at.Bucket, key)
+		if s3Code(err) == "NoSuchKey" {
+			err = nil
+		}
+		results <- infoResult{backup: backup, done: done, err: err}
+	}
+}
+
+// collectInfos takes the results of the readInfos workers and gives each
+// DONE backup to visit.
+//
+// Parameters:
+//   - results carries the result of each read.
+//   - total is the number of IDs, which is the number of results to wait
+//     for.
+//   - visit is the function that readInfos got.
+//
+// It returns what readInfos returns (see readInfos).
+func collectInfos(ctx context.Context, results <-chan infoResult, total int, visit func(BaseBackup) bool) (int, error) {
 	read := 0
-	var first, last error
-	for read < len(ids) {
+	var failed readErrors
+	for read < total {
 		select {
 		case r := <-results:
 			read++
 			if r.err != nil {
-				if first == nil {
-					first = r.err
-				}
-				if !errors.Is(r.err, context.DeadlineExceeded) && !errors.Is(r.err, context.Canceled) {
-					last = r.err
-				}
+				failed.add(r.err)
 				continue
 			}
 			if r.done && visit(r.backup) {
 				return read, nil
 			}
 		case <-ctx.Done():
-			return read, &OutOfTimeError{Backups: len(ids), Read: read, Failed: last, Err: ctx.Err()}
+			return read, &OutOfTimeError{Backups: total, Read: read, Failed: failed.last, Err: ctx.Err()}
 		}
 	}
-	return read, first
+	return read, failed.first
+}
+
+// readErrors keeps the errors of the backup.info reads for collectInfos.
+type readErrors struct {
+	// first is the first error of any kind.
+	first error
+	// last is the last error that is not the end of the context.
+	last error
+}
+
+// add keeps err as first when no error came before it, and as last when
+// err is not a context deadline or cancel.
+func (e *readErrors) add(err error) {
+	if e.first == nil {
+		e.first = err
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		e.last = err
+	}
 }
 
 // s3Code returns the S3 error code anywhere in err's chain, such as NoSuchKey
