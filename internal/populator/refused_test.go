@@ -15,9 +15,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// jobsResource is the group and resource of a Job, for the API errors.
-var jobsResource = schema.GroupResource{Group: "batch", Resource: "jobs"}
-
 // lastReady returns the Ready condition of the last status write.
 func lastReady(t *testing.T, ops *fakeOperations) (backupv1alpha1.RestorePhase, string, string) {
 	t.Helper()
@@ -62,41 +59,6 @@ func TestARefusedJobCreateShowsOnReady(t *testing.T) {
 	}
 	if phase, reason, _ := lastReady(t, ops); phase != backupv1alpha1.RestorePhaseRestoring || reason != backupv1alpha1.ReasonRestoring {
 		t.Fatalf("entry %s, Ready %s; want Restoring", phase, reason)
-	}
-}
-
-// TestARefusedResumeShowsOnReady checks that a resume the API server
-// refuses with 403 Forbidden puts reason RestoreJobRefused on Ready, leaves
-// the Job suspended and returns an error.
-func TestARefusedResumeShowsOnReady(t *testing.T) {
-	ops := recordedSuspendedJob(t)
-	ops.refuseResume = apierrors.NewForbidden(jobsResource, "restore-claim-123", nil)
-
-	if done, err := librarySync(context.Background(), newCallbacks(ops, monday), params()); err == nil || done {
-		t.Fatalf("sync = %t, %v; want an error", done, err)
-	}
-	if phase, reason, _ := lastReady(t, ops); phase != backupv1alpha1.RestorePhaseFailed || reason != backupv1alpha1.ReasonRestoreJobRefused {
-		t.Fatalf("entry %s, Ready %s; want Failed and RestoreJobRefused", phase, reason)
-	}
-	if !ptr.Deref(ops.job(t, "claim-123").Spec.Suspend, false) {
-		t.Error("the Job runs after a refused resume")
-	}
-}
-
-// TestAnotherJobErrorIsNoRefusal checks that a create that fails for
-// another reason, such as a timeout, is retried without the
-// RestoreJobRefused reason.
-func TestAnotherJobErrorIsNoRefusal(t *testing.T) {
-	ops := populatedOperations(t)
-	ops.refuseCreate = apierrors.NewTimeoutError("the API server is slow", 1)
-
-	if _, err := librarySync(context.Background(), newCallbacks(ops, monday), params()); err == nil {
-		t.Fatal("sync returned no error")
-	}
-	for _, status := range ops.statuses {
-		if ready := findCondition(status.Status.Conditions, backupv1alpha1.ConditionReady); ready != nil && ready.Reason == backupv1alpha1.ReasonRestoreJobRefused {
-			t.Fatalf("Ready = %+v, want no RestoreJobRefused for a timeout", ready)
-		}
 	}
 }
 

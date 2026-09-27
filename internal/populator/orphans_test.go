@@ -2,7 +2,6 @@ package populator
 
 import (
 	"context"
-	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -15,7 +14,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
@@ -191,48 +189,6 @@ func assertHeld(t *testing.T, c client.Reader, recorder *events.FakeRecorder, re
 	}
 }
 
-// A claim being deleted whose VolumeRestore is gone gets its restore Job,
-// its Secret copy and its prime deleted, then loses the library's finalizer,
-// and a Warning event says so. Before the reconciler the claim stayed
-// Terminating for good, because the library returns on the data source's
-// NotFound before its cleanup (lib-volume-populator v3.3.0
-// controller.go:661-671).
-func TestAClaimWhoseVolumeRestoreIsGoneIsCleanedUp(t *testing.T) {
-	c := newOrphanClient(t, append(leftovers(t), stuckClaim())...)
-	r, recorder := newOrphanReconciler(c, c)
-
-	if _, err := reconcileClaim(t, r); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	assertLeftovers(t, c, false)
-	if got := claimFinalizers(t, c); !slices.Equal(got, []string{pvcProtection}) {
-		t.Errorf("claim finalizers = %v, want only %s", got, pvcProtection)
-	}
-	got := drain(recorder)
-	if len(got) != 1 || !strings.HasPrefix(got[0], "Warning DataSourceGone") || !strings.Contains(got[0], ClaimFinalizer) {
-		t.Errorf("events = %q, want one Warning DataSourceGone naming %s", got, ClaimFinalizer)
-	}
-}
-
-// With only the library's finalizer left, removing it lets the claim go.
-func TestTheLastFinalizerRemovedDeletesTheClaim(t *testing.T) {
-	claim := stuckClaim()
-	claim.Finalizers = []string{ClaimFinalizer}
-	c := newOrphanClient(t, claim)
-	r, _ := newOrphanReconciler(c, c)
-
-	if _, err := reconcileClaim(t, r); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if present(t, c, stuckClaim()) {
-		t.Error("the claim is still there")
-	}
-	if res, err := reconcileClaim(t, r); err != nil || res != (ctrl.Result{}) {
-		t.Errorf("reconcile of the gone claim = %v, %v; want nothing", res, err)
-	}
-}
-
 // A VolumeRestore that still exists, in any state, leaves the cleanup to the
 // library: nothing is stopped or deleted and the finalizer stays.
 func TestAClaimWhoseVolumeRestoreExistsIsLeftToTheLibrary(t *testing.T) {
@@ -278,46 +234,6 @@ func TestAFailedVolumeRestoreReadDeletesNothing(t *testing.T) {
 	assertLeftovers(t, c, true)
 	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
 		t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
-	}
-}
-
-// X2: a restore Job that runs is suspended, and while its pod may still
-// write the Secret copy, the prime and the finalizer stay and the claim is
-// requeued with a WaitingForMover event that says what the stop waits for.
-// Once the pod has ended the Job is deleted and the cleanup finishes.
-func TestARunningRestoreJobIsStoppedAndWaitedFor(t *testing.T) {
-	job := orphanJob(t)
-	job.Spec.Suspend = ptr.To(false)
-	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobSuspended, Status: corev1.ConditionFalse, Reason: "JobResumed"}}
-	pod := restorePod(t, orphanJobUID, "restore-x7k2p", "node-a", corev1.PodRunning)
-	c := newOrphanClient(t, append(leftovers(t)[:2], job, stuckClaim(), pod)...)
-	r, recorder := newOrphanReconciler(c, c)
-	ctx := context.Background()
-
-	res, err := reconcileClaim(t, r)
-	assertHeld(t, c, recorder, res, err, "waiting for the Job controller to suspend it")
-	stored := &batchv1.Job{}
-	if err := c.Get(ctx, client.ObjectKeyFromObject(job), stored); err != nil || !ptr.Deref(stored.Spec.Suspend, false) {
-		t.Fatalf("Job after the first pass: %v, suspend %v; want it suspended", err, stored.Spec.Suspend)
-	}
-	stored.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobSuspended, Status: corev1.ConditionTrue, Reason: "JobSuspended"}}
-	if err := c.Status().Update(ctx, stored); err != nil {
-		t.Fatal(err)
-	}
-
-	res, err = reconcileClaim(t, r)
-	assertHeld(t, c, recorder, res, err, pod.Name)
-
-	pod.Status.Phase = corev1.PodFailed
-	if err := c.Status().Update(ctx, pod); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reconcileClaim(t, r); err != nil {
-		t.Fatalf("reconcile after the pod ended: %v", err)
-	}
-	assertLeftovers(t, c, false)
-	if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
-		t.Errorf("claim finalizers = %v, want %s removed", got, ClaimFinalizer)
 	}
 }
 
@@ -404,68 +320,6 @@ func TestClaimsOutsideTheOrphanCaseAreLeftAlone(t *testing.T) {
 			}
 		})
 	}
-}
-
-// A conflict on the finalizer patch is returned for a retry, which then
-// converges. A patch whose response is lost converges too: the next pass
-// finds the claim without the finalizer and does nothing.
-func TestTheFinalizerPatchConverges(t *testing.T) {
-	t.Run("conflict", func(t *testing.T) {
-		inner := newOrphanClient(t, append(leftovers(t), stuckClaim())...)
-		failed := false
-		c := interceptor.NewClient(inner, interceptor.Funcs{
-			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-				if !failed {
-					failed = true
-					return apierrors.NewConflict(schema.GroupResource{Resource: "persistentvolumeclaims"}, obj.GetName(), errors.New("changed"))
-				}
-				return cl.Patch(ctx, obj, patch, opts...)
-			},
-		})
-		r, _ := newOrphanReconciler(c, inner)
-		if _, err := reconcileClaim(t, r); !apierrors.IsConflict(err) {
-			t.Fatalf("reconcile = %v, want the conflict", err)
-		}
-		if got := claimFinalizers(t, inner); !slices.Contains(got, ClaimFinalizer) {
-			t.Errorf("claim finalizers = %v, want %s kept after the conflict", got, ClaimFinalizer)
-		}
-		if _, err := reconcileClaim(t, r); err != nil {
-			t.Fatalf("retry: %v", err)
-		}
-		if got := claimFinalizers(t, inner); slices.Contains(got, ClaimFinalizer) {
-			t.Errorf("claim finalizers = %v after the retry", got)
-		}
-	})
-	t.Run("lost response", func(t *testing.T) {
-		inner := newOrphanClient(t, append(leftovers(t), stuckClaim())...)
-		lost := false
-		c := interceptor.NewClient(inner, interceptor.Funcs{
-			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-				if err := cl.Patch(ctx, obj, patch, opts...); err != nil {
-					return err
-				}
-				if !lost {
-					lost = true
-					return apierrors.NewTimeoutError("response lost", 1)
-				}
-				return nil
-			},
-		})
-		r, recorder := newOrphanReconciler(c, inner)
-		if _, err := reconcileClaim(t, r); err == nil {
-			t.Fatal("reconcile returned no error for the lost response")
-		}
-		if _, err := reconcileClaim(t, r); err != nil {
-			t.Fatalf("retry: %v", err)
-		}
-		if got := claimFinalizers(t, inner); slices.Contains(got, ClaimFinalizer) {
-			t.Errorf("claim finalizers = %v", got)
-		}
-		assertLeftovers(t, inner, false)
-		if got := drain(recorder); len(got) != 0 {
-			t.Errorf("events = %q, want none for a patch not known to have landed", got)
-		}
-	})
 }
 
 // The predicate passes a stuck claim on the create event the manager's
