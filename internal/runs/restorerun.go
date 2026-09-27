@@ -124,8 +124,8 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // pass that reads, creates or deletes a VolSync object gets an error naming
 // the kind and v1alpha1, which it returns for a retry (see serve). The run
 // changes nothing on that error, and an app it has already stopped stays
-// stopped until v1alpha1 is served again. VolSync is upgraded after the controller, so a supported
-// cluster never gets there.
+// stopped until v1alpha1 is served again. VolSync is upgraded after the
+// controller, so a supported cluster never gets there.
 //
 // A run that recorded status.ending has decided to end, and every later pass
 // only finishes it with that reason and message (see finish), also one that
@@ -257,16 +257,19 @@ func checksTimedOut(deadline time.Time, why string) string {
 // of the read or of the write otherwise.
 //
 // It reads the stored run with the uncached Reader and skips the write only
-// when the stored resourceVersion is the one the pass holds and the whole
-// stored status, items and ending included, equals the computed one. Any
-// difference writes the status, so whatever the pass changed in it before
-// it waits reaches the API server in that pass.
+// when the whole stored status, items and ending included, equals the
+// computed one. Any difference writes the status, so whatever the pass
+// changed in it before it waits reaches the API server in that pass. The
+// resourceVersion does not count: a pass whose copy of the run is older than
+// the stored run, and whose status is already stored, has nothing to write,
+// and a write with the older resourceVersion would only fail with a
+// conflict.
 func (r *RestoreRunReconciler) writeChangedStatus(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
 	stored := &backupv1alpha1.RestoreRun{}
 	if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(run), stored); err != nil {
 		return fmt.Errorf("get RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
 	}
-	if stored.ResourceVersion == run.ResourceVersion && equality.Semantic.DeepEqual(stored.Status, run.Status) {
+	if equality.Semantic.DeepEqual(stored.Status, run.Status) {
 		return nil
 	}
 	return r.writeStatus(ctx, run)
@@ -2059,9 +2062,10 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 //
 // Every unfinished item fails with reason TimedOut (see
 // failRemainingItems), and finish records the Ready message, with the note
-// of each Cluster the run left deleted, in status.ending. Every status write from then on carries
-// the ending, and a later pass, such as one after the wait for a stopped
-// mover replaced the SourceBusy condition, ends with it as recorded.
+// of each Cluster the run left deleted, in status.ending. Every status
+// write from then on carries the ending, and a later pass, such as one
+// after the wait for a stopped mover replaced the SourceBusy condition,
+// ends with it as recorded.
 func (r *RestoreRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
 	failRemainingItems(run, message, backupv1alpha1.ItemReasonTimedOut)
 	return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, leftDeletedNotes(run.Status.Items, message))

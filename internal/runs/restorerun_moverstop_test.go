@@ -923,3 +923,27 @@ func TestWorkStoresItsItemsWhenTheMoverWaitIsUnchanged(t *testing.T) {
 		t.Errorf("item %s = %+v in the pass that skipped it, want it stored Skipped", pgN, item)
 	}
 }
+
+// A pass whose copy of the run is older than the stored run, as a pass
+// started by a pod event before the run's own last write reached the
+// informer, writes nothing when the stored status already equals its own.
+// The stored status is what counts: a write with the older resourceVersion
+// would only fail with a conflict and back off.
+func TestAnUnchangedStatusIsNotWrittenFromAnOlderCopy(t *testing.T) {
+	run := restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN })
+	run.Status.Phase = backupv1alpha1.RunPhaseRunning
+	r, c := restoreReconciler(t, nil, run)
+	older := readRestoreRun(t, c)
+	stored := older.DeepCopy()
+	stored.Labels = map[string]string{"touched": "true"}
+	if err := c.Update(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.writeChangedStatus(context.Background(), older); err != nil {
+		t.Fatalf("writeChangedStatus from an older copy with the stored status: %v, want nil", err)
+	}
+	if again := readRestoreRun(t, c); again.ResourceVersion != stored.ResourceVersion {
+		t.Errorf("resourceVersion = %s, want %s: an unchanged status was written", again.ResourceVersion, stored.ResourceVersion)
+	}
+}
