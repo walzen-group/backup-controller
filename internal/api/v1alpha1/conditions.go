@@ -63,10 +63,9 @@ const (
 
 	// ReasonShutdown reports a restore waiting for something it deleted or
 	// stopped to be gone: a deleted Cluster's instance pods and PVCs, or the
-	// Job and pods of a mover whose ReplicationDestination it deleted. Until
-	// they are gone the app stays stopped, any Kustomization the run
-	// suspended stays suspended, and the run holds its Leases and its
-	// finalizer.
+	// pods of a restore Job it stopped. Until they are gone the app stays
+	// stopped, any Kustomization the run suspended stays suspended, and the
+	// run holds its Leases and its finalizer.
 	ReasonShutdown = "WaitingForShutdown"
 
 	// ReasonClaimInUse reports an in-place restore waiting for a pod to stop
@@ -77,9 +76,9 @@ const (
 	// ReasonTimedOut reports a RestoreRun that had not finished by the end of
 	// its spec.timeout, or an into restore whose claim had not bound by then.
 	// A run whose checks never passed counts its timeout from its creation.
-	// The run removes its ReplicationDestinations and gives back any workloads
-	// it stopped before it reports this. A BackupRun that runs out of time
-	// reports ReasonFailed.
+	// The run stops its restore Jobs and gives back any workloads it stopped
+	// before it reports this. A BackupRun that runs out of time reports
+	// ReasonFailed.
 	ReasonTimedOut = "TimedOut"
 
 	// ReasonInvalid reports a spec the controller will not act on. The
@@ -111,8 +110,8 @@ const (
 	// failed, or whose state the run could not read. That step is giving a
 	// stopped workload its replicas back or resuming a Kustomization the run
 	// suspended. For a RestoreRun it can also be the step that comes first,
-	// stopping its movers: deleting each ReplicationDestination and waiting
-	// until the mover's Job and pods are gone. A BackupRun reports it while it
+	// stopping its restore Jobs: suspending each and waiting until no pod of
+	// it can still write, then deleting it. A BackupRun reports it while it
 	// is still backing up, as soon as the restart after the clones are cut
 	// fails, and a run reports it when it is ending or being deleted. The run
 	// stays unfinished and tries again on every reconcile until it can,
@@ -124,25 +123,23 @@ const (
 	// lets the run go on by itself. After a failed restart step, so does
 	// scaling those workloads and resuming those Kustomizations by hand: the
 	// run skips what is already back. After a mover the run could not stop,
-	// the message also names the ReplicationDestination and the mover's Job,
-	// which a person can delete by hand. A run that is still working must not
-	// be deleted. Only for a run that is ending or being deleted after a
-	// failed restart step does the message also say, after the scaling step,
-	// that a person can delete the run and remove its
-	// backup.wlz.li/run-cleanup finalizer. The run records a Warning event
-	// when it first reports this.
+	// the message also names the restore Job, which a person can delete by
+	// hand with its pods. A run that is still working must not be deleted.
+	// Only for a run that is ending or being deleted after a failed restart
+	// step does the message also say, after the scaling step, that a person
+	// can delete the run and remove its backup.wlz.li/run-cleanup finalizer.
+	// The run records a Warning event when it first reports this.
 	ReasonRestartFailed = "RestartFailed"
 
 	// ReasonReleaseFailed reports a BackupRun or RestoreRun that is ending,
 	// or being deleted, and holds no workload stopped, because it gave the
 	// app back or stopped none, but could not release what it still holds:
 	// its Leases on its claims and repositories, its Kueue Workload, or a
-	// restore mover it has to stop (its ReplicationDestination, and the
-	// mover's Job and pods). The run stays unfinished and tries again on
-	// every reconcile until it can. The message names what the run could not
-	// do and the error, and says what a person can fix or delete by hand,
-	// after which the run finishes by itself. The run records a Warning event
-	// when it first reports this.
+	// restore Job it has to stop, with its pods. The run stays unfinished
+	// and tries again on every reconcile until it can. The message names
+	// what the run could not do and the error, and says what a person can fix
+	// or delete by hand, after which the run finishes by itself. The run
+	// records a Warning event when it first reports this.
 	ReasonReleaseFailed = "ReleaseFailed"
 
 	// ReasonVolSyncUnsupported reports a BackupRun that met an API server
@@ -152,9 +149,11 @@ const (
 	// version. The message names the kind, v1alpha1 and the versions served.
 	// Giving the app back needs no VolSync object, so the run ends Failed
 	// with this reason, after it starts the workloads it stopped. Only
-	// BackupRuns use it. A RestoreRun's VolSync requests fail instead, and
-	// the run retries them until v1alpha1 is served again. An app the run
-	// has already stopped stays stopped until then.
+	// BackupRuns use it. A RestoreRun's VolSync reads fail instead, and the
+	// run retries them, with an app it has already stopped kept stopped.
+	// Ending a RestoreRun needs no VolSync object, so one that passes its
+	// spec.timeout or is deleted still stops its restore Jobs and gives the
+	// app back.
 	ReasonVolSyncUnsupported = "VolSyncUnsupported"
 
 	// ReasonClusterVersionUnsupported reports a RestoreRun that found the API

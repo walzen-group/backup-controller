@@ -129,9 +129,9 @@ type RestoreRunSpec struct {
 	// +kubebuilder:default="4h"
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
-	// MoverSecurityContext is copied onto the ReplicationDestination. Set it
-	// for an app whose files belong to a user the mover has to run as. When
-	// omitted, the one on the claim's VolumeRestore applies.
+	// MoverSecurityContext is the pod security context of the run's restore
+	// Jobs. Set it for an app whose files belong to a user the restore has to
+	// run as. When omitted, the one on the claim's VolumeRestore applies.
 	// +optional
 	MoverSecurityContext *corev1.PodSecurityContext `json:"moverSecurityContext,omitempty"`
 
@@ -225,8 +225,8 @@ type RestoreItem struct {
 	// +optional
 	Message string `json:"message,omitempty"`
 	// Snapshot is the short ID of the restic snapshot the run's checks
-	// selected for a volume. The item succeeds only when the mover's log
-	// names this snapshot as the one it restored.
+	// selected for a volume, for display. The restore Job restores it by its
+	// full ID (see SnapshotID).
 	// +optional
 	Snapshot string `json:"snapshot,omitempty"`
 	// SnapshotID is the full ID of the snapshot the run selected for a

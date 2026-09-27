@@ -23,15 +23,15 @@ import (
 //
 // No controller runs here. The test builds every object by hand, the backup
 // included: a ReplicationSource with a manual trigger stands in for a
-// BackupRun, and there is no RestoreRun and no VolumeRestore. The claim and
-// the destination carry the spec fields scratchClaim and directDestination
-// write, with a fixed destination name, restore-copy-0, and trigger,
-// restore-1, where the controller uses restore-<first 8 characters of the
-// run's UID>-0 and the run's UID, and the claim has no ownerReference to a
-// run. So the test shows what VolSync, the scheduler and the CSI driver do
-// with those objects. The run's own steps for an into restore (its checks,
-// Leases, log check and cleanup) are covered by the unit tests only: the
-// e2e tests that create a RestoreRun restore in place.
+// BackupRun, and there is no RestoreRun and no VolumeRestore. The claim
+// carries the spec fields scratchClaim writes, and has no ownerReference to
+// a run. The destination, under the fixed name restore-copy-0 and trigger
+// restore-1, stands in for the controller's restore Job: that Job mounts the
+// claim by name as its first consumer in the same way. So the test shows
+// what the scheduler and the CSI driver do with such a claim. The run's own
+// steps for an into restore (its checks, Leases, restore Job and cleanup)
+// are covered by the unit tests only: the e2e tests that create a
+// RestoreRun restore in place.
 //
 // The test backs up a claim a running writer mounts, then restores the
 // snapshot into the new claim while the writer keeps running. The mover must
@@ -142,9 +142,10 @@ spec:
 	pin := snap.Time.UTC().Format(time.RFC3339)
 	t.Logf("snapshot %s at %s", snap.ShortID, snap.Time.Format(time.RFC3339Nano))
 
-	// The claim and the destination with the spec fields scratchClaim and
-	// directDestination write for spec.claim: data, spec.into: copy, built
-	// by hand under a fixed name and trigger (see the test's comment).
+	// The claim with the spec fields scratchClaim writes for spec.claim:
+	// data, spec.into: copy, and the destination that fills it in place of
+	// the restore Job, built by hand under a fixed name and trigger (see the
+	// test's comment).
 	apply(t, fmt.Sprintf(`apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

@@ -124,16 +124,17 @@ rules:
     resources: ["localqueues"]
     verbs: ["list"]
   # One destination per populator restore, created and removed by the
-  # callbacks. A RestoreRun lists destinations for its exclusion check. The
-  # populator orphan reconciler deletes the destination of a claim whose
-  # VolumeRestore is gone.
+  # callbacks. The populator orphan reconciler deletes the destination of a
+  # claim whose VolumeRestore is gone. No run reads destinations: a backup's
+  # exclusion check looks for restore Jobs (the batch rule below).
   - apiGroups: ["volsync.backube"]
     resources: ["replicationdestinations"]
     verbs: ["get", "list", "watch", "create", "delete"]
   # The restore Job (internal/restorejob) runs restic for a RestoreRun or the
-  # populator: the controller creates it, reads it by name, suspends it with a
-  # merge patch and deletes it with Foreground propagation, and a RestoreRun
-  # lists its own restore Jobs by label for the exclusion check. Reads go
+  # populator: the controller creates it suspended, reads it by name, resumes
+  # it once it has recorded it and suspends it to stop it, both with a
+  # merge patch, and deletes it with Foreground propagation. A backup lists
+  # the controller's restore Jobs by label for its exclusion check. Reads go
   # through the uncached reader, so no watch. The Job's pods are listed by
   # their controller-uid label under the pods rule above. The populator
   # orphan reconciler (internal/populator/orphans.go) reads a VolSync

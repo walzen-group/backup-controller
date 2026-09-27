@@ -49,8 +49,7 @@ type RestoreRunReconciler struct {
 
 	// Reader reads straight from the API server, without the informer cache.
 	// The run reads claims, VolumeRestores, Secrets, ObjectStores, Clusters,
-	// ReplicationDestinations, Deployments, StatefulSets, pods and Jobs through
-	// it.
+	// ReplicationSources, Deployments, StatefulSets, pods and Jobs through it.
 	Reader client.Reader
 
 	// Snapshots lists the snapshots in a restic repository. plan uses it to
@@ -112,10 +111,13 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // event on the run.
 //
 // While VolSync serves its kinds only at a version other than v1alpha1, a
-// pass that reads, creates or deletes a VolSync object gets an error naming
-// the kind and v1alpha1, which it returns for a retry (see serve). The run
-// changes nothing on that error, and an app it has already stopped stays
-// stopped until v1alpha1 is served again. VolSync is upgraded after the
+// pass that reads a VolSync object, such as the ReplicationSources a volume
+// item lists before it starts its restore Job (see otherMover), gets an
+// error naming the kind and v1alpha1, which it returns for a retry (see
+// serve). The run changes nothing on that error, and an app it has already
+// stopped stays stopped while it retries. Ending the run needs no VolSync
+// object, so a run that passes spec.timeout or is deleted still stops its
+// restore Jobs and gives the app back. VolSync is upgraded after the
 // controller, so a supported cluster never gets there.
 //
 // A run that recorded status.ending has decided to end, and every later pass
