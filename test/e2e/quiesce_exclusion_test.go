@@ -62,7 +62,10 @@ func fluxImageRef(t *testing.T, name string) string {
 // Parameters:
 //   - appNamespace is the namespace the Kustomization applies into.
 //   - deployName is the Deployment's name, and the image is the pinned
-//     busybox the Deployment's pod runs.
+//     busybox the Deployment's pod runs. The Deployment carries
+//     backup.wlz.li/quiesce: "true" in the manifest, as prod declares it:
+//     Flux removes an annotation that kubectl annotate added once it applies
+//     the Deployment again.
 //
 // It returns the namespace and name of the Kustomization it created, which it
 // deletes when the test ends.
@@ -78,6 +81,8 @@ kind: Deployment
 metadata:
   name: %[1]s
   namespace: %[2]s
+  annotations:
+    backup.wlz.li/quiesce: "true"
 spec:
   replicas: 2
   selector: {matchLabels: {app: %[1]s}}
@@ -289,7 +294,10 @@ func TestQuiesceExclusion(t *testing.T) {
 	kustomizationNamespace, kustomizationName := applyFluxKustomization(t, ns.Name, app)
 	t.Logf("Kustomization %s/%s applies Deployment %s/%s", kustomizationNamespace, kustomizationName, ns.Name, app)
 
-	appObjects := `apiVersion: backup.wlz.li/v1alpha1
+	// appObjects follows the repository Secret in one stream, so it starts
+	// with its own document separator.
+	appObjects := `---
+apiVersion: backup.wlz.li/v1alpha1
 kind: VolumeRestore
 metadata:
   name: %[2]s
@@ -348,13 +356,21 @@ spec:
           persistentVolumeClaim: {claimName: %[2]s}
 `
 	apply(t, repo.secretManifest(ns.Name, "restic-data")+fmt.Sprintf(appObjects, ns.Name, claim, ns.Queue, fluxImageRef(t, "busybox")))
-	mustKubectl(t, "", "-n", ns.Name, "annotate", "deployment", app, backupv1alpha1.AnnotationQuiesce+"=true")
 	waitFor(t, "the app's Deployment to be ready", 5*time.Minute, 2*time.Second, func() (bool, string, error) {
 		out, err := kubectlQuick(ns.Name, "get", "deployment", app, "-o", "jsonpath={.spec.replicas}/{.status.readyReplicas}")
 		if err != nil {
 			return false, firstLine(err.Error()), nil
 		}
 		return out == "2/2", "replicas/ready = " + out, nil
+	}, evidence)
+	// A backup of a claim that holds no file takes no snapshot, so the
+	// writer's file has to be there first.
+	waitFor(t, "the writer to write known.txt", 3*time.Minute, 2*time.Second, func() (bool, string, error) {
+		out, err := kubectlQuick(ns.Name, "exec", "deploy/writer", "--", "cat", "/data/known.txt")
+		if err != nil {
+			return false, "not yet: " + firstLine(err.Error()), nil
+		}
+		return out == "quiesce-exclusion", fmt.Sprintf("file holds %q", out), nil
 	}, evidence)
 
 	// One backup first, so the restore has a snapshot to reach.
@@ -364,7 +380,7 @@ metadata:
   name: first
   namespace: %s
 spec:
-  claim: %s
+  source: %s
   timeout: 8m
 `, ns.Name, claim))
 	waitFor(t, "the first BackupRun to succeed", 10*time.Minute, 3*time.Second, func() (bool, string, error) {
@@ -382,7 +398,9 @@ spec:
 	}
 
 	// The restore stops the app, and the second backup starts right after it
-	// has: the two must not stop the app together.
+	// has: the two must not stop the app together. The restore also stops the
+	// writer, which mounts the claim, since an in-place restore starts only
+	// once no pod mounts it.
 	apply(t, fmt.Sprintf(`apiVersion: backup.wlz.li/v1alpha1
 kind: RestoreRun
 metadata:
@@ -392,6 +410,7 @@ spec:
   claim: %s
   quiesce:
     - {kind: Deployment, name: %s}
+    - {kind: Deployment, name: writer}
   timeout: 10m
 `, ns.Name, claim, app))
 
@@ -407,8 +426,12 @@ spec:
 		if restore.Status.QuiescedAt != nil {
 			quiescedAt = *restore.Status.QuiescedAt
 		}
-		return restore.Status.QuiescedAt != nil, fmt.Sprintf("phase=%s quiescedAt=%v replicas=%d",
-			restore.Status.Phase, restore.Status.QuiescedAt, appReplicas(t, ns.Name, app)), nil
+		state := fmt.Sprintf("phase=%s quiescedAt=%v replicas=%d",
+			restore.Status.Phase, restore.Status.QuiescedAt, appReplicas(t, ns.Name, app))
+		if restore.Status.QuiescedAt == nil && restore.Status.Phase.Finished() {
+			return false, state, fmt.Errorf("the RestoreRun ended without stopping the app: %s", readyMessage(restore.Status.Conditions))
+		}
+		return restore.Status.QuiescedAt != nil, state, nil
 	}, evidence)
 	t.Logf("the restore stopped the app at %s", quiescedAt.UTC().Format(time.RFC3339))
 

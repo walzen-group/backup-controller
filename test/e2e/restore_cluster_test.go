@@ -464,7 +464,9 @@ spec:
 		if err != nil {
 			return false, firstLine(err.Error()), nil
 		}
-		got := strings.TrimSpace(out)
+		// psql prints a result for each statement, so the select's row is
+		// the last line.
+		got := lastLine(out)
 		return got == row, fmt.Sprintf("note=%q", got), nil
 	}, evidence)
 
