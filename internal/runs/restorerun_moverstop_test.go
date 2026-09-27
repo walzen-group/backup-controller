@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // The tests in this file check that a restore stops a mover the way rule X2
@@ -385,6 +387,23 @@ func TestADeletedRestoreWaitsForItsStoppedMoversPod(t *testing.T) {
 	}
 }
 
+// loseShutdownWrite returns a client over c that fails, with a conflict,
+// the first status write of a RestoreRun whose Ready reason is
+// WaitingForShutdown: the write of the wait for a stopped mover, which
+// comes after finish stored the ending.
+func loseShutdownWrite(c client.Client) client.Client {
+	lost := false
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if run, ok := obj.(*backupv1alpha1.RestoreRun); ok && !lost && readyReason(run.Status.Conditions) == backupv1alpha1.ReasonShutdown {
+				lost = true
+				return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("restoreruns").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+}
+
 // A wait for a stopped Job's pod whose status write is lost is reported
 // again on the next pass. The run holds what it must meanwhile: the pod, its
 // finalizer and the Leases.
@@ -395,7 +414,7 @@ func TestALostStatusWriteInTheMoverWaitConverges(t *testing.T) {
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
 		stoppedDeployment(), kustomization(true), job, pod, lease)
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-	r.Client = loseNextStatusWrite(c)
+	r.Client = loseShutdownWrite(c)
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
 		t.Fatal("the wait pass succeeded, want its lost status write returned")
@@ -894,5 +913,71 @@ func TestAnUnchangedStatusIsNotWrittenFromAnOlderCopy(t *testing.T) {
 	}
 	if again := readRestoreRun(t, c); again.ResourceVersion != stored.ResourceVersion {
 		t.Errorf("resourceVersion = %s, want %s: an unchanged status was written", again.ResourceVersion, stored.ResourceVersion)
+	}
+}
+
+// endsAfterFirstRead returns a client over c on which the restore Job named
+// name ends Failed right after the first read of it returns it running, as
+// a Job whose last pod failed between followJob's read and settleJobs'.
+func endsAfterFirstRead(t *testing.T, c client.Client, name string) client.WithWatch {
+	read := false
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			err := cl.Get(ctx, key, obj, opts...)
+			if _, ok := obj.(*batchv1.Job); ok && err == nil && !read && key.Name == name {
+				read = true
+				endJob(t, c, name, batchv1.JobFailed, "BackoffLimitExceeded", "Job has reached the specified backoff limit")
+			}
+			return err
+		},
+	})
+}
+
+// A timeout whose stop of the restore Job completes in the same pass keeps
+// what it decided when that pass's final status write is lost: finish
+// stores the ending and the items' ends before it stops the Job. The next
+// pass ends the run TimedOut from the stored ending, and the item keeps the
+// end the timeout pass gave it: TimedOut in place, where the timeout reads
+// the Job first while it still runs, and the Job's own Failed into a new
+// claim, where the item's first read saw it running and the timeout's saw
+// it Failed. Before, the lost write left the item Running on a Job that was
+// gone, and the next pass failed it as a Job deleted before it finished.
+func TestATimeoutWhoseStopEndsInOnePassKeepsItsEnding(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		shape  func(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job, []client.Object)
+		reason backupv1alpha1.ItemReason
+	}{
+		{"in place", func(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job, []client.Object) {
+			run, job := restoringOnJob(t)
+			return run, job, []client.Object{claim(), volumeRestore(), repository()}
+		}, backupv1alpha1.ItemReasonTimedOut},
+		{"into", func(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job, []client.Object) {
+			run, job := intoOnJob(t)
+			return run, job, []client.Object{intoClaim(run), sourceOnNode(), volumeRestore(), repository()}
+		}, backupv1alpha1.ItemReasonRestoreJobFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run, job, objects := tc.shape(t)
+			r, c := restoreReconciler(t, nil, append([]client.Object{run, job}, objects...)...)
+			r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+			ends := endsAfterFirstRead(t, c, job.Name)
+			r.Client, r.Reader = loseFailedRunWrite(ends), ends
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+				t.Fatal("the pass whose final write was lost succeeded, want the error returned")
+			}
+			if jobs := restoreJobs(t, c); len(jobs) != 0 {
+				t.Fatalf("restore Jobs = %d after the lost write, want the stop completed in that pass", len(jobs))
+			}
+
+			r.Client, r.Reader = c, c
+			done := stepUntilFinished(t, r, c, 3)
+			if item := done.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != tc.reason {
+				t.Errorf("item = %+v, want Failed with reason %s", item, tc.reason)
+			}
+			if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+				t.Errorf("phase = %q, reason = %q; want Failed, %s", done.Status.Phase, readyReason(done.Status.Conditions), backupv1alpha1.ReasonTimedOut)
+			}
+		})
 	}
 }

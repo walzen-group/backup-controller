@@ -2127,14 +2127,14 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // unfinished. A step that fails is reported through releaseFailed, whose
 // error it returns for a retry; a failed status write comes back as it is.
 //
-// finish first records reason and message in status.ending, so every status
-// write from then on carries them, and the items the caller failed go in
-// the same write. The wait for a stopped mover writes the status whenever
-// it differs from the stored one (see waitForStopped), so the pass that
-// records the ending stores it even when the wait is the same as before,
-// and a failed release writes it as well, ending included. The next pass
-// finds status.ending and calls finish with it (see Reconcile), so the run
-// ends as it decided to, whatever it waited for when it decided.
+// finish first records reason and message in status.ending and writes the
+// status, with the items the caller failed, before it stops anything. Every
+// status write from then on carries the ending, and the next pass finds it
+// and calls finish with it (see Reconcile), so the run ends as it decided
+// to, whatever it waited for when it decided. A stop that completes in the
+// same pass therefore cannot lose the items' ends with a lost final write:
+// the next pass would otherwise find an item Running on a Job that is gone
+// and fail it as a Job deleted before it finished.
 //
 // The steps run in this order, and each one runs only once the one before it
 // went through:
@@ -2157,10 +2157,15 @@ func anyRestorePending(items []backupv1alpha1.RestoreItem) bool {
 // timeOut, which fail the item with the note from clusterLeftDeleted first
 // (see failRemainingItems).
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
-	if run.Status.Ending == nil {
-		run.Status.Ending = &backupv1alpha1.RunEnding{Reason: reason, Message: message}
+	ending := backupv1alpha1.RunEnding{Reason: reason, Message: message}
+	if run.Status.Ending != nil {
+		ending = *run.Status.Ending
+	} else {
+		run.Status.Ending = ending.DeepCopy()
+		if err := r.writeStatus(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
-	ending := *run.Status.Ending
 	left, err := r.stopMovers(ctx, run, anyItem)
 	if err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, err)

@@ -765,7 +765,7 @@ func TestAFinishWhoseStatusWriteIsLostKeepsTheQuiesceLease(t *testing.T) {
 			Now: func() time.Time { return frozen.Add(4*time.Hour + time.Second) }}
 		seedQuiesceLease(t, c, "RestoreRun", stopping())
 
-		rr.Client = loseNextStatusWrite(c)
+		rr.Client = loseStatusWriteAt(c, 2)
 		if _, err := rr.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
 			t.Fatal("the pass succeeded although the status write that ends the run was lost")
 		}

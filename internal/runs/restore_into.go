@@ -193,24 +193,21 @@ func (r *RestoreRunReconciler) followIntoJob(ctx context.Context, run *backupv1a
 	return after(pollInterval, r.writeChangedStatus(ctx, run))
 }
 
-// endInto records an into restore's item end and ends the run.
+// endInto ends an into restore whose item has ended, or returns the error
+// of the step that did not end it.
 //
 // Parameters:
-//   - run is the RestoreRun, whose item has ended.
+//   - run is the RestoreRun, whose item has ended when err is nil.
 //   - err is the error of the step that ended it, from settled. When it is
 //     not nil the item has not ended, and endInto returns it for a retry.
 //
-// It returns what finishInto returns, or the error of the status write.
-//
-// The item's end goes into the status before finish stops the Job. A lost
-// write then leaves the item as it was with its Job recorded, so the retry
-// reads the same Job and ends the item again, instead of taking the stopped
-// Job for one that was deleted before it finished.
+// It returns what finishInto returns. finish writes the item's end with the
+// run's ending before it stops the Job, so a lost write leaves the item as
+// it was with its Job recorded: the retry reads the same Job and ends the
+// item again, instead of taking the stopped Job for one that was deleted
+// before it finished.
 func (r *RestoreRunReconciler) endInto(ctx context.Context, run *backupv1alpha1.RestoreRun, err error) (ctrl.Result, error) {
 	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.writeStatus(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.finishInto(ctx, run)
