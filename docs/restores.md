@@ -540,6 +540,24 @@ The second message occurs when someone deletes the claim while the pod of the
 Job mounts it. Kubernetes keeps the claim, Terminating, until that pod is gone
 (pvc-protection). Thus the Job can finish into a claim that is about to go.
 
+An item with spec.into checks the claim that the run created before the run
+resumes the restore Job. The run fails the item with reason ClaimLost when the
+claim is gone, is being deleted, or is no longer controlled by the run. Then
+the Job has not run, and the message says that the Job wrote nothing:
+
+```text
+claim scratch was deleted before its restore Job ran, so the Job wrote nothing
+claim scratch is being deleted, and its restore Job has not run, so the Job wrote nothing
+claim scratch is no longer controlled by the run, and its restore Job has not run, so the Job wrote nothing
+```
+
+When the run finds after the Job ran that the claim is no longer controlled by
+the run, the message is:
+
+```text
+claim scratch is no longer controlled by the run, so it may not be the claim the run created. The restore Job mounts claim scratch by name, so it may have written into it; check its data, and create a new RestoreRun to restore it
+```
+
 ### When VolSync stops serving v1alpha1
 
 A RestoreRun reads VolSync only to wait for a backup of its claim or repository

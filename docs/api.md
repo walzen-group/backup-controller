@@ -255,7 +255,7 @@ that ended by a path that records no reason leaves it empty
 | RestoreJobDeleted | RestoreRun | someone deleted the restore Job before it finished, or its name now holds a Job with another UID. The run records no result from it. The run gives nothing back until no pod of the Job can still write |
 | RestoreJobRefused | RestoreRun | the run created no restore Job, or the Job never ran. The API server refused the create or the resume as Forbidden or Invalid. Or the controller could not build the Job's spec. Or a Job that the run did not create holds its name. The run wrote nothing to the claim |
 | SnapshotChanged | RestoreRun | the selected snapshot was no longer in the repository when the run listed it again immediately before it created the Job |
-| ClaimLost | RestoreRun | the claim stopped being the run's while the restore ran: someone deleted it, replaced it, or took it |
+| ClaimLost | RestoreRun | the claim stopped being the run's: someone deleted it, replaced it, or took it. For a spec.into item the run also checks the claim before it resumes the restore Job. A loss found then says that the Job wrote nothing. A claim that is no longer controlled by the run gives its own message |
 | ClaimDeleting | RestoreRun | the claim was in deletion when the run was about to start the restore |
 | IntoClaimTaken | RestoreRun | the name that `spec.into` gives holds a claim, or a VolumeRestore, that the run did not create. The run finds it before it creates the claim. It also finds it when it takes over a restore Job that an earlier pass created and did not record. The run then stops that Job before the Job writes. The run wrote nothing to that claim |
 | ClusterRestoredElsewhere | RestoreRun | another unfinished RestoreRun restores the Cluster |
