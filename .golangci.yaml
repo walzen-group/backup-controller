@@ -6,11 +6,9 @@
 #
 # The set is strict: small functions, typed errors, exhaustive switches,
 # checked type assertions. Test files and the test infrastructure (hack/,
-# internal/testinfra/) skip only the size and structure checks. Code written
-# before the strict set is waived for the size and structure checks alone in
-# the legacy block below, one entry per function, line or file; every
-# correctness linter applies to every file. A //nolint names its linter, why,
-# and the step that removes it (nolintlint enforces the form).
+# internal/testinfra/) skip only the size and structure checks. Every other
+# file is under the full set. A //nolint names its linter and the reason
+# (nolintlint enforces the form).
 version: "2"
 run:
   # The envtest, conformance and e2e suites and the demo (e2e && demo) are
@@ -106,28 +104,6 @@ linters:
       - path: '^(hack/|internal/testinfra/)'
         linters: [revive]
         text: '^(file-length-limit|function-result-limit|argument-limit|max-control-nesting|confusing-results)'
-      # legacy:begin
-      # Code written before the strict set. Only the size and structure
-      # checks are waived, each for the named function, line or file; every
-      # correctness linter applies everywhere. A step that brings a function
-      # under the thresholds deletes its name here; a step that changes a
-      # listed function's signature or a listed line either brings it under
-      # the thresholds or updates the entry in the same change. Empty at v0.9.0.
-      - path: '^internal/quiesce/plan\.go$'
-        linters: [funlen, gocognit]
-        source: '^func Plan\('
-      - path: '^internal/quiesce/(plan|quiesce|stop)\.go$'
-        linters: [goconst]
-      - path: '^internal/quiesce/restart\.go$'
-        linters: [funlen, gocognit]
-        source: '^func Restart\('
-      - path: '^internal/runs/release_report\.go$'
-        linters: [goconst]
-      - path: '^internal/runs/release_report\.go$'
-        linters: [revive]
-        text: '^confusing-results:'
-        source: '^func releaseFailure\('
-      # legacy:end
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0

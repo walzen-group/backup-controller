@@ -118,9 +118,9 @@ func specReplicas(object client.Object) *int32 {
 func workloadObject(namespace string, w backupv1alpha1.QuiescedWorkload) client.Object {
 	var object client.Object
 	switch w.Kind {
-	case "Deployment":
+	case backupv1alpha1.WorkloadKindDeployment:
 		object = &appsv1.Deployment{}
-	case "StatefulSet":
+	case backupv1alpha1.WorkloadKindStatefulSet:
 		object = &appsv1.StatefulSet{}
 	default:
 		return nil

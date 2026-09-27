@@ -96,8 +96,8 @@ type releasePlan struct {
 // runs again.
 // When err holds both a restart and a release failure, as BackupRun.release
 // returns them, the message names both and gives both pieces of advice.
-func releaseFailure(err error, plan releasePlan) (string, string) {
-	reason := backupv1alpha1.ReasonRestartFailed
+func releaseFailure(err error, plan releasePlan) (reason, message string) {
+	reason = backupv1alpha1.ReasonRestartFailed
 	var failed, advice []string
 	var restart *quiesce.RestartError
 	var step *releaseError
@@ -132,7 +132,7 @@ func releaseFailure(err error, plan releasePlan) (string, string) {
 		advice = append(advice, fmt.Sprintf("The app stays stopped until the run gets past this. To give it back sooner, "+
 			"make sure no restore Job of the run still writes to its claims, then %s yourself.", byHand(plan.stopped, plan.suspended)))
 	}
-	message := strings.Join(failed, "; it also ") + ". The run retries until it can"
+	message = strings.Join(failed, "; it also ") + ". The run retries until it can"
 	if plan.scheduled {
 		message += ", and this namespace's schedule waits for it"
 	}

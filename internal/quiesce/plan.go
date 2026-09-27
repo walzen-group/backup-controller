@@ -53,50 +53,113 @@ import (
 // another namespace. A Kustomization that applies several targets is listed
 // once.
 func Plan(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, runNamespace string, targets []Workload) ([]backupv1alpha1.QuiescedWorkload, []string, error) {
-	var suspend []string
-	read := map[string]*unstructured.Unstructured{}
-	for _, t := range targets {
-		name := t.object.GetLabels()[FluxNameLabel]
-		namespace := t.object.GetLabels()[FluxNamespaceLabel]
-		if name == "" || namespace == "" {
-			continue
-		}
-		key := namespace + "/" + name
-		kustomization, done := read[key]
-		if !done {
-			var err error
-			kustomization, err = getKustomization(ctx, reader, mapper, namespace, name)
-			if err != nil {
-				if !apierrors.IsNotFound(err) {
-					return nil, nil, fmt.Errorf("get Kustomization %s: %w", key, err)
-				}
-				kustomization = nil
-			}
-			read[key] = kustomization
-		}
-		if kustomization == nil || slices.Contains(suspend, key) {
-			continue
-		}
-		if _, err := inventoryIDs(kustomization); err != nil {
-			return nil, nil, err
-		}
-		if !inventoryLists(kustomization, t) {
-			continue
-		}
-		if namespaces := OtherNamespaces(kustomization, runNamespace); len(namespaces) > 1 {
-			return nil, nil, &CrossNamespaceError{Kustomization: key, Namespaces: namespaces}
-		}
-		if already, _, _ := unstructured.NestedBool(kustomization.Object, "spec", "suspend"); already {
-			continue
-		}
-		suspend = append(suspend, key)
+	suspend, err := toSuspend(ctx, reader, mapper, runNamespace, targets)
+	if err != nil {
+		return nil, nil, err
 	}
-
 	stop := make([]backupv1alpha1.QuiescedWorkload, 0, len(targets))
 	for _, t := range targets {
 		stop = append(stop, backupv1alpha1.QuiescedWorkload{Kind: t.kind, Name: t.object.GetName(), Replicas: t.replicas})
 	}
 	return stop, suspend, nil
+}
+
+// toSuspend lists the Kustomizations that Plan suspends for the targets.
+//
+// Parameters:
+//   - reader and mapper read each Kustomization, as in Plan.
+//   - runNamespace is the run's namespace, which holds the targets.
+//   - targets are the workloads to stop.
+//
+// It returns the "namespace/name" keys of the Kustomizations to suspend, in
+// the order of the targets, with each key one time. It returns the errors
+// that Plan documents.
+//
+// The function reads each Kustomization one time, also when several targets
+// name it. A target with no Kustomization, or with a Kustomization that
+// suspendable refuses to suspend, adds no key.
+func toSuspend(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, runNamespace string, targets []Workload) ([]string, error) {
+	var suspend []string
+	read := map[string]*unstructured.Unstructured{}
+	for _, t := range targets {
+		key, kustomization, err := labelledKustomization(ctx, reader, mapper, read, t)
+		if err != nil {
+			return nil, err
+		}
+		if kustomization == nil || slices.Contains(suspend, key) {
+			continue
+		}
+		add, err := suspendable(kustomization, key, runNamespace, t)
+		if err != nil {
+			return nil, err
+		}
+		if add {
+			suspend = append(suspend, key)
+		}
+	}
+	return suspend, nil
+}
+
+// labelledKustomization gets the Kustomization that the kustomize-controller
+// labels on a target name.
+//
+// Parameters:
+//   - reader and mapper read the Kustomization, as in Plan.
+//   - read keeps each Kustomization that the function got before, by its
+//     "namespace/name" key. A nil value is a Kustomization that does not
+//     exist. The function adds each new read to it.
+//   - t is the target.
+//
+// It returns the key and the Kustomization. It returns a nil Kustomization
+// when the target has no labels or the Kustomization does not exist. It
+// returns a wrapped error when the read fails for a different cause.
+func labelledKustomization(ctx context.Context, reader client.Reader, mapper meta.RESTMapper, read map[string]*unstructured.Unstructured, t Workload) (string, *unstructured.Unstructured, error) {
+	name := t.object.GetLabels()[FluxNameLabel]
+	namespace := t.object.GetLabels()[FluxNamespaceLabel]
+	if name == "" || namespace == "" {
+		return "", nil, nil
+	}
+	key := namespace + "/" + name
+	if kustomization, done := read[key]; done {
+		return key, kustomization, nil
+	}
+	kustomization, err := getKustomization(ctx, reader, mapper, namespace, name)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return "", nil, fmt.Errorf("get Kustomization %s: %w", key, err)
+		}
+		kustomization = nil
+	}
+	read[key] = kustomization
+	return key, kustomization, nil
+}
+
+// suspendable reports whether Plan suspends a Kustomization for a target.
+//
+// Parameters:
+//   - kustomization is the Kustomization that the labels on t name.
+//   - key is its "namespace/name" key, for the errors.
+//   - runNamespace is the run's namespace.
+//   - t is the target.
+//
+// It returns true when the inventory of the Kustomization lists t and the
+// spec.suspend of the Kustomization is not true. It returns false when the
+// inventory does not list t, or when spec.suspend is true already. It returns
+// the *InventoryError from inventoryIDs when the inventory is missing or does
+// not parse. It returns a *CrossNamespaceError when the inventory lists t and
+// also lists a workload in a different namespace.
+func suspendable(kustomization *unstructured.Unstructured, key, runNamespace string, t Workload) (bool, error) {
+	if _, err := inventoryIDs(kustomization); err != nil {
+		return false, err
+	}
+	if !inventoryLists(kustomization, t) {
+		return false, nil
+	}
+	if namespaces := OtherNamespaces(kustomization, runNamespace); len(namespaces) > 1 {
+		return false, &CrossNamespaceError{Kustomization: key, Namespaces: namespaces}
+	}
+	already, _, _ := unstructured.NestedBool(kustomization.Object, "spec", "suspend")
+	return !already, nil
 }
 
 // OtherNamespaces lists the namespaces a Kustomization applies workloads in
@@ -128,7 +191,7 @@ func OtherNamespaces(kustomization *unstructured.Unstructured, namespace string)
 		}
 		id, _ := fields["id"].(string)
 		parts := strings.Split(id, "_")
-		if len(parts) != 4 || parts[2] != appsv1.GroupName || (parts[3] != "Deployment" && parts[3] != "StatefulSet") || parts[0] == "" {
+		if len(parts) != 4 || parts[2] != appsv1.GroupName || (parts[3] != backupv1alpha1.WorkloadKindDeployment && parts[3] != backupv1alpha1.WorkloadKindStatefulSet) || parts[0] == "" {
 			continue
 		}
 		seen[parts[0]] = true

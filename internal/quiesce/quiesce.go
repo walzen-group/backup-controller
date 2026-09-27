@@ -107,7 +107,7 @@ func Targets(ctx context.Context, c client.Reader, namespace string) ([]Workload
 	for i := range deployments.Items {
 		d := &deployments.Items[i]
 		if marked(d) {
-			targets = append(targets, Workload{kind: "Deployment", object: d, replicas: replicas(d.Spec.Replicas), selector: d.Spec.Selector})
+			targets = append(targets, Workload{kind: backupv1alpha1.WorkloadKindDeployment, object: d, replicas: replicas(d.Spec.Replicas), selector: d.Spec.Selector})
 		}
 	}
 	statefulSets := &appsv1.StatefulSetList{}
@@ -117,7 +117,7 @@ func Targets(ctx context.Context, c client.Reader, namespace string) ([]Workload
 	for i := range statefulSets.Items {
 		s := &statefulSets.Items[i]
 		if marked(s) {
-			targets = append(targets, Workload{kind: "StatefulSet", object: s, replicas: replicas(s.Spec.Replicas), selector: s.Spec.Selector})
+			targets = append(targets, Workload{kind: backupv1alpha1.WorkloadKindStatefulSet, object: s, replicas: replicas(s.Spec.Replicas), selector: s.Spec.Selector})
 		}
 	}
 	sort.Slice(targets, func(i, j int) bool {
@@ -150,13 +150,13 @@ func Named(ctx context.Context, c client.Reader, namespace string, refs []backup
 	for _, ref := range refs {
 		key := types.NamespacedName{Namespace: namespace, Name: ref.Name}
 		switch ref.Kind {
-		case "Deployment":
+		case backupv1alpha1.WorkloadKindDeployment:
 			d := &appsv1.Deployment{}
 			if err := c.Get(ctx, key, d); err != nil {
 				return nil, missingWorkload(ref, err)
 			}
 			targets = append(targets, Workload{kind: ref.Kind, object: d, replicas: replicas(d.Spec.Replicas), selector: d.Spec.Selector})
-		case "StatefulSet":
+		case backupv1alpha1.WorkloadKindStatefulSet:
 			s := &appsv1.StatefulSet{}
 			if err := c.Get(ctx, key, s); err != nil {
 				return nil, missingWorkload(ref, err)

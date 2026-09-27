@@ -38,6 +38,23 @@ import (
 // client.CacheOptions.Unstructured is false by default), so they need only
 // the get verb and start no informer.
 func Restart(ctx context.Context, c client.Client, namespace string, stopped []backupv1alpha1.QuiescedWorkload, suspended []string) error {
+	if err := giveBack(ctx, c, namespace, stopped); err != nil {
+		return err
+	}
+	return resume(ctx, c, suspended)
+}
+
+// giveBack gives each stopped workload its recorded replica count back.
+//
+// Parameters:
+//   - namespace is the run's namespace, which holds the stopped workloads.
+//   - stopped is the run's status.quiesced.
+//
+// It returns nil when each workload has its count or does not exist. It
+// returns a *RestartError for the first scale that fails for a different
+// cause. It skips a workload of an unknown kind and a workload that has its
+// count already (see atCount).
+func giveBack(ctx context.Context, c client.Client, namespace string, stopped []backupv1alpha1.QuiescedWorkload) error {
 	for _, w := range stopped {
 		object := workloadObject(namespace, w)
 		if object == nil {
@@ -50,6 +67,20 @@ func Restart(ctx context.Context, c client.Client, namespace string, stopped []b
 			return &RestartError{action: fmt.Sprintf("give %s %s its %d replicas back", w.Kind, w.Name, w.Replicas), err: err}
 		}
 	}
+	return nil
+}
+
+// resume resumes each Kustomization that the run suspended.
+//
+// Parameters:
+//   - suspended is the run's status.suspendedKustomizations, as
+//     "namespace/name" keys.
+//
+// It returns nil when it resumes each Kustomization or the Kustomization does
+// not exist. It returns a *RestartError for the first resume that fails for a
+// different cause. It skips a Kustomization that it reads with spec.suspend
+// false. When the read fails, the write decides.
+func resume(ctx context.Context, c client.Client, suspended []string) error {
 	for _, key := range suspended {
 		ns, name, _ := strings.Cut(key, "/")
 		if kustomization, err := getKustomization(ctx, c, c.RESTMapper(), ns, name); err == nil {

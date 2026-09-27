@@ -67,7 +67,7 @@ var textMatcherAllowlist = []messageRuleEntry{
 		what: "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built"},
 	{pkg: "quiesce", decl: "Applied",
 		what: "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built"},
-	{pkg: "quiesce", decl: "Restart",
+	{pkg: "quiesce", decl: "resume",
 		what: "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built"},
 	{pkg: "runs", decl: "resticSpan",
 		what: "the regexp of the span syntax restic's --keep-within takes"},
