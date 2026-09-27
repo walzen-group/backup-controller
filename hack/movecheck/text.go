@@ -29,12 +29,14 @@ type edit struct {
 //
 // It returns the text, or the error of a reference that resolves to
 // nothing. Each imported package name in the node is replaced with its
-// import path and each renamed identifier is respelled (see edits).
+// import path, each renamed identifier is respelled (see edits), and the
+// rename map is applied to the comments in the range (see commentEdits).
 func (h hasher) text(node ast.Node, start, end token.Pos) (string, error) {
 	edits, err := h.edits(node)
 	if err != nil {
 		return "", err
 	}
+	edits = append(edits, h.commentEdits(start, end)...)
 	return h.splice(start, end, edits), nil
 }
 
@@ -55,6 +57,7 @@ func (h hasher) specBody(spec ast.Spec) (string, error) {
 		return "", err
 	}
 	edits = append(edits, h.indentEdits(spec)...)
+	edits = append(edits, h.commentEdits(spec.Pos(), spec.End())...)
 	return h.splice(spec.Pos(), spec.End(), edits), nil
 }
 

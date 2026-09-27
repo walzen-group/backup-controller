@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,7 +207,8 @@ func TestSplittingAnIotaGroupChangesItsHashes(t *testing.T) {
 }
 
 // oldRuns is the old side of the rename cases: a package runs that declares
-// getCluster, calls it, and has a local of the same name.
+// getCluster, calls it, and has a local of the same name. The doc comments
+// name getCluster, as the doc comments of a real package do.
 var oldRuns = map[string]string{"a.go": `package runs
 
 // getCluster returns one.
@@ -215,7 +217,7 @@ func getCluster() int { return 1 }
 // user calls getCluster.
 func user() int { return getCluster() }
 
-// local shadows getCluster.
+// local declares a local of that name.
 func local() int {
 	getCluster := 2
 	return getCluster
@@ -237,7 +239,7 @@ func compareDirs(t *testing.T, renames, oldDir, newDir string) (int, string) {
 func TestTheRenameMapComparesAMoveIntoAnotherPackage(t *testing.T) {
 	cnpg := writePkg(t, map[string]string{"cluster.go": `package cnpg
 
-// getCluster returns one.
+// GetCluster returns one.
 func GetCluster() int { return 1 }
 `})
 	status, out := compareDirs(t, "getCluster=cnpg.GetCluster", writePkg(t, oldRuns), cnpg)
@@ -247,7 +249,7 @@ func GetCluster() int { return 1 }
 
 	changedBody := writePkg(t, map[string]string{"cluster.go": `package cnpg
 
-// getCluster returns one.
+// GetCluster returns one.
 func GetCluster() int { return 2 }
 `})
 	status, out = compareDirs(t, "getCluster=cnpg.GetCluster", writePkg(t, oldRuns), changedBody)
@@ -261,10 +263,10 @@ func TestTheRenameMapSpellsAQualifiedReference(t *testing.T) {
 
 import "example.com/internal/cnpg"
 
-// user calls getCluster.
+// user calls cnpg.GetCluster.
 func user() int { return cnpg.GetCluster() }
 
-// local shadows getCluster.
+// local declares a local of that name.
 func local() int {
 	getCluster := 2
 	return getCluster
@@ -281,5 +283,22 @@ func TestAnUnresolvedSelectorIsAnError(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if status := run([]string{dir}, &out, &errOut); status != 2 || !strings.Contains(errOut.String(), "nowhere resolves to no declaration or import") {
 		t.Errorf("status = %d, stderr %q, want 2 naming nowhere", status, errOut.String())
+	}
+}
+
+func TestTheRenameMapRespellsTheCommentsOfASpec(t *testing.T) {
+	oldDir := writePkg(t, map[string]string{"a.go": "package runs\n\n// maxKeys caps the cache.\nconst maxKeys = 1 // maxKeys is one.\n\n// T holds keys.\ntype T struct {\n\t// n is at most maxKeys.\n\tn int\n}\n"})
+	newDir := writePkg(t, map[string]string{"a.go": "package runs\n\n// MaxKeys caps the cache.\nconst MaxKeys = 1 // MaxKeys is one.\n\n// T holds keys.\ntype T struct {\n\t// n is at most MaxKeys.\n\tn int\n}\n"})
+	if status, out := compareDirs(t, "maxKeys=MaxKeys", oldDir, newDir); status != 0 {
+		t.Errorf("status = %d (%s), want 0: only the name changed, in the code and in the comments", status, out)
+	}
+}
+
+func TestAWordAfterADotKeepsItsNameInAComment(t *testing.T) {
+	src := "package runs\n\nconst %[1]s = 1\n\n// T holds a field named like the const.\ntype T struct{ maxKeys int }\n\n// get returns t.maxKeys.\nfunc (t T) get() int { return t.maxKeys }\n"
+	oldDir := writePkg(t, map[string]string{"a.go": fmt.Sprintf(src, "maxKeys")})
+	newDir := writePkg(t, map[string]string{"a.go": fmt.Sprintf(src, "MaxKeys")})
+	if status, out := compareDirs(t, "maxKeys=MaxKeys", oldDir, newDir); status != 0 {
+		t.Errorf("status = %d (%s), want 0: the comment names the field, which keeps its name", status, out)
 	}
 }

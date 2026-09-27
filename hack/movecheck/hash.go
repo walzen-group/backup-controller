@@ -265,13 +265,13 @@ func (h hasher) specText(d *ast.GenDecl, spec ast.Spec) (string, error) {
 			continue
 		}
 		for _, c := range group.List {
-			b.WriteString(c.Text + "\n")
+			b.WriteString(h.renameWords(c.Text) + "\n")
 		}
 	}
 	b.WriteString(body + "\n")
 	if comment != nil {
 		for _, c := range comment.List {
-			b.WriteString(c.Text + "\n")
+			b.WriteString(h.renameWords(c.Text) + "\n")
 		}
 	}
 	return b.String(), nil

@@ -14,8 +14,12 @@
 //
 // With two directories it compares the declarations found in both, after
 // applying the rename map to the old side, and prints each one whose hash
-// differs. A step that moves declarations into another package uses it: the
-// old directory holds the package before the move, the new one the package
+// differs. The rename map applies to the code and to the comments of the
+// old side (see renameWords). So a doc comment that names the declaration
+// it documents does not make a moved declaration differ.
+//
+// A step that moves declarations into another package uses it: the old
+// directory holds the package before the move, the new one the package
 // that received them. Declarations found only on the old side are counted
 // on standard error, since the old side of a move out of a package holds
 // much that stays there. Every declaration found only on the new side is
@@ -64,6 +68,12 @@
 // the new side is listed in -new; 1 when a compared declaration differs, a
 // declaration is found only on the new side without being listed, or a
 // -new entry names none; 2 on a usage or parse error.
+//
+// Each directory must be inside a Go module: a go.mod in the directory or
+// above it. go list reads it to name the imports. For the old side, check
+// out the old commit whole, for example with git worktree add. A copy of
+// the package directory alone gives the wrong names, and a selector on an
+// import then resolves to no declaration.
 package main
 
 import (
@@ -77,7 +87,8 @@ import (
 )
 
 // usage is the synopsis printed with a usage error.
-const usage = "usage: movecheck DIR | movecheck [-rename old=pkg.New,...] [-new Name,...] OLDDIR NEWDIR"
+const usage = "usage: movecheck DIR | movecheck [-rename old=pkg.New,...] [-new Name,...] OLDDIR NEWDIR\n" +
+	"each directory must be inside a Go module (a go.mod in it or above it), also the old side: check out the old commit whole, for example with git worktree add"
 
 // errReported stands for an error the flag package has already printed.
 var errReported = errors.New("flags: reported")
