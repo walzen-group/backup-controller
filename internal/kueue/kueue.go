@@ -109,46 +109,49 @@ func WorkloadName(uid types.UID) string {
 // server has stopped serving is an error as well (see served.VersionGone), and no
 // Workload is created then, since one may exist at another version.
 func EnsureWorkload(ctx context.Context, c client.Client, owner client.Object, ownerKind schema.GroupVersionKind, queue string) (*unstructured.Unstructured, error) {
-	name := WorkloadName(owner.GetUID())
-	gvk, err := served.Kind(c.RESTMapper(), WorkloadGVK.GroupKind())
+	workload, err := ReadWorkload(ctx, c, owner.GetNamespace(), owner.GetUID())
+	if err != nil || workload != nil {
+		return workload, err
+	}
+	workload, err = workloadObject(c.RESTMapper(), owner.GetNamespace(), owner.GetUID())
 	if err != nil {
-		return nil, fmt.Errorf("get Workload %s: %w", name, err)
+		return nil, fmt.Errorf("create Workload %s: %w", WorkloadName(owner.GetUID()), err)
+	}
+	workload.Object["spec"] = map[string]any{
+		"queueName": queue,
+		"podSets": []any{map[string]any{
+			"name":  "run",
+			"count": int64(1),
+			"template": map[string]any{
+				"spec": map[string]any{
+					"restartPolicy": "Never",
+					"containers": []any{map[string]any{
+						"name":  "run",
+						"image": admissionImage,
+					}},
+				},
+			},
+		}},
+	}
+	workload.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(owner, ownerKind)})
+	if err := served.VersionGone(c.RESTMapper(), workload.GroupVersionKind(), c.Create(ctx, workload)); err != nil && !apierrors.IsAlreadyExists(err) {
+		return nil, fmt.Errorf("create Workload %s: %w", workload.GetName(), err)
+	}
+	return workload, nil
+}
+
+// workloadObject returns the Workload of the run whose UID is given, with
+// only its kind, namespace and name set. The kind is at the version the API
+// server serves (see served.Kind). It returns the error of served.Kind.
+func workloadObject(mapper meta.RESTMapper, namespace string, uid types.UID) (*unstructured.Unstructured, error) {
+	gvk, err := served.Kind(mapper, WorkloadGVK.GroupKind())
+	if err != nil {
+		return nil, err
 	}
 	workload := &unstructured.Unstructured{}
 	workload.SetGroupVersionKind(gvk)
-	err = served.VersionGone(c.RESTMapper(), gvk, c.Get(ctx, types.NamespacedName{Namespace: owner.GetNamespace(), Name: name}, workload))
-	if err == nil {
-		return workload, nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("get Workload %s: %w", name, err)
-	}
-
-	workload = &unstructured.Unstructured{Object: map[string]any{
-		"spec": map[string]any{
-			"queueName": queue,
-			"podSets": []any{map[string]any{
-				"name":  "run",
-				"count": int64(1),
-				"template": map[string]any{
-					"spec": map[string]any{
-						"restartPolicy": "Never",
-						"containers": []any{map[string]any{
-							"name":  "run",
-							"image": admissionImage,
-						}},
-					},
-				},
-			}},
-		},
-	}}
-	workload.SetGroupVersionKind(gvk)
-	workload.SetName(name)
-	workload.SetNamespace(owner.GetNamespace())
-	workload.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(owner, ownerKind)})
-	if err := served.VersionGone(c.RESTMapper(), gvk, c.Create(ctx, workload)); err != nil && !apierrors.IsAlreadyExists(err) {
-		return nil, fmt.Errorf("create Workload %s: %w", name, err)
-	}
+	workload.SetNamespace(namespace)
+	workload.SetName(WorkloadName(uid))
 	return workload, nil
 }
 
@@ -187,19 +190,16 @@ func Evicted(workload *unstructured.Unstructured) bool {
 // served.Kind), or nil when the Workload does not exist. A failed lookup
 // of the served version or a failed get comes back as an error.
 func ReadWorkload(ctx context.Context, c client.Client, namespace string, uid types.UID) (*unstructured.Unstructured, error) {
-	name := WorkloadName(uid)
-	gvk, err := served.Kind(c.RESTMapper(), WorkloadGVK.GroupKind())
+	workload, err := workloadObject(c.RESTMapper(), namespace, uid)
 	if err != nil {
-		return nil, fmt.Errorf("get Workload %s: %w", name, err)
+		return nil, fmt.Errorf("get Workload %s: %w", WorkloadName(uid), err)
 	}
-	workload := &unstructured.Unstructured{}
-	workload.SetGroupVersionKind(gvk)
-	err = served.VersionGone(c.RESTMapper(), gvk, c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, workload))
+	err = served.VersionGone(c.RESTMapper(), workload.GroupVersionKind(), c.Get(ctx, client.ObjectKeyFromObject(workload), workload))
 	if apierrors.IsNotFound(err) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("get Workload %s: %w", name, err)
+		return nil, fmt.Errorf("get Workload %s: %w", workload.GetName(), err)
 	}
 	return workload, nil
 }
@@ -251,18 +251,14 @@ func MarkPodsReady(ctx context.Context, c client.Client, workload *unstructured.
 // (see served.VersionGone), because the Workload may still exist at another
 // version.
 func DeleteWorkload(ctx context.Context, c client.Client, namespace string, uid types.UID) error {
-	gvk, err := served.Kind(c.RESTMapper(), WorkloadGVK.GroupKind())
+	workload, err := workloadObject(c.RESTMapper(), namespace, uid)
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("delete Workload %s: %w", WorkloadName(uid), err)
 	}
-	workload := &unstructured.Unstructured{}
-	workload.SetGroupVersionKind(gvk)
-	workload.SetNamespace(namespace)
-	workload.SetName(WorkloadName(uid))
-	if err := served.VersionGone(c.RESTMapper(), gvk, c.Delete(ctx, workload)); err != nil && !apierrors.IsNotFound(err) {
+	if err := served.VersionGone(c.RESTMapper(), workload.GroupVersionKind(), c.Delete(ctx, workload)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete Workload %s: %w", workload.GetName(), err)
 	}
 	return nil
