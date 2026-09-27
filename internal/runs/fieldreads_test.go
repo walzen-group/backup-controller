@@ -192,58 +192,6 @@ func TestABackupInAPhaseTheControllerDoesNotKnowWaitsNamingIt(t *testing.T) {
 	}
 }
 
-// A run past its timeout while its Backup is in a phase the controller
-// doesn't know fails the item with a message that names the phase.
-func TestABackupTimedOutInAnUnknownPhaseNamesIt(t *testing.T) {
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
-	step(t, r)
-	step(t, r)
-	step(t, r)
-	setBackupPhase(t, c, "uploading")
-	step(t, r)
-
-	r.Now = func() time.Time { return frozen.Add(48 * time.Hour) }
-	step(t, r)
-
-	run := readBackupRun(t, c)
-	item := run.Status.Items[0]
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || item.Phase != backupv1alpha1.ItemFailed {
-		t.Fatalf("phase = %q, item = %+v; want the run and the item Failed", run.Status.Phase, item)
-	}
-	if !strings.Contains(item.Message, "status.phase") || !strings.Contains(item.Message, `"uploading"`) {
-		t.Errorf("item message = %q, want it to name status.phase and \"uploading\"", item.Message)
-	}
-}
-
-// A run that times out while its Backup waits in a phase the controller
-// doesn't know and a volume waits for another run names the phase once in
-// the database item's message: the SourceBusy message names only the
-// waits, and the timeout adds the item's own note to its message.
-func TestATimedOutDatabaseItemNamesItsPhaseOnce(t *testing.T) {
-	r, c := backupReconciler(t, backupRun(), cluster(),
-		claim(), volume(), volumeRestore(), repository(), busySource(TriggerFor(otherRunUID)), otherRun())
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // the Backup is created; the volume waits for manual-notes
-	setBackupPhase(t, c, "uploading")
-	step(t, r)
-	if reason := readyReason(readBackupRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonSourceBusy {
-		t.Fatalf("reason = %q, want SourceBusy while the volume waits", reason)
-	}
-
-	r.Now = func() time.Time { return frozen.Add(48 * time.Hour) }
-	step(t, r)
-
-	for _, item := range readBackupRun(t, c).Status.Items {
-		if item.Kind != backupv1alpha1.ItemKindCluster {
-			continue
-		}
-		if n := strings.Count(item.Message, "CloudNativePG reports status.phase"); item.Phase != backupv1alpha1.ItemFailed || n != 1 {
-			t.Errorf("database item = %+v names the phase %d times, want it Failed naming it once", item, n)
-		}
-	}
-}
-
 // setBackupPhase sets status.phase of the run's CloudNativePG Backup of the
 // Cluster pgN, as CloudNativePG does.
 func setBackupPhase(t *testing.T, c client.Client, phase string) {

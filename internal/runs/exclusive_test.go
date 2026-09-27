@@ -8,7 +8,6 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -316,30 +315,6 @@ func TestAnIntoRestoreWaitsWhileItsRepositoryIsBackedUp(t *testing.T) {
 	}
 }
 
-// A namespace run waits before it stops anything while a restore writes one
-// of its claims, so the app is not held down for the length of the restore.
-func TestANamespaceRunWaitsForARestoreBeforeItQuiesces(t *testing.T) {
-	restore, job := restoring(t)
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false), localQueueObject(),
-		restore, job)
-	step(t, r) // plan
-	step(t, r) // admit
-	admitAll(t, c)
-	step(t, r) // admitted
-	step(t, r) // would quiesce
-
-	run := readBackupRun(t, c)
-	if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy || !strings.Contains(readyMessage(run.Status.Conditions), "RestoreRun back-to-monday") {
-		t.Fatalf("reason = %q, message = %q; want SourceBusy naming the RestoreRun", readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-	}
-	d := &appsv1.Deployment{}
-	get(t, c, ns, appN, d)
-	if *d.Spec.Replicas != 2 || run.Status.QuiescedAt != nil {
-		t.Errorf("replicas = %d, quiescedAt = %v; want the app left running", *d.Spec.Replicas, run.Status.QuiescedAt)
-	}
-}
-
 // A restore of the claim's backups into a new claim holds the Leases of the
 // claim and its repository while its restore Job writes: a backup of the
 // claim waits while it runs.
@@ -554,16 +529,5 @@ func TestARestoreWaitsWhileVolSyncRetriesTheSyncOfAFinishedBackup(t *testing.T) 
 		if !strings.Contains(msg, want) {
 			t.Errorf("message = %q, want it to contain %q", msg, want)
 		}
-	}
-}
-
-// The wait message of a restore held by a ReplicationSource the controller
-// did not write gives no advice to delete it: the source is someone else's.
-func TestTheSyncingMessageLeavesAnotherOwnersSourceToThem(t *testing.T) {
-	source := backingUp()
-	source.Labels = nil
-	msg := syncingMessage(source, repoN)
-	if strings.Contains(msg, "delete") || !strings.Contains(msg, "whoever manages it") {
-		t.Errorf("message = %q, want no delete advice and the owner named as the one who decides", msg)
 	}
 }

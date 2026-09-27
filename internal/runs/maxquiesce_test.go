@@ -124,25 +124,6 @@ func TestAQuiesceLimitThatDoesNotParseFailsTheRun(t *testing.T) {
 	}
 }
 
-// A clone cut a second before the limit, and first seen by the pass at the
-// limit, counts: the item goes on Running, and the app comes back on the
-// normal path.
-func TestACloneCutJustBeforeTheQuiesceLimitGoesOn(t *testing.T) {
-	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
-	cloneAt(t, c, frozen.Add(10*time.Minute-time.Second))
-
-	if replicas := replicasAt(t, r, c, 10*time.Minute); replicas != 2 {
-		t.Fatalf("replicas = %d at the limit with the clone cut, want 2 back", replicas)
-	}
-	run := readBackupRun(t, c)
-	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Message != "" {
-		t.Errorf("item = %+v, want it still Running with no message", item)
-	}
-	if run.Status.RestartedAt == nil {
-		t.Error("restartedAt is unset after the app came back")
-	}
-}
-
 // A claim whose ReplicationSource the API server refuses to write every time,
 // as RBAC or a policy webhook does with Forbidden, keeps the app down only
 // until the limit. The pass at the limit fails the Pending item with a

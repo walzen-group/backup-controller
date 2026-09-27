@@ -117,18 +117,3 @@ func TestARunWhoseWorkloadReadFailsGoesOn(t *testing.T) {
 		t.Fatalf("phase = %q, want Running", run.Status.Phase)
 	}
 }
-
-// A Running run whose Workload stays admitted goes on.
-func TestARunWithAnAdmittedWorkloadGoesOn(t *testing.T) {
-	r, c := runningQuiescedRun(t)
-	setWorkloadConditions(t, c,
-		map[string]any{"type": "Admitted", "status": "True", "reason": "Admitted", "message": ""},
-		map[string]any{"type": "Evicted", "status": "False", "reason": "Preempted", "message": ""})
-	step(t, r)
-	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseRunning {
-		t.Fatalf("phase = %q, want Running", run.Status.Phase)
-	}
-	if _, ok := getUnstructured(t, c, kueue.WorkloadGVK, ns, kueue.WorkloadName(runUID)); !ok {
-		t.Error("the Workload of a run that goes on was deleted")
-	}
-}

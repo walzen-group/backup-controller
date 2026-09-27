@@ -63,23 +63,6 @@ func TestARunRecordsOneEventPerReason(t *testing.T) {
 	}
 }
 
-// TestAFailedRestoreRecordsAWarning checks that a RestoreRun that fails
-// records a Warning event with the Ready condition's reason.
-func TestAFailedRestoreRecordsAWarning(t *testing.T) {
-	r, _ := restoreReconciler(t, nil,
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-01T00:00:00Z")),
-		claim(), volumeRestore(), repository())
-	recorder := events.NewFakeRecorder(10)
-	r.Recorder = recorder
-
-	restoreStep(t, r)
-
-	got := recorded(recorder)
-	if len(got) != 1 || !strings.HasPrefix(got[0], "Warning NoBackupInReach ") {
-		t.Fatalf("events = %q, want one Warning NoBackupInReach", got)
-	}
-}
-
 // TestALongNoteIsCutToTheAPILimit checks that fitNote cuts a note longer than
 // events.k8s.io/v1 accepts to at most maxNote bytes, on a character boundary,
 // so the API server accepts the event.

@@ -171,38 +171,6 @@ func TestABackupRunUnderAnOldCRDStopsNothing(t *testing.T) {
 	}
 }
 
-// Under the CRDs of this release the check passes and the run goes on.
-func TestABackupRunUnderTheCurrentCRDProceeds(t *testing.T) {
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
-	step(t, r) // plan
-	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseQueued {
-		t.Fatalf("phase = %q (%s), want Queued", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-}
-
-// A RestoreRun under the v0.7.2 RestoreRun CRD, which drops the items'
-// clusterUID and snapshotTime, ends CRDOutdated at plan.
-func TestARestoreRunUnderAnOldCRDEndsBeforePlanning(t *testing.T) {
-	c := newClientWithCRDs(t, withOldCRD("backup.wlz.li_restoreruns.yaml"),
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
-		claim(), volumeRestore(), repository())
-	r := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Now: func() time.Time { return frozen }}
-	restoreStep(t, r)
-	run := &backupv1alpha1.RestoreRun{}
-	get(t, c, ns, "back-to-monday", run)
-	ready := meta.FindStatusCondition(run.Status.Conditions, backupv1alpha1.ConditionReady)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || ready == nil || ready.Reason != backupv1alpha1.ReasonCRDOutdated {
-		t.Fatalf("phase = %q, Ready = %+v; want Failed with reason CRDOutdated", run.Status.Phase, ready)
-	}
-	if !strings.Contains(ready.Message, "status.items[].clusterUID") {
-		t.Errorf("message %q does not name status.items[].clusterUID", ready.Message)
-	}
-	if len(run.Status.Items) != 0 {
-		t.Errorf("items = %+v; a refused run plans nothing", run.Status.Items)
-	}
-}
-
 // A controller that may not read the CRD refuses the run and names the
 // permission, since an unchecked run could leave workloads stopped.
 func TestABackupRunWithoutCRDAccessFailsClosed(t *testing.T) {

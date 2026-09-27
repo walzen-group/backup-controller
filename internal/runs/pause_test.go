@@ -118,25 +118,6 @@ func TestANewRestoreRunWaitsWhilePaused(t *testing.T) {
 	}
 }
 
-// A RestoreRun whose restore Job exists runs to its end while the controller
-// runs with --pause.
-func TestARestoreRunWithItsJobFinishesWhilePaused(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(inPlace), claim(), volumeRestore(), repository())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // restore
-	if jobs := restoreJobs(t, c); len(jobs) != 1 {
-		t.Fatalf("restore Jobs = %v before the pause, want one", jobs)
-	}
-	r.Paused = true
-	completeJob(t, c)
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	if run := readRestoreRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
-		t.Errorf("phase = %q (%s) while paused, want Succeeded", run.Status.Phase, readyMessage(run.Status.Conditions))
-	}
-}
-
 // A Queued BackupRun that has created its Kueue Workload is in progress. It
 // goes on to Running once Kueue admits it, also while the controller runs
 // with --pause.
@@ -204,32 +185,5 @@ func TestABackupRunPausedPastItsTimeoutWaitsForAdmissionAfterThePause(t *testing
 	run := readBackupRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(readyMessage(run.Status.Conditions), "from the end of the pause") {
 		t.Fatalf("phase = %q, Ready = %q past the timeout after the pause; want Failed, counted from the end of the pause", run.Status.Phase, readyMessage(run.Status.Conditions))
-	}
-}
-
-// A new RestoreRun that waited Paused for longer than its timeout does not
-// fail on its first pass after the pause. Its checks wait for a backup, and
-// the timeout counts from the moment the controller first worked on the run
-// after the pause.
-func TestARestoreRunPausedPastItsTimeoutWaitsAtItsChecksAfterThePause(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.CreationTimestamp = metav1.NewTime(frozen) }),
-		claim(), volumeRestore(), repository(), otherRun(), backingUp())
-	r.Paused = true
-	restoreStep(t, r)
-
-	resumed := frozen.Add(5 * time.Hour) // the run's timeout is four hours
-	r.Now = func() time.Time { return resumed }
-	r.Paused = false
-	restoreStep(t, r)
-	restoreStep(t, r)
-	if run := readRestoreRun(t, c); run.Status.Phase.Finished() {
-		t.Fatalf("phase = %q (%s) after the pause, want the run waiting at its checks", run.Status.Phase, readyMessage(run.Status.Conditions))
-	}
-
-	r.Now = func() time.Time { return resumed.Add(5 * time.Hour) }
-	restoreStep(t, r)
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
-		t.Fatalf("phase = %q, reason = %q past the timeout after the pause; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
 }

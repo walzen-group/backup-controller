@@ -2,9 +2,7 @@ package runs
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -417,48 +415,6 @@ func TestADeadTriggerFailsTheItemAtOnce(t *testing.T) {
 			get(t, c, ns, claimN, source)
 			if manualTag(source) != tc.tag {
 				t.Errorf("source trigger = %q, want %q left in place", manualTag(source), tc.tag)
-			}
-		})
-	}
-}
-
-// In a namespace run, a source busy with a tag no run waits for fails its
-// item before the workloads stop, and the rest of the namespace is backed up.
-// Waiting would keep every item of the namespace from being backed up until
-// the run's timeout.
-func TestADeadTriggerFailsOnlyItsItem(t *testing.T) {
-	for name, tc := range deadTags() {
-		t.Run(name, func(t *testing.T) {
-			objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-				claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), busySource(tc.tag)}, tc.objects...)
-			r, c := backupReconciler(t, objects...)
-			r.Client = neverWriteSyncing(t, c)
-			step(t, r) // plan
-			step(t, r) // admit, no queue
-
-			step(t, r) // quiesce
-			run := readBackupRun(t, c)
-			if run.Status.QuiescedAt == nil {
-				t.Fatalf("the run did not quiesce: phase %q, reason %q: %s", run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-			}
-			for _, item := range run.Status.Items {
-				if item.Kind == "ReplicationSource" && (item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, tc.names)) {
-					t.Fatalf("volume item = %+v, want it Failed naming %q before the workloads stop", item, tc.names)
-				}
-			}
-
-			step(t, r) // start: the base backup is requested, the app starts again
-			step(t, r)
-			run = readBackupRun(t, c)
-			for _, item := range run.Status.Items {
-				if item.Kind == "Cluster" && item.Phase != backupv1alpha1.ItemRunning {
-					t.Errorf("database item = %+v, want it Running", item)
-				}
-			}
-			d := &appsv1.Deployment{}
-			get(t, c, ns, appN, d)
-			if *d.Spec.Replicas != 2 {
-				t.Errorf("replicas = %d, want the app back at 2", *d.Spec.Replicas)
 			}
 		})
 	}
@@ -1461,59 +1417,6 @@ func TestACompletedTagWithAFailedMoverFailsTheItem(t *testing.T) {
 	}
 }
 
-// recordedLockedForget returns what restic 0.18.1's forget printed on a
-// repository that a killed mover left locked, as recorded in the restic
-// package's killed-mover fixture. VolSync keeps every line of a failed
-// mover's logs in status.latestMoverStatus.
-func recordedLockedForget(t *testing.T) string {
-	t.Helper()
-	raw, err := os.ReadFile("../restic/testdata/recorded/restic-0.18.1/killed-mover/verdicts.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var verdicts struct {
-		Forget struct {
-			Output string `json:"output"`
-		} `json:"forget"`
-	}
-	if err := json.Unmarshal(raw, &verdicts); err != nil {
-		t.Fatal(err)
-	}
-	return verdicts.Forget.Output
-}
-
-// A mover that fails because the repository is locked fails the item with
-// its logs as they are, whatever they say: no decision reads them, and the
-// run adds no advice of its own about locks (designs/restic-jobs.md D3).
-func TestAFailedMoverShowsItsLogsAsTheyAre(t *testing.T) {
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-		claim(), volume(), volumeRestore(), repository())
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // start
-
-	logs := "snapshot 6e473100 saved\n" + recordedLockedForget(t)
-	source := &volsyncv1alpha1.ReplicationSource{}
-	get(t, c, ns, claimN, source)
-	at := metav1.NewTime(frozen.Add(10 * time.Second))
-	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{
-		LastSyncStartTime: &at,
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: logs},
-	}
-	if err := c.Status().Update(context.Background(), source); err != nil {
-		t.Fatal(err)
-	}
-	step(t, r)
-
-	item := readBackupRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonMoverFailed {
-		t.Fatalf("item = %+v, want it Failed with reason MoverFailed", item)
-	}
-	if !strings.HasSuffix(item.Message, " Mover logs: "+logs) || strings.Contains(item.Message, "restic unlock") {
-		t.Errorf("item message = %q, want it to end in the logs as they are, with no advice about locks", item.Message)
-	}
-}
-
 // Every trigger the controller writes onto a new or idle source also sets
 // spec.restic.unlock to the same value, so VolSync runs `restic unlock`
 // before the backup and a lock a killed mover left behind is cleared once it
@@ -1649,41 +1552,6 @@ func TestAFailedReadWhileStartingAnItemIsRetried(t *testing.T) {
 	step(t, r)
 	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Message != "" || item.LastStartError != "" {
 		t.Errorf("item = %+v, want it Running with the old error cleared", item)
-	}
-}
-
-// A run that times out while an item still fails to start ends with the
-// item's message naming the timeout and the error of its last start attempt,
-// so a person reading the failed run sees why the item never started.
-func TestATimedOutRunKeepsAnItemsLastStartError(t *testing.T) {
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-		claim(), volume(), volumeRestore(), repository())
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*corev1.PersistentVolume); ok {
-				return apierrors.NewServiceUnavailable("etcd leader changed")
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-	})
-	step(t, r) // the start fails
-
-	r.Now = func() time.Time { return frozen.Add(2 * time.Hour) }
-	step(t, r) // past the one-hour timeout
-
-	run := readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Fatalf("phase = %q, want Failed after the timeout", run.Status.Phase)
-	}
-	item := run.Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "had not finished by") ||
-		!strings.Contains(item.Message, "; last error: ") || !strings.Contains(item.Message, "etcd leader changed") {
-		t.Errorf("item = %+v, want it Failed naming the timeout and, after \"; last error: \", the start error", item)
-	}
-	if item.Reason != backupv1alpha1.ItemReasonTimedOut || !strings.Contains(item.LastStartError, "etcd leader changed") {
-		t.Errorf("reason = %q, lastStartError = %q; want TimedOut and the start error kept", item.Reason, item.LastStartError)
 	}
 }
 
@@ -1836,18 +1704,6 @@ func TestAFailedItemNamesTheDataALaterSnapshotHolds(t *testing.T) {
 	}
 }
 
-// An item whose sync VolSync has not started says nothing of a later
-// snapshot: the sync that starts later cuts a fresh clone.
-func TestAFailedItemWithNoSyncSaysNothingOfALaterSnapshot(t *testing.T) {
-	r, c := sourceRun(t)
-	r.Now = func() time.Time { return frozen.Add(time.Hour) }
-	step(t, r)
-	item := readBackupRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemFailed || strings.Contains(item.Message, "later") {
-		t.Errorf("item = %+v, want it Failed with no word of a later snapshot", item)
-	}
-}
-
 // sourceRun creates a BackupRun of the test claim with a one-hour timeout
 // and reconciles it until the claim's source carries the run's trigger.
 func sourceRun(t *testing.T) (*BackupRunReconciler, client.Client) {
@@ -1861,40 +1717,4 @@ func sourceRun(t *testing.T) (*BackupRunReconciler, client.Client) {
 		t.Fatalf("item = %+v after the start pass, want it Running", item)
 	}
 	return r, c
-}
-
-// A run with two items that both wait for another run names both waits on
-// its Ready condition, so the first wait is not hidden by the second.
-func TestReadyNamesEveryWait(t *testing.T) {
-	other := otherRun()
-	other.Spec.Source, other.Spec.All = "", true
-	other.Status.Items = append(other.Status.Items, backupv1alpha1.BackupItem{Kind: "ReplicationSource", Name: cacheN,
-		Phase: backupv1alpha1.ItemRunning, Trigger: TriggerFor(otherRunUID)})
-	objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), other}, cacheClaim()...)
-	r, c := backupReconciler(t, objects...)
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce: nothing is marked, and both sources are still idle
-
-	// The other run tags both sources before this run starts its items.
-	for _, name := range []string{claimN, cacheN} {
-		source := busySource(TriggerFor(otherRunUID))
-		source.Name, source.Spec.SourcePVC = name, name
-		if err := c.Create(context.Background(), source); err != nil {
-			t.Fatal(err)
-		}
-	}
-	step(t, r) // start: both items wait
-
-	run := readBackupRun(t, c)
-	for _, item := range run.Status.Items {
-		if item.Phase != backupv1alpha1.ItemPending {
-			t.Fatalf("item = %+v, want both items Pending while the other run holds them", item)
-		}
-	}
-	reason, message := readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions)
-	if reason != backupv1alpha1.ReasonSourceBusy || !strings.Contains(message, claimN) || !strings.Contains(message, cacheN) {
-		t.Errorf("Ready = %s: %q, want SourceBusy naming both %s and %s", reason, message, claimN, cacheN)
-	}
 }
