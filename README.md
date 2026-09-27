@@ -1,8 +1,9 @@
 # backup-controller
 
 A Kubernetes controller that schedules and runs a namespace's backups, and
-brings volumes and CloudNativePG databases back from them, with VolSync and the
-barman-cloud plugin moving every byte.
+brings volumes and CloudNativePG databases back from them. VolSync's mover
+writes every volume backup, a restic Job of the controller's own writes every
+volume restore, and the barman-cloud plugin moves every database byte.
 
 It does three jobs in one binary:
 
@@ -66,7 +67,7 @@ the volume and the database back ending on the same tick.
 | v0.8.0 | a restore from a repository with `into:` writes through a Direct ReplicationDestination, a restore keeps the snapshot its checks selected and leaves an opted-out Cluster alone, a quiesce records its plan before it stops anything, a failed mover fails its item, the webhook ignores failed base backups and compares endpoints, and the controller gets health probes and a Recreate rollout |
 | v0.8.1 | a RestoreRun leaves a Cluster alone when its owner declares its own bootstrap method, such as `pg_basebackup` |
 | v0.8.2 | a failed mover no longer deletes the ReplicationSource, which killed the retry mover and left a restic lock that stopped every later `forget`. Upgrading needs `restic unlock` on each repository that had a mover failure under v0.8.0 or v0.8.1, see [namespace-backups.md](docs/namespace-backups.md) |
-| v0.9.0 | a backup and a restore of one claim or repository never run at once, through a Lease per claim and per repository, and two runs never stop one namespace's workloads at once, through a quiesce Lease per namespace; two in-place restores of one claim run one after the other, and a second RestoreRun for a Cluster another run is restoring ends Invalid; a run that cannot give its app back reports `RestartFailed`, and one that cannot release its Leases, Workload or mover reports `ReleaseFailed`, and neither finishes until it can; a restore that stops its mover waits until the mover's Job and pods are gone before it gives the app back; a restore whose every item was Skipped ends with reason `NoBackupInReach`; a restore succeeds only when its mover's log names the snapshot the checks selected, and refuses a snapshot that mover would not restore; an `into:` restore writes through the run's own mover; a run reads the installed CRD first and ends with reason `CRDOutdated` when it lacks a field the controller writes; a run gives a quiesced app back at `backup.wlz.li/max-quiesce`, ten minutes by default, failing the volume items whose clones were not cut; an item VolSync keeps retrying names what data a later snapshot of that sync holds; every new trigger unlocks the repository first; the webhook refuses a database that could never archive into the archive under its prefix, and compares bucket and prefix only; a run refuses a Flux Kustomization that applies workloads of two namespaces; the controller holds no code for runs an older version started. Upgrading: upgrade only while no run is active, apply the release's CRDs and RBAC with the image, give the S3 credential `s3:ListBucket` on the server prefix, and check that no two Clusters share an archive, see [docs/upgrading.md](docs/upgrading.md) |
+| v0.9.0 | every volume restore, a RestoreRun's and the populator's, runs in a restic Job of the controller's own, which restores the selected snapshot by its full ID and reports success only on the Job's `Complete=True`, with restic's exit code and last lines on a failure; the Job is created suspended and resumed once its owner has recorded it, and is stopped by a suspend that ends restic with SIGTERM, a wait until none of its pods can still write, and a delete; two snapshots in one second are each restorable, and only snapshots with a VolSync mover's layout are candidates; a backup finds its snapshot in the repository by its sync's time window, with no mover log read anywhere, and records a claim as empty only after two listings; an admission policy lets the controller's ServiceAccount create only restore Jobs of that shape; quiesce sets replicas through the `scale` subresource, and the ClusterRole holds no write verb on workloads and nothing on ReplicationDestinations; items carry a typed `reason`; a backup and a restore of one claim or repository never run at once, through a Lease per claim and per repository, and two runs never stop one namespace's workloads at once, through a quiesce Lease per namespace; two in-place restores of one claim run one after the other, and a second RestoreRun for a Cluster another run is restoring ends Invalid; a run that cannot give its app back reports `RestartFailed`, and one that cannot release its Leases, Workload or restore Job reports `ReleaseFailed`, and neither finishes until it can; a restore whose every item was Skipped ends with reason `NoBackupInReach`; a run reads the installed CRD first and ends with reason `CRDOutdated` when it lacks a field the controller writes; a run gives a quiesced app back at `backup.wlz.li/max-quiesce`, ten minutes by default, failing the volume items whose clones were not cut; an item VolSync keeps retrying names what data a later snapshot of that sync holds; every new trigger unlocks the repository first; the webhook refuses a database that could never archive into the archive under its prefix, and compares bucket and prefix only; a run refuses a Flux Kustomization that applies workloads of two namespaces; the controller holds no code for runs an older version started. Upgrading: upgrade only while no run is active and no ReplicationDestination or claim waiting on a VolumeRestore is left, apply the release's CRDs, RBAC and admission policy with the image, pass `--restore-image` with VolSync's restic image, give the S3 credential `s3:ListBucket` on the server prefix, and check that no two Clusters share an archive, see [docs/upgrading.md](docs/upgrading.md) |
 
 The early fixes below explain behaviour that is still in the code.
 
@@ -120,9 +121,10 @@ and a second dataset, the destination's restored copy, stays on the pool for the
 life of the claim.
 
 This controller keeps the behaviour and removes the clone. It fills an ordinary
-empty volume by running a VolSync restore directly into it, then hands that
-volume to the app's claim. No VolumeSnapshot is taken, no clone exists, nothing
-is pinned, and the destination's permanent restored copy is gone.
+empty volume by running `restic restore` directly into it, in a Job with the
+same restic image VolSync backs up with, then hands that volume to the app's
+claim. No VolumeSnapshot is taken, no clone exists, nothing is pinned, and no
+destination keeps a permanent restored copy.
 
 Scheduling came later, in v0.5.0. VolSync's per-source schedules started every
 mover at the same minute and Kueue admitted them one pod at a time, so a
@@ -131,8 +133,9 @@ stopped for its backup at all.
 
 ## What it is not
 
-It does not move data. VolSync's mover writes and reads every volume byte, and
-the barman-cloud plugin every database byte. The controller decides when each
+It does not move data itself. VolSync's mover writes every volume backup, the
+controller's restore Job runs restic for every volume restore, and the
+barman-cloud plugin moves every database byte. The controller decides when each
 runs, writes the objects that start them, and reads the results.
 
 It does not replace VolSync or the barman-cloud plugin, and it keeps no state of

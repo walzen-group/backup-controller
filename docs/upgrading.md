@@ -37,6 +37,26 @@ between two ticks of the schedules you know about. The Deployment's Recreate
 strategy stops the old pod before the new one starts, so the two versions never
 reconcile a run at the same moment.
 
+v0.9.0 restores through a Job of its own and neither reads nor deletes
+ReplicationDestinations. Check that nothing of the old restore path is in
+flight, a destination or a claim waiting for the populator:
+
+```
+kubectl get replicationdestinations.volsync.backube -A
+```
+
+```
+kubectl get pvc -A -o json | jq -r '.items[] | select(.spec.dataSourceRef.kind == "VolumeRestore" and .status.phase != "Bound") | "\(.metadata.namespace)/\(.metadata.name)"'
+```
+
+Expected result: `No resources found`, and no output. A destination left in
+backup-system or in an app namespace keeps its mover and its claim to itself
+under v0.9.0, and for a claim still waiting on a VolumeRestore the new
+populator creates its restore Job into a prime claim that the old
+destination's mover may still be writing. Wait for a pending
+claim to bind, or delete it, and delete a destination only once its run or
+claim is gone, before you upgrade.
+
 v0.9.0 has no code for a run an older version started. It carries on a run that
 was still active at the upgrade as if it had planned that run itself, and it
 does not check what the older version wrote into that run's status. The older
@@ -103,8 +123,9 @@ permissions.
 
 ### Step 4: Apply the CRDs, the RBAC and the image together
 
-The ClusterRole gains four rules. Until the first of them is applied, the
-webhook refuses every Cluster create while any other Cluster archives:
+Against v0.8.2 the ClusterRole gains five rules. Until the first of them is
+applied, the webhook refuses every Cluster create while any other Cluster
+archives:
 
 - `list` on `objectstores.barmancloud.cnpg.io`, which the webhook's
   shared-archive check uses to read every ObjectStore in one call;
@@ -113,24 +134,45 @@ webhook refuses every Cluster create while any other Cluster archives:
   check below;
 - get, list, create, update and delete on `leases` in `coordination.k8s.io`,
   for the Lease a run acquires on a claim and its repository before it starts a
-  mover, and the Lease `backup-controller-quiesce` it acquires before it stops
-  a namespace's workloads;
-- `get` on `jobs` in `batch`, which a RestoreRun and the orphan reconciler use
-  to wait until the Job of a mover they stopped is gone.
+  mover or a restore Job, and the Lease `backup-controller-quiesce` it acquires
+  before it stops a namespace's workloads;
+- get, list, create, patch and delete on `jobs` in `batch`, for the restore
+  Job of a RestoreRun and of the populator: created suspended, resumed and
+  suspended with a patch, deleted with Foreground propagation, and listed by a
+  backup that waits for a restore of its claim;
+- get and update on `deployments/scale` and `statefulsets/scale` in `apps`,
+  through which quiesce sets a workload's replica count.
 
-One rule loses a verb: `create` on `volumerestores.backup.wlz.li` goes, because
-a RestoreRun with `into:` no longer creates a VolumeRestore. The VolumeRestores
-a claim names in `dataSourceRef`, such as the one a Flux template writes for
-each backed-up claim, keep working unchanged: the populator fills a new claim
-from them, and every run reads a claim's repository from its VolumeRestore, as
-before.
+Three rules lose verbs:
+
+- `patch` on `deployments` and `statefulsets` goes; the rule keeps get and
+  list, and the controller writes no field of a workload but the replica count
+  through `scale`;
+- the rule on `replicationdestinations.volsync.backube` goes entirely, since no
+  restore creates a ReplicationDestination any more;
+- `create` on `volumerestores.backup.wlz.li` goes, because a RestoreRun with
+  `into:` no longer creates a VolumeRestore. The VolumeRestores a claim names
+  in `dataSourceRef`, such as the one a Flux template writes for each backed-up
+  claim, keep working unchanged: the populator fills a new claim from them, and
+  every run reads a claim's repository from its VolumeRestore, as before.
+
 [packaging.md](packaging.md#rbac-the-controller-needs) lists every rule and its
 caller.
 
-Apply deploy/rbac.yaml, or upgrade the chart, in the same change that moves the
-image. Under the v0.8.x ClusterRole, a v0.9.0 webhook answers each of those
-Cluster creates with an HTTP 500, and a v0.9.0 run ends with reason
-CRDOutdated because it may not read its CRD.
+The release also carries the ValidatingAdmissionPolicy and
+ValidatingAdmissionPolicyBinding `backup-controller-restore-jobs`
+(deploy/admissionpolicy.yaml), which narrow the new `jobs` rule to Jobs of the
+restore Job's shape
+([packaging.md](packaging.md#admission-policy-on-the-restore-jobs)). They need
+Kubernetes 1.30 or later.
+
+Apply deploy/rbac.yaml and deploy/admissionpolicy.yaml, or upgrade the chart,
+in the same change that moves the image. Under the v0.8.x ClusterRole, a v0.9.0
+webhook answers each of those Cluster creates with an HTTP 500, a v0.9.0 run
+ends with reason CRDOutdated because it may not read its CRD, a quiesce fails
+with Forbidden on `deployments/scale`, and every restore Job create fails with
+Forbidden. The controller also needs `--restore-image`, which step 5 adds; the
+release manifest leaves it out.
 
 The CRDs go with the image as well. A run reads the installed CRD of its kind
 before it changes anything and ends with reason CRDOutdated when the schema
@@ -177,7 +219,215 @@ carries no `backup.wlz.li/quiesce` annotation does not appear in the first
 listing; compare those with the `status.quiesced` of the RestoreRuns that list
 them.
 
-### Step 5: Check how long an app may stay down
+### Step 5: Change the infra units
+
+This step is for the walzen infrastructure repository (~/repos/infra), read at
+its commit 6315b4e; paths below are relative to it. v0.9.0 restores with its
+own restic Job, which must run the same restic image VolSync backs up with, so
+the image is declared once, in the volsync unit, and both units read it. The
+controller refuses to start without `--restore-image`, and the release
+manifest leaves the flag out for the installer to append.
+
+1. In environments/prod/cluster/volsync/inputs.yaml, add below `chart_version`:
+
+   ```yaml
+   # restic_image: <tag>@sha256:<digest>, the image VolSync runs its restic mover in
+   # and backup-controller runs its restore Job in. One declaration for both, so
+   # the restic that writes the backups is the one that restores them. Keep the
+   # tag at the chart's appVersion; the digest decides, and a bump moves both.
+   # renovate: datasource=docker
+   restic_image: "quay.io/backube/volsync:0.16.0@sha256:0d03a6aad57569eba2c0eaa0848cf4a908d9744b372ff2224bb291a320f36d76"
+   ```
+
+   Add the same lines below `chart_version` in
+   environments/test/cluster/volsync/inputs.yaml (line 5). The test
+   environment is parked (environments/test/.disable; root.hcl:16-20 skips a
+   parked environment), but its volsync unit uses the same module, and
+   `restic_image` has no default, so without the input the unit would fail the
+   moment the environment is unparked.
+
+2. In modules/cluster/volsync/opentofu/variables.tf, add:
+
+   ```hcl
+   variable "restic_image" {
+     description = "Image VolSync runs its restic mover in, pinned by digest. backup-controller restores with the same image. See the module README."
+     type        = string
+
+     validation {
+       condition     = strcontains(var.restic_image, "@sha256:")
+       error_message = "restic_image is pinned by digest: <repository>:<tag>@sha256:<digest>."
+     }
+   }
+   ```
+
+3. In modules/cluster/volsync/opentofu/main.tf, pass the image to the chart in
+   `helm_release.volsync`, the way every other chart module passes values
+   (modules/cluster/kueue/opentofu/main.tf:51), and update the comment above
+   it (main.tf:1-4), which says "Chart defaults everywhere":
+
+   ```hcl
+     # The restic mover's image, declared once in the unit's inputs and shared
+     # with backup-controller's restore Job. The chart replaces the whole
+     # reference with it. See the README.
+     values = [yamlencode({
+       restic = { image = var.restic_image }
+     })]
+   ```
+
+4. In modules/cluster/volsync/opentofu/outputs.tf, add:
+
+   ```hcl
+   output "restic_image" {
+     description = "Image VolSync runs its restic mover in; backup-controller passes it to its restore Job."
+     value       = var.restic_image
+   }
+   ```
+
+5. In environments/prod/cluster/backup-controller/terragrunt.hcl, add the
+   dependency, keep `../volsync` in the `dependencies` block, and replace the
+   `inputs = yamldecode(...)` line (terragrunt.hcl:20):
+
+   ```hcl
+   # The restic image VolSync backs up with, which the controller's restore Job runs.
+   # Shallow merge so a read-only command works before the volsync unit has applied
+   # the output: that unit already has outputs, and terragrunt uses mock outputs
+   # only for a dependency with none. A real apply uses the actual value, because
+   # the dependency makes that unit apply first.
+   dependency "volsync" {
+     config_path = "../volsync"
+
+     mock_outputs = {
+       restic_image = "quay.io/backube/volsync:0.16.0@sha256:0d03a6aad57569eba2c0eaa0848cf4a908d9744b372ff2224bb291a320f36d76"
+     }
+     mock_outputs_merge_strategy_with_state  = "shallow"
+     mock_outputs_allowed_terraform_commands = ["init", "validate", "plan", "show", "output", "state", "console", "destroy"]
+   }
+
+   inputs = merge(yamldecode(file("${get_terragrunt_dir()}/inputs.yaml")), {
+     restore_image = dependency.volsync.outputs.restic_image
+   })
+   ```
+
+   The volsync unit has outputs today (namespace, flux_substitution_sources,
+   release), so without the shallow merge a plan run before the volsync change
+   is applied reads the real outputs, finds no `restic_image`, and fails. The
+   comment above `dependencies` (terragrunt.hcl:10-11) names "volsync's
+   ReplicationDestination kind"; reword it to the restic image.
+
+6. In environments/test/cluster/backup-controller/terragrunt.hcl, add the same
+   `dependency "volsync"` block and replace the `inputs` line
+   (terragrunt.hcl:21) the same way; its `dependencies` block already lists
+   `../volsync` (terragrunt.hcl:13-15), and the comment above it
+   (terragrunt.hcl:10-12) names the ReplicationDestination kind too; reword it
+   the same way. In environments/test/cluster/backup-controller/inputs.yaml, set
+   `backup_controller_version: "v0.9.0"` (inputs.yaml:5 pins `v0.5.6`). Both
+   changes are for the day the test environment is unparked: the module now
+   requires `restore_image` and appends `--restore-image` to every release's
+   Deployment, and v0.5.6 exits at start on a flag it does not know, just as
+   v0.9.0 exits without it.
+
+7. In modules/cluster/backup-controller/opentofu/variables.tf, add:
+
+   ```hcl
+   variable "restore_image" {
+     description = "Image the controller's restore Job runs restic in, passed as --restore-image; the controller refuses to start without it. The volsync unit's restic_image. See the README."
+     type        = string
+
+     validation {
+       condition     = strcontains(var.restore_image, "@sha256:")
+       error_message = "restore_image is the restic image pinned by digest, <repository>:<tag>@sha256:<digest>, never empty: the controller refuses to start without it."
+     }
+   }
+   ```
+
+   With no default, a unit that passes nothing fails the plan with "No value
+   for required variable", and an empty string or a tag without a digest fails
+   the validation, so the module never installs the controller without the
+   flag.
+
+8. In modules/cluster/backup-controller/opentofu/main.tf, replace the
+   `workload` local (main.tf:10) so it appends the flag to the `controller`
+   container's args of the Deployment document, for every release and with no
+   condition, the way the `namespaces` local patches the Namespace document
+   (main.tf:20-36). The document keeps its key, so `kubectl_manifest.workload`
+   keeps its address: no new resource and no `moved` block.
+
+   ```hcl
+     # The restore Job's image, from the volsync unit, so restores run the restic
+     # that wrote the backups: appended to the controller container's args, the
+     # way the Namespace document below gets its label. The release leaves the
+     # flag out, and the controller refuses to start without it. See the README.
+     workload = {
+       for id, doc in local.documents : id => (
+         yamldecode(doc).kind == "Deployment" ? yamlencode(merge(yamldecode(doc), {
+           spec = merge(yamldecode(doc).spec, {
+             template = merge(yamldecode(doc).spec.template, {
+               spec = merge(yamldecode(doc).spec.template.spec, {
+                 containers = [
+                   for c in yamldecode(doc).spec.template.spec.containers :
+                   c.name == "controller" ? merge(c, { args = concat(c.args, ["--restore-image=${var.restore_image}"]) }) : c
+                 ]
+               })
+             })
+           })
+         })) : doc
+       ) if !contains(["CustomResourceDefinition", "Namespace"], yamldecode(doc).kind)
+     }
+   ```
+
+9. In environments/prod/cluster/backup-controller/inputs.yaml, set
+   `backup_controller_version: "v0.9.0"`.
+
+10. In modules/cluster/backup-controller/opentofu/README.md, list under
+    workload in the "What the unit installs" table the
+    ValidatingAdmissionPolicy and ValidatingAdmissionPolicyBinding the release
+    now carries, and say that the Deployment gets `--restore-image` from the
+    volsync unit. The intro and "Restores run as root" say that the
+    controller's restore Job writes the claim, still as root in namespaces
+    annotated privileged-movers. The volsync module's README documents
+    `restic_image`. flux/templates/backups/pvc/volumerestore.yaml:7-8 says the
+    controller "has VolSync restore into it"; reword it to the restore Job.
+
+Apply the volsync unit first, then backup-controller; terragrunt's dependency
+order does this in a run-all.
+
+#### Check the images and the admission policy
+
+```
+kubectl -n volsync-system get deploy volsync -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].args}' | tr ',' '\n' | grep restic-container-image
+```
+
+```
+kubectl -n backup-system get deploy backup-controller -o jsonpath='{.spec.template.spec.containers[?(@.name=="controller")].args}' | tr ',' '\n' | grep restore-image
+```
+
+```
+kubectl get validatingadmissionpolicy,validatingadmissionpolicybinding backup-controller-restore-jobs
+```
+
+```
+kubectl get validatingadmissionpolicy backup-controller-restore-jobs -o jsonpath='{.spec.matchConditions[0].expression}{"\n"}'
+```
+
+Expected result: both images are the `restic_image` value, the second command
+prints exactly one `--restore-image`, both policy objects exist, and the match
+condition names `system:serviceaccount:backup-system:backup-controller`, the
+namespace and ServiceAccount the Deployment runs as. A policy object that is
+missing, or a match condition that names another namespace or ServiceAccount,
+leaves the controller's Job grant as wide as RBAC alone: every Job its
+ServiceAccount creates is admitted. Apply deploy/admissionpolicy.yaml from the
+release, with the username changed to match an install that renamed either.
+
+A backup-controller pod in CrashLoopBackOff whose previous log says `refusing
+to start: --restore-image is required` means the append in item 8 is missing:
+the unit ran an older module, or someone applied the release asset's
+Deployment by hand.
+
+```
+kubectl -n backup-system logs deploy/backup-controller -c controller --previous
+```
+
+### Step 6: Check how long an app may stay down
 
 A run with `all: true` now keeps an app stopped for at most the namespace's
 `backup.wlz.li/max-quiesce`, ten minutes without it, counted from the run's
@@ -186,7 +436,7 @@ the annotation before the upgrade, or the run gives the app back and fails the
 volume item whose clone VolSync had not cut by then, with the clone named in
 the message. The annotation holds a Go duration, such as `20m`.
 
-### Step 6: Check for Kustomizations that apply two namespaces
+### Step 7: Check for Kustomizations that apply two namespaces
 
 A run that stops workloads now refuses, with reason `Invalid` and before it
 stops anything, when the Flux Kustomization of one of its workloads also
@@ -200,16 +450,6 @@ kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o json | jq -r '.item
 
 Expected result: no output, or only Kustomizations whose workloads no run
 stops. Give each namespace whose workloads a run stops its own Kustomization.
-
-### Step 7: Check what VolSync keeps of a restore mover's log
-
-A volume restore now succeeds only when the log of the mover that completed its
-trigger names the snapshot the run's checks selected, so a VolSync that cuts
-that log too short leaves every restore unconfirmed, and the run fails it.
-VolSync keeps the last `MOVER_LOG_MAX_BYTES` bytes of the filtered log, 1024 by
-default. Leave the default, or set it to at least a few kilobytes; a value of 0
-leaves the log empty and every restore then fails with `the mover finished, but
-its logs name no snapshot, so the run cannot confirm what claim <claim> holds`.
 
 ### Step 8: Find Clusters v0.8.x admitted over an old archive
 
@@ -388,18 +628,27 @@ a second Cluster from the repaired archive to count its rows.
 ### Ready reasons that are new or mean more
 
 A dashboard or an alert that reads a run's Ready reason sees three new reasons
-and six that cover more cases than before. api.md has the full table for a
-[BackupRun](api.md#ready-reasons) and for a
-[RestoreRun](api.md#ready-reasons-of-a-restorerun).
+and seven that cover more cases than before, and a VolumeRestore has one new
+reason. api.md has the full table for a
+[BackupRun](api.md#ready-reasons), for a
+[RestoreRun](api.md#ready-reasons-of-a-restorerun) and for a
+[VolumeRestore](api.md#status).
 
 | Reason | From v0.9.0 |
 | --- | --- |
 | CRDOutdated | new: the run ended before it changed anything, because the installed CRD of its kind lacks a field the controller writes, or the controller may not read that CRD |
 | RestartFailed | new: the run could not give its app back, and stays unfinished until it can; the app is still down |
-| ReleaseFailed | new: the app is back, and the run stays unfinished until it can release its Leases, its Kueue Workload or a restore mover it stopped |
+| ReleaseFailed | new: the app is back, and the run stays unfinished until it can release its Leases, its Kueue Workload or a restore Job it stopped |
+| RestoreJobRefused | new on a VolumeRestore: the API server refused to create or resume a claim's restore Job, such as the admission policy refusing its `moverSecurityContext` |
 | SourceBusy | also a backup and a restore of the same claim or repository, a Lease another run holds on either, another run that has stopped this namespace's workloads, and a RestoreRun that has deleted a Cluster and waits for it to be created again |
-| NoBackupInReach | also a snapshot VolSync's mover would not restore when pinned to its second, and a RestoreRun whose every item was Skipped |
-| ClaimInUse | also another ReplicationDestination writing into the claim of an in-place restore |
-| WaitingForShutdown | also a RestoreRun waiting for the Job and pods of a restore mover it stopped |
-| TimedOut | also an `into` restore whose mover had not finished by `spec.timeout` |
+| NoBackupInReach | also a repository that holds no snapshot with the layout a VolSync mover writes, and a RestoreRun whose every item was Skipped |
+| ClaimInUse | also the restore Job pod of another run writing into the claim of an in-place restore |
+| WaitingForShutdown | also a RestoreRun waiting for the pods of a restore Job it stopped to end |
+| TimedOut | also an `into` restore whose restore Job had not finished by `spec.timeout` |
+| VolSyncUnsupported | also a RestoreRun that waits, with nothing changed, while the API server does not serve ReplicationSource at v1alpha1 |
 | Retrying | also on a BackupRun, for an item whose start failed with an error a retry may fix |
+
+Items carry a new field, `status.items[].reason`, a one-word cause for the
+item's phase such as RestoreJobFailed or MoverFailed; the
+[item reasons](api.md#item-reasons) table lists them. A run records why it
+ended in `status.ending`.
