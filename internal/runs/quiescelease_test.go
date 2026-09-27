@@ -172,8 +172,9 @@ func TestARestoreAndANamespaceBackupNeverStopTheAppTogether(t *testing.T) {
 	if got := replicasOf(t, c); got != 2 {
 		t.Fatalf("replicas = %d after the backup's restart, want 2", got)
 	}
-	complete(t, c, "snapshot 6e473100 saved")
-	step(t, br) // collect and finish
+	complete(t, c)
+	step(t, br) // find the snapshot
+	step(t, br) // move it, and finish
 	if backup := readBackupRun(t, c); backup.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("the backup ended %s: %s", backup.Status.Phase, readyMessage(backup.Status.Conditions))
 	}
@@ -217,8 +218,9 @@ func TestTwoNamespaceBackupsNeverStopTheAppTogether(t *testing.T) {
 	if got := replicasOf(t, c); got != 2 {
 		t.Fatalf("replicas = %d after the first run's restart, want 2", got)
 	}
-	complete(t, c, "snapshot 6e473100 saved")
-	step(t, br) // collect and finish, releasing the first run's Leases
+	complete(t, c)
+	step(t, br) // find the snapshot
+	step(t, br) // move it, and finish, releasing the first run's Leases
 
 	stepIn(t, br, ns, second) // quiesce: plans now that the first run is done
 	other = backupIn(t, c, ns, second)
@@ -326,8 +328,9 @@ func TestALostWriteAfterTheRestartKeepsTheQuiesceLease(t *testing.T) {
 	// The retry stores the cleared flag and finishes the backup; only then
 	// does the restore stop the app, and nothing scales it back up.
 	br.Client = healthy
-	complete(t, c, "snapshot 6e473100 saved")
-	step(t, br) // retry the restart, collect, and finish
+	complete(t, c)
+	step(t, br) // retry the restart, and find the snapshot
+	step(t, br) // move it, and finish
 	backup := readBackupRun(t, c)
 	if backup.Status.Phase != backupv1alpha1.RunPhaseSucceeded || backup.Status.RestartPending {
 		t.Fatalf("the backup ended %s with restartPending = %t", backup.Status.Phase, backup.Status.RestartPending)
@@ -603,8 +606,9 @@ func TestARunNeverRepeatsARestartItsStatusShowsDone(t *testing.T) {
 	if got := replicasOf(t, c); got != 0 || !suspended(t, c) {
 		t.Fatalf("replicas = %d, suspended = %t; want the other stop left alone", got, suspended(t, c))
 	}
-	complete(t, c, "snapshot 6e473100 saved")
-	step(t, r) // collect and finish
+	complete(t, c)
+	step(t, r) // find the snapshot
+	step(t, r) // move it, and finish
 	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q (%s), want Succeeded", run.Status.Phase, readyMessage(run.Status.Conditions))
 	}

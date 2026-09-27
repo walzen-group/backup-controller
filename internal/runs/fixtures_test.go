@@ -179,9 +179,9 @@ var (
 
 // retimeCall holds the arguments of one call to retimer.Retime.
 type retimeCall struct {
-	short string
-	at    time.Time
-	tag   string
+	id  string
+	at  time.Time
+	tag string
 }
 
 // retimer is a restic.Retimer that records each call. It answers with the
@@ -194,12 +194,12 @@ type retimer struct {
 
 // Retime records the call and returns the rewritten snapshot, which carries
 // the requested time and tag, or returns r.err when it is set.
-func (r *retimer) Retime(_ context.Context, _ *corev1.Secret, short string, at time.Time, tag string) (restic.Snapshot, error) {
-	r.calls = append(r.calls, retimeCall{short: short, at: at, tag: tag})
+func (r *retimer) Retime(_ context.Context, _ *corev1.Secret, id string, at time.Time, tag string) (restic.Snapshot, error) {
+	r.calls = append(r.calls, retimeCall{id: id, at: at, tag: tag})
 	if r.err != nil {
 		return restic.Snapshot{}, r.err
 	}
-	return restic.Snapshot{ID: fullID("c0ffee00"), Time: at, Tags: []string{tag}, Original: short}, nil
+	return restic.Snapshot{ID: fullID("c0ffee00"), Time: at, Tags: []string{tag}, Original: id}, nil
 }
 
 // prober answers the questions about a Cluster's base backups from a fixed

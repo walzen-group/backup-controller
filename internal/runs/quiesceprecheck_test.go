@@ -104,8 +104,9 @@ func TestANamespaceBackupAndARestoreNeverStopTheAppTogether(t *testing.T) {
 
 	// The backup's upload ends and the backup ends, so the restore may stop
 	// the app and records the count the backup gave back.
-	complete(t, c, "snapshot 6e473100 saved")
-	step(t, br)
+	complete(t, c)
+	step(t, br) // find the snapshot
+	step(t, br) // move it, and finish
 	if backup := readBackupRun(t, c); backup.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("the backup ended %s: %s", backup.Status.Phase, readyMessage(backup.Status.Conditions))
 	}
@@ -240,7 +241,7 @@ func TestAQuiescedRestoreWaitsForABackupBeforeStopping(t *testing.T) {
 	if err := c.Status().Update(context.Background(), finished); err != nil {
 		t.Fatal(err)
 	}
-	complete(t, c, "snapshot 6e473100 saved")
+	complete(t, c)
 	restoreStep(t, rr)
 	restore = readRestoreRun(t, c)
 	if len(restore.Status.Quiesced) != 1 || restore.Status.Quiesced[0].Replicas != 2 {

@@ -9,9 +9,6 @@
 package runs
 
 import (
-	"fmt"
-	"regexp"
-	"strings"
 	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
@@ -89,65 +86,6 @@ func lastManual(source *volsyncv1alpha1.ReplicationSource) string {
 // for the next run.
 func busy(source *volsyncv1alpha1.ReplicationSource) bool {
 	return manualTag(source) != "" && manualTag(source) != lastManual(source)
-}
-
-// savedSnapshot matches the line restic prints after a backup, such as
-// "snapshot da4d7eb4 saved", and captures the snapshot ID. VolSync keeps that
-// line in the mover's status logs.
-var savedSnapshot = regexp.MustCompile(`snapshot ([0-9a-f]{8,64}) saved`)
-
-// emptyDirectory is the line VolSync's mover prints when the volume holds no
-// files. The mover then runs no backup, and the repository gains no snapshot.
-const emptyDirectory = "Directory is empty skipping backup"
-
-// moverOutcome reads the logs of a finished mover from the source's
-// status.latestMoverStatus. It returns the ID of the snapshot the mover
-// saved, as restic printed it, or true in empty when the mover found the
-// volume empty. When the logs show neither, it returns an empty ID and false.
-func moverOutcome(source *volsyncv1alpha1.ReplicationSource) (snapshot string, empty bool) {
-	if source.Status == nil || source.Status.LatestMoverStatus == nil {
-		return "", false
-	}
-	logs := source.Status.LatestMoverStatus.Logs
-	if match := savedSnapshot.FindStringSubmatch(logs); match != nil {
-		return match[1], false
-	}
-	return "", strings.Contains(logs, emptyDirectory)
-}
-
-// alreadyLocked is what restic prints when it can't take its lock because
-// another lock is in the repository, as in "unable to create lock in
-// backend: repository is already locked by PID 33 on
-// volsync-src-notes-data-7xk2p" (restic 0.18.1 internal/restic/lock.go:56,
-// recorded in internal/restic/testdata/recorded/restic-0.18.1/killed-mover).
-// VolSync keeps every line of a failed mover's logs (mover.go:612).
-const alreadyLocked = "repository is already locked"
-
-// moverFailure returns the item's message for a mover of source that failed
-// with the given logs. When the logs show that restic found the repository
-// locked, the message first says what that lock is and how it is cleared,
-// and then gives the logs. Otherwise it is the logs as they are.
-//
-// A mover killed mid-backup leaves its lock, and restic's forget, which the
-// mover runs after the backup, refuses any other lock. `restic unlock`
-// removes a lock of another host only once it is older than 30 minutes. The
-// controller writes spec.restic.unlock with every new trigger, so the next
-// backup of the claim runs it first. The retries of this sync run it too
-// while spec.restic.unlock differs from status.restic.lastUnlocked, which is
-// the case for a sync the controller triggered.
-func moverFailure(source *volsyncv1alpha1.ReplicationSource, logs string) string {
-	if !strings.Contains(logs, alreadyLocked) {
-		return logs
-	}
-	next := "The next backup does so by itself once the lock is older than 30 minutes."
-	if source.Spec.Restic != nil && source.Spec.Restic.Unlock != "" &&
-		(source.Status == nil || source.Status.Restic == nil || source.Status.Restic.LastUnlocked != source.Spec.Restic.Unlock) {
-		next = "VolSync's retries of this backup and the next backup do so by themselves once the lock is older than 30 minutes."
-	}
-	return fmt.Sprintf("The restic repository is locked (%s): a lock that another restic process holds or left behind, "+
-		"such as one of a mover that was killed, keeps restic from taking the lock it needs. "+
-		"`restic unlock` clears a stale lock, and restic counts a lock from another host as stale once it is older than 30 minutes. "+
-		"%s Mover logs: %s", alreadyLocked, next, logs)
 }
 
 // moverFailed reports whether a mover Job failed in the sync of a run's

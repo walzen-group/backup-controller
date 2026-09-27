@@ -89,7 +89,10 @@ func TestARunGivesTheAppBackAfterFluxIsRemoved(t *testing.T) {
 		t.Fatalf("replicas = %d after the restart pass, want 2 back", replicas)
 	}
 
-	complete(t, c, "snapshot 6e473100 saved")
+	complete(t, c)
+	if err := tryStep(r); err != nil {
+		t.Fatalf("identify pass: %v", err)
+	}
 	if err := tryStep(r); err != nil {
 		t.Fatalf("collect pass: %v", err)
 	}
@@ -150,7 +153,7 @@ func TestASourceRunFinishesWithoutKueue(t *testing.T) {
 	step(t, r) // plan
 	step(t, r) // admit: no Kueue, so it starts at once
 	step(t, r) // start
-	complete(t, c, "snapshot 6e473100 saved")
+	complete(t, c)
 	if err := tryStep(r); err != nil {
 		t.Fatalf("collect pass: %v", err)
 	}
@@ -345,7 +348,7 @@ func TestAReleaseFailureNamesWhatFailed(t *testing.T) {
 			step(t, r) // plan
 			step(t, r) // admit, no queue
 			step(t, r) // start: the run takes the Leases
-			complete(t, c, "snapshot 6e473100 saved")
+			complete(t, c)
 			recorder := events.NewFakeRecorder(10)
 			r.Recorder = recorder
 			if err := tryStep(r); err == nil {

@@ -40,7 +40,8 @@ type BackupRunReconciler struct {
 	Reader client.Reader
 
 	// Snapshots lists the snapshots in a restic repository. The run uses it to
-	// read the time restic stamped on the snapshot a mover saved.
+	// find the snapshot a volume's sync wrote, with the time restic stamped
+	// on it.
 	Snapshots restic.Lister
 
 	// Retimer rewrites a snapshot with a new time and a tag. A quiesced run
@@ -1080,93 +1081,234 @@ func (r *BackupRunReconciler) syncGoesOn(ctx context.Context, run *backupv1alpha
 // collectItem records the result of a Running item once it has one, and
 // leaves the item Running until then.
 //
-// A volume item is done when its ReplicationSource has completed the run's
-// trigger tag. VolSync completes a tag only after a mover Job succeeds. A Job
-// that fails leaves the tag open: VolSync writes the logs into
-// status.latestMoverStatus, deletes the Job and starts another, for as long
-// as the tag stays. So while the tag is open, a Failed result that
-// moverFailed places in this run's sync fails the item with the mover's
-// logs, and, when restic found the repository locked, with how that lock is
-// cleared (see moverFailure). collectItem leaves the source alone: VolSync
-// has already started the next mover Job by then, and deleting the source
-// would kill that mover mid-backup and leave restic's lock in the
-// repository. VolSync keeps retrying, and a later run fails its item for the
-// claim at once while this run's tag is still open (see holder). The
-// message also says what data a snapshot of that sync saves later holds
-// (see syncGoesOn). A volume with no files succeeds with Empty set,
-// since VolSync takes no snapshot of it. Otherwise the item records the snapshot ID
-// the mover logged and the time restic stamped on it. On a quiesced run, the
-// snapshot is first moved to status.restartedAt and tagged quiesced, and the
-// item stays Running until that rewrite succeeds.
+// Parameters:
+//   - run is the BackupRun, for its namespace, its start and its restart
+//     moment.
+//   - item is the Running item. It is changed in place.
 //
-// A database item follows the phase of its CloudNativePG Backup (see
+// It returns a sentence for the run's Ready message while a database item
+// waits in a Backup phase that needs naming, such as one CloudNativePG 1.30
+// does not have, and "" otherwise.
+//
+// A volume item follows its ReplicationSource (see collectVolume), and a
+// database item follows the phase of its CloudNativePG Backup (see
 // collectDatabase).
-//
-// It returns a sentence for the run's Ready message while the item waits in
-// a Backup phase that needs naming, such as one CloudNativePG 1.30 does not
-// have, and "" otherwise.
-//
-// A volume item that fails because its mover failed records reason
-// MoverFailed.
 func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) string {
 	switch item.Kind {
 	case backupv1alpha1.ItemKindSource:
-		source := &volsyncv1alpha1.ReplicationSource{}
-		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source); err != nil {
-			return ""
-		}
-		if lastManual(source) != item.Trigger {
-			if logs, failed := moverFailed(source, item.Trigger, run.Status.StartedAt); failed {
-				// The source is left alone. VolSync writes the failure after
-				// it has already started a new mover Job, and deleting the
-				// source would kill that mover mid-backup and leave restic's
-				// lock in the repository.
-				message := moverFailure(source, logs)
-				if note := r.syncGoesOn(ctx, run, *item, source); note != "" {
-					if !strings.Contains(logs, alreadyLocked) {
-						message = "Mover logs: " + message
-					}
-					message = note + " " + message
-				}
-				failBackupItem(item, refuse(backupv1alpha1.ItemReasonMoverFailed, "%s", message))
-			}
-			return ""
-		}
-		if source.Status.LatestMoverStatus != nil && source.Status.LatestMoverStatus.Result == volsyncv1alpha1.MoverResultFailed {
-			failBackupItem(item, refuse(backupv1alpha1.ItemReasonMoverFailed, "%s", moverFailure(source, source.Status.LatestMoverStatus.Logs)))
-			return ""
-		}
-		snapshot, empty := moverOutcome(source)
-		if empty {
-			item.Phase, item.Empty = backupv1alpha1.ItemSucceeded, true
-			item.Message = "the volume held no files, so VolSync took no snapshot"
-			return ""
-		}
-		if quiesced(run) {
-			// The item stays Running until the rewrite goes through. That way
-			// the run never reports success for a snapshot that a synced
-			// restore cannot use.
-			moved, err := r.retime(ctx, run.Namespace, item.Name, snapshot, run.Status.RestartedAt.Time)
-			if err != nil {
-				item.Message = fmt.Sprintf("snapshot %s is saved and waits to be moved to %s and tagged %s: %v",
-					snapshot, run.Status.RestartedAt.UTC().Format(time.RFC3339), restic.QuiescedTag, err)
-				return ""
-			}
-			item.Phase, item.Message = backupv1alpha1.ItemSucceeded, ""
-			item.Snapshot, item.SnapshotTime = moved.ShortID(), newTime(metav1.NewTime(moved.Time))
-			return ""
-		}
-		item.Phase, item.Snapshot = backupv1alpha1.ItemSucceeded, snapshot
-		if at, err := r.snapshotTime(ctx, run.Namespace, item.Name, snapshot); err != nil {
-			item.Message = fmt.Sprintf("the snapshot's time could not be read: %v", err)
-		} else {
-			item.SnapshotTime = at
-		}
-
+		r.collectVolume(ctx, run, item)
 	case backupv1alpha1.ItemKindCluster:
 		return r.collectDatabase(ctx, run, item)
 	}
 	return ""
+}
+
+// collectVolume records the result of a Running volume item once its
+// ReplicationSource has one.
+//
+// Parameters:
+//   - run is the BackupRun, for its namespace, its start and its restart
+//     moment.
+//   - item is the Running volume item, which names the claim and the run's
+//     trigger tag. It is changed in place.
+//
+// A volume item is done when its ReplicationSource has completed the run's
+// trigger tag. VolSync completes a tag only after a mover Job succeeds.
+// While the tag is open, a Failed mover result of this run's sync fails the
+// item (see failedSync). A completed tag whose latest mover result is Failed
+// fails the item with reason MoverFailed and the mover's logs as they are;
+// no decision reads the logs.
+//
+// A completed sync gets its snapshot from the repository (see
+// identifySnapshot). On a quiesced run the item then stays Running until the
+// status holding the snapshot's full ID is written, and a later pass moves
+// that snapshot to status.restartedAt and tags it quiesced (see
+// retimeRecorded). A failed read of the source leaves the item as it was,
+// for the next pass.
+func (r *BackupRunReconciler) collectVolume(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) {
+	source := &volsyncv1alpha1.ReplicationSource{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Name}, source); err != nil {
+		return
+	}
+	switch {
+	case lastManual(source) != item.Trigger:
+		r.failedSync(ctx, run, item, source)
+	case source.Status.LatestMoverStatus != nil && source.Status.LatestMoverStatus.Result == volsyncv1alpha1.MoverResultFailed:
+		failBackupItem(item, refuse(backupv1alpha1.ItemReasonMoverFailed, "Mover logs: %s", source.Status.LatestMoverStatus.Logs))
+	case item.SnapshotID != "":
+		r.retimeRecorded(ctx, run, item)
+	default:
+		r.identifySnapshot(ctx, run, item, source)
+	}
+}
+
+// failedSync fails a volume item whose sync is still open when a mover Job
+// of that sync failed, and leaves the item alone otherwise.
+//
+// Parameters:
+//   - run is the BackupRun, for its start.
+//   - item is the Running volume item. It is changed in place.
+//   - source is the item's ReplicationSource as this pass read it.
+//
+// A Failed result that moverFailed places in this run's sync fails the item
+// with reason MoverFailed and the message "Mover logs: " followed by the
+// logs as VolSync kept them. When VolSync goes on with the sync, the message
+// first says what data a snapshot of that sync saves later holds (see
+// syncGoesOn).
+//
+// The source is left alone. VolSync writes the failure after it has already
+// started a new mover Job, and deleting the source would kill that mover
+// mid-backup and leave restic's lock in the repository. VolSync keeps
+// retrying, and a later run fails its item for the claim at once while this
+// run's tag is still open (see holder).
+func (r *BackupRunReconciler) failedSync(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem, source *volsyncv1alpha1.ReplicationSource) {
+	logs, failed := moverFailed(source, item.Trigger, run.Status.StartedAt)
+	if !failed {
+		return
+	}
+	message := "Mover logs: " + logs
+	if note := r.syncGoesOn(ctx, run, *item, source); note != "" {
+		message = note + " " + message
+	}
+	failBackupItem(item, refuse(backupv1alpha1.ItemReasonMoverFailed, "%s", message))
+}
+
+// identifySnapshot records the snapshot a completed sync wrote, found in the
+// repository, and succeeds the item when the run need not move it.
+//
+// Parameters:
+//   - run is the BackupRun, for its namespace and whether it quiesced.
+//   - item is the Running volume item whose sync completed. It is changed
+//     in place.
+//   - source is the item's ReplicationSource, whose status records when the
+//     sync ran.
+//
+// The window comes from the source's status (see windowOf); a status that
+// lacks it fails the item with reason NoMoverSnapshot. The snapshot is the
+// newest a mover wrote in that window (see identify), and the item records
+// its full ID, its short ID and its time, and names the sync's other
+// snapshots in its message. With no such snapshot the sync backed up an
+// empty claim: VolSync's mover takes no snapshot of a volume that holds
+// nothing but lost+found and still reports success, so the item succeeds
+// with Empty set. A failed listing leaves the item Running with the error in
+// its message, and the next pass tries again until the run's timeout.
+//
+// A quiesced run's item stays Running with the snapshot recorded, so the
+// status holds the original's full ID before any rewrite. A crash after the
+// rewrite then finds the rewritten copy through that ID, where a new search
+// would find no snapshot and take the claim for empty.
+func (r *BackupRunReconciler) identifySnapshot(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem, source *volsyncv1alpha1.ReplicationSource) {
+	window, err := windowOf(source)
+	if err != nil {
+		failBackupItem(item, err)
+		return
+	}
+	found, err := r.findSnapshot(ctx, run, item.Name, window)
+	if err != nil {
+		item.Message = fmt.Sprintf("the run could not list the repository for the snapshot its sync wrote: %v", err)
+		return
+	}
+	if !found.found {
+		item.Phase, item.Empty = backupv1alpha1.ItemSucceeded, true
+		item.Message = "the volume held no files, so VolSync took no snapshot"
+		return
+	}
+	s := found.snapshot
+	item.SnapshotID, item.Snapshot, item.SnapshotTime = s.ID, s.ShortID(), newTime(metav1.NewTime(s.Time))
+	item.Message = found.note()
+	if !quiesced(run) {
+		item.Phase = backupv1alpha1.ItemSucceeded
+	}
+}
+
+// findSnapshot lists the repository of a claim and picks the snapshot one
+// sync of it wrote.
+//
+// Parameters:
+//   - run is the BackupRun, for its namespace and its UID.
+//   - claimName names the claim whose repository is listed.
+//   - window is the sync's window (see windowOf).
+//
+// It returns what identify found. It returns an error when the reconciler
+// has no Snapshots lister, and when the repository Secret, the repository or
+// the namespace's BackupRuns can't be read.
+func (r *BackupRunReconciler) findSnapshot(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string, window syncWindow) (identified, error) {
+	if r.Snapshots == nil {
+		return identified{}, errors.New("the controller has no repository lister")
+	}
+	secret, err := r.repositorySecret(ctx, run.Namespace, claimName)
+	if err != nil {
+		return identified{}, err
+	}
+	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
+	if err != nil {
+		return identified{}, err
+	}
+	recorded, err := r.recordedSnapshots(ctx, run, claimName)
+	if err != nil {
+		return identified{}, err
+	}
+	return identify(window, snapshots, recorded), nil
+}
+
+// recordedSnapshots returns the full snapshot IDs that other BackupRuns in
+// the run's namespace recorded for items of the same claim, as a set.
+//
+// Parameters:
+//   - run is the BackupRun that looks for its snapshot; its own items are
+//     left out.
+//   - claimName names the claim.
+//
+// It reads the BackupRuns through the uncached Reader, so a run that
+// recorded its snapshot a moment ago is seen. It returns an error when the
+// list fails.
+func (r *BackupRunReconciler) recordedSnapshots(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string) (map[string]bool, error) {
+	runs := &backupv1alpha1.BackupRunList{}
+	if err := r.Reader.List(ctx, runs, client.InNamespace(run.Namespace)); err != nil {
+		return nil, fmt.Errorf("list BackupRuns in %s: %w", run.Namespace, err)
+	}
+	recorded := map[string]bool{}
+	for _, other := range runs.Items {
+		if other.UID == run.UID {
+			continue
+		}
+		for _, item := range other.Status.Items {
+			if item.Kind == backupv1alpha1.ItemKindSource && item.Name == claimName && item.SnapshotID != "" {
+				recorded[item.SnapshotID] = true
+			}
+		}
+	}
+	return recorded, nil
+}
+
+// retimeRecorded moves a quiesced run's recorded snapshot to the run's
+// restart moment, tags it quiesced, and succeeds the item.
+//
+// Parameters:
+//   - run is the quiesced BackupRun, for its namespace and
+//     status.restartedAt.
+//   - item is the Running volume item, whose snapshotID an earlier pass
+//     recorded. It is changed in place.
+//
+// The item records the rewritten snapshot's IDs and time and succeeds. When
+// the rewrite fails, for example because another process holds a lock on
+// the repository, the item stays Running with the error in its message and
+// the next pass tries again, so the run never reports success for a
+// snapshot a synced restore can't use. A run that turns out not to be
+// quiesced succeeds the item with the snapshot as it was recorded.
+func (r *BackupRunReconciler) retimeRecorded(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) {
+	if !quiesced(run) {
+		item.Phase = backupv1alpha1.ItemSucceeded
+		return
+	}
+	moved, err := r.retime(ctx, run.Namespace, item.Name, item.SnapshotID, run.Status.RestartedAt.Time)
+	if err != nil {
+		item.Message = fmt.Sprintf("snapshot %s is saved and waits to be moved to %s and tagged %s: %v",
+			item.Snapshot, run.Status.RestartedAt.UTC().Format(time.RFC3339), restic.QuiescedTag, err)
+		return
+	}
+	item.Phase, item.Message = backupv1alpha1.ItemSucceeded, ""
+	item.SnapshotID, item.Snapshot, item.SnapshotTime = moved.ID, moved.ShortID(), newTime(metav1.NewTime(moved.Time))
 }
 
 // collectDatabase records the result of a Running database item once its
@@ -1208,31 +1350,35 @@ func quiesced(run *backupv1alpha1.BackupRun) bool {
 	return run.Spec.All && len(run.Status.Quiesced) > 0 && run.Status.RestartedAt != nil
 }
 
-// retime moves the snapshot a mover saved to a new time and tags it quiesced,
+// retime moves a snapshot a mover saved to a new time and tags it quiesced,
 // so a RestoreRun with syncDatabaseToVolume can find it.
 //
 // Parameters:
 //   - namespace and claimName name the claim that was backed up. retime reads
 //     the repository Secret through the claim's VolumeRestore.
-//   - short is the snapshot ID the mover logged, eight hex characters or
-//     more. It is empty when the mover logged no snapshot.
-//   - at is the time the snapshot should carry. collectItem passes the run's
+//   - id is the snapshot's full ID, as the item recorded it when the run
+//     found the snapshot in the repository.
+//   - at is the time the snapshot should carry. The caller passes the run's
 //     status.restartedAt.
 //
 // It returns the rewritten snapshot, which has a new ID. It returns an error
-// when the mover logged no snapshot, when the reconciler has no Retimer, when
-// the Secret can't be read, and when the rewrite fails. A *restic.LockedError
-// means another process holds a lock on the repository, and the caller tries
-// again on its next pass.
-func (r *BackupRunReconciler) retime(ctx context.Context, namespace, claimName, short string, at time.Time) (restic.Snapshot, error) {
-	if short == "" || r.Retimer == nil {
-		return restic.Snapshot{}, fmt.Errorf("the mover logged no snapshot")
+// when no ID is given, when the reconciler has no Retimer, when the Secret
+// can't be read, and when the rewrite fails. A *restic.LockedError means
+// another process holds a lock on the repository, and the caller tries again
+// on its next pass. A snapshot an earlier call already rewrote comes back as
+// that copy (see restic.Repository.Retime).
+func (r *BackupRunReconciler) retime(ctx context.Context, namespace, claimName, id string, at time.Time) (restic.Snapshot, error) {
+	if id == "" {
+		return restic.Snapshot{}, errors.New("no snapshot is recorded to move")
+	}
+	if r.Retimer == nil {
+		return restic.Snapshot{}, errors.New("the controller has no snapshot retimer")
 	}
 	secret, err := r.repositorySecret(ctx, namespace, claimName)
 	if err != nil {
 		return restic.Snapshot{}, err
 	}
-	return r.Retimer.Retime(ctx, secret, short, at, restic.QuiescedTag)
+	return r.Retimer.Retime(ctx, secret, id, at, restic.QuiescedTag)
 }
 
 // repositorySecret reads the Secret holding the restic repository settings
@@ -1252,30 +1398,6 @@ func (r *BackupRunReconciler) repositorySecret(ctx context.Context, namespace, c
 		return nil, fmt.Errorf("get Secret %s: %w", vr.Spec.Repository, err)
 	}
 	return secret, nil
-}
-
-// snapshotTime reads the time restic stamped on a snapshot a mover saved. It
-// lists the repository of the claim named claimName and looks for the
-// snapshot whose ID starts with the prefix in short. It returns an error when
-// that prefix is empty, when the reconciler has no Snapshots lister, and when
-// the repository holds no such snapshot.
-func (r *BackupRunReconciler) snapshotTime(ctx context.Context, namespace, claimName, short string) (*metav1.Time, error) {
-	if short == "" || r.Snapshots == nil {
-		return nil, fmt.Errorf("the mover logged no snapshot")
-	}
-	secret, err := r.repositorySecret(ctx, namespace, claimName)
-	if err != nil {
-		return nil, err
-	}
-	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
-	if err != nil {
-		return nil, err
-	}
-	found, ok := restic.ByShortID(snapshots, short)
-	if !ok {
-		return nil, fmt.Errorf("the repository holds no snapshot %s", short)
-	}
-	return newTime(metav1.NewTime(found.Time)), nil
 }
 
 // runningNote returns a sentence for the message of a Running item that

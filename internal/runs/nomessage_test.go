@@ -14,14 +14,11 @@ import (
 
 // messageRuleScope is the code TestNoDecisionReadsAMessage reads: the
 // non-test Go files of each directory, or only the named files when a scope
-// lists them. It covers every non-test file of internal/runs but trigger.go,
-// whose mover log reads restic-jobs step 10 (J3) removes, and
-// internal/populator; and internal/restorejob, whose Read renders the
-// termination message restic leaves and must never decide on it. Step 10
-// drops the exception, so the scope then holds every non-test file of
-// internal/runs.
+// lists them. It covers every non-test file of internal/runs and
+// internal/populator, and internal/restorejob, whose Read renders the
+// termination message restic leaves and must never decide on it.
 var messageRuleScope = []messageRuleDir{
-	{dir: ".", except: []string{"trigger.go"}},
+	{dir: "."},
 	{dir: "../populator"},
 	{dir: "../restorejob"},
 }
@@ -33,10 +30,6 @@ type messageRuleDir struct {
 	// files names the files to read in it. Empty means every non-test Go
 	// file.
 	files []string
-	// except names files the rule leaves out of a scope that reads every
-	// non-test Go file. The test fails when one of them is not there, so a
-	// renamed file never widens the exception.
-	except []string
 }
 
 // messageRuleEntry names one top-level declaration the rule lets through,
@@ -79,14 +72,6 @@ var textMatcherAllowlist = []messageRuleEntry{
 		what: "strings.Split and TrimSpace on a mover log, to show its last lines in a message; no decision reads the result"},
 }
 
-// textMatcherPending holds the text matchers a later step removes. Each
-// entry is a known message read, kept only until that step lands, and the
-// step empties it.
-var textMatcherPending = []messageRuleEntry{
-	{pkg: "runs", decl: "BackupRunReconciler.collectItem",
-		what: "strings.Contains(logs, alreadyLocked) reads the mover's log for restic's lock line; restic-jobs step 10 (J3) removes it"},
-}
-
 // messageComparisonAllowlist lets a declaration compare a message, a log or
 // an error string (part 2 of the rule). A new entry needs a reviewer's eye
 // like any rule exception.
@@ -120,7 +105,7 @@ func TestNoDecisionReadsAMessage(t *testing.T) {
 		findings = append(findings, scanMessageRule(t, scope)...)
 	}
 	lists := messageRuleLists{
-		matchers:    slices.Concat(textMatcherAllowlist, textMatcherPending),
+		matchers:    textMatcherAllowlist,
 		comparisons: messageComparisonAllowlist,
 	}
 	left, unused := lists.apply(findings)
@@ -233,13 +218,8 @@ func scanMessageRule(t *testing.T, scope messageRuleDir) []messageFinding {
 			t.Fatal(err)
 		}
 		for _, path := range all {
-			if !strings.HasSuffix(path, "_test.go") && !slices.Contains(scope.except, filepath.Base(path)) {
+			if !strings.HasSuffix(path, "_test.go") {
 				paths = append(paths, path)
-			}
-		}
-		for _, name := range scope.except {
-			if !slices.Contains(all, filepath.Join(scope.dir, name)) {
-				t.Fatalf("the scope %s leaves out %s, which it does not hold", scope.dir, name)
 			}
 		}
 	}

@@ -190,8 +190,10 @@ type itemFailure struct {
 // this order with errors.As: a *refusalError (its own reason), an
 // invalidSettingError (SettingsInvalid), a *sourceHeldError for a source no
 // run waits for (SourceAbandoned), a *restorejob.FailureError of a restore
-// Job that ended Failed (RestoreJobFailed), and a *restorejob.SpecError of
-// a restore Job the run could not build (RestoreJobRefused). The message is
+// Job that ended Failed (RestoreJobFailed), a *restorejob.SpecError of a
+// restore Job the run could not build (RestoreJobRefused), and an
+// *identifyError of a completed sync that left no record of when it ran
+// (NoMoverSnapshot). The message is
 // err.Error(). Any other error, and nil, gives false: the pass returns the
 // error and retries. An *invalidSpecError is not on the list, because only
 // run-level sites meet one, and an item that recorded it would carry a
@@ -216,6 +218,10 @@ func asItemFailure(err error) (itemFailure, bool) {
 	var badSpec *restorejob.SpecError
 	if errors.As(err, &badSpec) {
 		return itemFailure{reason: backupv1alpha1.ItemReasonRestoreJobRefused, message: err.Error()}, true
+	}
+	var unidentified *identifyError
+	if errors.As(err, &unidentified) {
+		return itemFailure{reason: backupv1alpha1.ItemReasonNoMoverSnapshot, message: err.Error()}, true
 	}
 	return itemFailure{}, false
 }

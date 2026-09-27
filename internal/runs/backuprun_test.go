@@ -65,20 +65,14 @@ func readBackupRun(t *testing.T, c client.Client) *backupv1alpha1.BackupRun {
 	return run
 }
 
-// complete stands in for VolSync finishing a backup. It marks the claim's
-// ReplicationSource as having completed its current trigger tag, with a
-// successful mover that printed the given logs.
-func complete(t *testing.T, c client.Client, logs string) {
+// complete stands in for VolSync finishing a backup whose mover wrote
+// monday's snapshot. It marks the claim's ReplicationSource as having
+// completed its current trigger tag, with the status VolSync writes then
+// (see completeSync): a sync that took three seconds and ended two seconds
+// after restic stamped monday's snapshot.
+func complete(t *testing.T, c client.Client) {
 	t.Helper()
-	source := &volsyncv1alpha1.ReplicationSource{}
-	get(t, c, ns, claimN, source)
-	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{
-		LastManualSync:    manualTag(source),
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultSuccessful, Logs: logs},
-	}
-	if err := c.Status().Update(context.Background(), source); err != nil {
-		t.Fatalf("complete the source: %v", err)
-	}
+	completeSync(t, c, monday.Time.Add(2*time.Second), 3*time.Second)
 }
 
 // A volume run writes the claim's ReplicationSource itself, with the
@@ -115,7 +109,7 @@ func TestAVolumeRunWritesTheSourceAndReportsResticsTime(t *testing.T) {
 		t.Errorf("owners = %v, want the claim", source.OwnerReferences)
 	}
 
-	complete(t, c, "using parent snapshot 2edf5bab\nsnapshot 6e473100 saved\nRestic completed in 2s")
+	complete(t, c)
 	step(t, r)
 
 	run := readBackupRun(t, c)
@@ -292,24 +286,6 @@ func TestARefusedRunWhoseReleaseFailedEndsInvalid(t *testing.T) {
 		readyMessage(run.Status.Conditions) != refusal {
 		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, %q", run.Status.Phase,
 			readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), refusal)
-	}
-}
-
-// A volume with no files, which VolSync skips without taking a snapshot,
-// succeeds with Empty set and no snapshot ID.
-func TestAnEmptyVolumeSucceedsWithoutASnapshot(t *testing.T) {
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-		claim(), volume(), volumeRestore(), repository())
-	step(t, r)
-	step(t, r)
-	step(t, r)
-
-	complete(t, c, "== Directory is empty skipping backup ===")
-	step(t, r)
-
-	item := readBackupRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemSucceeded || !item.Empty || item.Snapshot != "" {
-		t.Fatalf("item = %+v, want Succeeded and Empty", item)
 	}
 }
 
@@ -493,8 +469,9 @@ func TestADeadTriggerOnOneClaimLeavesTheOtherBackedUp(t *testing.T) {
 	step(t, r) // start
 	cutClone(t, c)
 	step(t, r) // restart
-	complete(t, c, "snapshot 6e473100 saved")
-	step(t, r)
+	complete(t, c)
+	step(t, r) // find the snapshot
+	step(t, r) // move it, and finish
 
 	run := readBackupRun(t, c)
 	byName := map[string]backupv1alpha1.BackupItem{}
@@ -895,13 +872,14 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 		t.Error("the Kustomization the run suspended was not resumed")
 	}
 
-	complete(t, c, "snapshot 6e473100 saved")
+	complete(t, c)
 	backup, _ := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
 	_ = unstructured.SetNestedField(backup.Object, "completed", "status", "phase")
 	if err := c.Status().Update(context.Background(), backup); err != nil {
 		t.Fatal(err)
 	}
-	step(t, r)
+	step(t, r) // find the snapshot
+	step(t, r) // move it, and finish
 
 	run := readBackupRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
@@ -914,7 +892,9 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 
 // quiescedRunToUpload drives a namespace run with the app marked for quiesce
 // through the clone and the restart, and completes the upload and the base
-// backup. The next step collects the results.
+// backup, and runs the pass that finds the volume's snapshot in the
+// repository and records it. The next step moves that snapshot and collects
+// the results.
 func quiescedRunToUpload(t *testing.T) (*BackupRunReconciler, client.Client) {
 	t.Helper()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -929,12 +909,13 @@ func quiescedRunToUpload(t *testing.T) (*BackupRunReconciler, client.Client) {
 		t.Fatal("the app was not restarted once the clone was cut")
 	}
 
-	complete(t, c, "snapshot 6e473100 saved")
+	complete(t, c)
 	backup, _ := getUnstructured(t, c, BackupGVK, ns, backupName(pgN, runUID))
 	_ = unstructured.SetNestedField(backup.Object, "completed", "status", "phase")
 	if err := c.Status().Update(context.Background(), backup); err != nil {
 		t.Fatal(err)
 	}
+	step(t, r) // find the snapshot
 	return r, c
 }
 
@@ -951,7 +932,7 @@ func TestAQuiescedRunMovesTheSnapshotToItsRestartMoment(t *testing.T) {
 		t.Fatalf("phase = %q (%s), want Succeeded", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
 	calls := r.Retimer.(*retimer).calls
-	if len(calls) != 1 || calls[0].short != "6e473100" || !calls[0].at.Equal(run.Status.RestartedAt.Time) || calls[0].tag != "quiesced" {
+	if len(calls) != 1 || calls[0].id != monday.ID || !calls[0].at.Equal(run.Status.RestartedAt.Time) || calls[0].tag != "quiesced" {
 		t.Fatalf("retime calls = %+v, want snapshot 6e473100 moved to restartedAt %s and tagged quiesced", calls, run.Status.RestartedAt)
 	}
 	item := run.Status.Items[0]
@@ -1179,8 +1160,9 @@ func TestARestartRetriedAfterALostStatusWriteKeepsItsMoment(t *testing.T) {
 
 	r.Now = func() time.Time { return frozen.Add(time.Minute) }
 	step(t, r) // restart again
-	complete(t, c, "snapshot 6e473100 saved")
-	step(t, r) // collect
+	complete(t, c)
+	step(t, r) // find the snapshot
+	step(t, r) // move it, and finish
 
 	run := readBackupRun(t, c)
 	if run.Status.RestartedAt == nil || !run.Status.RestartedAt.Time.Equal(frozen) {
@@ -1193,9 +1175,9 @@ func TestARestartRetriedAfterALostStatusWriteKeepsItsMoment(t *testing.T) {
 }
 
 // A clock with a fraction of a second gives the run a restartedAt in whole
-// seconds, the precision the status keeps. A snapshot moved in the same pass
-// that starts the app carries that same whole-second time, so it matches
-// restartedAt as later passes and a synced restore read it back.
+// seconds, the precision the status keeps. The snapshot is moved to that
+// same whole-second time, so it matches restartedAt as later passes and a
+// synced restore read it back.
 func TestARestartMomentIsKeptInWholeSeconds(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
@@ -1206,8 +1188,10 @@ func TestARestartMomentIsKeptInWholeSeconds(t *testing.T) {
 	step(t, r) // start
 
 	// The mover finishes and VolSync removes the clone before the run looks
-	// again, so the run starts the app and moves the snapshot in one pass.
-	complete(t, c, "snapshot 6e473100 saved")
+	// again, so the run starts the app and finds the snapshot in one pass,
+	// and moves it in the next.
+	complete(t, c)
+	step(t, r)
 	step(t, r)
 
 	run := readBackupRun(t, c)
@@ -1361,10 +1345,9 @@ func recordedLockedForget(t *testing.T) string {
 }
 
 // A mover that fails because the repository is locked fails the item with
-// a message that names the lock and says how it is cleared: `restic unlock`
-// removes a stale lock, and the backups the controller triggers run it first,
-// so they clear the lock once it is older than 30 minutes.
-func TestAMoverStoppedByALockSaysHowToClearIt(t *testing.T) {
+// its logs as they are, whatever they say: no decision reads them, and the
+// run adds no advice of its own about locks (designs/restic-jobs.md D3).
+func TestAFailedMoverShowsItsLogsAsTheyAre(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
 	step(t, r) // plan
@@ -1385,27 +1368,11 @@ func TestAMoverStoppedByALockSaysHowToClearIt(t *testing.T) {
 	step(t, r)
 
 	item := readBackupRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemFailed {
-		t.Fatalf("item = %+v, want it Failed", item)
+	if item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonMoverFailed {
+		t.Fatalf("item = %+v, want it Failed with reason MoverFailed", item)
 	}
-	for _, want := range []string{"repository is already locked", "`restic unlock`", "stale", "30 minutes", "next backup"} {
-		if !strings.Contains(item.Message, want) {
-			t.Errorf("item message %q does not say %q", item.Message, want)
-		}
-	}
-}
-
-// A mover that fails for another reason gets no word about locks.
-func TestAMoverFailureWithoutALockSaysNothingOfLocks(t *testing.T) {
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-		claim(), volume(), volumeRestore(), repository())
-	step(t, r)
-	step(t, r)
-	step(t, r)
-	failMover(t, c, frozen.Add(10*time.Second))
-	step(t, r)
-	if item := readBackupRun(t, c).Status.Items[0]; strings.Contains(item.Message, "unlock") {
-		t.Errorf("item message %q speaks of unlocking, but nothing was locked", item.Message)
+	if !strings.HasSuffix(item.Message, " Mover logs: "+logs) || strings.Contains(item.Message, "restic unlock") {
+		t.Errorf("item message = %q, want it to end in the logs as they are, with no advice about locks", item.Message)
 	}
 }
 

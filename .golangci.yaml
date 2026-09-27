@@ -129,14 +129,10 @@ linters:
         source: '^func \(r \*Repository\) (retime|checkLocks)\('
       - path: '^internal/runs/backuprun\.go$'
         linters: [funlen, gocognit]
-        source: '^func \(r \*BackupRunReconciler\) (items|admit|work|quiesce|startItem|collectItem)\('
+        source: '^func \(r \*BackupRunReconciler\) (items|admit|work|quiesce|startItem)\('
       - path: '^internal/runs/backuprun\.go$'
         linters: [nestif]
-        source: '^\s*if (queue != "" |run\.Spec\.All && run\.Status\.RestartedAt == nil && len\(run\.Status\.Quiesced\) > 0 |len\(run\.Status\.Quiesced\) == 0 |lastManual\(source\) != item\.Trigger )\{$'
-      - path: '^internal/runs/backuprun\.go$'
-        linters: [revive]
-        text: '^max-control-nesting:'
-        source: '^\s*if !strings\.Contains\(logs, alreadyLocked\) \{$'
+        source: '^\s*if (queue != "" |run\.Spec\.All && run\.Status\.RestartedAt == nil && len\(run\.Status\.Quiesced\) > 0 |len\(run\.Status\.Quiesced\) == 0 )\{$'
       - path: '^internal/runs/(backuprun|clusterwebhook|cnpg|exclusive|lease|objects|quiesce|restorerun|sources)\.go$'
         linters: [goconst]
       - path: '^internal/runs/(backuprun|quiesce|restorerun|sources)\.go$'
