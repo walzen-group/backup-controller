@@ -271,6 +271,7 @@ that ended by a path that records no reason leaves it empty
 | Ready reason | When |
 | --- | --- |
 | Queued | the run waits for Kueue to admit it |
+| Paused | the controller runs with `--pause`, and the run has started no work. The run keeps its phase, takes no Lease, and creates or stops nothing. The message is `the controller runs with --pause; this run starts when the controller runs without it` ([upgrading.md](upgrading.md#pause-the-controller)) |
 | Running | the run does its work. The message is `backing up`, or `waiting for pod <pod> to stop before the clones are cut` while a pod of a workload the run stopped still terminates |
 | SourceBusy | another run holds one of these: the run's claim or repository, or this namespace's quiesce Lease. Or another run deleted a Cluster that this run waits to see again. The message names that run, what it holds, and every wait |
 | Retrying | an item could not start, with an error that a retry may fix. An example is a Backup that a CloudNativePG webhook refuses. The message names every such item and its error |
@@ -290,7 +291,7 @@ note. These reasons record a Warning:
 - RestartFailed and ReleaseFailed, which the run reports while it is not
   finished.
 
-Queued, Running, SourceBusy, Retrying and Succeeded record Normal events.
+Queued, Paused, Running, SourceBusy, Retrying and Succeeded record Normal events.
 `kubectl describe brun <name>` lists them under Events. events.k8s.io/v1
 rejects a note over 1024 bytes. Thus the controller cuts a longer message at
 that length, and the full text stays on the condition.
@@ -382,6 +383,7 @@ A run writes only into a claim that it created itself:
 
 | Ready reason | When |
 | --- | --- |
+| Paused | the same as on a [BackupRun](#ready-reasons): the controller runs with `--pause`, and the run has not passed its checks. The phase stays empty, and the run creates no restore Job and stops no workload |
 | Retrying | the checks failed with an error that a retry may fix, such as a repository with the wrong password. The phase stays empty, and the message holds the error |
 | Running | the run does its work. The message is `restoring`, `restoring into claim <into>` for an `into` restore, or `waiting for pod <pod> to stop before anything is restored` while a pod of a workload the run stopped still terminates |
 | SourceBusy | a backup of the run's claim or repository is in progress. Or another run holds the Lease of either. Or another run stopped this namespace's workloads. It is also true if a RestoreRun deleted a Cluster in this namespace and waits for its owner to create it again. The message names that run and what it holds |
