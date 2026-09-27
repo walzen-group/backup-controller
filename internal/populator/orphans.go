@@ -2,6 +2,7 @@ package populator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -161,14 +162,15 @@ func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, fmt.Errorf("get VolumeRestore %s: %w", vrKey, err)
 	}
 
-	state, err := stopRestore(ctx, NewJobs(r.Reader, r.Client), r.Namespace, claim.UID)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if !state.Stopped {
+	err = stopRestore(ctx, NewJobs(r.Reader, r.Client), r.Namespace, claim.UID)
+	var stopping *stoppingError
+	switch {
+	case errors.As(err, &stopping):
 		r.Recorder.Eventf(claim, nil, corev1.EventTypeNormal, "WaitingForMover", "Cleanup",
-			"VolumeRestore %s is gone; %s before the cleanup goes on", vrKey.Name, state)
+			"VolumeRestore %s is gone; %s before the cleanup goes on", vrKey.Name, stopping.state)
 		return ctrl.Result{RequeueAfter: r.poll()}, nil
+	case err != nil:
+		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, r.release(ctx, claim, vrKey.Name)
 }

@@ -69,8 +69,7 @@ func (e *stoppingError) Error() string {
 	return e.state.String()
 }
 
-// stopRestore stops every restore Job that ever filled a claim, and reports
-// whether one of them may still write.
+// stopRestore stops every restore Job that ever filled a claim.
 //
 // Parameters:
 //   - ctx bounds the API calls.
@@ -80,10 +79,10 @@ func (e *stoppingError) Error() string {
 //     (JobName) and selects its pods by the backup.wlz.li/restore-claim
 //     label.
 //
-// It returns a StopState whose Stopped field is true once no Job of the claim
-// can start a pod and no pod of one may still write, and an error from any
-// API call or from restorejob.Stop. A caller that gets Stopped false waits and
-// calls again.
+// It returns nil once no Job of the claim can start a pod and no pod of one
+// may still write. It returns a *stoppingError while one may, and a caller
+// that gets it waits and calls again. It returns an error from any API call
+// or from restorejob.Stop.
 //
 // The populator keeps no record of its Jobs that outlives the claim's prime,
 // so it stops by what it can always find. It reads the Job of the claim by
@@ -94,29 +93,32 @@ func (e *stoppingError) Error() string {
 // Job of the claim, since each pod keeps both labels until it is gone.
 // restorejob.Build sets the claim label after the settings' pod labels, so no
 // setting can take it off.
-func stopRestore(ctx context.Context, jobs Jobs, namespace string, claimUID types.UID) (restorejob.StopState, error) {
+func stopRestore(ctx context.Context, jobs Jobs, namespace string, claimUID types.UID) error {
 	name := JobName(claimUID)
 	var refs []restorejob.Ref
 	job, err := jobs.GetJob(ctx, types.NamespacedName{Namespace: namespace, Name: name})
 	switch {
 	case apierrors.IsNotFound(err):
 	case err != nil:
-		return restorejob.StopState{Job: name}, fmt.Errorf("read restore Job %s/%s: %w", namespace, name, err)
+		return fmt.Errorf("read restore Job %s/%s: %w", namespace, name, err)
 	default:
 		refs = append(refs, restorejob.RefOf(job))
 	}
 	pods, err := jobs.ListClaimPods(ctx, namespace, claimUID)
 	if err != nil {
-		return restorejob.StopState{Job: name}, fmt.Errorf("list the restore pods of claim %s: %w", claimUID, err)
+		return fmt.Errorf("list the restore pods of claim %s: %w", claimUID, err)
 	}
 	refs = appendPodJobs(refs, pods, namespace, name)
 	for _, ref := range refs {
 		state, err := restorejob.Stop(ctx, jobs, ref)
-		if err != nil || !state.Stopped {
-			return state, err
+		if err != nil {
+			return err
+		}
+		if !state.Stopped {
+			return &stoppingError{state: state}
 		}
 	}
-	return restorejob.StopState{Stopped: true, Job: name}, nil
+	return nil
 }
 
 // appendPodJobs adds a Ref for each Job UID the pods carry that refs lacks.

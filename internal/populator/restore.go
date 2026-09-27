@@ -200,12 +200,8 @@ func (c *Callbacks) recordJob(ctx context.Context, prime *corev1.PersistentVolum
 // marked the claim Failed with reason NoBackupInReach (a *noBackupError).
 // Any failed call returns its error.
 func (c *Callbacks) startJob(ctx context.Context, r restore) error {
-	state, err := stopRestore(ctx, c.operations, c.namespace, r.claim.UID)
-	if err != nil {
+	if err := stopRestore(ctx, c.operations, c.namespace, r.claim.UID); err != nil {
 		return claimError(r.claim, err)
-	}
-	if !state.Stopped {
-		return claimError(r.claim, &stoppingError{state: state})
 	}
 	chosen, err := c.selectSnapshot(ctx, r.vr, r.claim)
 	var none *noBackupError

@@ -253,12 +253,8 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 		return err
 	}
 	claim := params.Pvc
-	state, err := stopRestore(ctx, c.operations, c.namespace, claim.UID)
-	if err != nil {
+	if err := stopRestore(ctx, c.operations, c.namespace, claim.UID); err != nil {
 		return claimError(claim, err)
-	}
-	if !state.Stopped {
-		return claimError(claim, &stoppingError{state: state})
 	}
 	if err := c.operations.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: c.namespace, Name: SecretCopyName(claim.UID)}}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete copied repository Secret: %w", err)
