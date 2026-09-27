@@ -25,7 +25,7 @@ cluster/kueue. Thus these objects exist first:
 
 From v0.9.0, the volsync unit also gives it the restic image that its restore
 Job runs. The module appends the image to the controller's args as
-`--restore-image`. [upgrading.md](upgrading.md#step-5-change-the-infra-units)
+`--restore-image`. [upgrading.md](upgrading.md#step-2-edit-the-infra-units)
 has the change.
 
 The module downloads the release's rendered manifest and applies it in three

@@ -553,7 +553,7 @@ objects that an older version left.
 Objects that outlive a run carry across versions as before: VolumeRestores,
 schedules, repositories, snapshots, Clusters and the CRDs. Each run checks the
 CRDs before it changes anything.
-[upgrading.md](upgrading.md#step-1-upgrade-only-while-no-run-is-active) has the
+[upgrading.md](upgrading.md#step-1-check-the-preconditions) has the
 check to run before an upgrade.
 
 ## Restore through the controller's own Job
@@ -695,7 +695,7 @@ What the policy guarantees is true for any image and any environment. The
 policy also matches the ServiceAccount by its username. Thus an install that
 renames the namespace or the ServiceAccount, and does not change the policy,
 runs with RBAC alone. The upgrade check in
-[upgrading.md](upgrading.md#step-5-change-the-infra-units) reads the policy
+[upgrading.md](upgrading.md#step-4-check-the-upgrade) reads the policy
 back.
 
 ## Write replicas through the scale subresource

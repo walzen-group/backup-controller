@@ -154,7 +154,7 @@ PATH works. The controller has no restic or VolSync version of its own.
 
 | Install path | Where the flag comes from |
 | --- | --- |
-| the rendered manifest | nothing: deploy/deployment.yaml does not contain the flag. The installer appends `--restore-image=<image>@sha256:<digest>` to the args of the `controller` container. The walzen infrastructure repository does that in its backup-controller unit ([upgrading.md](upgrading.md#step-5-change-the-infra-units)) |
+| the rendered manifest | nothing: deploy/deployment.yaml does not contain the flag. The installer appends `--restore-image=<image>@sha256:<digest>` to the args of the `controller` container. The walzen infrastructure repository does that in its backup-controller unit ([upgrading.md](upgrading.md#step-2-edit-the-infra-units)) |
 | the Helm chart | the value `restoreImage`, which is required: `helm template` fails while it is empty |
 | the e2e setup | hack/e2e/backup-controller/backup-controller.sh appends the image that hack/e2e/volsync/pins.json pins for VolSync |
 

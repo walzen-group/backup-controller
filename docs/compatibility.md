@@ -28,7 +28,7 @@ when a hack/e2e/<component>/pins.json names a different version.
 | Kueue | 0.19.5 | environments/prod/cluster/kueue/inputs.yaml |
 | VolSync | 0.16.0 | environments/prod/cluster/volsync/inputs.yaml |
 | restic in the VolSync mover | 0.18.1 | mover-restic/SOURCE_VERSIONS in VolSync 0.16.0 |
-| restic in the restore Job | 0.18.1, from the same image | `restic_image` in environments/prod/cluster/volsync/inputs.yaml from the v0.9.0 rollout on, which the backup-controller unit passes as `--restore-image` ([upgrading.md](upgrading.md#step-5-change-the-infra-units)) |
+| restic in the restore Job | 0.18.1, from the same image | `restic_image` in environments/prod/cluster/volsync/inputs.yaml from the v0.9.0 rollout on, which the backup-controller unit passes as `--restore-image` ([upgrading.md](upgrading.md#step-2-edit-the-infra-units)) |
 | restic run by hand | 0.19.1 | the operator's shell |
 | RustFS | 1.0.0 | the S3 store behind shared-secrets/backup/backup.yaml |
 

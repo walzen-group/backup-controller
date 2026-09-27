@@ -678,8 +678,9 @@ and never back anything up. The steps are:
    grows until the volume is full.
 
 [compatibility.md](compatibility.md#cloudnativepg-1300) has the source lines.
-v0.8.x admitted such a Cluster as written.
-[upgrading.md](upgrading.md#v090) tells how to find a Cluster that it admitted.
+v0.7.x and v0.8.x admitted such a Cluster as written.
+[upgrading.md](upgrading.md#step-5-find-clusters-that-v07x-admitted-over-an-old-archive)
+tells how to find a Cluster that v0.7.x admitted.
 
 The webhook applies the WAL file name filter of barman. It admits a prefix that
 holds only failed base backups, or other objects, and no WAL, because the check
