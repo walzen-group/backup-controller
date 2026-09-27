@@ -79,6 +79,9 @@ func (e *noBackupError) Error() string {
 	case noSnapshot:
 		return fmt.Sprintf("%s asks for %s and the repository holds no snapshot", e.pin.source, e.pin.value)
 	case noCandidate:
+		if len(e.all) == 1 {
+			return "the repository holds 1 snapshot, which no VolSync mover wrote (host volsync, paths [/data]): " + passedOver(e.all)
+		}
 		return fmt.Sprintf("the repository holds %d snapshots, none written by a VolSync mover (host volsync, paths [/data]): %s",
 			len(e.all), passedOver(e.all))
 	case outOfReach:

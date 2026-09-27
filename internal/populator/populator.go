@@ -295,7 +295,7 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 func (c *Callbacks) retire(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim) error {
 	before := vr.Status.DeepCopy()
 	retireClaimStatus(vr, claim)
-	if err := c.summarize(ctx, vr); err != nil {
+	if err := c.summarize(ctx, vr, ""); err != nil {
 		return err
 	}
 	if err := c.writeChanged(ctx, vr, before); err != nil && !apierrors.IsNotFound(err) {

@@ -25,9 +25,40 @@ import (
 //
 // It returns an error from summarize's reads or from the status write.
 func (c *Callbacks) markRestoring(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim) error {
+	return c.markPending(ctx, vr, claim, "")
+}
+
+// markBindingEmpty marks Restoring the entry of a claim that gets no restore
+// Job, because its repository holds no snapshot and nothing pins it, and
+// writes the status when that changed something. The library then binds
+// the claim's empty volume, as on a first deploy.
+//
+// Parameters:
+//   - vr is the VolumeRestore, changed in place and written.
+//   - claim is the claim that binds empty. The Ready message says the claim
+//     waits to bind its empty volume, so a reader doesn't look for a restore
+//     Job that is never created.
+//
+// It returns an error from summarize's reads or from the status write.
+func (c *Callbacks) markBindingEmpty(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim) error {
+	return c.markPending(ctx, vr, claim, claim.UID)
+}
+
+// markPending marks a claim's entry Restoring, sets Ready with summarize and
+// writes the status when that changed something.
+//
+// Parameters:
+//   - vr is the VolumeRestore, changed in place and written.
+//   - claim is the claim being filled.
+//   - bindingEmpty is the UID of the claim this pass found binding empty, or
+//     the empty UID when it found none; summarize names that claim apart
+//     from the restore Jobs.
+//
+// It returns an error from summarize's reads or from the status write.
+func (c *Callbacks) markPending(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim, bindingEmpty types.UID) error {
 	before := vr.Status.DeepCopy()
 	setClaimStatus(vr, claim, backupv1alpha1.RestorePhaseRestoring)
-	if err := c.summarize(ctx, vr); err != nil {
+	if err := c.summarize(ctx, vr, bindingEmpty); err != nil {
 		return err
 	}
 	return c.writeChanged(ctx, vr, before)
@@ -74,6 +105,10 @@ func (c *Callbacks) writeChanged(ctx context.Context, vr *backupv1alpha1.VolumeR
 //
 // Parameters:
 //   - vr is the VolumeRestore, changed in place.
+//   - bindingEmpty is the UID of the claim whose pass found its repository
+//     empty and created no restore Job, or the empty UID for none. Only that
+//     claim's own pass knows the claim binds empty, so every other caller
+//     passes the empty UID.
 //
 // It returns an error when a claim's Job or its pods can't be read.
 //
@@ -81,10 +116,11 @@ func (c *Callbacks) writeChanged(ctx context.Context, vr *backupv1alpha1.VolumeR
 // Failed, it leaves Ready as it is: the failed claim's own pass writes its
 // failure, and another claim's pass must not overwrite it. Otherwise Ready
 // is False with reason Restoring, and the message names the restore Job of
-// every entry, in status.claims order, with the waiting reason of its pod
-// while there is one, and the controller namespace they run in, since a
-// reader who looks in the app's namespace won't find them.
-func (c *Callbacks) summarize(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
+// every other entry, in status.claims order, with the waiting reason of its
+// pod while there is one, and the controller namespace they run in, since a
+// reader who looks in the app's namespace won't find them. The claim that
+// binds empty is named as waiting to bind its empty volume.
+func (c *Callbacks) summarize(ctx context.Context, vr *backupv1alpha1.VolumeRestore, bindingEmpty types.UID) error {
 	claims := vr.Status.Claims
 	if len(claims) == 0 {
 		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionTrue, backupv1alpha1.ReasonRestored, "no claim is being restored")
@@ -94,7 +130,12 @@ func (c *Callbacks) summarize(ctx context.Context, vr *backupv1alpha1.VolumeRest
 		return nil
 	}
 	jobs := make([]string, 0, len(claims))
+	empty := ""
 	for _, status := range claims {
+		if bindingEmpty != "" && status.UID == bindingEmpty {
+			empty = status.Name
+			continue
+		}
 		note, err := c.jobNote(ctx, status.UID)
 		if err != nil {
 			return err
@@ -105,7 +146,14 @@ func (c *Callbacks) summarize(ctx context.Context, vr *backupv1alpha1.VolumeRest
 	if len(jobs) > 1 {
 		noun = "restore Jobs"
 	}
-	waiting := fmt.Sprintf("waiting for %s %s in %s", noun, strings.Join(jobs, ", "), c.namespace)
+	var waits []string
+	if len(jobs) > 0 {
+		waits = append(waits, fmt.Sprintf("%s %s in %s", noun, strings.Join(jobs, ", "), c.namespace))
+	}
+	if empty != "" {
+		waits = append(waits, fmt.Sprintf("claim %s to bind its empty volume, since its repository holds no snapshot to restore", empty))
+	}
+	waiting := "waiting for " + strings.Join(waits, " and for ")
 	backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoring, waiting)
 	return nil
 }

@@ -219,7 +219,7 @@ func (c *Callbacks) startJob(ctx context.Context, r restore) error {
 	case err != nil:
 		return claimError(r.claim, err)
 	case chosen.empty:
-		return c.markRestoring(ctx, r.vr, r.claim)
+		return c.markBindingEmpty(ctx, r.vr, r.claim)
 	}
 	job, err := c.createJob(ctx, r, chosen.snapshot)
 	if err != nil {

@@ -282,6 +282,10 @@ func TestAnEmptyRepositoryBindsAnEmptyClaim(t *testing.T) {
 	if job := ops.job(t, "claim-123"); job != nil {
 		t.Errorf("Job %s created for an empty repository", job.Name)
 	}
+	ready := findCondition(ops.statuses[len(ops.statuses)-1].Status.Conditions, backupv1alpha1.ConditionReady)
+	if want := "waiting for claim notes to bind its empty volume, since its repository holds no snapshot to restore"; ready == nil || ready.Message != want {
+		t.Errorf("Ready = %#v, want the message %q", ready, want)
+	}
 }
 
 // failingLister is a SnapshotLister whose listing fails.
@@ -324,8 +328,8 @@ func TestSnapshotsOfAnotherLayoutNeverBindEmpty(t *testing.T) {
 	}
 	last := ops.statuses[len(ops.statuses)-1]
 	ready := findCondition(last.Status.Conditions, backupv1alpha1.ConditionReady)
-	if ready == nil || ready.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(ready.Message, "6e473100 (host laptop") {
-		t.Fatalf("Ready = %#v, want NoBackupInReach naming the snapshot passed over", ready)
+	if ready == nil || ready.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(ready.Message, "the repository holds 1 snapshot, which no VolSync mover wrote (host volsync, paths [/data]): 6e473100 (host laptop") {
+		t.Fatalf("Ready = %#v, want NoBackupInReach naming the one snapshot passed over", ready)
 	}
 	if got, err := callbacks.Complete(context.Background(), params()); err != nil || got {
 		t.Errorf("Complete() = %t, %v; want false", got, err)
