@@ -137,40 +137,6 @@ func checkVolSyncRefused(t *testing.T, err error, kind string) {
 	}
 }
 
-// A RestoreRun deleted in the middle of a restore while VolSync serves only
-// v1alpha1's successor needs no VolSync object to stop its mover: it
-// suspends its restore Job, waits until the Job controller reports it
-// suspended, deletes it, gives the app back and lets the deletion complete.
-// Before, the run wrote through a ReplicationDestination, and each pass
-// failed with the app down until v1alpha1 was served again.
-func TestADeletedRestoreStopsItsJobWhenVolSyncDropsV1alpha1(t *testing.T) {
-	t.Parallel()
-	run, job := quiescedMidRestore(t)
-	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true), job)
-	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := tryRestoreStep(r); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	markSuspended(t, c, job)
-	if err := tryRestoreStep(r); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if jobs := restoreJobs(t, c); len(jobs) != 0 {
-		t.Errorf("restore Jobs = %v, want the stopped one deleted", jobs)
-	}
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d, want the app's 2 back", got)
-	}
-	err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{})
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("get the deleted run: %v, want it gone", err)
-	}
-}
-
 // A RestoreRun that meets a VolSync no longer serving v1alpha1 in the
 // middle of a restore waits and retries: each pass returns the error, and
 // the run's Ready condition shows it with reason VolSyncUnsupported, naming

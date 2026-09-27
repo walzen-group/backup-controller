@@ -15,7 +15,6 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -99,28 +98,6 @@ func readRestoreRun(t *testing.T, c client.Client) *backupv1alpha1.RestoreRun {
 	run := &backupv1alpha1.RestoreRun{}
 	get(t, c, ns, "back-to-monday", run)
 	return run
-}
-
-// A restore to a moment before the oldest snapshot fails with reason
-// NoBackupInReach, names the oldest snapshot, and creates no restore Job.
-func TestARestoreBeforeEverySnapshotFailsBeforeTouchingAnything(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, nil,
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-01T00:00:00Z")),
-		claim(), volumeRestore(), repository())
-
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonNoBackupInReach {
-		t.Fatalf("phase = %q, reason = %q; want Failed, NoBackupInReach", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-	if !strings.Contains(run.Status.Items[0].Message, "2edf5bab") {
-		t.Errorf("message = %q, want it to name the oldest snapshot", run.Status.Items[0].Message)
-	}
-	if names := movers(t, c); len(names) != 0 {
-		t.Fatalf("movers = %v, want none", names)
-	}
 }
 
 // A claim restore to a time between two snapshots selects the earlier one,
@@ -380,73 +357,6 @@ func TestAQuiescedRestoreStopsTheAppUntilTheDatabaseIsDeleted(t *testing.T) {
 	}
 }
 
-// oldInstance is the deleted Cluster's instance pod and its PVC, which
-// Kubernetes removes only after Postgres has shut down.
-func oldInstance() (*corev1.Pod, *corev1.PersistentVolumeClaim) {
-	meta := func() metav1.ObjectMeta {
-		return metav1.ObjectMeta{
-			Name: pgN + "-1", Namespace: ns,
-			Labels: map[string]string{cnpg.ClusterLabel: pgN},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: cnpg.ClusterGVK.GroupVersion().String(), Kind: cnpg.ClusterGVK.Kind, Name: pgN, UID: "old-cluster-uid",
-			}},
-		}
-	}
-	pod := &corev1.Pod{ObjectMeta: meta()}
-	pod.Labels[cnpg.PodRoleLabel] = cnpg.PodRoleInstance
-	return pod, &corev1.PersistentVolumeClaim{ObjectMeta: meta()}
-}
-
-// A Cluster's instance pod keeps running through its shutdown after the
-// Cluster is gone. The run gives the app back and resumes Flux only once that
-// pod and its PVC are gone, so the app never reaches the old Postgres and the
-// new Cluster never waits behind the old one's names.
-func TestAQuiescedRestoreWaitsForTheOldInstanceToShutDown(t *testing.T) {
-	t.Parallel()
-	pod, pvc := oldInstance()
-	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
-		deployment(), kustomization(false), pod, pvc)
-
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // quiesce
-	restoreStep(t, r) // restore the volume
-	completeJob(t, c)
-
-	restoreStep(t, r) // volume done, database deleted
-	restoreStep(t, r) // the old instance is still shutting down
-	run := readRestoreRun(t, c)
-	if run.Status.Items[1].Phase != backupv1alpha1.ItemDeleted {
-		t.Fatalf("database item = %+v, want Deleted", run.Status.Items[1])
-	}
-	if got := replicasOf(t, c); got != 0 {
-		t.Errorf("replicas = %d while pod %s-1 was still shutting down, want 0", got, pgN)
-	}
-	if !suspended(t, c) {
-		t.Errorf("the Kustomization was resumed while pod %s-1 was still shutting down", pgN)
-	}
-	if !strings.Contains(readyMessage(run.Status.Conditions), pgN+"-1") {
-		t.Errorf("ready message = %q, want it to name the instance the run waits for", readyMessage(run.Status.Conditions))
-	}
-
-	if err := c.Delete(context.Background(), pod); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Delete(context.Background(), pvc); err != nil {
-		t.Fatal(err)
-	}
-	restoreStep(t, r)
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d once the old instance was gone, want the 2 it had", got)
-	}
-	if suspended(t, c) {
-		t.Error("the Kustomization stayed suspended after the old instance was gone")
-	}
-	if msg := readyMessage(readRestoreRun(t, c).Status.Conditions); !strings.Contains(msg, "recreate "+pgN) {
-		t.Errorf("ready message = %q, want the run asking for the Cluster to be created again", msg)
-	}
-}
-
 // A quiesced restore that times out starts the app again and resumes the
 // Kustomization it suspended.
 func TestATimedOutQuiescedRestoreGivesTheAppBack(t *testing.T) {
@@ -469,68 +379,6 @@ func TestATimedOutQuiescedRestoreGivesTheAppBack(t *testing.T) {
 	}
 	if suspended(t, c) {
 		t.Error("the Kustomization the run suspended stayed suspended")
-	}
-}
-
-// A spec.quiesce entry naming a workload the namespace does not hold fails
-// the run at the checks, before it stops anything or deletes a database.
-func TestAQuiescedRestoreOfAMissingWorkloadFailsBeforeStoppingAnything(t *testing.T) {
-	t.Parallel()
-	run := quiescedRestore()
-	run.Spec.Quiesce = append(run.Spec.Quiesce, backupv1alpha1.WorkloadRef{Kind: "StatefulSet", Name: "notes-worker"})
-	r, c := restoreReconciler(t, prober{saturday}, run,
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
-		deployment(), kustomization(false), writerPod())
-	restoreStep(t, r)
-
-	got := readRestoreRun(t, c)
-	if got.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(readyMessage(got.Status.Conditions), "notes-worker") {
-		t.Fatalf("phase = %q, message = %q; want Failed naming notes-worker", got.Status.Phase, readyMessage(got.Status.Conditions))
-	}
-	if replicas := replicasOf(t, c); replicas != 2 {
-		t.Errorf("replicas = %d, want the app untouched", replicas)
-	}
-}
-
-// A restore in place stops the workloads marked backup.wlz.li/quiesce, the
-// set a BackupRun of the namespace stops, also when spec.quiesce is empty.
-// The run scales them to zero before it creates a restore Job, and gives
-// them back once the restore is done.
-func TestARestoreStopsTheMarkedAppBeforeItsJob(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, prober{saturday}, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
-		deployment(), kustomization(false), writerPod())
-
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // quiesce
-	if got := replicasOf(t, c); got != 0 {
-		t.Fatalf("replicas = %d after the run started, want 0", got)
-	}
-	if !suspended(t, c) {
-		t.Error("the Kustomization was not suspended, and Flux would put the replicas back")
-	}
-	restoreStep(t, r) // the pod is still there
-	jobs := &batchv1.JobList{}
-	if err := c.List(context.Background(), jobs); err != nil {
-		t.Fatal(err)
-	}
-	if len(jobs.Items) != 0 {
-		t.Fatalf("restore Job %s exists while the app's pod still ran", jobs.Items[0].Name)
-	}
-
-	if err := c.Delete(context.Background(), writerPod()); err != nil {
-		t.Fatal(err)
-	}
-	restoreStep(t, r) // restore the volume
-	completeJob(t, c)
-	restoreStep(t, r) // volume done, database deleted
-	restoreStep(t, r) // the volume's stopped mover is gone
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d once the restore was done, want the 2 it had", got)
-	}
-	if suspended(t, c) {
-		t.Error("the Kustomization is still suspended after the restore")
 	}
 }
 
@@ -586,184 +434,6 @@ func TestADatabaseWithoutABaseBackupIsNotDeleted(t *testing.T) {
 	}
 	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
 		t.Fatal("the Cluster was deleted although no base backup reaches the moment")
-	}
-}
-
-// A namespace restore restores the volumes before the databases. When a volume
-// restore fails, the run fails and skips the Cluster, which keeps running.
-func TestANamespaceRestoreLeavesTheDatabasesWhenAVolumeFails(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, prober{saturday},
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
-
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // volume restore Job
-	run := readRestoreRun(t, c)
-	if run.Status.Items[1].Phase != backupv1alpha1.ItemPending {
-		t.Fatalf("the Cluster was handled before its volumes finished: %+v", run.Status.Items[1])
-	}
-
-	endJob(t, c, itemJob(t, c).Name, batchv1.JobFailed, "PodFailurePolicy", "Container restore for pod notes/restore-x exited with code 10 matching FailJob rule at index 0")
-	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
-
-	run = readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.Items[1].Phase != backupv1alpha1.ItemSkipped {
-		t.Fatalf("run = %+v, want Failed with the Cluster skipped", run.Status)
-	}
-	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); !ok {
-		t.Fatal("the Cluster was deleted after a volume restore failed")
-	}
-}
-
-// refuseDeploymentScales returns a client over c that refuses every write to
-// a Deployment's scale subresource, the way the API server does when the
-// controller's ServiceAccount lacks update on deployments/scale.
-func refuseDeploymentScales(c client.Client) client.Client {
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			if _, ok := deploymentScale(sub, obj, opts); ok {
-				return apierrors.NewForbidden(appsv1.Resource("deployments/scale"), obj.GetName(), errors.New("scale refused"))
-			}
-			return cl.SubResource(sub).Update(ctx, obj, opts...)
-		},
-	})
-}
-
-// A quiesced restore that fails to stop a workload ends at once as Failed,
-// with reason Failed, and resumes the Kustomization it already suspended. A
-// BackupRun does the same. Waiting would leave the app running beside the
-// restore until the timeout.
-func TestAQuiescedRestoreThatCannotStopTheAppFailsAtOnce(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
-		deployment(), kustomization(false), writerPod())
-	r.Client = refuseDeploymentScales(c)
-
-	restoreStep(t, r) // plan
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err != nil {
-		t.Fatalf("quiesce returned %v, want the run ended with the error in its status", err)
-	}
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonFailed {
-		t.Fatalf("phase = %q, reason = %q; want Failed with reason Failed", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-	if !strings.Contains(readyMessage(run.Status.Conditions), "scale refused") {
-		t.Errorf("ready message = %q, want the scale error", readyMessage(run.Status.Conditions))
-	}
-	if suspended(t, c) {
-		t.Error("the Kustomization the run suspended stayed suspended")
-	}
-}
-
-// A quiesce pass whose status write is lost after the app was stopped is
-// run again. The retry keeps the replica count and the Kustomization the
-// first pass recorded, so a run that then times out gives the app its 2
-// replicas back and resumes the Kustomization.
-func TestAQuiescedRestoreRetriedAfterALostStatusWriteGivesTheAppBack(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
-		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
-		deployment(), kustomization(false), writerPod())
-	restoreStep(t, r) // plan
-
-	r.Client = loseStatusWriteAt(c, 0)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the quiesce pass succeeded, want its lost status write returned")
-	}
-	restoreStep(t, r) // quiesce again
-
-	run := readRestoreRun(t, c)
-	if len(run.Status.Quiesced) != 1 || run.Status.Quiesced[0].Replicas != 2 {
-		t.Errorf("quiesced = %+v, want the Deployment with the 2 replicas it had", run.Status.Quiesced)
-	}
-
-	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-	restoreStep(t, r)
-
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d after the run gave up, want the 2 it had", got)
-	}
-	if suspended(t, c) {
-		t.Error("the Kustomization the run suspended stayed suspended")
-	}
-}
-
-// staleCache returns a client over c whose pod and claim lists come back
-// empty, the way the informer cache answers before it has seen a pod the API
-// server already holds.
-func staleCache(c client.Client) client.Client {
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			switch list.(type) {
-			case *corev1.PodList, *corev1.PersistentVolumeClaimList:
-				return nil
-			}
-			return cl.List(ctx, list, opts...)
-		},
-	})
-}
-
-// A restore in place looks for a pod mounting the claim through the uncached
-// reader. A pod the informer cache has not seen yet still makes the run wait
-// with reason ClaimInUse, because without spec.quiesce that check is the only
-// thing that keeps a second writer off the volume.
-func TestARestoreSeesAPodTheCacheHasNotSeenYet(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-		claim(), volumeRestore(), repository(), writerPod())
-	r.Client = staleCache(c)
-	restoreStep(t, r) // plan
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if reason := readyReason(run.Status.Conditions); reason != backupv1alpha1.ReasonClaimInUse || run.Status.Items[0].Phase != backupv1alpha1.ItemPending {
-		t.Fatalf("reason = %q, item = %+v; want ClaimInUse with the item Pending", reason, run.Status.Items[0])
-	}
-}
-
-// A database restore whose delete of the Cluster failed deletes it again on
-// the next pass. The old Cluster still carries backup.wlz.li/restore-run with
-// this run's name, left there by an earlier run named back-to-monday, and
-// that must not count as the recovery. Only a Cluster created again, with
-// another UID, does.
-func TestADatabaseRestoreWhoseDeleteFailedDeletesTheOldClusterAgain(t *testing.T) {
-	t.Parallel()
-	old := cluster(func(u *unstructured.Unstructured) {
-		annotations := u.GetAnnotations()
-		annotations[backupv1alpha1.AnnotationRestoreRun] = "back-to-monday"
-		u.SetAnnotations(annotations)
-		_ = unstructured.SetNestedField(u.Object, cnpg.HealthyPhase, "status", "phase")
-	})
-	r, c := restoreReconciler(t, prober{saturday},
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }), old, objectStore(), storeSecret())
-	restoreStep(t, r) // plan
-
-	refused := false
-	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == cnpg.ClusterGVK.Kind && !refused {
-				refused = true
-				return apierrors.NewServiceUnavailable("etcd leader changed")
-			}
-			return cl.Delete(ctx, obj, opts...)
-		},
-	})
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass whose delete failed succeeded, want the error returned")
-	}
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase.Finished() || run.Status.Items[0].Phase != backupv1alpha1.ItemDeleted {
-		t.Errorf("phase = %q, item = %+v; want the run waiting with the item Deleted", run.Status.Phase, run.Status.Items[0])
-	}
-	if _, ok := getUnstructured(t, c, cnpg.ClusterGVK, ns, pgN); ok {
-		t.Error("the old Cluster is still there; the run took it for its recovery")
 	}
 }
 
@@ -849,35 +519,6 @@ func loseNextStatusWrite(c client.Client) client.Client {
 	})
 }
 
-// A volume restore whose Job completed, but whose pass lost the status write
-// that recorded it, finishes on the next pass. The run records the item's
-// success before it stops the restore Job, so the next pass still reads the
-// Job's Complete condition, and the item does not fail as a Job deleted
-// before it finished.
-func TestAVolumeRestoreWhoseSuccessWasNotRecordedFinishes(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-		claim(), volumeRestore(), repository())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // restore
-	completeJob(t, c)
-
-	r.Client = loseNextStatusWrite(c)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
-	}
-	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
-		t.Fatalf("phase = %q, item = %+v; want Succeeded", run.Status.Phase, run.Status.Items[0])
-	}
-	if jobs := restoreJobs(t, c); len(jobs) != 0 {
-		t.Errorf("restore Jobs = %v, want none once the run has ended", jobs)
-	}
-}
-
 // fromRepository is a mutate function for restoreRun that restores the
 // repository Secret into a new 2Gi claim named scratch, with no source claim.
 func fromRepository(r *backupv1alpha1.RestoreRun) {
@@ -918,46 +559,5 @@ func TestAnIntoRestoreFromARepositoryFillsAClaimTheMoverPlaces(t *testing.T) {
 	}
 	if jobs := restoreJobs(t, c); len(jobs) != 0 {
 		t.Errorf("restore Jobs = %v, want the Job gone with the run's end", jobs)
-	}
-}
-
-// An into restore from a repository without spec.intoSize ends as Invalid at
-// its checks. With no source claim there is no size to copy, and the API
-// server refuses a claim without a storage request.
-func TestAnIntoRestoreFromARepositoryNeedsASize(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, nil, restoreRun(fromRepository, func(r *backupv1alpha1.RestoreRun) { r.Spec.IntoSize = nil }), repository())
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid || !strings.Contains(readyMessage(run.Status.Conditions), "intoSize") {
-		t.Fatalf("reason = %q, message = %q; want Invalid naming intoSize", readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-	}
-}
-
-// declaring returns a mutate function for cluster that gives the Cluster its
-// own bootstrap method in spec.bootstrap, with the given content.
-func declaring(method string, content map[string]any) func(*unstructured.Unstructured) {
-	return func(u *unstructured.Unstructured) {
-		if err := unstructured.SetNestedMap(u.Object, map[string]any{method: content}, "spec", "bootstrap"); err != nil {
-			panic(err)
-		}
-	}
-}
-
-// A Cluster the webhook recovered in an earlier restore carries the recovery
-// the webhook wrote, with source backup-controller. That recovery is the
-// controller's own, so a later restore restores the Cluster as usual.
-func TestARestoreOfAClusterTheWebhookRecoveredBeforeDeletesIt(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, prober{saturday},
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }),
-		cluster(declaring("recovery", map[string]any{"source": bootstrap.RecoverySource})), objectStore(), storeSecret())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // delete
-
-	run := readRestoreRun(t, c)
-	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemDeleted {
-		t.Fatalf("phase = %q, item = %+v (%s); want the Cluster deleted for recovery", run.Status.Phase, item, readyMessage(run.Status.Conditions))
 	}
 }

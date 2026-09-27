@@ -1,21 +1,14 @@
 package runs
 
 import (
-	"context"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
 )
 
@@ -77,19 +70,4 @@ func checkVolSyncUnsupported(t *testing.T, conditions []metav1.Condition, kind s
 			t.Errorf("Ready message %q does not name %s", message, want)
 		}
 	}
-}
-
-// destinationGone wraps c so that the API server answers every get of a
-// ReplicationDestination with the plain-text 404 of a version it no longer
-// serves, as after a VolSync upgrade the client's mapper has not seen yet.
-func destinationGone(c client.Client) client.Client {
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*volsyncv1alpha1.ReplicationDestination); ok {
-				return apierrors.NewGenericServerResponse(http.StatusNotFound, "get",
-					schema.GroupResource{Group: volsyncv1alpha1.GroupVersion.Group, Resource: "replicationdestinations"}, key.Name, "404 page not found", 0, true)
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-	})
 }

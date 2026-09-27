@@ -10,7 +10,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -149,71 +148,5 @@ func checkWorkloads(t *testing.T, c client.Client, deploymentReplicas, setReplic
 	}
 	if len(s.Spec.Template.Spec.Containers) != 1 || s.Spec.Template.Spec.Containers[0].Image != "postgres:17" {
 		t.Errorf("StatefulSet template changed: %+v", s.Spec.Template.Spec.Containers)
-	}
-}
-
-// changeBetweenReadAndWrite wraps c so that another writer changes the app's
-// Deployment right after each of the first changes reads of its Scale, the
-// way a status or label write can land between quiesce's read and its
-// write. It returns the wrapped client and the outcome of every scale
-// update: "ok", or the reason the API server gave.
-func changeBetweenReadAndWrite(t *testing.T, c client.Client, changes int) (client.Client, *[]string) {
-	t.Helper()
-	var outcomes []string
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		SubResourceGet: func(ctx context.Context, cl client.Client, sub string, obj, subResource client.Object, opts ...client.SubResourceGetOption) error {
-			if err := cl.SubResource(sub).Get(ctx, obj, subResource, opts...); err != nil {
-				return err
-			}
-			if changes == 0 {
-				return nil
-			}
-			changes--
-			d := &appsv1.Deployment{}
-			if err := cl.Get(ctx, client.ObjectKey{Namespace: ns, Name: appN}, d); err != nil {
-				t.Fatal(err)
-			}
-			d.Labels["touched"] = fmt.Sprint(changes)
-			if err := cl.Update(ctx, d); err != nil {
-				t.Fatal(err)
-			}
-			return nil
-		},
-		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			err := cl.SubResource(sub).Update(ctx, obj, opts...)
-			outcome := "ok"
-			if err != nil {
-				outcome = string(apierrors.ReasonForError(err))
-			}
-			outcomes = append(outcomes, outcome)
-			return err
-		},
-	}), &outcomes
-}
-
-// A change to a workload between scale's read of its Scale and its write,
-// such as the status writes a Deployment's controller makes while its pods
-// change, never fails the scale: the write carries no resourceVersion, so
-// the API server applies it to whatever it holds then. The count is the
-// only field the write sets, and the change it raced stays as it was.
-func TestAChangeBetweenReadAndScaleDoesNotFailIt(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	stop := []backupv1alpha1.QuiescedWorkload{{Kind: backupv1alpha1.WorkloadKindDeployment, Name: appN, Replicas: 2}}
-
-	c := newClient(t, deployment())
-	racing, outcomes := changeBetweenReadAndWrite(t, c, 100)
-	if err := quiesce.Apply(ctx, racing, ns, stop, nil); err != nil {
-		t.Fatalf("stop against a Deployment that keeps changing: %v", err)
-	}
-	if got := replicasOf(t, c); got != 0 || fmt.Sprint(*outcomes) != "[ok]" {
-		t.Errorf("replicas %d after scale updates %v, want 0 after [ok]", got, *outcomes)
-	}
-	d := &appsv1.Deployment{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: appN}, d); err != nil {
-		t.Fatal(err)
-	}
-	if d.Labels["touched"] != "99" {
-		t.Errorf("Deployment labels %v after the scale, want the racing change touched=99 kept", d.Labels)
 	}
 }

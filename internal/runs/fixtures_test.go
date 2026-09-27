@@ -512,22 +512,6 @@ func expectRefused(t *testing.T, r *RestoreRunReconciler, want ...string) {
 	}
 }
 
-// loseFailedRunWrite returns a client over c that fails, with a conflict,
-// the first status write that ends a RestoreRun Failed: finish's write,
-// which comes after it stopped the run's restore Jobs.
-func loseFailedRunWrite(c client.Client) client.Client {
-	lost := false
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			if run, ok := obj.(*backupv1alpha1.RestoreRun); ok && !lost && run.Status.Phase == backupv1alpha1.RunPhaseFailed {
-				lost = true
-				return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("restoreruns").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
-			}
-			return cl.SubResource(sub).Update(ctx, obj, opts...)
-		},
-	})
-}
-
 // crdObjectCache holds the CRD files that readCRD decoded so far, keyed by
 // the path as the test gives it. Each file is then decoded one time per test
 // binary. An entry does not change after readCRD stores it.

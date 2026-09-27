@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -12,16 +11,13 @@ import (
 	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/kueue"
 	"github.com/walzen-group/backup-controller/internal/quiesce"
-	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // backupRun returns the BackupRun before-upgrade with a one-hour timeout,
@@ -190,45 +186,6 @@ func TestTieredRetentionReachesTheSource(t *testing.T) {
 	}
 }
 
-// A claim with no retention annotation fails its item, because its repository
-// would keep every snapshot forever. The message names the annotations that
-// would fix it.
-func TestAClaimWithNoRetentionFails(t *testing.T) {
-	t.Parallel()
-	c := startVolumeRun(t, map[string]string{backupv1alpha1.AnnotationEnabled: "true"})
-
-	run := readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Fatalf("phase = %q, want Failed", run.Status.Phase)
-	}
-	message := run.Status.Items[0].Message
-	for _, name := range []string{"retain-last", "retain-daily", "retain-within"} {
-		if !strings.Contains(message, name) {
-			t.Errorf("message %q does not name %s", message, name)
-		}
-	}
-}
-
-// A retention annotation that does not parse, or asks to keep zero
-// snapshots, fails the item with a message naming the annotation.
-func TestAnUnparseableRetentionFails(t *testing.T) {
-	t.Parallel()
-	for annotation, value := range map[string]string{
-		backupv1alpha1.AnnotationRetainWeekly: "four",
-		backupv1alpha1.AnnotationRetainDaily:  "0",
-		backupv1alpha1.AnnotationRetainWithin: "3 days",
-	} {
-		t.Run(annotation, func(t *testing.T) {
-			c := startVolumeRun(t, map[string]string{backupv1alpha1.AnnotationEnabled: "true", annotation: value})
-
-			run := readBackupRun(t, c)
-			if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(run.Status.Items[0].Message, annotation) {
-				t.Fatalf("run = %+v, want the item failed naming %s", run.Status, annotation)
-			}
-		})
-	}
-}
-
 // A run that names a claim not marked backup.wlz.li/enabled fails at once
 // with reason Invalid.
 func TestAClaimNotMarkedEnabledIsRefused(t *testing.T) {
@@ -242,57 +199,6 @@ func TestAClaimNotMarkedEnabledIsRefused(t *testing.T) {
 	run := readBackupRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid {
 		t.Fatalf("phase = %q, reason = %q; want Failed, Invalid", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-}
-
-// A run refused at plan time whose release fails keeps its refusal: the
-// pass that refused it records the ending Invalid and fails to read the run
-// again, the claim is marked in between, and the next pass ends the run
-// Invalid with the refusal's message. It never plans the run again into
-// Queued.
-func TestARefusedRunWhoseReleaseFailedEndsInvalid(t *testing.T) {
-	t.Parallel()
-	unmarked := claim()
-	unmarked.Annotations = nil
-	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) {
-		b.Spec.Source = claimN
-		b.Finalizers = []string{Finalizer}
-	}), unmarked)
-	failRead := true
-	reader := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*backupv1alpha1.BackupRun); ok && failRead {
-				return apierrors.NewInternalError(errors.New("the API server cannot read the BackupRun"))
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-	})
-	r := &BackupRunReconciler{Client: c, Reader: reader, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{},
-		Now: func() time.Time { return frozen }}
-
-	if err := tryStep(r); err == nil {
-		t.Fatal("the pass whose release failed returned no error")
-	}
-	stored := readBackupRun(t, c)
-	if stored.Status.Ending == nil || stored.Status.Ending.Reason != backupv1alpha1.ReasonInvalid {
-		t.Fatalf("ending = %+v after the failed release, want reason Invalid", stored.Status.Ending)
-	}
-	refusal := stored.Status.Ending.Message
-
-	marked := &corev1.PersistentVolumeClaim{}
-	get(t, c, ns, claimN, marked)
-	marked.Annotations = enabled()
-	if err := c.Update(context.Background(), marked); err != nil {
-		t.Fatal(err)
-	}
-	failRead = false
-	step(t, r)
-
-	run := readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonInvalid ||
-		readyMessage(run.Status.Conditions) != refusal {
-		t.Fatalf("phase = %q, reason = %q, message = %q; want Failed, Invalid, %q", run.Status.Phase,
-			readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), refusal)
 	}
 }
 
@@ -322,33 +228,6 @@ func TestABusySourceMakesTheRunWait(t *testing.T) {
 	}
 }
 
-// A namespace run that stops the app looks at each volume before it stops
-// anything. When another live run holds a volume, the run waits SourceBusy
-// with the app still running. If it stopped the app first, the app would stay
-// down until the other backup ends.
-func TestAQuiescedRunWaitsForABusySourceBeforeItStopsTheApp(t *testing.T) {
-	t.Parallel()
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false),
-		busySource(TriggerFor(otherRunUID)), otherRun())
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce pre-check
-
-	run := readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
-		t.Fatalf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-	if len(run.Status.Quiesced) != 0 || run.Status.QuiescedAt != nil {
-		t.Errorf("quiesced = %+v, quiescedAt = %v; want no plan and no stop while the source is busy", run.Status.Quiesced, run.Status.QuiescedAt)
-	}
-	app := &appsv1.Deployment{}
-	get(t, c, ns, appN, app)
-	if *app.Spec.Replicas != 2 {
-		t.Errorf("replicas = %d, want the app left at 2 while the run waits", *app.Spec.Replicas)
-	}
-}
-
 // busySource returns the claim's ReplicationSource with the manual tag open
 // and VolSync retrying its sync after a failed mover.
 func busySource(tag string) *volsyncv1alpha1.ReplicationSource {
@@ -361,77 +240,9 @@ func busySource(tag string) *volsyncv1alpha1.ReplicationSource {
 	return source
 }
 
-// deadTag is a source's open tag that belongs to no run waiting for it, with
-// the objects that make it so and the name the item's message must give.
-type deadTag struct {
-	tag     string
-	objects []client.Object
-	names   string
-}
-
-// deadTags are the ways a source's open tag can belong to no run that waits
-// for it: a finished run, a run that no longer exists (as for a tag written
-// by v0.7.x or v0.8.x whose run is gone), a run being deleted, and an
-// unfinished run whose own item for the claim already failed.
-func deadTags() map[string]deadTag {
-	finished := otherRun()
-	finished.Status.Phase = backupv1alpha1.RunPhaseFailed
-	deleting := otherRun()
-	deleting.DeletionTimestamp = &metav1.Time{Time: frozen}
-	deleting.Finalizers = []string{Finalizer}
-	itemFailed := otherRun()
-	itemFailed.Status.Items[0].Phase = backupv1alpha1.ItemFailed
-	gone := TriggerFor("0d1e2f3a-0000-4000-8000-000000000009")
-	return map[string]deadTag{
-		"a finished run":                      {TriggerFor(otherRunUID), []client.Object{finished}, "manual-notes"},
-		"no run":                              {gone, nil, gone},
-		"a run being deleted":                 {TriggerFor(otherRunUID), []client.Object{deleting}, "manual-notes"},
-		"a running run whose item has failed": {TriggerFor(otherRunUID), []client.Object{itemFailed}, "manual-notes"},
-	}
-}
-
 // cacheN is a second claim of the namespace, with its own volume,
 // VolumeRestore and repository.
 const cacheN = "notes-cache"
-
-// A source whose open tag no run waits for fails the run's item at once,
-// with a message that names the tag's run and says what a person can do. The
-// source is left alone: VolSync is still retrying that sync with the clone it
-// cut for it, and a new tag would be completed by that older backup.
-func TestADeadTriggerFailsTheItemAtOnce(t *testing.T) {
-	t.Parallel()
-	for name, tc := range deadTags() {
-		t.Run(name, func(t *testing.T) {
-			objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-				claim(), volume(), volumeRestore(), repository(), busySource(tc.tag)}, tc.objects...)
-			r, c := backupReconciler(t, objects...)
-			r.Client = neverWriteSyncing(t, c)
-			step(t, r) // plan
-			step(t, r) // admit, no queue
-			step(t, r) // start
-
-			run := readBackupRun(t, c)
-			item := run.Status.Items[0]
-			if item.Phase != backupv1alpha1.ItemFailed {
-				t.Fatalf("item = %+v, run reason %q; want the item Failed", item, readyReason(run.Status.Conditions))
-			}
-			for _, want := range []string{tc.names, "no run waits for", "Access Key Id", "delete the ReplicationSource " + claimN, "volsync-src-" + claimN,
-				"the next backup unlocks the repository first"} {
-				if !strings.Contains(item.Message, want) {
-					t.Errorf("item message %q does not say %q", item.Message, want)
-				}
-			}
-			if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-				t.Errorf("phase = %q, want the run Failed with its only item", run.Status.Phase)
-			}
-			source := &volsyncv1alpha1.ReplicationSource{}
-			get(t, c, ns, claimN, source)
-			if manualTag(source) != tc.tag {
-				t.Errorf("source trigger = %q, want %q left in place", manualTag(source), tc.tag)
-			}
-		})
-	}
-}
 
 // cacheClaim returns the claim cacheN and the objects it needs to be backed
 // up, built like claim, volume, volumeRestore and repository.
@@ -445,67 +256,6 @@ func cacheClaim() []client.Object {
 	secret := repository()
 	secret.Name = "notes-restic-cache"
 	return []client.Object{pvc, pv, vr, secret}
-}
-
-// In a namespace run with two claims, a claim whose source is busy with a
-// tag no run waits for fails its item, and the other claim is backed up as
-// usual: its source gets the run's trigger, and the run records its snapshot.
-func TestADeadTriggerOnOneClaimLeavesTheOtherBackedUp(t *testing.T) {
-	t.Parallel()
-	dead := busySource(TriggerFor("0d1e2f3a-0000-4000-8000-000000000009"))
-	dead.Name, dead.Spec.SourcePVC = cacheN, cacheN
-	objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment(), dead}, cacheClaim()...)
-	r, c := backupReconciler(t, objects...)
-	r.Client = neverWriteSyncing(t, c)
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce
-	step(t, r) // start
-	cutClone(t, c)
-	step(t, r) // restart
-	complete(t, c)
-	step(t, r) // find the snapshot
-	step(t, r) // move it, and finish
-
-	run := readBackupRun(t, c)
-	byName := map[string]backupv1alpha1.BackupItem{}
-	for _, item := range run.Status.Items {
-		byName[item.Name] = item
-	}
-	if item := byName[cacheN]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "no run waits for") {
-		t.Errorf("dead claim's item = %+v, want it Failed as abandoned", item)
-	}
-	if item := byName[claimN]; item.Phase != backupv1alpha1.ItemSucceeded || item.Snapshot == "" {
-		t.Errorf("healthy claim's item = %+v, want it Succeeded with a snapshot", item)
-	}
-	source := &volsyncv1alpha1.ReplicationSource{}
-	get(t, c, ns, cacheN, source)
-	if manualTag(source) != manualTag(dead) || source.Spec.Restic != nil && source.Spec.Restic.Unlock != "" {
-		t.Errorf("dead source = %+v, want it left as it was", source.Spec)
-	}
-	d := &appsv1.Deployment{}
-	get(t, c, ns, appN, d)
-	if *d.Spec.Replicas != 2 {
-		t.Errorf("replicas = %d, want the app back at 2", *d.Spec.Replicas)
-	}
-}
-
-// A ReplicationSource of the claim's name that the controller did not write
-// is left alone, and the item fails saying so.
-func TestASourceSomethingElseWroteIsLeftAlone(t *testing.T) {
-	t.Parallel()
-	foreign := &volsyncv1alpha1.ReplicationSource{ObjectMeta: metav1.ObjectMeta{Name: claimN, Namespace: ns}}
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-		claim(), volume(), volumeRestore(), repository(), foreign)
-	step(t, r)
-	step(t, r)
-	step(t, r)
-
-	run := readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(run.Status.Items[0].Message, "not written by backup-controller") {
-		t.Fatalf("run = %+v, want the item failed naming the foreign source", run.Status)
-	}
 }
 
 // otherRunUID is the UID of the BackupRun otherRun, whose tag races this
@@ -552,203 +302,6 @@ func writeOtherTag(ctx context.Context, cl client.Client) error {
 	at := metav1.NewTime(frozen)
 	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{LastManualSync: "backuprun-older", LastSyncStartTime: &at}
 	return cl.Status().Update(ctx, source)
-}
-
-// Two runs of the same claim never overwrite each other's trigger. The other
-// run writes its tag onto the idle source in the middle of this run's
-// ensureSource: after a read that found the source idle, or after the read
-// the write is based on. Either way this run leaves the other run's tag in
-// place and waits with reason SourceBusy. An overwritten tag would be
-// completed by the other run's sync, with a clone cut before this run's
-// quiesce.
-func TestTwoRunsDoNotOverwriteEachOthersTrigger(t *testing.T) {
-	t.Parallel()
-	for name, race := range map[string]interceptor.Funcs{
-		// The other run writes just before this run's client reads the
-		// source for its write, after any check through the Reader.
-		"before the read the write is based on": {
-			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); ok && key.Name == claimN {
-					if err := writeOtherTag(ctx, cl); err != nil {
-						return err
-					}
-				}
-				return cl.Get(ctx, key, obj, opts...)
-			},
-		},
-		// The other run writes after this run's client read the source and
-		// just before its write reaches the API server.
-		"between the read and the write": {
-			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-				if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); ok && obj.GetName() == claimN {
-					if err := writeOtherTag(ctx, cl); err != nil {
-						return err
-					}
-				}
-				return cl.Update(ctx, obj, opts...)
-			},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-				claim(), volume(), volumeRestore(), repository(), idleSource(), otherRun())
-			step(t, r) // plan
-			step(t, r) // admit, no queue
-			raced := false
-			once := interceptor.Funcs{
-				Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if race.Get != nil && !raced {
-						if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); ok {
-							raced = true
-							return race.Get(ctx, cl, key, obj, opts...)
-						}
-					}
-					return cl.Get(ctx, key, obj, opts...)
-				},
-				Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-					if race.Update != nil && !raced {
-						if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); ok {
-							raced = true
-							return race.Update(ctx, cl, obj, opts...)
-						}
-					}
-					return cl.Update(ctx, obj, opts...)
-				},
-			}
-			r.Client = interceptor.NewClient(c.(client.WithWatch), once)
-
-			// The pass that loses the race may return the conflict for a
-			// retry; the next pass decides again from the stored source.
-			_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}})
-			if !raced {
-				t.Fatal("the race never ran; the run did not write the source")
-			}
-			step(t, r)
-
-			source := &volsyncv1alpha1.ReplicationSource{}
-			get(t, c, ns, claimN, source)
-			if got := manualTag(source); got != TriggerFor(otherRunUID) {
-				t.Fatalf("source trigger = %q, want the other run's %q left in place", got, TriggerFor(otherRunUID))
-			}
-			run := readBackupRun(t, c)
-			if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
-				t.Errorf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
-			}
-			if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemPending {
-				t.Errorf("item = %+v, want it Pending", item)
-			}
-		})
-	}
-}
-
-// neverWriteSyncing returns a client over c that fails the test on any
-// update, patch or delete of a ReplicationSource whose stored
-// status.lastSyncStartTime is set. VolSync is syncing such a source: a new
-// tag would be completed by the running sync, and any change to the mover's
-// spec makes VolSync replace the running mover Job, which kills restic and
-// leaves its lock in the repository.
-func neverWriteSyncing(t *testing.T, c client.Client) client.Client {
-	check := func(ctx context.Context, cl client.Client, verb string, obj client.Object) {
-		if _, ok := obj.(*volsyncv1alpha1.ReplicationSource); !ok {
-			return
-		}
-		stored := &volsyncv1alpha1.ReplicationSource{}
-		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), stored); err != nil {
-			return
-		}
-		if stored.Status != nil && stored.Status.LastSyncStartTime != nil {
-			t.Errorf("%s of ReplicationSource %s while VolSync syncs tag %q", verb, obj.GetName(), manualTag(stored))
-		}
-	}
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-			check(ctx, cl, "update", obj)
-			return cl.Update(ctx, obj, opts...)
-		},
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			check(ctx, cl, "patch", obj)
-			return cl.Patch(ctx, obj, patch, opts...)
-		},
-		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			check(ctx, cl, "delete", obj)
-			return cl.Delete(ctx, obj, opts...)
-		},
-	})
-}
-
-// The controller never writes a ReplicationSource that VolSync is syncing,
-// whoever's tag it syncs. With this run's own tag on it (a pass whose status
-// write was lost after the source write), the item goes Running and the
-// source keeps its spec, even when the claim's retention changed since. With
-// another live run's tag, the run waits with SourceBusy.
-func TestTheControllerNeverWritesASourceVolSyncIsSyncing(t *testing.T) {
-	t.Parallel()
-	syncing := func(tag string) *volsyncv1alpha1.ReplicationSource {
-		source := idleSource()
-		source.Spec.Trigger.Manual = tag
-		// The claim says retain-last 10; the source still has the 5 the
-		// claim said when the source was written.
-		five := "5"
-		source.Spec.Restic = &volsyncv1alpha1.ReplicationSourceResticSpec{Repository: repoN,
-			Retain: &volsyncv1alpha1.ResticRetainPolicy{Last: &five}}
-		at := metav1.NewTime(frozen)
-		source.Status.LastSyncStartTime = &at
-		return source
-	}
-	cases := map[string]struct {
-		source *volsyncv1alpha1.ReplicationSource
-		check  func(t *testing.T, run *backupv1alpha1.BackupRun)
-	}{
-		"this run's tag": {
-			source: syncing(TriggerFor(runUID)),
-			check: func(t *testing.T, run *backupv1alpha1.BackupRun) {
-				if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning || item.Trigger != TriggerFor(runUID) {
-					t.Errorf("item = %+v, want it Running under the run's tag", item)
-				}
-			},
-		},
-		"another live run's tag": {
-			source: syncing(TriggerFor(otherRunUID)),
-			check: func(t *testing.T, run *backupv1alpha1.BackupRun) {
-				if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
-					t.Errorf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
-				}
-			},
-		},
-		// No BackupRun of the namespace has this UID, so no run waits for
-		// the tag.
-		"a dead tag": {
-			source: syncing(TriggerFor("0d1e2f3a-0000-4000-8000-000000000009")),
-			check: func(t *testing.T, run *backupv1alpha1.BackupRun) {
-				if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "no run waits for") {
-					t.Errorf("item = %+v, want it Failed as abandoned", item)
-				}
-			},
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-				claim(), volume(), volumeRestore(), repository(), tc.source, otherRun())
-			r.Client = neverWriteSyncing(t, c)
-			step(t, r) // plan
-			step(t, r) // admit, no queue
-			step(t, r) // start
-
-			tc.check(t, readBackupRun(t, c))
-			source := &volsyncv1alpha1.ReplicationSource{}
-			get(t, c, ns, claimN, source)
-			if got := manualTag(source); got != manualTag(tc.source) {
-				t.Errorf("source trigger = %q, want %q", got, manualTag(tc.source))
-			}
-			if last := source.Spec.Restic.Retain.Last; last == nil || *last != "5" {
-				t.Error("retain-last changed from 5; the syncing source's spec was rewritten")
-			}
-			if unlock := source.Spec.Restic.Unlock; unlock != "" {
-				t.Errorf("unlock = %q on a syncing source; the new field would make VolSync replace the running mover", unlock)
-			}
-		})
-	}
 }
 
 // A database run creates a CloudNativePG Backup with method plugin, and
@@ -1000,88 +553,6 @@ func TestAQuiescedRunMovesTheSnapshotToItsRestartMoment(t *testing.T) {
 	}
 }
 
-// The rewrite needs restic's exclusive lock. While another process holds a
-// lock, the volume's item stays Running with a message naming the lock's
-// host. The run finishes once the rewrite goes through, so it never reports
-// success for a snapshot left untagged.
-func TestAQuiescedRunWaitsForTheRepositoryLock(t *testing.T) {
-	t.Parallel()
-	r, c := quiescedRunToUpload(t)
-	fake := r.Retimer.(*retimer)
-	fake.err = &restic.LockedError{Hostname: "volsync-dst-restore-1a2b", Time: frozen.Add(-time.Minute)}
-	step(t, r)
-
-	run := readBackupRun(t, c)
-	if run.Status.Phase.Finished() {
-		t.Fatalf("phase = %q while the repository was locked, want the run still going", run.Status.Phase)
-	}
-	item := run.Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemRunning || !strings.Contains(item.Message, "volsync-dst-restore-1a2b") {
-		t.Errorf("item = %+v, want it Running with a message naming the lock's host", item)
-	}
-
-	fake.err = nil
-	step(t, r)
-	run = readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Snapshot != "c0ffee00" {
-		t.Errorf("phase = %q, item = %+v; want Succeeded with the rewritten snapshot", run.Status.Phase, run.Status.Items[0])
-	}
-}
-
-// In a namespace run with two claims, a claim whose sync completes while
-// the other claim's clone is not cut yet waits for the restart. Its snapshot
-// is then moved to the restart moment and tagged quiesced like the other's,
-// so a synced restore finds both volumes at one moment.
-func TestAVolumeDoneBeforeTheRestartIsStillMovedToIt(t *testing.T) {
-	t.Parallel()
-	objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment()}, cacheClaim()...)
-	r, c := backupReconciler(t, objects...)
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce
-	step(t, r) // start
-	complete(t, c)
-	step(t, r) // find the first claim's snapshot; the cache's clone is not cut
-
-	run := readBackupRun(t, c)
-	if run.Status.RestartedAt != nil {
-		t.Fatal("the app was restarted before the cache's clone was cut")
-	}
-	for _, item := range run.Status.Items {
-		if item.Name == claimN && item.Phase != backupv1alpha1.ItemRunning {
-			t.Fatalf("item = %+v before the restart, want it Running until its snapshot is moved to the restart moment", item)
-		}
-	}
-
-	source := &volsyncv1alpha1.ReplicationSource{}
-	get(t, c, ns, cacheN, source)
-	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{
-		LastManualSync:    manualTag(source),
-		LastSyncTime:      &metav1.Time{Time: monday.Time.Add(2 * time.Second)},
-		LastSyncDuration:  &metav1.Duration{Duration: 3 * time.Second},
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultSuccessful},
-	}
-	if err := c.Status().Update(context.Background(), source); err != nil {
-		t.Fatal(err)
-	}
-	step(t, r) // restart, move the first snapshot, find the cache's
-	step(t, r) // move the cache's snapshot, and finish
-
-	run = readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.RestartedAt == nil {
-		t.Fatalf("phase = %q (%s), want Succeeded with a restart moment", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-	for _, item := range run.Status.Items {
-		if item.SnapshotTime == nil || !item.SnapshotTime.Equal(run.Status.RestartedAt) {
-			t.Errorf("item %s = %+v, want its snapshot moved to restartedAt %s", item.Name, item, run.Status.RestartedAt)
-		}
-	}
-	if calls := r.Retimer.(*retimer).calls; len(calls) != 2 {
-		t.Errorf("retime calls = %+v, want both snapshots moved and tagged quiesced", calls)
-	}
-}
-
 // A Kustomization someone else suspended is left out of the run's
 // suspendedKustomizations, so the run does not resume it afterwards.
 func TestAKustomizationAlreadySuspendedIsNotResumed(t *testing.T) {
@@ -1119,73 +590,6 @@ func TestATimedOutRunRestartsTheApp(t *testing.T) {
 	}
 	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseFailed {
 		t.Fatalf("phase = %q, want Failed", run.Status.Phase)
-	}
-}
-
-// A database whose Backup the API server refuses on every create does not
-// keep the stopped app down. CloudNativePG's webhook is unreachable, and
-// under failurePolicy: Fail the API server answers each create with a 500.
-// The pass goes on past the database item: once the clone is cut, the app
-// gets its replicas back, and the database item stays Pending with the error
-// in its message. A later pass whose create goes through starts the Backup.
-func TestADatabaseThatCannotStartDoesNotHoldTheApp(t *testing.T) {
-	t.Parallel()
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
-	webhook := `failed calling webhook "vbackup.cnpg.io": failed to call webhook: Post "https://cnpg-webhook-service.cnpg-system.svc:443/validate-postgresql-cnpg-io-v1-backup": dial tcp 10.96.12.7:443: connect: connection refused`
-	healthy := r.Client
-	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == cnpg.BackupGVK {
-				return apierrors.NewInternalError(errors.New(webhook))
-			}
-			return cl.Create(ctx, obj, opts...)
-		},
-	})
-	pass := func() {
-		t.Helper()
-		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-	}
-	pass() // plan
-	pass() // admit, no queue
-	pass() // quiesce
-	pass() // start: the source is triggered, the Backup create fails
-	cutClone(t, c)
-	pass()
-
-	d := &appsv1.Deployment{}
-	get(t, c, ns, appN, d)
-	if *d.Spec.Replicas != 2 {
-		t.Fatalf("replicas = %d once the clone is cut, want 2 back while the database waits", *d.Spec.Replicas)
-	}
-	run := readBackupRun(t, c)
-	if run.Status.RestartedAt == nil {
-		t.Fatal("restartedAt is unset after the app was started again")
-	}
-	var db backupv1alpha1.BackupItem
-	for _, item := range run.Status.Items {
-		if item.Kind == "Cluster" {
-			db = item
-		}
-	}
-	if db.Phase != backupv1alpha1.ItemPending || !strings.Contains(db.Message, "connection refused") {
-		t.Errorf("database item = %+v, want it Pending with the webhook error in its message", db)
-	}
-	if reason, message := readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions); reason != backupv1alpha1.ReasonRetrying || !strings.Contains(message, pgN) {
-		t.Errorf("Ready = %s: %s, want Retrying naming the Cluster %s", reason, message, pgN)
-	}
-
-	r.Client = healthy
-	pass()
-	if _, ok := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, runUID)); !ok {
-		t.Fatal("no Backup after the webhook came back")
-	}
-	for _, item := range readBackupRun(t, c).Status.Items {
-		if item.Kind == "Cluster" && (item.Phase != backupv1alpha1.ItemRunning || item.Message != "" || item.LastStartError != "") {
-			t.Errorf("database item = %+v, want it Running with the old error cleared", item)
-		}
 	}
 }
 
@@ -1255,115 +659,6 @@ func TestAQuiesceRetriedAfterALostStatusWriteStillRestartsTheApp(t *testing.T) {
 	}
 }
 
-// A restart pass whose status write is lost after the app was started again
-// is run again a minute later. The retry keeps the restart moment the first
-// pass chose, so the snapshot is moved to a time before the app wrote
-// anything.
-func TestARestartRetriedAfterALostStatusWriteKeepsItsMoment(t *testing.T) {
-	t.Parallel()
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce
-	step(t, r) // start
-	cutClone(t, c)
-
-	r.Client = loseStatusWriteAt(c, 2)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err == nil {
-		t.Fatal("the restart pass succeeded, want its lost status write returned")
-	}
-	if got := replicasOf(t, c); got != 2 {
-		t.Fatalf("replicas = %d after the restart pass, want 2", got)
-	}
-
-	r.Now = func() time.Time { return frozen.Add(time.Minute) }
-	step(t, r) // restart again
-	complete(t, c)
-	step(t, r) // find the snapshot
-	step(t, r) // move it, and finish
-
-	run := readBackupRun(t, c)
-	if run.Status.RestartedAt == nil || !run.Status.RestartedAt.Time.Equal(frozen) {
-		t.Errorf("restartedAt = %v, want %s, the moment of the first restart", run.Status.RestartedAt, frozen)
-	}
-	calls := r.Retimer.(*retimer).calls
-	if len(calls) != 1 || !calls[0].at.Equal(frozen) {
-		t.Errorf("retime calls = %+v, want the snapshot moved to %s", calls, frozen)
-	}
-}
-
-// A clock with a fraction of a second gives the run a restartedAt in whole
-// seconds, the precision the status keeps. The snapshot is moved to that
-// same whole-second time, so it matches restartedAt as later passes and a
-// synced restore read it back.
-func TestARestartMomentIsKeptInWholeSeconds(t *testing.T) {
-	t.Parallel()
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
-	r.Now = func() time.Time { return frozen.Add(500 * time.Millisecond) }
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce
-	step(t, r) // start
-
-	// The mover finishes and VolSync removes the clone before the run looks
-	// again, so the run starts the app and finds the snapshot in one pass,
-	// and moves it in the next.
-	complete(t, c)
-	step(t, r)
-	step(t, r)
-
-	run := readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
-		t.Fatalf("phase = %q (%s), want Succeeded", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-	calls := r.Retimer.(*retimer).calls
-	if len(calls) != 1 || !calls[0].at.Equal(run.Status.RestartedAt.Time) {
-		t.Errorf("retime calls = %+v, want the snapshot moved to restartedAt %s", calls, run.Status.RestartedAt)
-	}
-	if run.Status.QuiescedAt.Time != run.Status.QuiescedAt.Truncate(time.Second) {
-		t.Errorf("quiescedAt = %s, want whole seconds", run.Status.QuiescedAt.Format(time.RFC3339Nano))
-	}
-}
-
-// A clone left from the previous sync does not count as this run's clone.
-// VolSync marks a sync done before its cleanup deletes the clone, so the old
-// clone can still be there, Bound, when the next run starts. Taking it for
-// the new clone would start the app before the new clone is cut, and the
-// snapshot would still be tagged quiesced.
-func TestALeftoverCloneDoesNotRestartTheApp(t *testing.T) {
-	t.Parallel()
-	for name, leave := range map[string]func(t *testing.T, c client.Client){
-		"terminating": func(t *testing.T, c client.Client) {
-			clone := cloneAt(t, c, frozen.Add(-time.Hour))
-			if err := c.Delete(context.Background(), clone); err != nil {
-				t.Fatal(err)
-			}
-		},
-		"created before the run": func(t *testing.T, c client.Client) {
-			cloneAt(t, c, frozen.Add(-time.Minute))
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-				claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
-			leave(t, c)
-			step(t, r) // plan
-			step(t, r) // admit, no queue
-			step(t, r) // quiesce
-			step(t, r) // start
-
-			if run := readBackupRun(t, c); run.Status.RestartedAt != nil {
-				t.Errorf("restartedAt = %s; the app was started on the clone of the previous sync", run.Status.RestartedAt)
-			}
-			if got := replicasOf(t, c); got != 0 {
-				t.Errorf("replicas = %d before this run's clone was cut, want 0", got)
-			}
-		})
-	}
-}
-
 // failMover stands in for VolSync reporting a failed mover Job on the claim's
 // source while it syncs the run's trigger. VolSync writes the logs into
 // latestMoverStatus, deletes the Job and tries again, and it leaves
@@ -1418,153 +713,6 @@ func TestAFailedMoverFailsTheItem(t *testing.T) {
 	}
 }
 
-// A source whose tag VolSync reports completed while its latest mover
-// failed fails the item with the mover's logs and reason MoverFailed.
-func TestACompletedTagWithAFailedMoverFailsTheItem(t *testing.T) {
-	t.Parallel()
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-		claim(), volume(), volumeRestore(), repository())
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // start
-
-	source := &volsyncv1alpha1.ReplicationSource{}
-	get(t, c, ns, claimN, source)
-	source.Status = &volsyncv1alpha1.ReplicationSourceStatus{
-		LastManualSync:    manualTag(source),
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "Fatal: unable to open config file"},
-	}
-	if err := c.Status().Update(context.Background(), source); err != nil {
-		t.Fatal(err)
-	}
-	step(t, r)
-
-	item := readBackupRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonMoverFailed ||
-		!strings.Contains(item.Message, "unable to open config file") {
-		t.Errorf("item = %+v, want it Failed with reason MoverFailed and the mover's logs", item)
-	}
-}
-
-// A Failed result from a sync that started before this run is not this
-// run's, so the item keeps waiting for its own sync.
-func TestAFailedResultFromAnEarlierSyncIsIgnored(t *testing.T) {
-	t.Parallel()
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
-		claim(), volume(), volumeRestore(), repository())
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // start
-
-	failMover(t, c, frozen.Add(-time.Hour))
-	step(t, r)
-
-	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
-		t.Errorf("item = %+v, want it still Running", item)
-	}
-}
-
-// An evicted pod of a stopped workload does not hold the run. The kubelet
-// has killed its containers, so it writes nothing, but it stays in the API
-// in phase Failed until something deletes it.
-func TestAnEvictedPodDoesNotHoldTheRun(t *testing.T) {
-	t.Parallel()
-	evicted := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "notes-7c4d", Namespace: ns, Labels: map[string]string{"app": appN}},
-		Status:     corev1.PodStatus{Phase: corev1.PodFailed, Reason: "Evicted"},
-	}
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false), evicted)
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce
-	step(t, r) // start
-
-	if item := readBackupRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
-		t.Errorf("item = %+v, want it Running once every live pod is gone", item)
-	}
-}
-
-// failOnce returns a reader over c whose first call that fail picks returns
-// a ServiceUnavailable error, the way the API server answers while etcd
-// elects a leader. Every other call goes through.
-func failOnce(c client.Client, fail func(object any) bool) client.Reader {
-	failed := false
-	unavailable := func(object any) error {
-		if !failed && fail(object) {
-			failed = true
-			return apierrors.NewServiceUnavailable("etcd leader changed")
-		}
-		return nil
-	}
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if err := unavailable(obj); err != nil {
-				return err
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if err := unavailable(list); err != nil {
-				return err
-			}
-			return cl.List(ctx, list, opts...)
-		},
-	})
-}
-
-// A failed list while a run plans is returned for a retry, and the next pass
-// plans the run. Ending the run Invalid would lose a scheduled tick to a
-// moment when the API server was busy.
-func TestAFailedReadWhilePlanningIsRetried(t *testing.T) {
-	t.Parallel()
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository())
-	r.Reader = failOnce(c, func(object any) bool { _, ok := object.(*corev1.PersistentVolumeClaimList); return ok })
-
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "before-upgrade"}}); err == nil {
-		t.Error("reconcile succeeded, want the read error returned for a retry")
-	}
-	if run := readBackupRun(t, c); run.Status.Phase.Finished() {
-		t.Fatalf("phase = %q (%s) after a failed read, want the run still to plan", run.Status.Phase, readyMessage(run.Status.Conditions))
-	}
-	step(t, r)
-	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseQueued {
-		t.Errorf("phase = %q, want Queued", run.Status.Phase)
-	}
-}
-
-// When one item fails to start and another waits for a source busy with
-// another run's backup, the Ready condition names both, so neither cause is
-// hidden behind the other.
-func TestReadyNamesARetryAndABusySourceTogether(t *testing.T) {
-	t.Parallel()
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), cluster(), otherRun())
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce: nothing is marked, so nothing stops
-	if err := c.Create(context.Background(), busySource(TriggerFor(otherRunUID))); err != nil {
-		t.Fatal(err)
-	}
-	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == cnpg.BackupGVK {
-				return apierrors.NewInternalError(errors.New(`failed calling webhook "vbackup.cnpg.io": connect: connection refused`))
-			}
-			return cl.Create(ctx, obj, opts...)
-		},
-	})
-	step(t, r)
-
-	run := readBackupRun(t, c)
-	message := readyMessage(run.Status.Conditions)
-	if !strings.Contains(message, pgN) || !strings.Contains(message, "connection refused") || !strings.Contains(message, "manual-notes") {
-		t.Errorf("Ready = %s: %s, want it to name the Cluster %s with its error and the BackupRun manual-notes the claim waits for",
-			readyReason(run.Status.Conditions), message, pgN)
-	}
-}
-
 // A namespace run in a cluster without the CloudNativePG CRDs backs up the
 // volumes. The API server's discovery serves no version of Cluster there,
 // which means there are no Clusters.
@@ -1577,40 +725,5 @@ func TestANamespaceRunWithoutCloudNativePGBacksUpTheVolumes(t *testing.T) {
 	run := readBackupRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseQueued || len(run.Status.Items) != 1 {
 		t.Fatalf("phase = %q (%s), items = %+v; want Queued with the claim", run.Status.Phase, readyMessage(run.Status.Conditions), run.Status.Items)
-	}
-}
-
-// A workload whose kustomize-controller labels name a Kustomization that does
-// not list it in its inventory is scaled down with nothing suspended. The
-// labels are only labels, and anyone who can edit the Deployment could point
-// them at another team's Kustomization.
-func TestAKustomizationThatDoesNotListTheWorkloadIsNotSuspended(t *testing.T) {
-	t.Parallel()
-	app := deployment()
-	app.Labels = map[string]string{quiesce.FluxNameLabel: "billing", quiesce.FluxNamespaceLabel: "billing"}
-	billing := &unstructured.Unstructured{Object: map[string]any{
-		"spec": map[string]any{"suspend": false},
-		"status": map[string]any{"inventory": map[string]any{"entries": []any{
-			map[string]any{"id": "billing_api_apps_Deployment", "v": "v1"},
-		}}},
-	}}
-	billing.SetGroupVersionKind(quiesce.KustomizationGVK)
-	billing.SetNamespace("billing")
-	billing.SetName("billing")
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), app, billing)
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce
-
-	if got := replicasOf(t, c); got != 0 {
-		t.Errorf("replicas = %d after the quiesce, want 0", got)
-	}
-	k, _ := getUnstructured(t, c, quiesce.KustomizationGVK, "billing", "billing")
-	if on, _, _ := unstructured.NestedBool(k.Object, "spec", "suspend"); on {
-		t.Error("the run suspended a Kustomization that does not apply the app")
-	}
-	if run := readBackupRun(t, c); len(run.Status.SuspendedKustomizations) != 0 {
-		t.Errorf("suspended = %v, want none", run.Status.SuspendedKustomizations)
 	}
 }

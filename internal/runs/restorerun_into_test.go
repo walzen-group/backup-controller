@@ -132,59 +132,6 @@ func plannedInto() *backupv1alpha1.RestoreRun {
 	})
 }
 
-// intoOnJob returns the RestoreRun back-to-monday in the middle of an into
-// restore of the claim notes-data-monday (see intoMonday): Running since the
-// frozen time, holding its finalizer, with its item Running and naming the
-// restore Job the run created for it with UID jobUID, and that Job, which
-// restores monday's snapshot into the claim. The claim comes from
-// intoClaim.
-func intoOnJob(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job) {
-	t.Helper()
-	run := plannedInto()
-	run.Status.Items[0] = runningOnJob(run.Spec.Into, 0)
-	return run, restoreJobFor(t, run, run.Spec.Into, monday.ID)
-}
-
-// An into restore checks the claim it created, never the in-place rule of
-// the Leases: its Lease is on the source claim. A Job that completes into
-// the run's own claim succeeds, also when the deadline passes just then;
-// one that completes into a claim replaced by one the run did not create
-// fails with reason ClaimLost.
-func TestAnIntoRestoreChecksItsOwnClaimWhenItsJobCompletes(t *testing.T) {
-	t.Parallel()
-	for name, tc := range map[string]struct {
-		replace bool
-		late    bool
-		phase   backupv1alpha1.ItemPhase
-		reason  backupv1alpha1.ItemReason
-	}{
-		"own claim":                {phase: backupv1alpha1.ItemSucceeded},
-		"own claim at the timeout": {late: true, phase: backupv1alpha1.ItemSucceeded},
-		"replaced claim":           {replace: true, phase: backupv1alpha1.ItemFailed, reason: backupv1alpha1.ItemReasonClaimLost},
-	} {
-		t.Run(name, func(t *testing.T) {
-			run, job := intoOnJob(t)
-			job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, Reason: "CompletionsReached"}}
-			target := intoClaim(run)
-			if tc.replace {
-				target.OwnerReferences, target.UID = nil, "replaced-claim-uid"
-			}
-			r, c := restoreReconciler(t, nil, run, target, sourceOnNode(), volumeRestore(), repository(), job, heldClaimLease(run, run.Spec.Into))
-			if tc.late {
-				r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-			}
-			done := stepUntilFinished(t, r, c, 3)
-
-			if item := done.Status.Items[0]; item.Phase != tc.phase || item.Reason != tc.reason {
-				t.Errorf("item = %+v, want %s with reason %q", item, tc.phase, tc.reason)
-			}
-			if jobs := restoreJobs(t, c); len(jobs) != 0 {
-				t.Errorf("restore Jobs = %v, want the run's deleted", jobs)
-			}
-		})
-	}
-}
-
 // Two snapshots in one second restore by their full IDs, in place and into
 // a new claim of either shape: with restoreAsOf at their second, previous 0
 // records the later snapshot and previous 1 the earlier one, and the

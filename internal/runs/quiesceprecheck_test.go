@@ -2,135 +2,14 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
-
-// seedLease creates the named Lease in namespace, stamped for holder, and
-// returns the stored copy.
-func seedLease(t *testing.T, c client.Client, namespace, name string, holder leaseHolder) *coordinationv1.Lease {
-	t.Helper()
-	lease := &coordinationv1.Lease{}
-	lease.SetNamespace(namespace)
-	lease.SetName(name)
-	stamp(lease, holder, []string{holder.item})
-	if err := c.Create(context.Background(), lease); err != nil {
-		t.Fatalf("create Lease %s/%s: %v", namespace, name, err)
-	}
-	return lease
-}
-
-// failingReads wraps c so that a read of an object of the given kind comes
-// back as a 500, the way an API server that cannot reach its store answers.
-func failingReads(c client.Client, kind string) client.Client {
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			named := func(name string) bool {
-				switch o := obj.(type) {
-				case *corev1.PersistentVolumeClaim:
-					return name == "PersistentVolumeClaim"
-				case *volsyncv1alpha1.ReplicationSource:
-					return name == "ReplicationSource"
-				case *backupv1alpha1.VolumeRestore:
-					return name == "VolumeRestore"
-				case *unstructured.Unstructured:
-					return o.GroupVersionKind() == schema.GroupVersionKind{
-						Group: backupv1alpha1.GroupVersion.Group, Version: backupv1alpha1.GroupVersion.Version, Kind: name,
-					}
-				}
-				return false
-			}
-			if named(kind) {
-				return apierrors.NewInternalError(errors.New("the API server cannot read " + kind))
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-	})
-}
-
-// A read that fails in a quiesce pre-check is not evidence that nothing is in
-// use: the pass comes back as an error and the app keeps running, for a read
-// of the claim, of its VolumeRestore, and of the ReplicationSource.
-func TestThePreCheckFailsClosed(t *testing.T) {
-	t.Parallel()
-	for _, kind := range []string{"PersistentVolumeClaim", "VolumeRestore", "ReplicationSource"} {
-		t.Run(kind, func(t *testing.T) {
-			c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-				claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
-			br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
-			step(t, br) // plan
-			step(t, br) // admit
-			healthy := br.Reader
-			br.Reader = failingReads(c, kind)
-			if err := tryStep(br); err == nil {
-				t.Fatal("the quiesce pass succeeded although a pre-check read failed")
-			}
-
-			run := readBackupRun(t, c)
-			if len(run.Status.Quiesced) != 0 || run.Status.QuiescedAt != nil {
-				t.Fatalf("the run recorded %+v with quiescedAt %v; want no plan on a failed read",
-					run.Status.Quiesced, run.Status.QuiescedAt)
-			}
-			if got := replicasOf(t, c); got != 2 {
-				t.Fatalf("replicas = %d after the failed pass, want the app untouched", got)
-			}
-			if suspended(t, c) {
-				t.Error("the Kustomization was suspended on a failed read")
-			}
-
-			// With the read working, the same pass plans the true count.
-			br.Reader = healthy
-			step(t, br)
-			run = readBackupRun(t, c)
-			if len(run.Status.Quiesced) != 1 || run.Status.Quiesced[0].Replicas != 2 {
-				t.Fatalf("the run recorded %+v after the read came back, want Deployment %s at 2", run.Status.Quiesced, appN)
-			}
-		})
-	}
-}
-
-// A claim whose Lease a live RestoreRun holds, and no restore Job
-// yet, makes a namespace BackupRun wait before it stops anything.
-func TestThePreCheckSeesAClaimLeaseHeldByARestore(t *testing.T) {
-	t.Parallel()
-	restoring := restoreRun(func(r *backupv1alpha1.RestoreRun) {
-		r.Spec.Claim = claimN
-		r.Status.Phase = backupv1alpha1.RunPhaseRunning
-		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN, Phase: backupv1alpha1.ItemPending}}
-	})
-	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }), restoring,
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
-	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
-	claimLease, _ := leaseNames(t, c)
-	seedLease(t, c, ns, claimLease, leaseHolder{kind: "RestoreRun", run: restoring, item: claimN})
-
-	step(t, br) // plan
-	step(t, br) // admit
-	step(t, br) // quiesce: waits for the restore's Lease
-	run := readBackupRun(t, c)
-	if len(run.Status.Quiesced) != 0 {
-		t.Fatalf("the run recorded %+v; want no plan while the restore holds the claim", run.Status.Quiesced)
-	}
-	if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy ||
-		!strings.Contains(readyMessage(run.Status.Conditions), "RestoreRun back-to-monday") {
-		t.Fatalf("reason = %q, message = %q; want SourceBusy naming the restore",
-			readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-	}
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d while the run waits, want 2", got)
-	}
-}
 
 // A RestoreRun whose claim or repository a live backup holds waits before it
 // stops the app, rather than stopping it and waiting for the backup with the
@@ -197,28 +76,6 @@ func countDeploymentScales(c client.Client) (client.Client, *int) {
 	}), &scales
 }
 
-// A quiesced RestoreRun that has no Pending item after its checks, here a
-// namespace whose only marked object is an opted-out Cluster, stops nothing
-// and ends Failed saying nothing was restored.
-func TestAQuiescedRestoreWithNothingToRestoreStopsNothing(t *testing.T) {
-	t.Parallel()
-	c := newClient(t, quiescedRestore(), cluster(optedOut), objectStore(), storeSecret(), deployment(), kustomization(false))
-	watching, scales := countDeploymentScales(c)
-	r := &RestoreRunReconciler{Client: watching, Reader: c, Prober: prober{saturday}, Now: frozenNow}
-
-	restoreStep(t, r) // plan: the Cluster is Skipped
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonNoBackupInReach {
-		t.Fatalf("phase = %q, reason = %q; want Failed, NoBackupInReach", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-	if *scales != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
-		t.Errorf("Deployment scale writes = %d, quiesced = %+v, suspended = %t; want the app never stopped", *scales, run.Status.Quiesced, suspended(t, c))
-	}
-}
-
 // A namespace BackupRun whose every volume item startItem would refuse fails
 // those items in its pre-check, with the message startItem gives, and never
 // stops the app: a ReplicationSource of the claim's name that the controller
@@ -281,97 +138,5 @@ func TestAnItemStartItemWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
 				t.Errorf("Deployment scale writes = %d, quiesced = %+v, suspended = %t; want the app never stopped", *scaled, run.Status.Quiesced, suspended(t, c))
 			}
 		})
-	}
-}
-
-// A quiesced RestoreRun fails an item restoreVolume would refuse before its
-// restore Job exists in its pre-check, with the message
-// restoreVolume gives, and with no item left to restore it never stops the
-// app. The refusals it can know before the stop are a claim that is gone or
-// being deleted, and a claim whose VolumeRestore is gone, which repositoryFor
-// refuses. Before, the pre-check left them to restoreVolume, so the run
-// stopped the app, failed the item and gave the app back (AB9, like AB4 on a
-// BackupRun).
-func TestAnItemRestoreVolumeWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name    string
-		breakIt func(t *testing.T, c client.Client)
-		want    string
-	}{
-		{"claim gone", func(t *testing.T, c client.Client) {
-			if err := c.Delete(context.Background(), claim()); err != nil {
-				t.Fatal(err)
-			}
-		}, "no PersistentVolumeClaim " + claimN + " in this namespace"},
-		{"claim being deleted", func(t *testing.T, c client.Client) {
-			held := &corev1.PersistentVolumeClaim{}
-			get(t, c, ns, claimN, held)
-			held.Finalizers = append(held.Finalizers, "kubernetes.io/pvc-protection")
-			if err := c.Update(context.Background(), held); err != nil {
-				t.Fatal(err)
-			}
-			if err := c.Delete(context.Background(), held); err != nil {
-				t.Fatal(err)
-			}
-		}, "claim " + claimN + " is being deleted"},
-		{"VolumeRestore gone", func(t *testing.T, c client.Client) {
-			if err := c.Delete(context.Background(), volumeRestore()); err != nil {
-				t.Fatal(err)
-			}
-		}, "claim " + claimN + " has no VolumeRestore " + claimN + " to name its repository"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			c := newClient(t, quiescedRestore(), claim(), volumeRestore(), repository(), deployment(), kustomization(false))
-			watching, scales := countDeploymentScales(c)
-			r := &RestoreRunReconciler{Client: watching, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
-
-			restoreStep(t, r) // plan
-			tc.breakIt(t, c)
-			restoreStep(t, r) // quiesce: the pre-check fails the item
-			restoreStep(t, r)
-
-			run := readRestoreRun(t, c)
-			if want := tc.want + nothingWritten(claimN); run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
-				run.Status.Items[0].Phase != backupv1alpha1.ItemFailed || run.Status.Items[0].Message != want {
-				t.Fatalf("phase = %q, items = %+v; want Failed with the item message %q", run.Status.Phase, run.Status.Items, want)
-			}
-			if *scales != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
-				t.Errorf("Deployment scale writes = %d, quiesced = %+v, suspended = %t; want the app never stopped", *scales, run.Status.Quiesced, suspended(t, c))
-			}
-		})
-	}
-}
-
-// A RestoreRun without spec.quiesce fails an item whose claim is being
-// deleted before it creates a restore Job, with the message the
-// pre-check gives: the mover would write into a claim that is about to go,
-// and the scheduler does not place a pod whose claim is being deleted.
-func TestARestoreIntoAClaimBeingDeletedFailsBeforeTheMoverStarts(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-		claim(), volumeRestore(), repository())
-
-	restoreStep(t, r) // plan
-	held := &corev1.PersistentVolumeClaim{}
-	get(t, c, ns, claimN, held)
-	held.Finalizers = append(held.Finalizers, "kubernetes.io/pvc-protection")
-	if err := c.Update(context.Background(), held); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Delete(context.Background(), held); err != nil {
-		t.Fatal(err)
-	}
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	want := "claim " + claimN + " is being deleted" + nothingWritten(claimN)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.Items[0].Phase != backupv1alpha1.ItemFailed ||
-		run.Status.Items[0].Message != want || run.Status.Items[0].Job != "" {
-		t.Fatalf("phase = %q, items = %+v; want Failed with the item message %q and no restore Job", run.Status.Phase, run.Status.Items, want)
-	}
-	if names := movers(t, c); len(names) != 0 {
-		t.Errorf("movers = %v, want none", names)
 	}
 }

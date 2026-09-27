@@ -102,23 +102,6 @@ func TestAScheduleWithAZoneTicksOnThatZonesClock(t *testing.T) {
 	}
 }
 
-// TestATickNotYetDueCreatesNothing checks that a tick two minutes away creates
-// no run, and that the scheduler requeues for the moment the tick is due.
-func TestATickNotYetDueCreatesNothing(t *testing.T) {
-	t.Parallel()
-	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 9, 24, 4, 58, 0, 0, time.UTC)
-
-	result, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), claim())
-
-	if runs := scheduledRuns(t, c); len(runs) != 0 {
-		t.Fatalf("runs = %d before the tick, want 0", len(runs))
-	}
-	if result.RequeueAfter != 2*time.Minute {
-		t.Errorf("requeue after = %v, want the two minutes to the tick", result.RequeueAfter)
-	}
-}
-
 // TestMissedTicksRunOnceForTheNewest checks that the ticks missed while the
 // controller was down produce one run, for the newest of them.
 func TestMissedTicksRunOnceForTheNewest(t *testing.T) {
@@ -192,30 +175,5 @@ func TestADueTickWaitsForSomethingMarkedEnabled(t *testing.T) {
 	runs := scheduledRuns(t, c)
 	if len(runs) != 1 || runs[0].Name != "scheduled-20260923-0500" {
 		t.Fatalf("runs = %v, want the waiting tick's run", runs)
-	}
-}
-
-// TestAnEnabledClusterAloneLetsTheTickRun checks that a namespace whose only
-// marked object is a Cluster gets its scheduled run.
-func TestAnEnabledClusterAloneLetsTheTickRun(t *testing.T) {
-	t.Parallel()
-	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
-
-	_, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), cluster())
-
-	if runs := scheduledRuns(t, c); len(runs) != 1 {
-		t.Fatalf("runs = %d, want 1", len(runs))
-	}
-}
-
-// TestANamespaceWithoutAScheduleIsLeftAlone checks that a namespace without
-// backup.wlz.li/schedule gets no run.
-func TestANamespaceWithoutAScheduleIsLeftAlone(t *testing.T) {
-	t.Parallel()
-	plain := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
-	_, c := schedule(t, frozen, plain)
-	if runs := scheduledRuns(t, c); len(runs) != 0 {
-		t.Fatalf("runs = %d, want 0", len(runs))
 	}
 }

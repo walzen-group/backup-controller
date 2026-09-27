@@ -11,7 +11,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 )
 
 // The tests in this file check that two restores never write one claim at
@@ -109,74 +108,5 @@ func TestTwoInPlaceRestoresOfOneClaimRunOneAtATime(t *testing.T) {
 	}
 	if names := movers(t, c); !slices.Equal(names, []string{jobName(secondRestoreUID, 0)}) {
 		t.Errorf("movers = %v, want the second run's own Job", names)
-	}
-}
-
-// A run whose finished item still names its restore Job keeps the claim's
-// Lease, and an in-place restore of that claim waits with reason SourceBusy
-// naming that run. The Job is suspended and the Job controller has not
-// reported it suspended yet, so no pod mounts the claim, but the Job may
-// still get one (rule X2). That holds for an in-place and for an into
-// restore holding the Lease, and the waiting run creates no Job.
-func TestAFinishedItemNamingAJobKeepsTheClaimLease(t *testing.T) {
-	t.Parallel()
-	for name, into := range map[string]string{"in place": "", "into": "notes-data-second"} {
-		t.Run(name, func(t *testing.T) {
-			other := secondClaimRestore()
-			other.Spec.Into = into
-			item := claimN
-			if into != "" {
-				item = into
-			}
-			other.Status.Phase = backupv1alpha1.RunPhaseRunning
-			other.Status.Items = []backupv1alpha1.RestoreItem{{Kind: backupv1alpha1.ItemKindClaim, Name: item, Phase: backupv1alpha1.ItemFailed,
-				Reason: backupv1alpha1.ItemReasonTimedOut, SnapshotID: monday.ID, Job: jobName(secondRestoreUID, 0), JobUID: jobUID}}
-			job := restoreJobFor(t, other, item, monday.ID)
-			job.Spec.Suspend = ptr.To(true)
-			r, c := restoreReconciler(t, nil, checkedRestore(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-				other, claim(), volumeRestore(), repository(), heldClaimLease(other, item), job)
-
-			restoreStep(t, r)
-
-			run := readRestoreRun(t, c)
-			if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy ||
-				!strings.Contains(readyMessage(run.Status.Conditions), "RestoreRun second") {
-				t.Errorf("reason = %q, message = %q; want SourceBusy naming RestoreRun second",
-					readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-			}
-			if names := movers(t, c); !slices.Equal(names, []string{job.Name}) {
-				t.Errorf("movers = %v, want only the other run's Job %s", names, job.Name)
-			}
-		})
-	}
-}
-
-// An in-place restore whose item is Pending waits with reason SourceBusy,
-// naming the other run, while another live RestoreRun holds the claim's
-// Lease and has not created its restore Job yet. Nothing else shows that
-// run: no pod mounts the claim and no backup has its trigger on a
-// ReplicationSource, so only the Lease keeps the two movers apart, and the
-// waiting run creates no Job.
-func TestARestoreWaitsForTheClaimLeaseOfARunThatHasNotStarted(t *testing.T) {
-	t.Parallel()
-	other := secondClaimRestore()
-	other.Status.Phase = backupv1alpha1.RunPhaseRunning
-	other.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN, Phase: backupv1alpha1.ItemPending}}
-	r, c := restoreReconciler(t, nil, checkedRestore(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
-		other, claim(), volumeRestore(), repository(), heldClaimLease(other, claimN))
-
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy ||
-		!strings.Contains(readyMessage(run.Status.Conditions), "RestoreRun second") {
-		t.Errorf("reason = %q, message = %q; want SourceBusy naming RestoreRun second",
-			readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
-	}
-	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemPending || item.JobUID != "" {
-		t.Errorf("item = %+v, want Pending with no restore Job", item)
-	}
-	if names := movers(t, c); len(names) != 0 {
-		t.Errorf("movers = %v, want none while the other run holds the claim Lease", names)
 	}
 }

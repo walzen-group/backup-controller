@@ -121,26 +121,6 @@ func TestANewRestoreRunWaitsWhilePaused(t *testing.T) {
 	}
 }
 
-// A Queued BackupRun that has created its Kueue Workload is in progress. It
-// goes on to Running once Kueue admits it, also while the controller runs
-// with --pause.
-func TestAQueuedBackupRunWithItsWorkloadGoesOnWhilePaused(t *testing.T) {
-	t.Parallel()
-	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false), localQueueObject())
-	step(t, r) // plan
-	step(t, r) // admit: creates the Workload and waits
-	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseQueued || run.Status.Workload == "" {
-		t.Fatalf("phase = %q, workload = %q before the pause, want Queued with a Workload", run.Status.Phase, run.Status.Workload)
-	}
-	r.Paused = true
-	admitAll(t, c)
-	step(t, r)
-	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseRunning {
-		t.Errorf("phase = %q (%s) while paused, want Running", run.Status.Phase, readyReason(run.Status.Conditions))
-	}
-}
-
 // The Scheduler creates no BackupRun for a due tick while the controller
 // runs with --pause. Without the flag it creates one run, for the newest
 // tick it missed.

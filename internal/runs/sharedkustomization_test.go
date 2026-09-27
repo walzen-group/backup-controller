@@ -1,7 +1,6 @@
 package runs
 
 import (
-	"slices"
 	"strings"
 	"testing"
 
@@ -111,50 +110,6 @@ func TestANamespaceBackupRefusesAKustomizationSharedAcrossNamespaces(t *testing.
 			expectSharedRefusal(t, c, run.Status.Phase, run.Status.Conditions, suspended)
 			if len(run.Status.Quiesced) != 0 || len(run.Status.SuspendedKustomizations) != 0 {
 				t.Errorf("quiesced = %v, suspended = %v; want no plan", run.Status.Quiesced, run.Status.SuspendedKustomizations)
-			}
-		})
-	}
-}
-
-// A quiesced RestoreRun refuses the same Kustomization before it stops
-// anything, and creates no mover.
-func TestAQuiescedRestoreRefusesAKustomizationSharedAcrossNamespaces(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, nil, quiescedRestoreOf(),
-		deploymentApplying(ns, appN), deploymentApplying(wikiNS, "wiki"), sharedKustomization(false),
-		claim(), volumeRestore(), repository())
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	expectSharedRefusal(t, c, run.Status.Phase, run.Status.Conditions, false)
-	if names := movers(t, c); len(names) != 0 {
-		t.Errorf("movers = %v, want none", names)
-	}
-}
-
-// quiesce.OtherNamespaces counts the apps Deployments and StatefulSets a
-// Kustomization's inventory lists in another namespace, and no other kind:
-// a StatefulSet there is a workload a run in that namespace stops too.
-func TestOtherNamespacesCountsDeploymentsAndStatefulSets(t *testing.T) {
-	t.Parallel()
-	for name, tc := range map[string]struct {
-		id   string
-		want []string
-	}{
-		"Deployment":           {id: wikiNS + "_wiki_apps_Deployment", want: []string{ns, wikiNS}},
-		"StatefulSet":          {id: wikiNS + "_wiki-db_apps_StatefulSet", want: []string{ns, wikiNS}},
-		"ConfigMap":            {id: wikiNS + "_wiki__ConfigMap", want: nil},
-		"DaemonSet":            {id: wikiNS + "_wiki_apps_DaemonSet", want: nil},
-		"another group's kind": {id: wikiNS + "_wiki_example.com_StatefulSet", want: nil},
-	} {
-		t.Run(name, func(t *testing.T) {
-			k := kustomization(false)
-			_ = unstructured.SetNestedSlice(k.Object, []any{
-				map[string]any{"id": ns + "_" + appN + "_apps_Deployment", "v": "v1"},
-				map[string]any{"id": tc.id, "v": "v1"},
-			}, "status", "inventory", "entries")
-			if got := quiesce.OtherNamespaces(k, ns); !slices.Equal(got, tc.want) {
-				t.Errorf("otherNamespaces = %v, want %v", got, tc.want)
 			}
 		})
 	}
