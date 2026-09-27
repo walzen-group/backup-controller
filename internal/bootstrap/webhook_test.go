@@ -244,27 +244,11 @@ func elsewhere(t *testing.T, mutate func(map[string]any)) (*unstructured.Unstruc
 	return other, otherStore
 }
 
-// TestAHolderWithoutItsSecretStillCollides checks that a Cluster archiving to
-// the same prefix is found even when the Secret its ObjectStore names is
-// missing. Where a Cluster archives is written in its ObjectStore, and a
-// missing credential does not move it.
-func TestAHolderWithoutItsSecretStillCollides(t *testing.T) {
-	other, otherStore := elsewhere(t, nil)
-
-	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore)
-
-	if response.Allowed {
-		t.Fatal("a Cluster was admitted while another database archives to its prefix")
-	}
-	if !strings.Contains(response.Result.Message, "other/app-pg") {
-		t.Errorf("the refusal does not name the holder: %q", response.Result.Message)
-	}
-}
-
 // TestTheSamePrefixOnAnotherEndpointIsACollision checks that a Cluster is
 // refused when another Cluster uses the same bucket and prefix behind a
-// different endpointURL, and that the refusal tells the owner to give one of
-// the two its own prefix.
+// different endpointURL, with the bucket name in another letter case and no
+// Secret for the credentials its ObjectStore names, and that the refusal names
+// the holder and tells the owner to give one of the two its own prefix.
 //
 // No comparison of two endpoint names can prove they are different services:
 // an Ingress host and a Service name, an IP and a DNS name, or a CNAME can all
@@ -272,15 +256,16 @@ func TestAHolderWithoutItsSecretStillCollides(t *testing.T) {
 // the two databases' WAL interleave in one prefix, silently leaving every base
 // backup behind them unrecoverable. The check refuses instead, and an owner
 // with two genuinely separate services moves one of them to another prefix.
+// S3 and MinIO bucket names are lower case, so Backups and backups can only
+// name one bucket. Where a Cluster archives is written in its ObjectStore,
+// and a missing credential does not move it.
 func TestTheSamePrefixOnAnotherEndpointIsACollision(t *testing.T) {
 	other, otherStore := elsewhere(t, func(configuration map[string]any) {
 		configuration["endpointURL"] = "https://another-store.example"
+		configuration["destinationPath"] = "s3://Backups/app/"
 	})
 
-	otherSecret := secret()
-	otherSecret.Namespace = "other"
-
-	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore, otherSecret)
+	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore)
 
 	if response.Allowed {
 		t.Fatal("a Cluster was admitted while another database archives to its bucket and prefix behind another endpointURL")
@@ -289,21 +274,6 @@ func TestTheSamePrefixOnAnotherEndpointIsACollision(t *testing.T) {
 		if !strings.Contains(response.Result.Message, want) {
 			t.Errorf("the refusal does not say %q: %q", want, response.Result.Message)
 		}
-	}
-}
-
-// TestABucketNameInAnotherCaseIsACollision checks that bucket names are
-// compared without letter case. S3 and MinIO bucket names are lower case, so
-// Backups and backups can only name one bucket.
-func TestABucketNameInAnotherCaseIsACollision(t *testing.T) {
-	other, otherStore := elsewhere(t, func(configuration map[string]any) {
-		configuration["destinationPath"] = "s3://Backups/app/"
-	})
-
-	response := decide(t, cluster(t, nil), stubProber{has: false}, other, otherStore)
-
-	if response.Allowed {
-		t.Fatal("a Cluster was admitted while another database archives to its prefix in a bucket spelled Backups")
 	}
 }
 
@@ -357,10 +327,26 @@ func TestAnEmptyStoreLeavesTheClusterOnInitdb(t *testing.T) {
 // TestAStoreWithABackupRecoversTheCluster checks the rewrite of a Cluster
 // whose store holds a base backup: initdb is gone, the recovery reads through
 // one externalClusters entry named RecoverySource with the Cluster's own name
-// as serverName, and SkipCheckAnnotation is "enabled". The store is the
-// recorded done-base store, read through the real S3Prober.
+// as serverName, SkipCheckAnnotation is "enabled", and initdb's database,
+// owner and secret are copied into the recovery. The store is the recorded
+// done-base store, read through the real S3Prober.
+//
+// CloudNativePG defaults a recovery's database and owner to "app". A Cluster
+// created with another database name would then come back with its data in
+// that database and an empty "app" beside it, and the <cluster>-app Secret the
+// workload reads would point at the empty one. Measured on the test cluster
+// with v0.3.2, which dropped these fields.
 func TestAStoreWithABackupRecoversTheCluster(t *testing.T) {
-	original := cluster(t, nil)
+	original := cluster(t, func(object map[string]any) {
+		spec, _ := object["spec"].(map[string]any)
+		spec["bootstrap"] = map[string]any{
+			"initdb": map[string]any{
+				"database": "canary",
+				"owner":    "canary",
+				"secret":   map[string]any{"name": "canary-credentials"},
+			},
+		}
+	})
 	response := decideOn(t, original, recordedS3(t, barmanstore.MustLoad(t, "done-base")))
 
 	if !response.Allowed {
@@ -395,42 +381,12 @@ func TestAStoreWithABackupRecoversTheCluster(t *testing.T) {
 	if annotations[SkipCheckAnnotation] != "enabled" {
 		t.Errorf("%s = %q, want enabled", SkipCheckAnnotation, annotations[SkipCheckAnnotation])
 	}
-}
 
-// TestTheDatabaseAndOwnerSurviveTheRewrite checks that initdb's database,
-// owner and secret are copied into the recovery.
-//
-// CloudNativePG defaults a recovery's database and owner to "app". A Cluster
-// created with another database name would then come back with its data in
-// that database and an empty "app" beside it, and the <cluster>-app Secret the
-// workload reads would point at the empty one. Measured on the test cluster
-// with v0.3.2, which dropped these fields.
-func TestTheDatabaseAndOwnerSurviveTheRewrite(t *testing.T) {
-	original := cluster(t, func(object map[string]any) {
-		spec, _ := object["spec"].(map[string]any)
-		spec["bootstrap"] = map[string]any{
-			"initdb": map[string]any{
-				"database": "canary",
-				"owner":    "canary",
-				"secret":   map[string]any{"name": "canary-credentials"},
-			},
+	for field, want := range map[string]string{"database": "canary", "owner": "canary", "secret.name": "canary-credentials"} {
+		got, _, _ := unstructured.NestedString(patched, append([]string{"spec", "bootstrap", "recovery"}, strings.Split(field, ".")...)...)
+		if got != want {
+			t.Errorf("recovery %s = %q, want %q", field, got, want)
 		}
-	})
-
-	response := decideOn(t, original, recordedS3(t, barmanstore.MustLoad(t, "done-base")))
-	patched := applied(t, original, response)
-
-	database, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "database")
-	if database != "canary" {
-		t.Errorf("recovery database = %q, want canary", database)
-	}
-	owner, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "owner")
-	if owner != "canary" {
-		t.Errorf("recovery owner = %q, want canary", owner)
-	}
-	secretName, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "secret", "name")
-	if secretName != "canary-credentials" {
-		t.Errorf("recovery secret = %q, want canary-credentials", secretName)
 	}
 }
 
