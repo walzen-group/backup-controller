@@ -57,6 +57,7 @@ const (
 	msgServiceAcct   = "a restore Job's pod runs as its namespace's default ServiceAccount"
 	msgNoHost        = "a restore Job's pod uses no host namespace, names no node, and claims no device"
 	msgVolumes       = "a restore Job's pod mounts only claims, emptyDir and ephemeral claims without a data source"
+	msgOwnJob        = "backup-controller may change only a Job it created"
 	msgPodSecurity   = "a restore Job's pod security context sets no sysctls, SELinux options or unconfined profile"
 	msgUnprivileged  = "a restore Job's containers are unprivileged"
 	policyRefusalFmt = "ValidatingAdmissionPolicy '%s'"
@@ -86,9 +87,7 @@ type policyHarness struct {
 //
 // Parameters:
 //   - t stops the API server when the test ends, and fails the test when any
-//     step of the setup fails, when the API server reports a type-checking
-//     warning on the policy's expressions, or when the policy never takes
-//     effect.
+//     step of the setup fails or when the policy never takes effect.
 //
 // It returns the harness. Its controller client writes as the controller's
 // ServiceAccount, by impersonation, with the strict field validation of
@@ -180,10 +179,11 @@ func applyManifest(ctx context.Context, t *testing.T, admin client.Client, path 
 	}
 }
 
-// waitForPolicy waits until the policy refuses a Job with a hostPath volume.
+// waitForPolicy waits until the policy refuses a Job with a hostPath volume
+// with its own 403, the answer wantRefused checks for.
 //
 // Parameters:
-//   - t records an error when the policy still admits the Job after 30
+//   - t records an error when the policy has not refused the Job after 30
 //     seconds. It is an error and not a fatal failure, so the cases after it
 //     still run and show what an absent policy admits.
 //
@@ -191,12 +191,13 @@ func applyManifest(ctx context.Context, t *testing.T, admin client.Client, path 
 // created, and until then admits everything. Each attempt that is admitted
 // is deleted again by the administrator.
 //
-// The policy's status.typeChecking stays empty here: the controller that
-// type-checks the expressions against the Job schema runs in
-// kube-controller-manager, which envtest does not start. A validation that
-// does not compile or evaluate denies every Job with an error of its own
-// under failurePolicy Fail, so the admitted Jobs and the message each refusal
-// is asserted by stand in for that check.
+// Nothing here reads the policy's status.typeChecking. The controller that
+// fills it runs in kube-controller-manager, which envtest does not start,
+// and it checks only the expressions that read object or oldObject
+// directly: an expression that reads a variable is not type-checked, and a
+// misspelled field under has() is simply false at runtime. The guard against
+// a check that silently admits is TestEnvtestThePolicyRefusesJobsOutOfShape,
+// which refuses one Job per check and asserts each by its own message.
 func (h *policyHarness) waitForPolicy(ctx context.Context, t *testing.T) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
@@ -204,14 +205,14 @@ func (h *policyHarness) waitForPolicy(ctx context.Context, t *testing.T) {
 		job := h.build(t, nsApp, false)
 		job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, hostPathVolume())
 		err := h.jobs.CreateJob(ctx, job)
-		if apierrors.IsForbidden(err) {
+		if apierrors.IsForbidden(err) && strings.Contains(err.Error(), fmt.Sprintf(policyRefusalFmt, policyName)) {
 			return
 		}
 		if err == nil {
 			_ = h.admin.Delete(ctx, job)
 		}
 		if time.Now().After(deadline) {
-			t.Errorf("the controller's ServiceAccount could still create a Job with a hostPath volume after 30 seconds (last answer: %v)", err)
+			t.Errorf("the policy had not refused a Job with a hostPath volume after 30 seconds (last answer: %v)", err)
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -219,7 +220,7 @@ func (h *policyHarness) waitForPolicy(ctx context.Context, t *testing.T) {
 }
 
 // build returns the restore Job restorejob.Build makes for a RestoreRun's
-// item in a namespace, with a name of its own.
+// item in a namespace, with a name of its own, as buildAs does.
 //
 // Parameters:
 //   - t fails the test when Build refuses the Spec.
@@ -227,26 +228,42 @@ func (h *policyHarness) waitForPolicy(ctx context.Context, t *testing.T) {
 //   - privileged is what the caller sets from the namespace's
 //     privileged-movers annotation.
 //
-// A privileged Job runs as root with the three ownership capabilities; the
-// other one runs under a non-root moverSecurityContext, the values prod
-// sets.
+// A privileged Job runs as root with the three ownership capabilities and no
+// moverSecurityContext; the other one runs as user, group and fsGroup 1000.
 func (h *policyHarness) build(t *testing.T, namespace string, privileged bool) *batchv1.Job {
+	t.Helper()
+	var podSecurity *corev1.PodSecurityContext
+	if !privileged {
+		podSecurity = moverSecurityContext(1000, 1000, 1000)
+	}
+	return h.buildAs(t, namespace, privileged, podSecurity)
+}
+
+// buildAs returns the restore Job restorejob.Build makes for a RestoreRun's
+// item in a namespace, with a name of its own.
+//
+// Parameters:
+//   - t fails the test when Build refuses the Spec.
+//   - namespace is the Job's namespace, one of the test's namespaces.
+//   - privileged is what the caller sets from the namespace's
+//     privileged-movers annotation.
+//   - podSecurity is the settings' moverSecurityContext, nil when they set
+//     none.
+func (h *policyHarness) buildAs(t *testing.T, namespace string, privileged bool, podSecurity *corev1.PodSecurityContext) *batchv1.Job {
 	t.Helper()
 	h.serial++
 	spec := restorejob.Spec{
-		Name:       fmt.Sprintf("restore-%d", h.serial),
-		Namespace:  namespace,
-		Origin:     restorejob.Origin{Kind: restorejob.OriginRestoreRun, UID: types.UID(fmt.Sprintf("run-uid-%d", h.serial))},
-		Owner:      metav1.OwnerReference{APIVersion: "backup.wlz.li/v1alpha1", Kind: "RestoreRun", Name: "restore", UID: types.UID(fmt.Sprintf("run-uid-%d", h.serial)), Controller: ptr.To(true), BlockOwnerDeletion: ptr.To(true)},
-		SnapshotID: strings.Repeat("0123456789abcdef", 4),
-		Claim:      "data",
-		Repository: "data-restic",
-		Image:      pinnedRestoreImage,
-		Delete:     true,
-		Privileged: privileged,
-	}
-	if !privileged {
-		spec.SecurityContext = &corev1.PodSecurityContext{RunAsUser: ptr.To[int64](1000), RunAsGroup: ptr.To[int64](1000), FSGroup: ptr.To[int64](1000)}
+		Name:            fmt.Sprintf("restore-%d", h.serial),
+		Namespace:       namespace,
+		Origin:          restorejob.Origin{Kind: restorejob.OriginRestoreRun, UID: types.UID(fmt.Sprintf("run-uid-%d", h.serial))},
+		Owner:           metav1.OwnerReference{APIVersion: "backup.wlz.li/v1alpha1", Kind: "RestoreRun", Name: "restore", UID: types.UID(fmt.Sprintf("run-uid-%d", h.serial)), Controller: ptr.To(true), BlockOwnerDeletion: ptr.To(true)},
+		SnapshotID:      strings.Repeat("0123456789abcdef", 4),
+		Claim:           "data",
+		Repository:      "data-restic",
+		Image:           pinnedRestoreImage,
+		Delete:          true,
+		Privileged:      privileged,
+		SecurityContext: podSecurity,
 	}
 	job, err := restorejob.Build(spec)
 	if err != nil {
@@ -282,6 +299,13 @@ func (h *policyHarness) buildForClaim(t *testing.T) *batchv1.Job {
 	return job
 }
 
+// moverSecurityContext returns a moverSecurityContext that runs the pod as a
+// user and group and gives its volumes an fsGroup, the fields prod's
+// settings set.
+func moverSecurityContext(user, group, fsGroup int64) *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{RunAsUser: ptr.To(user), RunAsGroup: ptr.To(group), FSGroup: ptr.To(fsGroup)}
+}
+
 // hostPathVolume returns a volume that mounts the node's root.
 func hostPathVolume() corev1.Volume {
 	return corev1.Volume{Name: "host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/"}}}
@@ -309,7 +333,9 @@ func wantRefused(t *testing.T, what string, err error, message string) {
 
 // The controller's ServiceAccount runs a restore Job through its whole life
 // under the policy: restorejob.Build's Job for a RestoreRun in a privileged
-// and in a plain namespace, and for the populator, is created suspended,
+// and in a plain namespace, each also with a moverSecurityContext prod sets
+// (pgadmin's 5050 and insurgency-sandstorm's 99 and 100), and for the
+// populator, is created suspended,
 // resumed, suspended again and deleted with Foreground propagation, each
 // through restorejob's own API. Every step is admitted. The pod template's
 // containers cannot change, and a change that drops the pod's restore label
@@ -319,9 +345,11 @@ func TestEnvtestThePolicyAdmitsTheRestoreJob(t *testing.T) {
 	h := startPolicyHarness(t)
 
 	for name, job := range map[string]*batchv1.Job{
-		"a RestoreRun's Job in a privileged namespace": h.build(t, nsPrivileged, true),
-		"a RestoreRun's Job in a plain namespace":      h.build(t, nsApp, false),
-		"the populator's Job":                          h.buildForClaim(t),
+		"a RestoreRun's Job in a privileged namespace":         h.build(t, nsPrivileged, true),
+		"a RestoreRun's Job in a plain namespace":              h.build(t, nsApp, false),
+		"a RestoreRun's Job in a privileged namespace as 5050": h.buildAs(t, nsPrivileged, true, moverSecurityContext(5050, 5050, 5050)),
+		"a RestoreRun's Job in a plain namespace as 99":        h.buildAs(t, nsApp, false, moverSecurityContext(99, 100, 100)),
+		"the populator's Job":                                  h.buildForClaim(t),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := h.jobs.CreateJob(ctx, job); err != nil {
@@ -415,6 +443,53 @@ func TestEnvtestThePolicyRefusesJobsOutOfShape(t *testing.T) {
 		{"a host port", func(j *batchv1.Job) {
 			j.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 8080, HostPort: 8080}}
 		}, msgUnprivileged},
+		{"an ephemeral volume with a data source reference", func(j *batchv1.Job) {
+			for _, v := range j.Spec.Template.Spec.Volumes {
+				if v.Ephemeral != nil {
+					v.Ephemeral.VolumeClaimTemplate.Spec.DataSourceRef = &corev1.TypedObjectReference{Kind: "PersistentVolumeClaim", Name: "someone-elses"}
+				}
+			}
+		}, msgVolumes},
+		{"hostIPC", func(j *batchv1.Job) { j.Spec.Template.Spec.HostIPC = true }, msgNoHost},
+		{"a resource claim", func(j *batchv1.Job) {
+			j.Spec.Template.Spec.ResourceClaims = []corev1.PodResourceClaim{{Name: "gpu", ResourceClaimName: ptr.To("gpu")}}
+		}, msgNoHost},
+		// The API server copies the deprecated field into serviceAccountName
+		// when that is empty, and back, so the policy sees both fields set.
+		{"the controller's ServiceAccount in the deprecated field", func(j *batchv1.Job) {
+			j.Spec.Template.Spec.DeprecatedServiceAccount = "backup-controller"
+		}, msgServiceAcct},
+		{"pod SELinux options", func(j *batchv1.Job) {
+			j.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{SELinuxOptions: &corev1.SELinuxOptions{Type: "spc_t"}}
+		}, msgPodSecurity},
+		{"an unconfined pod seccomp profile", func(j *batchv1.Job) {
+			j.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined}}
+		}, msgPodSecurity},
+		{"an unconfined pod AppArmor profile", func(j *batchv1.Job) {
+			j.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{AppArmorProfile: &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeUnconfined}}
+		}, msgPodSecurity},
+		{"a writable root filesystem", func(j *batchv1.Job) { restore(j).ReadOnlyRootFilesystem = ptr.To(false) }, msgUnprivileged},
+		{"capabilities not dropped", func(j *batchv1.Job) { restore(j).Capabilities.Drop = []corev1.Capability{"NET_RAW"} }, msgUnprivileged},
+		{"container SELinux options", func(j *batchv1.Job) {
+			restore(j).SELinuxOptions = &corev1.SELinuxOptions{Type: "spc_t"}
+		}, msgUnprivileged},
+		{"an unconfined container seccomp profile", func(j *batchv1.Job) {
+			restore(j).SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined}
+		}, msgUnprivileged},
+		{"an unconfined container AppArmor profile", func(j *batchv1.Job) {
+			restore(j).AppArmorProfile = &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeUnconfined}
+		}, msgUnprivileged},
+		{"an unmasked /proc", func(j *batchv1.Job) {
+			// The API server allows an unmasked /proc only in a user namespace.
+			j.Spec.Template.Spec.HostUsers = ptr.To(false)
+			restore(j).ProcMount = ptr.To(corev1.UnmaskedProcMount)
+		}, msgUnprivileged},
+		{"a block device", func(j *batchv1.Job) {
+			j.Spec.Template.Spec.Volumes = append(j.Spec.Template.Spec.Volumes, corev1.Volume{Name: "device", VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "block"},
+			}})
+			j.Spec.Template.Spec.Containers[0].VolumeDevices = []corev1.VolumeDevice{{Name: "device", DevicePath: "/dev/xvdb"}}
+		}, msgUnprivileged},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -432,7 +507,8 @@ func TestEnvtestThePolicyRefusesJobsOutOfShape(t *testing.T) {
 // The policy matches only the controller's ServiceAccount, and only its Jobs.
 // The administrator may create a Job with a hostPath volume. The controller's
 // ServiceAccount may neither suspend nor delete a Job it did not create,
-// which carries no restore labels.
+// which carries no restore labels, nor add the managed-by label to a restore
+// shaped Job it did not create.
 func TestEnvtestThePolicyLeavesOtherUsersJobsAlone(t *testing.T) {
 	ctx := context.Background()
 	h := startPolicyHarness(t)
@@ -451,6 +527,17 @@ func TestEnvtestThePolicyLeavesOtherUsersJobsAlone(t *testing.T) {
 	suspend := client.RawPatch(types.MergePatchType, []byte(`{"spec":{"suspend":true}}`))
 	wantRefused(t, "the ServiceAccount's suspend of another user's Job", h.controller.Patch(ctx, theirs.DeepCopy(), suspend), msgLabelled)
 	wantRefused(t, "the ServiceAccount's delete of another user's Job", h.jobs.DeleteJob(ctx, theirs), msgLabelled)
+
+	// A Job of the restore shape the administrator created without the
+	// managed-by label: the change that adds it makes the new object pass
+	// every other check, so only the rule on the old object refuses it.
+	unmanaged := h.build(t, nsApp, false)
+	delete(unmanaged.Labels, restorejob.LabelManagedBy)
+	if err := h.admin.Create(ctx, unmanaged); err != nil {
+		t.Fatalf("the administrator's unlabelled restore Job = %v, want it admitted", err)
+	}
+	adopt := client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"labels":{"`+restorejob.LabelManagedBy+`":"backup-controller"}}}`))
+	wantRefused(t, "the ServiceAccount's labelling of another user's Job", h.controller.Patch(ctx, unmanaged.DeepCopy(), adopt), msgOwnJob)
 }
 
 // Under the shipped ClusterRole the controller's ServiceAccount changes a

@@ -15,8 +15,11 @@ spec:
   matchConstraints:
     matchPolicy: Equivalent
     resourceRules:
+    # A named version lets the API server type-check the expressions that read
+    # object and oldObject directly; with matchPolicy Equivalent the rule still
+    # matches a Job written through any later batch version.
     - apiGroups: ["batch"]
-      apiVersions: ["*"]
+      apiVersions: ["v1"]
       operations: ["CREATE", "UPDATE", "DELETE"]
       resources: ["jobs"]
   matchConditions:
