@@ -12,7 +12,6 @@ import (
 	"github.com/klauspost/compress/zstd"
 	//nolint:staticcheck // restic's format is Poly1305-AES, and a file this package writes has to carry that MAC.
 	"golang.org/x/crypto/poly1305"
-	"golang.org/x/crypto/scrypt"
 )
 
 // ivSize and macSize are the sizes of the parts of an encrypted file. restic's
@@ -64,24 +63,6 @@ type keyFile struct {
 	P    int    `json:"p"`
 	Salt []byte `json:"salt"`
 	Data []byte `json:"data"`
-}
-
-// deriveKey runs scrypt over the password with the parameters from a key file,
-// and splits the 64 bytes it produces into a key. It returns an error when the
-// key file names a KDF other than scrypt.
-func deriveKey(password string, file keyFile) (key, error) {
-	if file.KDF != "scrypt" {
-		return key{}, fmt.Errorf("key file uses kdf %q, and only scrypt is supported", file.KDF)
-	}
-	raw, err := scrypt.Key([]byte(password), file.Salt, file.N, file.R, file.P, 64)
-	if err != nil {
-		return key{}, fmt.Errorf("derive the key: %w", err)
-	}
-	var k key
-	copy(k.encrypt[:], raw[:32])
-	copy(k.macK[:], raw[32:48])
-	copy(k.macR[:], raw[48:64])
-	return k, nil
 }
 
 // masterKey opens one key file with a password and returns the master key
