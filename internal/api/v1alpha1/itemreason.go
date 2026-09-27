@@ -124,4 +124,9 @@ const (
 	// create its own. The run writes only into a claim it created, so
 	// nothing was written to that claim.
 	ItemReasonIntoClaimTaken ItemReason = "IntoClaimTaken"
+
+	// ItemReasonRunEnded is an item the run failed because the run ended
+	// before the item finished, for a cause other than the timeout. The
+	// run's status.ending says why the run ended.
+	ItemReasonRunEnded ItemReason = "RunEnded"
 )

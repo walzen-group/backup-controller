@@ -26,11 +26,11 @@ import (
 //   - message is the Ready message, and the start of each unfinished item's
 //     message.
 //
-// The items it fails record no reason; the run's ending says why. A run
-// past its deadline ends through timeOut instead.
+// The items it fails record the reason RunEnded. The run's ending says why.
+// A run past its deadline ends through timeOut instead.
 func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
 	r.failUnfinished(ctx, run, message, func(item *backupv1alpha1.BackupItem, text string) {
-		item.Phase, item.Message = backupv1alpha1.ItemFailed, text
+		failBackupItem(item, refuse(backupv1alpha1.ItemReasonRunEnded, "%s", text))
 	})
 	return r.finish(ctx, run, reason, message)
 }
@@ -230,7 +230,7 @@ func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.B
 // item.
 func backupItemDone(run *backupv1alpha1.BackupRun, name string) bool {
 	for _, item := range run.Status.Items {
-		if item.Kind == "ReplicationSource" && item.Name == name {
+		if item.Kind == backupv1alpha1.ItemKindSource && item.Name == name {
 			return item.Phase != backupv1alpha1.ItemPending && item.Phase != backupv1alpha1.ItemRunning
 		}
 	}

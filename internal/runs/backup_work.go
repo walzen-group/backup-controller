@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -75,13 +74,60 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	// The status keeps times in whole seconds. A snapshot moved in this pass
 	// must carry the restartedAt that later passes read back.
 	now := metav1.NewTime(r.Now()).Rfc3339Copy()
-	deadline, over, err := r.overdue(ctx, run)
-	if err != nil {
+	if done, err := r.endIfOverdue(ctx, run); done {
 		return ctrl.Result{}, err
 	}
-	if over {
-		return ctrl.Result{}, r.timeOut(ctx, run, deadline)
+	r.releaseFinished(ctx, run)
+	if done, result, err := r.quiesceFirst(ctx, run, now); done {
+		return result, err
 	}
+	limited, done, err := r.enforceQuiesceLimit(ctx, run, now)
+	if done {
+		return ctrl.Result{}, err
+	}
+	if done, result, err := r.waitForStoppedPods(ctx, run, limited); done {
+		return result, err
+	}
+	// An item that fails to start with an error the API server may stop
+	// giving keeps its place and is tried again on the next pass. The pass
+	// goes on, because the restart below looks only at volume items, and a
+	// database whose Backup cannot be created must not keep the app down.
+	waits, retrying := r.startPending(ctx, run)
+	if err := r.restartAfterCut(ctx, run, now); err != nil {
+		return ctrl.Result{}, err
+	}
+	notes := r.collectRunning(ctx, run)
+	return r.finishOrWait(ctx, run, waits, retrying, notes)
+}
+
+// endIfOverdue ends the run when its deadline has passed.
+//
+// Parameters:
+//   - run is the admitted BackupRun.
+//
+// It returns done true when the pass must stop here: the run is past its
+// deadline and timeOut ended it, or the read of the timeout failed. The
+// error is the error of that read or of timeOut.
+func (r *BackupRunReconciler) endIfOverdue(ctx context.Context, run *backupv1alpha1.BackupRun) (done bool, err error) {
+	deadline, over, err := r.overdue(ctx, run)
+	if err != nil {
+		return true, err
+	}
+	if !over {
+		return false, nil
+	}
+	return true, r.timeOut(ctx, run, deadline)
+}
+
+// releaseFinished releases the Leases that the run no longer needs. It is
+// best effort: it logs a failure and the pass goes on.
+//
+// Parameters:
+//   - run is the admitted BackupRun.
+//
+// The Leases of an item that finished in an earlier pass go first. The
+// quiesce Leases go once the stored status shows every workload back.
+func (r *BackupRunReconciler) releaseFinished(ctx context.Context, run *backupv1alpha1.BackupRun) {
 	// The Leases of an item that finished in an earlier pass go now, so a
 	// restore of that claim need not wait for the rest of the run. This is
 	// best effort: an error here must not keep the workloads down past the
@@ -101,57 +147,105 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 				"namespace", run.Namespace, "name", run.Name)
 		}
 	}
+}
 
-	if run.Spec.All && run.Status.QuiescedAt == nil {
-		return r.quiesce(ctx, run, now)
+// quiesceFirst stops the workloads of a namespace run that has not stopped
+// them yet (see quiesce). That pass does nothing else.
+//
+// Parameters:
+//   - run is the admitted BackupRun.
+//   - now is the time of the pass.
+//
+// It returns done true, with the result and the error of quiesce, when it
+// called quiesce. It returns done false when the run has no spec.all or
+// has recorded status.quiescedAt.
+func (r *BackupRunReconciler) quiesceFirst(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (done bool, result ctrl.Result, err error) {
+	if !run.Spec.All || run.Status.QuiescedAt != nil {
+		return false, ctrl.Result{}, nil
 	}
+	result, err = r.quiesce(ctx, run, now)
+	return true, result, err
+}
 
-	limited := false
-	if run.Spec.All && run.Status.RestartedAt == nil && len(run.Status.Quiesced) > 0 {
-		limit, err := maxQuiesceFor(ctx, r.Reader, run.Namespace)
-		if err != nil {
-			// A limit that no longer parses fails the run, which starts the
-			// workloads again, so they are never held without a limit.
-			var bad invalidSettingError
-			if errors.As(err, &bad) {
-				return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, bad.Error())
-			}
-			return ctrl.Result{}, err
-		}
-		if !now.Time.Before(run.Status.QuiescedAt.Add(limit)) {
-			r.giveUpUncut(ctx, run, limit, now)
-			limited = true
-		}
+// enforceQuiesceLimit fails the volume items whose clone is not cut when the
+// workloads have been stopped for the namespace's backup.wlz.li/max-quiesce
+// limit (see giveUpUncut).
+//
+// Parameters:
+//   - run is the admitted BackupRun, with status.quiescedAt set when it has
+//     spec.all.
+//   - now is the time of the pass.
+//
+// It returns limited true when the limit ran out in this pass, so the pass
+// does not wait for pods. It returns done true when the pass must stop
+// here: the limit does not parse and the run ended, or the read failed.
+// The error is the error of that read or of abort.
+func (r *BackupRunReconciler) enforceQuiesceLimit(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (limited, done bool, err error) {
+	if !run.Spec.All || run.Status.RestartedAt != nil || len(run.Status.Quiesced) == 0 {
+		return false, false, nil
 	}
-
-	if run.Spec.All && run.Status.RestartedAt == nil && !limited && anyPending(run.Status.Items) {
-		targets, err := quiesce.Targets(ctx, r.Reader, run.Namespace)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		gone, pod, err := quiesce.PodsGone(ctx, r.Reader, run.Namespace, targets)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !gone {
-			return after(2*time.Second, r.waitFor(ctx, run, backupv1alpha1.ReasonRunning,
-				fmt.Sprintf("waiting for pod %s to stop before the clones are cut", pod)))
-		}
+	limit, err := maxQuiesceFor(ctx, r.Reader, run.Namespace)
+	if err != nil {
+		// A limit that no longer parses fails the run, which starts the
+		// workloads again, so they are never held without a limit.
+		return false, true, r.abortOnInvalidSetting(ctx, run, err)
 	}
+	if now.Time.Before(run.Status.QuiescedAt.Add(limit)) {
+		return false, false, nil
+	}
+	r.giveUpUncut(ctx, run, limit, now)
+	return true, false, nil
+}
 
-	// An item that fails to start with an error the API server may stop
-	// giving keeps its place and is tried again on the next pass. The pass
-	// goes on, because the restart below looks only at volume items, and a
-	// database whose Backup cannot be created must not keep the app down.
-	waits, retrying := r.startPending(ctx, run)
+// waitForStoppedPods makes a namespace run wait until every pod of the
+// workloads it stopped is gone, before it starts an item.
+//
+// Parameters:
+//   - run is the admitted BackupRun.
+//   - limited is true when the quiesce limit ran out in this pass. Then
+//     the pass does not wait.
+//
+// It returns done true, with the result and the error the pass returns,
+// when a pod is still there or a read failed. The run then waits with
+// reason Running and looks again after two seconds.
+func (r *BackupRunReconciler) waitForStoppedPods(ctx context.Context, run *backupv1alpha1.BackupRun, limited bool) (done bool, result ctrl.Result, err error) {
+	if !run.Spec.All || run.Status.RestartedAt != nil || limited || !anyPending(run.Status.Items) {
+		return false, ctrl.Result{}, nil
+	}
+	targets, err := quiesce.Targets(ctx, r.Reader, run.Namespace)
+	if err != nil {
+		return true, ctrl.Result{}, err
+	}
+	gone, pod, err := quiesce.PodsGone(ctx, r.Reader, run.Namespace, targets)
+	if err != nil {
+		return true, ctrl.Result{}, err
+	}
+	if gone {
+		return false, ctrl.Result{}, nil
+	}
+	result, err = after(2*time.Second, r.waitFor(ctx, run, backupv1alpha1.ReasonRunning,
+		fmt.Sprintf("waiting for pod %s to stop before the clones are cut", pod)))
+	return true, result, err
+}
 
+// restartAfterCut starts the workloads of a namespace run again once every
+// volume's clone is cut, and repeats a restart that an earlier pass did not
+// finish.
+//
+// Parameters:
+//   - run is the admitted BackupRun. Its status is changed and written.
+//   - now is the time of the pass, which becomes status.restartedAt.
+//
+// It returns the error of a status write or a read, or the error of a
+// failed restart after releaseFailed has reported it on the run.
+func (r *BackupRunReconciler) restartAfterCut(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) error {
 	restart := false
 	if run.Spec.All && run.Status.RestartedAt == nil && r.clonesCut(ctx, run) {
 		// The moment is written before the workloads start, so a pass that
 		// starts them and then loses its status write is retried with it.
 		run.Status.RestartedAt, run.Status.RestartPending = newTime(now), true
 		if err := r.writeStatus(ctx, run); err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
 		// The write decodes the stored object back into run, and a CRD that
 		// lacks status.restartPending would have dropped the flag from it.
@@ -163,18 +257,30 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		// The flag came from the informer cache, which may lag behind a
 		// pass that has since done the restart; see readStop.
 		if _, err := readStop(ctx, r.Reader, run); err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
 	}
-	if restart || run.Status.RestartPending {
-		if err := quiesce.Restart(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
-			// The run says why the app is still down at once, rather than
-			// only at its timeout, and the error makes the pass run again.
-			return ctrl.Result{}, r.releaseFailed(ctx, run, err, true)
-		}
-		run.Status.RestartPending = false
+	if !restart && !run.Status.RestartPending {
+		return nil
 	}
+	if err := quiesce.Restart(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
+		// The run says why the app is still down at once, rather than
+		// only at its timeout, and the error makes the pass run again.
+		return r.releaseFailed(ctx, run, err, true)
+	}
+	run.Status.RestartPending = false
+	return nil
+}
 
+// collectRunning collects the result of every Running item (see
+// collectItem).
+//
+// Parameters:
+//   - run is the admitted BackupRun. Its items are changed in place.
+//
+// It returns the notes of the items, one sentence for each item that needs
+// one in the Ready message.
+func (r *BackupRunReconciler) collectRunning(ctx context.Context, run *backupv1alpha1.BackupRun) []string {
 	var notes []string
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
@@ -185,29 +291,46 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 			notes = append(notes, note)
 		}
 	}
+	return notes
+}
 
+// finishOrWait ends a run whose items are all done, and writes the Ready
+// condition of a run that goes on.
+//
+// Parameters:
+//   - run is the admitted BackupRun. Its status is written.
+//   - waits are the sentences of the items that wait for another run.
+//   - retrying are the lines of the items whose start failed.
+//   - notes are the notes of the Running items.
+//
+// It returns when to look again, and the error of finish or of the status
+// write.
+//
+// The run finishes once every item is done and, on a run with spec.all
+// set, the workloads are running again: Failed when an item failed, and
+// Succeeded otherwise. Otherwise the reason is Retrying when a start
+// failed, SourceBusy when an item only waits, and Running else.
+func (r *BackupRunReconciler) finishOrWait(ctx context.Context, run *backupv1alpha1.BackupRun, waits, retrying, notes []string) (ctrl.Result, error) {
 	if allDone(run.Status.Items) && (!run.Spec.All || run.Status.RestartedAt != nil) {
-		failed := failures(run.Status.Items)
-		if failed == "" {
-			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, summary(run.Status.Items))
+		if anyFailed(run.Status.Items) {
+			return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, failures(run.Status.Items))
 		}
-		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonFailed, failed)
+		return ctrl.Result{}, r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, summary(run.Status.Items))
 	}
-
+	if len(retrying) == 0 && len(waits) > 0 {
+		// Every wait is named, so one item's wait does not hide another's.
+		// A note stays on its own item's message, so a timeout that copies
+		// this wait does not repeat it.
+		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, strings.Join(waits, "; ")))
+	}
 	reason, message := backupv1alpha1.ReasonRunning, "backing up"
-	switch {
-	case len(retrying) > 0:
+	if len(retrying) > 0 {
 		// An item that waits for another run is named as well, so the retry
 		// does not hide it.
 		reason, message = backupv1alpha1.ReasonRetrying, "retrying the start of "+strings.Join(retrying, "; ")
 		if len(waits) > 0 {
 			message += "; " + strings.Join(waits, "; ")
 		}
-	case len(waits) > 0:
-		// Every wait is named, so one item's wait does not hide another's.
-		// A note stays on its own item's message, so a timeout that copies
-		// this wait does not repeat it.
-		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, strings.Join(waits, "; ")))
 	}
 	if len(notes) > 0 {
 		// A Backup in a phase that needs naming says why the run goes on.

@@ -28,9 +28,20 @@ func allDone(items []backupv1alpha1.BackupItem) bool {
 	return true
 }
 
+// anyFailed reports whether any item failed. The run decides its end on it:
+// Failed when an item failed, and Succeeded otherwise.
+func anyFailed(items []backupv1alpha1.BackupItem) bool {
+	for _, item := range items {
+		if item.Phase == backupv1alpha1.ItemFailed {
+			return true
+		}
+	}
+	return false
+}
+
 // failures returns one line per failed item, naming its kind, its name and
 // its message, joined with "; ". It returns an empty string when no item
-// failed.
+// failed. It only makes the message. anyFailed decides the end.
 func failures(items []backupv1alpha1.BackupItem) string {
 	message := ""
 	for _, item := range items {
