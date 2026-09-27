@@ -1009,10 +1009,13 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	// restore ended. Deleted first, a lost status write or a crash would
 	// leave a Running item whose Job is gone, and no later pass could tell
 	// how it ended. A later pass stops the Job of any finished item that
-	// still names one (see stopJobs).
+	// still names one (see stopJobs). The status is written only when it
+	// differs from the stored one: a pass that waits for the same stopped
+	// Job as the pass before has its items stored already, and a write
+	// would only start another reconcile.
 	var stopping jobList
 	if finishedWithMover(run.Status.Items) {
-		if err := r.writeStatus(ctx, run); err != nil {
+		if err := r.writeChangedStatus(ctx, run); err != nil {
 			return ctrl.Result{}, err
 		}
 		left, err := r.stopJobs(ctx, run, finished)

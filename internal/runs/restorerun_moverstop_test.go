@@ -944,3 +944,26 @@ func TestATimeoutWhoseStopEndsInOnePassKeepsItsEnding(t *testing.T) {
 		})
 	}
 }
+
+// A pass of work that waits for a finished item's stopped restore Job, and
+// changes nothing, writes nothing: the item's end is already stored, and
+// every write starts another reconcile. Before, work wrote the status on
+// every pass while a finished item still named its Job (RJ4F2 follow-up).
+func TestWorkWritesNothingWhileItWaitsForAStoppedJob(t *testing.T) {
+	run, job := quiescedRestoreDone(t)
+	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), job, pod)
+
+	restoreStep(t, r) // suspends the Job
+	restoreStep(t, r) // finds its pod still there
+	stored := readRestoreRun(t, c)
+	if readyReason(stored.Status.Conditions) != backupv1alpha1.ReasonShutdown {
+		t.Fatalf("reason = %q (%s), want %s", readyReason(stored.Status.Conditions), readyMessage(stored.Status.Conditions), backupv1alpha1.ReasonShutdown)
+	}
+	restoreStep(t, r)
+	if again := readRestoreRun(t, c); again.ResourceVersion != stored.ResourceVersion {
+		t.Errorf("resourceVersion = %s after a pass that changed nothing, want %s: the status was written again",
+			again.ResourceVersion, stored.ResourceVersion)
+	}
+}
