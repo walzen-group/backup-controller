@@ -275,7 +275,6 @@ func managerOptions(scheme *runtime.Scheme, metricsAddr, healthAddr string, hook
 	options := ctrl.Options{
 		Scheme:                 scheme,
 		Client:                 clientOptions(scheme),
-		Cache:                  managerCacheOptions(),
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: healthAddr,
 		LeaderElection:         false,
