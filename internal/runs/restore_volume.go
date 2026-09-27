@@ -366,7 +366,7 @@ func jobDeleted(name string, replaced bool) error {
 //   - outcome is what restorejob.Read found in the Job and its pods.
 //
 // It returns the outcome's waiting reason while the Job runs, and nil
-// otherwise. The error is a *refusalError with reason ClaimLost, or the
+// otherwise. The error is a *claimLostError (reason ClaimLost), or the
 // outcome's *restorejob.FailureError, when the item fails (see settled), and
 // a plain error from a failed read of the claim or the Leases, which leaves
 // the item Running.
@@ -374,7 +374,7 @@ func jobDeleted(name string, replaced bool) error {
 // Only the Job's terminal conditions decide. Complete=True means restic
 // exited 0 for exactly the item's snapshot, and the Job controller adds it
 // only once the pod has ended; the item succeeds when the claim is still the
-// one the run checked or created (see claimLostError), and fails with reason
+// one the run checked or created (see checkClaimKept), and fails with reason
 // ClaimLost otherwise. Failed=True fails it with the
 // *restorejob.FailureError, reason RestoreJobFailed, whose message carries
 // restic's exit code, its meaning and restic's last lines. A Job that has
@@ -384,7 +384,7 @@ func jobDeleted(name string, replaced bool) error {
 func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, outcome restorejob.Outcome) (*restorejob.Waiting, error) {
 	switch outcome.State {
 	case restorejob.Succeeded:
-		if err := r.claimLostError(ctx, run, *item); err != nil {
+		if err := r.checkClaimKept(ctx, run, *item); err != nil {
 			return nil, err
 		}
 		item.Phase, item.Message = backupv1alpha1.ItemSucceeded, ""
@@ -403,7 +403,7 @@ func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1al
 	return nil, nil
 }
 
-// claimLostError checks that the claim a volume item's restore Job wrote
+// checkClaimKept checks that the claim a volume item's restore Job wrote
 // into is still the one the run restored into.
 //
 // Parameters:
@@ -411,8 +411,8 @@ func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1al
 //     applies.
 //   - item is the volume item; its name is the claim's.
 //
-// It returns nil while the claim is the run's, a *refusalError with reason
-// ClaimLost when it is not, and a plain error from a failed read of the
+// It returns nil while the claim is the run's, a *claimLostError (reason
+// ClaimLost) when it is not, and a plain error from a failed read of the
 // claim or the Leases, which leaves the item as it was.
 //
 // An in-place item's claim is the one the run checked and took its claim
@@ -420,9 +420,9 @@ func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1al
 // created and controls (see claimLost). The run took its claim Lease before
 // it created that claim, on the source claim when there is one, so the
 // in-place rule would take the run's own new claim for a replaced one.
-func (r *RestoreRunReconciler) claimLostError(ctx context.Context, run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem) error {
+func (r *RestoreRunReconciler) checkClaimKept(ctx context.Context, run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem) error {
 	if run.Spec.Into != "" {
-		return r.claimLost(ctx, run)
+		return r.claimLost(ctx, run, false)
 	}
 	return r.inPlaceClaimLost(ctx, run, item.Name)
 }

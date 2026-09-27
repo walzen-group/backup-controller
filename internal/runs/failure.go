@@ -327,9 +327,9 @@ type claimLostError struct {
 	claim string
 	// loss is how the run lost the claim.
 	loss claimLoss
-	// into is true for the claim of an into item, which the run created.
-	// Error then gives the same sentence for each loss.
-	into bool
+	// unstarted is true when the restore Job had not run yet: it was still
+	// suspended since its create. The Job then wrote nothing to the claim.
+	unstarted bool
 	// found is the UID of the claim there now, for lossReplaced.
 	found string
 	// leased are the claim UIDs of the run's claim Leases for the item, for
@@ -340,8 +340,8 @@ type claimLostError struct {
 // Error returns the sentence for a person that says how the run lost the
 // claim and what to do next.
 func (e *claimLostError) Error() string {
-	if e.into {
-		return fmt.Sprintf("claim %s was deleted (or replaced) while its restore Job wrote into it", e.claim)
+	if e.unstarted {
+		return e.beforeJob()
 	}
 	switch e.loss {
 	case lossUnleased:
@@ -356,8 +356,25 @@ func (e *claimLostError) Error() string {
 			"and took its Lease on (UID %[3]s). The restore Job mounts claim %[1]s by name, so it may have written into it; check its data, "+
 			"and create a new RestoreRun to restore it", e.claim, e.found, strings.Join(e.leased, ", "))
 	case lossNotOwned:
-		// Only an into item loses its claim this way, and Error returns
-		// above for an into item.
+		return fmt.Sprintf("claim %[1]s is no longer controlled by the run, so it may not be the claim the run created. The restore Job mounts "+
+			"claim %[1]s by name, so it may have written into it; check its data, and create a new RestoreRun to restore it", e.claim)
 	}
 	return fmt.Sprintf("claim %s is no longer the claim the run checked", e.claim)
+}
+
+// beforeJob returns the sentence for a claim that the run lost before its
+// restore Job ran. Only an into item checks its claim before the resume of
+// the Job (see followIntoJob), so the three losses of an into item have
+// their own sentence.
+func (e *claimLostError) beforeJob() string {
+	switch e.loss {
+	case lossGone:
+		return fmt.Sprintf("claim %s was deleted before its restore Job ran, so the Job wrote nothing", e.claim)
+	case lossDeleting:
+		return fmt.Sprintf("claim %s is being deleted, and its restore Job has not run, so the Job wrote nothing", e.claim)
+	case lossNotOwned:
+		return fmt.Sprintf("claim %s is no longer controlled by the run, and its restore Job has not run, so the Job wrote nothing", e.claim)
+	default:
+		return fmt.Sprintf("claim %s is no longer the claim the run checked, and its restore Job has not run, so the Job wrote nothing", e.claim)
+	}
 }

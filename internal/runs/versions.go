@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -124,19 +123,39 @@ func clusterWebhookUnserved(mapper meta.RESTMapper) *UnservedError {
 // Parameters:
 //   - mapper is the manager's RESTMapper.
 //
-// It returns the errors.Join of the *UnservedError of VolSync's
-// ReplicationSource and of CloudNativePG's Cluster, and nil when neither
-// reports.
+// It returns an unservedKindsError that holds the *UnservedError of VolSync's
+// ReplicationSource, of CloudNativePG's Cluster, or of both, and nil when
+// neither reports.
 func CheckServedVersions(mapper meta.RESTMapper) error {
-	var errs []error
+	var errs unservedKindsError
 	if err := volsyncSourceUnserved(mapper); err != nil {
 		errs = append(errs, err)
 	}
 	if err := clusterWebhookUnserved(mapper); err != nil {
 		errs = append(errs, err)
 	}
-	return errors.Join(errs...)
+	if len(errs) == 0 {
+		return nil
+	}
+	return errs
 }
+
+// unservedKindsError is the error of CheckServedVersions: one error for each
+// kind that is not served at the version the controller uses.
+type unservedKindsError []error
+
+// Error joins the texts of the errors with "; ", so that the startup log
+// entry stays on one line.
+func (e unservedKindsError) Error() string {
+	texts := make([]string, 0, len(e))
+	for _, err := range e {
+		texts = append(texts, err.Error())
+	}
+	return strings.Join(texts, "; ")
+}
+
+// Unwrap returns the errors, so that errors.As finds each *UnservedError.
+func (e unservedKindsError) Unwrap() []error { return e }
 
 // endForVolSync ends a BackupRun that may touch VolSync objects while
 // volsyncSourceUnserved reports an incompatible VolSync.

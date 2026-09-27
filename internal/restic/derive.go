@@ -72,6 +72,13 @@ func deriveKey(password string, file keyFile) (key, error) {
 // derivation at a time, and returns the kept key for a password and key file
 // it has derived before. scrypt is deterministic, so the kept key is the one
 // a new derivation would give.
+//
+// restic sets p when it writes a key file: it raises p until one derivation
+// takes about 0.5s on the machine that runs `restic init`. The recorded key
+// files have p=8 and p=9, so one derivation takes 0.5s of CPU or more. Three
+// Opens of cold repositories at once wait in the gate one after another.
+// derive looks for a kept key only when it holds the gate. So an Open waits
+// while another derivation runs, also when derive keeps its key.
 func (d *keyDeriver) derive(password string, file keyFile) (key, error) {
 	if file.KDF != "scrypt" {
 		return key{}, fmt.Errorf("key file uses kdf %q, and only scrypt is supported", file.KDF)
@@ -99,8 +106,16 @@ func (d *keyDeriver) derive(password string, file keyFile) (key, error) {
 }
 
 // derivationOf returns the derivation that scrypt runs for a password and a
-// key file. Each variable-length part is prefixed with its length, so no two
-// inputs hash the same bytes.
+// key file.
+//
+// Parameters:
+//   - password is the repository password.
+//   - file is the decoded key file. Its salt, N, r and p go into the hash,
+//     so a key file with other cost parameters gets its own derivation.
+//
+// It returns the SHA-256 of the password, the salt and the cost parameters.
+// Each part of variable length has its length before it, so no two inputs
+// hash the same bytes.
 func derivationOf(password string, file keyFile) derivation {
 	input := binary.BigEndian.AppendUint64(nil, uint64(len(password)))
 	input = append(input, password...)

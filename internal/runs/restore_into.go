@@ -214,7 +214,7 @@ func (r *RestoreRunReconciler) createInto(ctx context.Context, run *backupv1alph
 //
 // The Job's terminal conditions decide the item's end, and a Job that is
 // gone or replaced fails it (see followJob). While the Job runs, every pass
-// also checks that the claim is still the run's (see claimLostError), so a
+// also checks that the claim is still the run's (see claimLost), so a
 // claim deleted or replaced mid-restore fails the item with reason
 // ClaimLost and the run stops the Job. A run past its deadline ends with
 // reason TimedOut. Otherwise a Job still suspended since its create is
@@ -226,7 +226,7 @@ func (r *RestoreRunReconciler) createInto(ctx context.Context, run *backupv1alph
 func (r *RestoreRunReconciler) followIntoJob(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (ctrl.Result, error) {
 	seen, err := r.followJob(ctx, run, item)
 	if err == nil && !finished(*item) {
-		err = r.claimLostError(ctx, run, *item)
+		err = r.claimLost(ctx, run, seen.unresumed != nil)
 	}
 	if done, err := settled(item, err); done || finished(*item) {
 		return r.endInto(ctx, run, err)
@@ -459,6 +459,9 @@ func (r *RestoreRunReconciler) createOwned(ctx context.Context, run *backupv1alp
 // Parameters:
 //   - run is the RestoreRun. spec.into names the claim, and the claim is the
 //     run's own when the run is its controller (see notCreatedByRun).
+//   - unstarted is true when the restore Job is still suspended since its
+//     create, so it has not run. The error then says that the Job wrote
+//     nothing.
 //
 // It returns nil while the run's own claim is there, and a *claimLostError
 // for an into item when the claim is gone (lossGone), is being deleted
@@ -468,22 +471,22 @@ func (r *RestoreRunReconciler) createOwned(ctx context.Context, run *backupv1alp
 // error, and the caller leaves the item as it was.
 //
 // An into restore checks it on every pass once its restore Job exists (see
-// claimLostError), so a Job that finished never counts as a restore into a
-// claim that is no longer the run's. inPlaceClaimLost does the same for an
-// in-place item.
-func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+// followIntoJob and checkClaimKept), so a Job that finished never counts
+// as a restore into a claim that is no longer the run's. inPlaceClaimLost
+// does the same for an in-place item.
+func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha1.RestoreRun, unstarted bool) error {
 	claim := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
 	err := r.Reader.Get(ctx, key, claim)
 	switch {
 	case apierrors.IsNotFound(err):
-		return &claimLostError{claim: run.Spec.Into, loss: lossGone, into: true}
+		return &claimLostError{claim: run.Spec.Into, loss: lossGone, unstarted: unstarted}
 	case err != nil:
 		return fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
 	case claim.DeletionTimestamp != nil:
-		return &claimLostError{claim: run.Spec.Into, loss: lossDeleting, into: true}
+		return &claimLostError{claim: run.Spec.Into, loss: lossDeleting, unstarted: unstarted}
 	case !metav1.IsControlledBy(claim, run):
-		return &claimLostError{claim: run.Spec.Into, loss: lossNotOwned, into: true}
+		return &claimLostError{claim: run.Spec.Into, loss: lossNotOwned, unstarted: unstarted}
 	}
 	return nil
 }

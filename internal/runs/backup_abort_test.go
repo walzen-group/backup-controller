@@ -15,8 +15,8 @@ import (
 
 // An item that abort fails records the reason RunEnded, and the run's
 // ending says why the run ended. The item's message stays as before: it
-// starts with the run's Ready message. The cases are the three ways abort
-// ends a BackupRun: a namespace timeout that does not parse at admission
+// starts with the run's Ready message. The cases are three of the ways that
+// abort ends a BackupRun: a namespace timeout that does not parse at admission
 // (the item is Pending), a stop of the app that fails (the item is
 // Pending), and a max-quiesce limit that stops to parse while the item
 // runs (the item is Running).

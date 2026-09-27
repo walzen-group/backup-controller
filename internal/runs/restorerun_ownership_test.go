@@ -268,7 +268,7 @@ func TestAnIntoRestoreWhoseClaimIsReplacedFails(t *testing.T) {
 	run := stepUntilFinished(t, r, c, 2)
 
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
-		!strings.Contains(readyMessage(run.Status.Conditions), "claim scratch was deleted (or replaced) while its restore Job wrote into it") {
+		!strings.Contains(readyMessage(run.Status.Conditions), "claim scratch is no longer controlled by the run, so it may not be the claim the run created") {
 		t.Fatalf("phase = %q, message = %q; want Failed saying the claim was replaced", run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
 }
@@ -375,4 +375,45 @@ func TestAnIntoRestoreRecordsIntoClaimTaken(t *testing.T) {
 	if after.ResourceVersion != foreign.ResourceVersion || len(after.OwnerReferences) != 0 || after.DeletionTimestamp != nil {
 		t.Errorf("claim = %+v, want the foreign claim untouched", after.ObjectMeta)
 	}
+}
+
+// An into restore whose status write was lost, and whose claim is then
+// deleted, takes the Job over and fails with reason ClaimLost. The Job never
+// ran, so the message says that the Job wrote nothing.
+func TestAnIntoClaimGoneBeforeTheJobRanSaysSo(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
+	restoreStep(t, r) // plan
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := obj.(*backupv1alpha1.RestoreRun); ok {
+				return apierrors.NewConflict(backupv1alpha1.GroupVersion.WithResource("restoreruns").GroupResource(), obj.GetName(), nil)
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
+	}
+	r.Client = c
+	jobs := restoreJobs(t, c)
+	if len(jobs) != 1 {
+		t.Fatalf("restore Jobs = %v, want the lost pass's one", jobs)
+	}
+	own := &corev1.PersistentVolumeClaim{}
+	get(t, c, ns, "scratch", own)
+	if err := c.Delete(context.Background(), own); err != nil {
+		t.Fatal(err)
+	}
+	stepUntilFinished(t, r, c, 3)
+	if !suspendedJob(t, c, jobs[0].Name) {
+		t.Errorf("Job %s was resumed, want it left suspended with its claim gone", jobs[0].Name)
+	}
+	markSuspended(t, c, &jobs[0])
+	run := stepUntilFinished(t, r, c, 2)
+
+	if message := readyMessage(run.Status.Conditions); run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
+		!strings.Contains(message, "claim scratch was deleted before its restore Job ran, so the Job wrote nothing") {
+		t.Fatalf("phase = %q, message = %q; want Failed saying the Job wrote nothing", run.Status.Phase, message)
+	}
+	expectItemReason(t, c, backupv1alpha1.ItemReasonClaimLost)
 }
