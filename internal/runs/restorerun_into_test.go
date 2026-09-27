@@ -19,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -273,8 +274,8 @@ func TestAnIntoTakeoverChecksTheJob(t *testing.T) {
 		}
 		kept := &batchv1.Job{}
 		get(t, c, ns, foreign.Name, kept)
-		if kept.Spec.Suspend != nil {
-			t.Errorf("the foreign Job's suspend = %v, want it untouched", *kept.Spec.Suspend)
+		if ptr.Deref(kept.Spec.Suspend, true) {
+			t.Errorf("the foreign Job's suspend = %v, want it untouched", kept.Spec.Suspend)
 		}
 		if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: run.Spec.Into}, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
 			t.Errorf("claim %s: %v, want it never created", run.Spec.Into, err)

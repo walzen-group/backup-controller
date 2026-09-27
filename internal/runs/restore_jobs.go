@@ -18,11 +18,11 @@ import (
 
 // The code in this file runs a volume restore, in place or into a new
 // claim, through the controller's own restore Job (internal/restorejob): it
-// creates the Job for the snapshot the run's checks selected, reads how the
-// Job ended, and stops it.
+// creates the Job for the snapshot the run's checks selected, resumes it
+// once the status records it, reads how the Job ended, and stops it.
 
-// jobs returns the API the run's restore Jobs are created, read and stopped
-// through. Its reads go through the reconciler's Reader, which reads the API
+// jobs returns the API the run's restore Jobs are created, resumed, read
+// and stopped through. Its reads go through the reconciler's Reader, which reads the API
 // server directly: the stop gate gives the app back once every pod it reads
 // has ended, and a cache that lags behind would show a pod as ended, or miss
 // a new one, while it still writes.
@@ -142,8 +142,8 @@ func (r *RestoreRunReconciler) recheckJobSnapshot(ctx context.Context, run *back
 		item.Snapshot, taken)
 }
 
-// createJob creates a volume item's restore Job, in place or into the claim
-// an into restore created, and moves the item to Running.
+// createJob creates a volume item's restore Job, suspended, in place or
+// into the claim an into restore created, and moves the item to Running.
 //
 // Parameters:
 //   - run is the RestoreRun, which controls the Job.
@@ -161,6 +161,14 @@ func (r *RestoreRunReconciler) recheckJobSnapshot(ctx context.Context, run *back
 // (see nothingWrittenTo). Any other failed read or create comes back as a
 // plain error for a retry; a create that went through although it answered
 // with an error is taken over by the next pass (see takeOverJob).
+//
+// Build creates the Job suspended, so no pod runs restic yet. A later pass
+// resumes it once it reads the item's Job name and UID from the stored
+// status (see resumeJob), so a Job the status does not record never
+// writes: one whose create answered with an error and was stored after a
+// later pass failed the item, or after the run finished, stays suspended
+// until the run stops it (see stopJobs) or the garbage collector deletes it
+// with the run.
 //
 // The Job restores with --delete, so the claim ends up holding exactly the
 // snapshot. It runs as root with the capabilities to restore file ownership
@@ -261,11 +269,11 @@ func (r *RestoreRunReconciler) settleJob(ctx context.Context, run *backupv1alpha
 			return nil, err
 		}
 	}
-	waiting, err := r.followJob(ctx, run, item)
+	seen, err := r.followJob(ctx, run, item)
 	if _, err := settled(item, err); err != nil {
 		return nil, err
 	}
-	return waiting, nil
+	return seen.waiting, nil
 }
 
 // addWaits adds to the message of each item a run failed as it ended early

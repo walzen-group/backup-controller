@@ -7,6 +7,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 )
 
 // restic's exit codes (cmd/restic/main.go:203-224 and doc/075_scripting.rst
@@ -48,6 +49,9 @@ type Outcome struct {
 	// Waiting is why a Running Job's newest pod has not started, for the
 	// item's message. It is nil when the pod is not waiting.
 	Waiting *Waiting
+	// Starting is true for a Running Job that still awaits its creator's
+	// resume (see AwaitsResume), for the item's message. It decides nothing.
+	Starting bool
 }
 
 // FailureError is a failed restore Job, rendered for a person. Nothing
@@ -111,7 +115,8 @@ func (w Waiting) String() string {
 // Running. The Job controller adds either condition only once every pod has
 // ended. A Failed outcome carries a FailureError built from the newest pod
 // whose container or init container ended non-zero. A Running outcome carries
-// the newest pod's waiting reason, if it has one. Neither decides anything.
+// the newest pod's waiting reason, if it has one. It is Starting while the Job
+// still awaits its creator's resume. None of these decides anything.
 func Read(job *batchv1.Job, pods []corev1.Pod) Outcome {
 	own := ownPods(job, pods)
 	switch {
@@ -120,7 +125,7 @@ func Read(job *batchv1.Job, pods []corev1.Pod) Outcome {
 	case conditionTrue(job, batchv1.JobFailed):
 		return Outcome{State: Failed, Failure: failure(job, own)}
 	default:
-		return Outcome{State: Running, Waiting: newestWaiting(own)}
+		return Outcome{State: Running, Waiting: newestWaiting(own), Starting: AwaitsResume(job)}
 	}
 }
 
@@ -224,4 +229,18 @@ func ExitMeaning(code int32) string {
 	default:
 		return "unknown exit code, counted as a failure"
 	}
+}
+
+// AwaitsResume reports whether a restore Job is still suspended since Build
+// created it, so its creator has to resume it before any pod runs.
+//
+// Parameters:
+//   - job is the Job as the caller just read it.
+//
+// It returns true for a Job with spec.suspend true that is neither Complete
+// nor Failed and not being deleted. A Job that Stop suspended also has
+// spec.suspend true; its caller stops only a Job it is done with, and never
+// asks about one.
+func AwaitsResume(job *batchv1.Job) bool {
+	return ptr.Deref(job.Spec.Suspend, false) && !finished(job) && job.DeletionTimestamp == nil
 }

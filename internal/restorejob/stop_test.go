@@ -63,22 +63,42 @@ func newCluster(t *testing.T) *cluster {
 	return &cluster{t: t, c: c, api: restorejob.NewAPI(c, noReads{c})}
 }
 
-// createJob creates the Job Build makes from runSpec, with the conditions
-// given set True in its status.
-func (k *cluster) createJob(conditions ...batchv1.JobConditionType) *batchv1.Job {
+// created creates the Job Build makes from runSpec, which starts
+// suspended, and sets Suspended=True as the Job controller does right after
+// the create. Nothing has resumed it.
+func (k *cluster) created() *batchv1.Job {
 	k.t.Helper()
 	ctx := context.Background()
 	job := build(k.t, runSpec())
 	if err := k.api.CreateJob(ctx, job); err != nil {
 		k.t.Fatal(err)
 	}
+	job = k.read(job)
+	withCondition(job, batchv1.JobSuspended, "JobSuspended", "Job suspended")
+	if err := k.c.Status().Update(ctx, job); err != nil {
+		k.t.Fatal(err)
+	}
+	return k.read(job)
+}
+
+// createJob creates the Job Build makes from runSpec and resumes it, as its
+// creator does once it has recorded the Job, with the conditions given set
+// True in its status.
+func (k *cluster) createJob(conditions ...batchv1.JobConditionType) *batchv1.Job {
+	k.t.Helper()
+	ctx := context.Background()
+	job := k.created()
+	if err := k.api.ResumeJob(ctx, job); err != nil {
+		k.t.Fatal(err)
+	}
+	// The Job controller sets Suspended to False with reason JobResumed.
+	job = k.read(job)
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobSuspended, Status: corev1.ConditionFalse, Reason: "JobResumed"}}
 	for _, typ := range conditions {
 		withCondition(job, typ, "", "")
 	}
-	if len(conditions) > 0 {
-		if err := k.c.Status().Update(ctx, job); err != nil {
-			k.t.Fatal(err)
-		}
+	if err := k.c.Status().Update(ctx, job); err != nil {
+		k.t.Fatal(err)
 	}
 	return k.read(job)
 }
@@ -422,6 +442,7 @@ func TestMayStillWrite(t *testing.T) {
 		holds bool
 	}{
 		{name: "running, no pod yet", holds: true},
+		{name: "created suspended, never resumed", job: suspendedJob},
 		{name: "suspend asked, condition not yet set", job: func(j *batchv1.Job) { j.Spec.Suspend = ptr.To(true) }, holds: true},
 		{name: "suspended", job: suspendedJob},
 		{name: "suspended, pod running", job: suspendedJob, pods: []corev1.Pod{pod(corev1.PodRunning, "worker-1", true, "job-uid")}, holds: true},
@@ -457,4 +478,74 @@ func suspendedJob(job *batchv1.Job) {
 // completeJob marks a Job Complete.
 func completeJob(job *batchv1.Job) {
 	withCondition(job, batchv1.JobComplete, "CompletionsReached", "")
+}
+
+// ResumeJob clears spec.suspend on the Job it is given, and on no Job that
+// replaced it under the same name.
+func TestResumeJobResumesOnlyTheJobGiven(t *testing.T) {
+	k := newCluster(t)
+	job := k.created()
+	stale := job.DeepCopy()
+	stale.UID = "an-earlier-job"
+	if err := k.api.ResumeJob(context.Background(), stale); err == nil {
+		t.Fatal("ResumeJob resumed a Job other than the one it was given")
+	}
+	if got := k.read(job); !ptr.Deref(got.Spec.Suspend, false) {
+		t.Fatal("the Job that replaced the one given was resumed")
+	}
+	if err := k.api.ResumeJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if got := k.read(job); ptr.Deref(got.Spec.Suspend, true) {
+		t.Errorf("spec.suspend = %v after ResumeJob, want false", got.Spec.Suspend)
+	}
+}
+
+// A Job that was created suspended and never resumed has no pod, so Stop
+// deletes it at once, with no suspend patch.
+func TestStopOfAJobNeverResumedDeletesIt(t *testing.T) {
+	k := newCluster(t)
+	job := k.created()
+	if state := k.stop(job); !state.Stopped {
+		t.Fatalf("state = %+v, want a Job that never ran stopped at once", state)
+	}
+	if !k.foregroundDeleted(job) {
+		t.Error("the Job was not deleted with Foreground propagation")
+	}
+}
+
+// Read reports a Job that is still suspended as starting, and a Job that
+// was resumed or has ended as not starting.
+func TestReadReportsAJobNotYetResumedAsStarting(t *testing.T) {
+	k := newCluster(t)
+	created := k.created()
+	if got := restorejob.Read(created, nil); got.State != restorejob.Running || !got.Starting {
+		t.Errorf("Read of a Job never resumed = %+v, want Running and starting", got)
+	}
+	if !restorejob.AwaitsResume(created) {
+		t.Error("AwaitsResume = false for a Job never resumed, want true")
+	}
+	for name, job := range map[string]*batchv1.Job{
+		"resumed":  newCluster(t).createJob(),
+		"complete": completedSuspended(newCluster(t).created()),
+	} {
+		if got := restorejob.Read(job, nil); got.Starting {
+			t.Errorf("Read of a %s Job = %+v, want not starting", name, got)
+		}
+		if restorejob.AwaitsResume(job) {
+			t.Errorf("AwaitsResume = true for a %s Job, want false", name)
+		}
+	}
+	deleting := created.DeepCopy()
+	deleting.DeletionTimestamp = ptr.To(metav1.NewTime(podTime))
+	if restorejob.AwaitsResume(deleting) {
+		t.Error("AwaitsResume = true for a Job being deleted, want false")
+	}
+}
+
+// completedSuspended marks a suspended Job Complete, which the Job
+// controller never does; it checks that a terminal condition wins.
+func completedSuspended(job *batchv1.Job) *batchv1.Job {
+	completeJob(job)
+	return job
 }

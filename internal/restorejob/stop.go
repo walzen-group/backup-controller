@@ -100,6 +100,10 @@ func (s StopState) String() string {
 // deleted with Foreground propagation and a UID precondition; Stop does not
 // wait for it to go, since nothing of it can write any more.
 //
+// A Job that was created suspended and never resumed has no pod. The Job
+// controller marks it Suspended=True right after the create, so Stop
+// deletes it with no suspend patch.
+//
 // A Job that is gone (NotFound, or the name now holds a Job with another
 // UID, which Stop leaves alone) goes straight to the gate on the ref's UID.
 // Someone may have deleted it while it ran: with the Orphan propagation its
@@ -219,14 +223,19 @@ func podsThatMayWrite(ctx context.Context, api API, ref Ref) ([]string, error) {
 // so a pod list in the same pass could miss a new pod. Only a later read that
 // shows the suspend and the condition together lets the gate go on.
 //
-// That narrows the gap after a resume by someone other than the controller
-// without closing it. When Stop's patch lands between the Job controller's
-// pod create and its JobResumed write, that write conflicts, and the Job
+// That narrows the gap after a resume without closing it. The Job is
+// resumed by its creator, which resumes each Job it created once it has
+// recorded it (see Build). When Stop's patch lands between the Job
+// controller's pod create and its JobResumed write, that write conflicts, and the Job
 // keeps the old Suspended=True beside spec.suspend true. A later read then
 // passes, and the pod list sees every pod created before the patch. A pod
 // the Job controller creates from a cache that still shows the Job resumed
-// can come after that list, within the Job controller's cache lag. The
-// declared setup has no one who resumes the controller's Jobs.
+// can come after that list, within the Job controller's cache lag. It takes
+// a stop within one Job controller sync of the resume: the caller never
+// resumes in a pass that ends its run, so only an abort, a timeout or a
+// delete of the run that comes that soon meets it. The Job controller's
+// next sync of the suspended Job deletes such a pod, and the garbage
+// collector does once the Job is gone.
 func suspend(ctx context.Context, api API, job *batchv1.Job) (bool, error) {
 	if !ptr.Deref(job.Spec.Suspend, false) {
 		if err := api.SuspendJob(ctx, job); err != nil {
@@ -261,7 +270,9 @@ func mayWrite(p *corev1.Pod) bool {
 // deleted, and not shown suspended by both spec.suspend and Suspended=True
 // in the same read, the rule the stop gate follows (see suspend). A pod may
 // run restic until it has ended, unless it was never scheduled and is being
-// deleted (see Stop).
+// deleted (see Stop). A Job created suspended and never resumed holds
+// nothing once the Job controller has marked it Suspended=True, right after
+// the create: it has no pod.
 func MayStillWrite(job *batchv1.Job, pods []corev1.Pod) bool {
 	suspended := ptr.Deref(job.Spec.Suspend, false) && conditionTrue(job, batchv1.JobSuspended)
 	if !finished(job) && job.DeletionTimestamp == nil && !suspended {

@@ -150,7 +150,9 @@ func (r *RestoreRunReconciler) intoChecks(ctx context.Context, run *backupv1alph
 // restores with --delete, mounts the claim by name and is its first
 // consumer, so on a WaitForFirstConsumer class the scheduler places the
 // volume where the Job's pod runs when no node was copied (see createJob).
-// The status write that follows records the Job's name and UID together.
+// The status write that follows records the Job's name and UID together,
+// and a later pass resumes the Job, which Build created suspended (see
+// followIntoJob).
 func (r *RestoreRunReconciler) createInto(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, settings restoreSettings) (ctrl.Result, error) {
 	err := nothingWrittenTo(run.Spec.Into, r.recheckJobSnapshot(ctx, run, *item, settings.Secret))
 	if done, err := settled(item, err); done {
@@ -180,10 +182,14 @@ func (r *RestoreRunReconciler) createInto(ctx context.Context, run *backupv1alph
 // also checks that the claim is still the run's (see claimLostError), so a
 // claim deleted or replaced mid-restore fails the item with reason
 // ClaimLost and the run stops the Job. A run past its deadline ends with
-// reason TimedOut. Otherwise the item's message shows why the Job's pod
-// waits, if it does, and the status is written when it changed.
+// reason TimedOut. Otherwise a Job still suspended since its create is
+// resumed (see resumeJob): the item's Job name and UID came from the stored
+// status, and the pass goes on with the restore. A refused resume fails the
+// item with reason RestoreJobRefused and ends the run Failed. The item's
+// message shows why the Job's pod waits, if it does, and the status is
+// written when it changed.
 func (r *RestoreRunReconciler) followIntoJob(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (ctrl.Result, error) {
-	_, err := r.followJob(ctx, run, item)
+	seen, err := r.followJob(ctx, run, item)
 	if err == nil && !finished(*item) {
 		err = r.claimLostError(ctx, run, *item)
 	}
@@ -192,6 +198,11 @@ func (r *RestoreRunReconciler) followIntoJob(ctx context.Context, run *backupv1a
 	}
 	if deadline, over := r.overdue(run); over {
 		return r.timeOut(ctx, run, intoTimedOut(run.Spec.Into, deadline))
+	}
+	if seen.unresumed != nil {
+		if done, err := settled(item, r.resumeJob(ctx, *item, seen.unresumed)); done {
+			return r.endInto(ctx, run, err)
+		}
 	}
 	return after(pollInterval, r.writeChangedStatus(ctx, run))
 }
@@ -237,8 +248,8 @@ func (r *RestoreRunReconciler) finishInto(ctx context.Context, run *backupv1alph
 //   - run is the RestoreRun, whose item records the Job's name and UID.
 //
 // It returns the error of the status write. The write records the Job's
-// name and UID together; a lost write leaves the Job to the next pass's
-// takeover (see takeOverJob).
+// name and UID together, and the next pass resumes the Job; a lost write
+// leaves the Job suspended for the next pass's takeover (see takeOverJob).
 func (r *RestoreRunReconciler) resume(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
 	if run.Status.Phase == backupv1alpha1.RunPhaseWaiting {
 		run.Status.Phase = backupv1alpha1.RunPhaseRunning

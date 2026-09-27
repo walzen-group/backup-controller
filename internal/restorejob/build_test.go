@@ -284,9 +284,6 @@ func TestBuildFailurePolicy(t *testing.T) {
 	if spec.PodReplacementPolicy == nil || *spec.PodReplacementPolicy != batchv1.Failed {
 		t.Errorf("podReplacementPolicy = %v, want Failed", spec.PodReplacementPolicy)
 	}
-	if spec.Suspend != nil && *spec.Suspend {
-		t.Error("the Job is created suspended")
-	}
 	want := []batchv1.PodFailurePolicyRule{
 		{Action: batchv1.PodFailurePolicyActionFailJob, OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
 			Operator: batchv1.PodFailurePolicyOnExitCodesOpIn, Values: []int32{10, 12}}},
@@ -361,5 +358,33 @@ func TestBuildLabelsAPopulatorJobByClaim(t *testing.T) {
 		if job.Labels[k] != v {
 			t.Errorf("label %s = %q, want %q", k, job.Labels[k], v)
 		}
+	}
+}
+
+// Build creates the Job suspended, so no pod runs restic until the caller
+// has recorded the Job and resumes it. The Job's own labels are never empty
+// and never carry Kueue's queue label: the API server copies the pod
+// template's labels onto a Job created with none, queue label included,
+// and Kueue then manages the Job and resumes it on its own.
+func TestBuildCreatesTheJobSuspendedWithoutTheQueueLabel(t *testing.T) {
+	spec := runSpec()
+	spec.PodLabels = map[string]string{"kueue.x-k8s.io/queue-name": "backups"}
+	for name, origin := range map[string]restorejob.Origin{
+		"RestoreRun": {Kind: restorejob.OriginRestoreRun, UID: "run-uid"},
+		"claim":      {Kind: restorejob.OriginClaim, UID: "claim-uid"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec.Origin = origin
+			job := build(t, spec)
+			if job.Spec.Suspend == nil || !*job.Spec.Suspend {
+				t.Errorf("spec.suspend = %v, want true", job.Spec.Suspend)
+			}
+			if len(job.Labels) == 0 {
+				t.Error("the Job has no labels; the API server would copy the pod template's onto it")
+			}
+			if _, ok := job.Labels["kueue.x-k8s.io/queue-name"]; ok {
+				t.Errorf("Job labels = %v, want no queue label", job.Labels)
+			}
+		})
 	}
 }

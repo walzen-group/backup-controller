@@ -42,7 +42,8 @@ func withNamespace(objects []client.Object) []client.Object {
 
 // restoreJobFor returns the restore Job the run back-to-monday creates for
 // its first item, restoring the snapshot with the given full ID into the
-// claim named claimName, as createJob builds it, with the UID jobUID.
+// claim named claimName, as createJob builds it, with the UID jobUID, and
+// resumed as the run resumes it once it has recorded the Job.
 func restoreJobFor(t *testing.T, run *backupv1alpha1.RestoreRun, claimName, snapshotID string) *batchv1.Job {
 	t.Helper()
 	job, err := restorejob.Build(restorejob.Spec{
@@ -55,6 +56,7 @@ func restoreJobFor(t *testing.T, run *backupv1alpha1.RestoreRun, claimName, snap
 		t.Fatal(err)
 	}
 	job.UID = jobUID
+	job.Spec.Suspend = ptr.To(false)
 	return job
 }
 

@@ -12,8 +12,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// API is what the package needs of the Kubernetes API to create, read and
-// stop a restore Job. Every read must be fresh from the API server: the stop
+// API is what the package needs of the Kubernetes API to create, resume,
+// read and stop a restore Job. Every read must be fresh from the API server: the stop
 // gate decides that no pod can still write from what it reads.
 type API interface {
 	// GetJob reads the Job of the given namespace and name.
@@ -23,6 +23,9 @@ type API interface {
 	// SuspendJob sets spec.suspend on the Job, and only on the Job with the
 	// given one's UID.
 	SuspendJob(ctx context.Context, job *batchv1.Job) error
+	// ResumeJob clears spec.suspend on the Job, and only on the Job with the
+	// given one's UID.
+	ResumeJob(ctx context.Context, job *batchv1.Job) error
 	// DeleteJob deletes the Job with Foreground propagation, and only the
 	// Job with the given one's UID.
 	DeleteJob(ctx context.Context, job *batchv1.Job) error
@@ -46,7 +49,7 @@ type clientAPI struct {
 //     cached client: the stop gate lets the app have its volume back once
 //     every pod it reads has ended, and a cache that lags behind would show
 //     a pod as ended, or miss a new one, while it still writes.
-//   - writer serves the create, the suspend and the delete. The caller
+//   - writer serves the create, the suspend, the resume and the delete. The caller
 //     passes the manager's client.
 func NewAPI(reader client.Reader, writer client.Client) API {
 	return &clientAPI{reader: reader, writer: writer}
@@ -66,14 +69,31 @@ func (a *clientAPI) CreateJob(ctx context.Context, job *batchv1.Job) error {
 	return a.writer.Create(ctx, job)
 }
 
-// SuspendJob sends a merge patch that sets spec.suspend and carries the
-// Job's UID. The API server refuses a patch that would change a stored
-// object's UID, so a Job created under the same name after the given one
-// was read is left alone.
+// SuspendJob sets spec.suspend through setSuspend.
 func (a *clientAPI) SuspendJob(ctx context.Context, job *batchv1.Job) error {
+	return a.setSuspend(ctx, job, true)
+}
+
+// ResumeJob clears spec.suspend through setSuspend.
+func (a *clientAPI) ResumeJob(ctx context.Context, job *batchv1.Job) error {
+	return a.setSuspend(ctx, job, false)
+}
+
+// setSuspend sends a merge patch that sets spec.suspend and carries the
+// Job's UID.
+//
+// Parameters:
+//   - job is the Job as the caller read or created it, with its UID.
+//   - suspend is the value spec.suspend gets.
+//
+// It returns the error of the patch, which wraps the API server's NotFound
+// for a Job that is gone. The API server refuses a patch that would change
+// a stored object's UID, so a Job created under the same name after the
+// given one was read is left alone.
+func (a *clientAPI) setSuspend(ctx context.Context, job *batchv1.Job, suspend bool) error {
 	patch, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{"uid": job.UID},
-		"spec":     map[string]any{"suspend": true},
+		"spec":     map[string]any{"suspend": suspend},
 	})
 	if err != nil {
 		return fmt.Errorf("build the suspend patch: %w", err)

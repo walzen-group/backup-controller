@@ -197,6 +197,19 @@ func PrivilegedMovers(ns *corev1.Namespace) bool {
 // the two kinds. A shorter ID would let restic resolve a snapshot of its own
 // choice, such as the only one there is.
 //
+// The Job is created suspended (spec.suspend true), so the Job controller
+// starts no pod for it and no restic runs until the caller has recorded the
+// Job and resumes it (see API.ResumeJob). A create answered with an error
+// can still store the Job later, and such a Job, or one whose record was
+// lost, never writes. Kueue leaves a Job without its queue label alone while
+// manageJobsWithoutQueueName is false, as the cluster sets it (kueue v0.19.5
+// pkg/controller/jobframework/reconciler.go:368-374), and admits the Job's
+// pod through its pod integration once the Job is resumed. So the Job's own
+// labels are never empty and never carry the queue label, which goes on the
+// pod template only: the API server copies the template's labels onto a
+// Job created with none, and Kueue would then manage the Job and resume it
+// itself.
+//
 // The Job runs one pod at a time and fails after four failed pods, or at once
 // when restic reports that the repository is missing (exit 10) or the
 // password is wrong (exit 12). A pod that Kubernetes or Kueue stops is not
@@ -227,6 +240,7 @@ func Build(spec Spec) (*batchv1.Job, error) {
 			OwnerReferences: []metav1.OwnerReference{spec.Owner},
 		},
 		Spec: batchv1.JobSpec{
+			Suspend:              ptr.To(true),
 			Completions:          ptr.To[int32](1),
 			Parallelism:          ptr.To[int32](1),
 			BackoffLimit:         ptr.To[int32](backoffLimit),

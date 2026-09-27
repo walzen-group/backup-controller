@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 )
@@ -47,10 +48,13 @@ func waiting(name, reason, message string) corev1.ContainerStatus {
 	}}
 }
 
+// readJob returns the Job Build makes from runSpec as its creator resumed
+// it.
 func readJob(t *testing.T) *batchv1.Job {
 	t.Helper()
 	job := build(t, runSpec())
 	job.UID = "job-uid"
+	job.Spec.Suspend = ptr.To(false)
 	return job
 }
 

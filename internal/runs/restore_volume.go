@@ -6,6 +6,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
+	batchv1 "k8s.io/api/batch/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -123,7 +124,7 @@ func (r *RestoreRunReconciler) startJob(ctx context.Context, run *backupv1alpha1
 // jobOfRun) means an earlier pass ran every start check, created the Job,
 // and lost the status write that recorded it. The item takes it over,
 // records its name and UID in the same status write, and moves to Running,
-// but only when the Job's snapshot-id annotation is the full ID the item
+// where a later pass resumes the suspended Job (see resumeJob), but only when the Job's snapshot-id annotation is the full ID the item
 // recorded. A Job with another ID is the controller's own bug: the refusal
 // has reason RestoreJobFailed, the item keeps the Job's name and UID, and
 // the run stops that Job like any other. A Job the run did not create under
@@ -150,6 +151,16 @@ func (r *RestoreRunReconciler) takeOverJob(ctx context.Context, run *backupv1alp
 	return true, nil
 }
 
+// followed is what followJob found in a Running volume item's restore Job.
+type followed struct {
+	// waiting is why the Job's newest pod has not started, when the Job
+	// still runs and its pod waits (see restorejob.Read), and nil otherwise.
+	waiting *restorejob.Waiting
+	// unresumed is the Job as followJob read it when it is still suspended
+	// since its create (see restorejob.AwaitsResume), and nil otherwise.
+	unresumed *batchv1.Job
+}
+
 // followJob reads a Running volume item's restore Job, in place or into a
 // new claim, and records how it ended.
 //
@@ -158,11 +169,12 @@ func (r *RestoreRunReconciler) takeOverJob(ctx context.Context, run *backupv1alp
 //   - item is the Running volume item, which names its Job and the Job's
 //     UID. followJob updates it in place.
 //
-// It returns why the Job's newest pod has not started, when the Job still
-// runs and its pod waits (see restorejob.Read), and nil otherwise. The error
-// is a *refusalError or a *restorejob.FailureError when the item fails,
-// which the caller records (see settled), and a plain error from a failed
-// read, which leaves the item as it was.
+// It returns what it found in a Job that still runs: why its newest pod
+// waits, and the Job when it still awaits the run's resume, which the caller
+// resumes only in a pass that goes on with the restore (see resumeJob). The
+// error is a *refusalError or a *restorejob.FailureError when the item
+// fails, which the caller records (see settled), and a plain error from a
+// failed read, which leaves the item as it was.
 //
 // A Job that is gone, or whose name now holds a Job with another UID, was
 // deleted before it finished: the run records an item's end before it
@@ -172,26 +184,65 @@ func (r *RestoreRunReconciler) takeOverJob(ctx context.Context, run *backupv1alp
 // Job for the item. A Job the run no longer controls is refused with reason
 // RestoreJobFailed and stopped the same way. Otherwise the Job's terminal
 // conditions decide (see recordJobEnd).
-func (r *RestoreRunReconciler) followJob(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (*restorejob.Waiting, error) {
+func (r *RestoreRunReconciler) followJob(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (followed, error) {
 	job, err := r.jobs().GetJob(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Job})
 	switch {
 	case apierrors.IsNotFound(err):
-		return nil, refuse(backupv1alpha1.ItemReasonRestoreJobDeleted,
+		return followed{}, refuse(backupv1alpha1.ItemReasonRestoreJobDeleted,
 			"the restore Job %s was deleted before it finished", item.Job)
 	case err != nil:
-		return nil, fmt.Errorf("get restore Job %s: %w", item.Job, err)
+		return followed{}, fmt.Errorf("get restore Job %s: %w", item.Job, err)
 	case job.UID != item.JobUID:
-		return nil, refuse(backupv1alpha1.ItemReasonRestoreJobDeleted,
+		return followed{}, refuse(backupv1alpha1.ItemReasonRestoreJobDeleted,
 			"the restore Job %s was deleted before it finished, and a Job with another UID holds its name now", item.Job)
 	case !metav1.IsControlledBy(job, run):
-		return nil, refuse(backupv1alpha1.ItemReasonRestoreJobFailed,
+		return followed{}, refuse(backupv1alpha1.ItemReasonRestoreJobFailed,
 			"the restore Job %s is no longer controlled by the run", item.Job)
 	}
 	pods, err := r.jobs().ListJobPods(ctx, run.Namespace, job.UID)
 	if err != nil {
-		return nil, fmt.Errorf("list the pods of restore Job %s: %w", job.Name, err)
+		return followed{}, fmt.Errorf("list the pods of restore Job %s: %w", job.Name, err)
 	}
-	return r.recordJobEnd(ctx, run, item, restorejob.Read(job, pods))
+	waiting, err := r.recordJobEnd(ctx, run, item, restorejob.Read(job, pods))
+	if err != nil || finished(*item) || !restorejob.AwaitsResume(job) {
+		return followed{waiting: waiting}, err
+	}
+	return followed{waiting: waiting, unresumed: job}, nil
+}
+
+// resumeJob resumes a Running volume item's restore Job, which Build
+// created suspended, so its pod can run.
+//
+// Parameters:
+//   - item is the Running volume item. The caller passes one whose Job name
+//     and UID it read from the stored status, so the status write that
+//     recorded them went through, and only in a pass that goes on with the
+//     restore.
+//   - job is the item's Job as followJob just read it, still suspended.
+//
+// It returns nil once the resume went through, a *refusalError with reason
+// RestoreJobRefused, saying that nothing was written to the claim, when the
+// API server refuses it as Forbidden or Invalid, and a plain error from any
+// other failed patch, for a retry.
+//
+// The patch carries the Job's UID, so a Job created under the name since
+// the read is left alone. The item's record comes first: a Job it does not
+// record, such as one whose create answered with an error and was stored
+// later, stays suspended with no pod, and the run stops it (see stopJobs).
+// A refused resume leaves the Job suspended too, and the run stops it once
+// the item has failed. A pass that ends the run never resumes: a stop right
+// after a resume could miss a pod the Job controller creates for it (see
+// restorejob.Stop).
+func (r *RestoreRunReconciler) resumeJob(ctx context.Context, item backupv1alpha1.RestoreItem, job *batchv1.Job) error {
+	err := r.jobs().ResumeJob(ctx, job)
+	switch {
+	case apierrors.IsForbidden(err) || apierrors.IsInvalid(err):
+		return nothingWrittenTo(item.Name, refuse(backupv1alpha1.ItemReasonRestoreJobRefused,
+			"the API server refused to resume restore Job %s, which never ran: %v", job.Name, err))
+	case err != nil:
+		return fmt.Errorf("resume restore Job %s: %w", job.Name, err)
+	}
+	return nil
 }
 
 // recordJobEnd records on a volume item how its restore Job stands.
@@ -215,7 +266,8 @@ func (r *RestoreRunReconciler) followJob(ctx context.Context, run *backupv1alpha
 // *restorejob.FailureError, reason RestoreJobFailed, whose message carries
 // restic's exit code, its meaning and restic's last lines. A Job that has
 // neither keeps the item Running, and its message shows why the newest pod
-// waits, if it does. The message is for a person and decides nothing.
+// waits, if it does, or that the Job has not been resumed yet. The message
+// is for a person and decides nothing.
 func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, outcome restorejob.Outcome) (*restorejob.Waiting, error) {
 	switch outcome.State {
 	case restorejob.Succeeded:
@@ -227,8 +279,11 @@ func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1al
 		return nil, outcome.Failure
 	case restorejob.Running:
 		item.Message = ""
-		if outcome.Waiting != nil {
+		switch {
+		case outcome.Waiting != nil:
 			item.Message = outcome.Waiting.String()
+		case outcome.Starting:
+			item.Message = "starting: the restore Job was created suspended, and the run resumes it once the status records it"
 		}
 		return outcome.Waiting, nil
 	}

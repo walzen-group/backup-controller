@@ -1125,15 +1125,21 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 // when an API call fails for a reason a retry may fix.
 //
 // A Pending item starts its restore Job once nothing holds it back (see
-// startJob). A Running item follows its Job to its end (see followJob). The
-// run stops the Job once the item's end is in the status (see stopJobs).
+// startJob). A Running item follows its Job to its end (see followJob), and
+// its Job, created suspended, is resumed once the item's Job name and UID
+// are in the stored status (see resumeJob): the pass read them from there,
+// and a pass with an item still Running does not end the run. The run
+// stops the Job once the item's end is in the status (see stopJobs).
 func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (reason, message string, err error) {
 	switch item.Phase {
 	case backupv1alpha1.ItemPending:
 		return r.startJob(ctx, run, index, item)
 	case backupv1alpha1.ItemRunning:
-		_, err = r.followJob(ctx, run, item)
-		_, err = settled(item, err)
+		seen, err := r.followJob(ctx, run, item)
+		if done, err := settled(item, err); done || seen.unresumed == nil {
+			return "", "", err
+		}
+		_, err = settled(item, r.resumeJob(ctx, *item, seen.unresumed))
 		return "", "", err
 	default:
 		// An item in any other phase has finished, so there is nothing
