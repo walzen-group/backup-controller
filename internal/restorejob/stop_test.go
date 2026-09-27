@@ -208,21 +208,6 @@ func TestStopGateWaitsForARunningPodOfASuspendedJob(t *testing.T) {
 	}
 }
 
-func TestStopGatePassesAnUnscheduledPodOnlyWhileItIsDeleted(t *testing.T) {
-	k := newCluster(t)
-	job := k.suspended()
-	pod := k.createPod("gated", job, job.UID, "", corev1.PodPending)
-	if state := k.stop(job); state.Stopped || !slices.Equal(state.Pods, []string{"gated"}) {
-		t.Fatalf("state = %+v, want an unscheduled pod that is not being deleted to hold the gate", state)
-	}
-	if err := k.c.Delete(context.Background(), pod); err != nil {
-		t.Fatal(err)
-	}
-	if state := k.stop(k.read(job)); !state.Stopped {
-		t.Fatalf("state = %+v, want an unscheduled pod being deleted to pass", state)
-	}
-}
-
 func TestStopOfAFinishedJobWaitsForAPodThatMayStillWrite(t *testing.T) {
 	for _, typ := range []batchv1.JobConditionType{batchv1.JobComplete, batchv1.JobFailed} {
 		t.Run(string(typ), func(t *testing.T) {

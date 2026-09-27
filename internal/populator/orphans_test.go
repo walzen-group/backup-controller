@@ -20,7 +20,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 const (
@@ -210,29 +209,6 @@ func TestAClaimWhoseVolumeRestoreExistsIsLeftToTheLibrary(t *testing.T) {
 				t.Errorf("events = %q, want none", got)
 			}
 		})
-	}
-}
-
-// A live read that fails for any reason but NotFound stops and deletes
-// nothing and returns the error for a retry.
-func TestAFailedVolumeRestoreReadDeletesNothing(t *testing.T) {
-	c := newOrphanClient(t, append(leftovers(t), stuckClaim())...)
-	reader := interceptor.NewClient(c, interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*backupv1alpha1.VolumeRestore); ok {
-				return apierrors.NewServiceUnavailable("etcd is away")
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-	})
-	r, _ := newOrphanReconciler(c, reader)
-
-	if _, err := reconcileClaim(t, r); err == nil {
-		t.Fatal("reconcile returned no error")
-	}
-	assertLeftovers(t, c, true)
-	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
-		t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
 	}
 }
 

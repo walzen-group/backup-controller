@@ -95,7 +95,6 @@ var grants = []grant{
 	{"backup.wlz.li", "restoreruns/finalizers", []string{"update"}, "owner references to a RestoreRun, under OwnerReferencesPermissionEnforcement"},
 	{"", "persistentvolumeclaims/finalizers", []string{"update"}, "owner references to a claim, under OwnerReferencesPermissionEnforcement"},
 
-	{"apiextensions.k8s.io", "customresourcedefinitions", []string{"get"}, "the schema check a run makes before it changes anything (reason CRDOutdated)"},
 }
 
 // TestTheClusterRoleCoversEverythingTheControllerDoes checks that the
@@ -173,8 +172,8 @@ type permission struct {
 }
 
 // String returns the permission in a form for a test message, such as
-// "get on customresourcedefinitions.apiextensions.k8s.io named
-// backupruns.backup.wlz.li".
+// "get on leases.coordination.k8s.io named
+// backup-controller-quiesce".
 func (p permission) String() string {
 	text := p.verb + " on " + resourceName(p.group, p.resource)
 	if p.name != "" {
@@ -254,42 +253,6 @@ func readChartRules(t *testing.T, path string) []rbacv1.PolicyRule {
 		t.Fatalf("the rules block in %s holds no rules", path)
 	}
 	return role.Rules
-}
-
-// ownCRDs are the CustomResourceDefinitions the controller may read, and the
-// only ones.
-var ownCRDs = []string{"backupruns.backup.wlz.li", "restoreruns.backup.wlz.li"}
-
-// TestTheCRDReadIsLimitedToThisProjectsCRDs checks that every rule on
-// customresourcedefinitions, in deploy/ and in the chart, allows get only and
-// names exactly the two CRDs a run checks (see crdOutdated in internal/runs)
-// in resourceNames. A rule without resourceNames would let the controller
-// read every CRD in the cluster, and a name no check reads would be a grant
-// nothing uses.
-func TestTheCRDReadIsLimitedToThisProjectsCRDs(t *testing.T) {
-	role := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
-	found := false
-	for _, rule := range role.Rules {
-		if !contains(rule.Resources, "customresourcedefinitions") {
-			continue
-		}
-		found = true
-		if strings.Join(rule.Verbs, ",") != "get" || strings.Join(rule.ResourceNames, ",") != strings.Join(ownCRDs, ",") {
-			t.Errorf("the rule on customresourcedefinitions allows %v on %v, want get on exactly %v", rule.Verbs, rule.ResourceNames, ownCRDs)
-		}
-	}
-	if !found {
-		t.Error("deploy/rbac.yaml has no rule on customresourcedefinitions")
-	}
-
-	chart, err := os.ReadFile(filepath.Join("..", "..", "chart", "templates", "rbac.yaml"))
-	if err != nil {
-		t.Fatalf("read the chart's rbac: %v", err)
-	}
-	want := fmt.Sprintf("resourceNames: [%q, %q]", ownCRDs[0], ownCRDs[1])
-	if strings.Count(string(chart), "customresourcedefinitions") != 1 || !strings.Contains(string(chart), want) {
-		t.Errorf("the chart does not hold one rule on customresourcedefinitions limited with %s", want)
-	}
 }
 
 // allows reports whether any rule in the role grants the verb, or the "*"

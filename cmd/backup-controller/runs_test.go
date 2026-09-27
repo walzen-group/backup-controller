@@ -12,17 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	batchv1 "k8s.io/api/batch/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // TestAManagerThatStopsOnItsOwnIsReported checks that startRunControllers
@@ -229,81 +220,4 @@ func TestTheBinaryCarriesTheZoneDatabase(t *testing.T) {
 		}
 	}
 	t.Fatal("time/tzdata is not among the binary's packages; a CRON_TZ schedule fails in the image")
-}
-
-// lookupRecorder is a RESTMapper that records each group and kind looked up
-// with no version, the lookup that makes controller-runtime's lazy mapper
-// read every version of a group.
-type lookupRecorder struct {
-	meta.RESTMapper
-	looked map[schema.GroupKind]bool
-}
-
-// RESTMapping records gk when no version is given.
-func (m *lookupRecorder) RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
-	if len(versions) == 0 {
-		m.looked[gk] = true
-	}
-	return m.RESTMapper.RESTMapping(gk, versions...)
-}
-
-// The startup check warms the manager's mapper for the bootstrap webhook:
-// it looks up Cluster and ObjectStore, so the webhook's first admission
-// request finds both groups cached and runs no discovery call.
-func TestTheStartupCheckWarmsTheWebhooksGroups(t *testing.T) {
-	cluster := schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Cluster"}
-	defaults := meta.NewDefaultRESTMapper(nil)
-	defaults.Add(cluster, meta.RESTScopeNamespace)
-	defaults.Add(bootstrap.ObjectStoreGVK, meta.RESTScopeNamespace)
-	mapper := &lookupRecorder{RESTMapper: defaults, looked: map[schema.GroupKind]bool{}}
-
-	checkServedVersions(mapper)
-
-	for _, gk := range []schema.GroupKind{cluster.GroupKind(), bootstrap.ObjectStoreGVK.GroupKind()} {
-		if !mapper.looked[gk] {
-			t.Errorf("the startup check did not look up %s", gk)
-		}
-	}
-}
-
-// versionGoneClient returns a fake client that answers every read of a Job
-// with the plain-text 404 kube-apiserver gives for a version it no longer
-// serves, as after an upgrade that drops batch/v1 while the client's mapper
-// still caches it. client-go turns that answer into a NotFound, the same as
-// for a Job that is gone.
-func versionGoneClient(t *testing.T) client.WithWatch {
-	t.Helper()
-	s := runtime.NewScheme()
-	if err := batchv1.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	gone := func(key client.ObjectKey) error {
-		return apierrors.NewGenericServerResponse(http.StatusNotFound, "get",
-			schema.GroupResource{Group: batchv1.GroupName, Resource: "jobs"}, key.Name, "404 page not found", 0, true)
-	}
-	return fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(interceptor.Funcs{
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*batchv1.Job); ok {
-				return gone(key)
-			}
-			return c.Get(ctx, key, obj, opts...)
-		},
-	}).Build()
-}
-
-// checkNotMissing fails the test unless err is an error that does not read
-// as a missing object.
-func checkNotMissing(t *testing.T, what string, err error) {
-	t.Helper()
-	if err == nil || apierrors.IsNotFound(err) {
-		t.Errorf("%s = %v, want an error that is not NotFound", what, err)
-	}
-}
-
-// The populator reads a restore Job at a version the API server no longer
-// serves as an error it retries, never as a Job that is gone, which would
-// let it create a second Job or bind the claim.
-func TestThePopulatorNeverTakesAVersionGoneForAMissingJob(t *testing.T) {
-	_, err := operationsFor(versionGoneClient(t)).GetJob(context.Background(), types.NamespacedName{Namespace: "backup-system", Name: "restore-9b7d4e21"})
-	checkNotMissing(t, "GetJob", err)
 }

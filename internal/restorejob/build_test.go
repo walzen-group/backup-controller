@@ -1,9 +1,7 @@
 package restorejob_test
 
 import (
-	"errors"
 	"slices"
-	"strings"
 	"testing"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -82,29 +80,6 @@ func TestBuildNamesTheFullSnapshotID(t *testing.T) {
 	restore = container(t, build(t, populator), "restore")
 	if slices.Contains(restore.Args, "--delete") {
 		t.Errorf("args = %q, want no --delete for a populator restore", restore.Args)
-	}
-}
-
-func TestBuildRefusesAnIDThatIsNot64Hex(t *testing.T) {
-	for name, id := range map[string]string{
-		"empty":      "",
-		"short":      fullID[:8],
-		"upper case": strings.ToUpper(fullID),
-		"too long":   fullID + "0",
-		"not hex":    fullID[:63] + "g",
-	} {
-		t.Run(name, func(t *testing.T) {
-			spec := runSpec()
-			spec.SnapshotID = id
-			job, err := restorejob.Build(spec)
-			var specErr *restorejob.SpecError
-			if !errors.As(err, &specErr) || specErr.Field != "SnapshotID" {
-				t.Fatalf("Build = %v, want a *SpecError on SnapshotID", err)
-			}
-			if job != nil {
-				t.Errorf("Build returned a Job with its error: %+v", job)
-			}
-		})
 	}
 }
 

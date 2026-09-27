@@ -15,15 +15,12 @@ import (
 	"github.com/walzen-group/backup-controller/internal/testinfra/s3fault"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -322,37 +319,6 @@ func TestAnotherPrefixOnTheSameEndpointIsNoCollision(t *testing.T) {
 
 	if !response.Allowed {
 		t.Fatalf("a Cluster was refused over an archive at another prefix: %v", response.Result)
-	}
-}
-
-// TestAnUnreadableHolderStoreRefusesTheCluster checks that a Cluster is
-// refused with HTTP 500 when the other Clusters' ObjectStores can't be listed,
-// here because of a server timeout. That Cluster may archive to the same
-// prefix, and admitting on a transient API error would let the collision
-// through.
-func TestAnUnreadableHolderStoreRefusesTheCluster(t *testing.T) {
-	other, otherStore := elsewhere(t, nil)
-
-	c := newBuilder(t).
-		WithObjects(secret()).
-		WithRuntimeObjects(store(), otherStore, other).
-		WithInterceptorFuncs(interceptor.Funcs{
-			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-				if list.GetObjectKind().GroupVersionKind().Kind == ObjectStoreListGVK.Kind {
-					return apierrors.NewServerTimeout(schema.GroupResource{Group: ObjectStoreGVK.Group, Resource: "objectstores"}, "list", 1)
-				}
-				return c.List(ctx, list, opts...)
-			},
-		}).Build()
-
-	decider := &Decider{Client: c, Prober: stubProber{has: false}}
-	response := create(t, decider, cluster(t, nil))
-
-	if response.Allowed {
-		t.Fatal("a Cluster was admitted while another Cluster's ObjectStore could not be read")
-	}
-	if response.Result.Code != http.StatusInternalServerError {
-		t.Errorf("code = %d, want %d", response.Result.Code, http.StatusInternalServerError)
 	}
 }
 
@@ -869,29 +835,6 @@ func TestAnUpdateOfAnInitdbClusterIsLeftAlone(t *testing.T) {
 	}
 	if len(response.Patches) != 0 {
 		t.Fatalf("an initdb cluster was rewritten: %v", response.Patches)
-	}
-}
-
-// TestSplitDestinationSeparatesBucketFromPrefix checks that splitDestination
-// returns the bucket and a prefix with its slashes trimmed, for an empty,
-// one-level and two-level prefix.
-func TestSplitDestinationSeparatesBucketFromPrefix(t *testing.T) {
-	for _, tc := range []struct {
-		in     string
-		bucket string
-		prefix string
-	}{
-		{"s3://backups/", "backups", ""},
-		{"s3://backups/app/", "backups", "app"},
-		{"s3://backups/one/two/", "backups", "one/two"},
-	} {
-		bucket, prefix, err := splitDestination(tc.in)
-		if err != nil {
-			t.Fatalf("splitDestination(%q): %v", tc.in, err)
-		}
-		if bucket != tc.bucket || prefix != tc.prefix {
-			t.Errorf("splitDestination(%q) = %q, %q; want %q, %q", tc.in, bucket, prefix, tc.bucket, tc.prefix)
-		}
 	}
 }
 

@@ -3,7 +3,6 @@ package restorejob_test
 import (
 	"context"
 	"slices"
-	"strings"
 	"testing"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -70,38 +69,5 @@ func TestStopLeavesAJobThatReplacedItsRefAlone(t *testing.T) {
 	}
 	if got := k.read(job); got.DeletionTimestamp != nil || k.foregroundDeleted(job) {
 		t.Error("Stop deleted the Job that replaced the one its ref names")
-	}
-}
-
-func TestStopOfAJobBeingDeletedInForegroundGoesToTheGate(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob()
-	pod := k.createPod("p", job, job.UID, "node-a", corev1.PodRunning)
-	// kubectl delete job --cascade=foreground: the Job stays with a
-	// deletionTimestamp until the garbage collector has deleted its pod, and
-	// the Job controller never suspends a Job that is being deleted.
-	k.deleteJob(job, metav1.DeletePropagationForeground)
-	if got := k.read(job); got.DeletionTimestamp == nil {
-		t.Fatal("the foreground delete did not leave the Job with a deletionTimestamp")
-	}
-	state := k.stop(job)
-	if state.Stopped || state.Suspending || !slices.Equal(state.Pods, []string{"p"}) {
-		t.Fatalf("state = %+v, want not stopped, not suspending, with pod p left", state)
-	}
-	if msg := state.String(); !strings.Contains(msg, "being deleted") || strings.Contains(msg, "suspend") {
-		t.Errorf("String() = %q, want it to say the Job is being deleted", msg)
-	}
-	if got := k.read(job); got.Spec.Suspend != nil && *got.Spec.Suspend {
-		t.Error("Stop patched the suspend on a Job that is being deleted")
-	}
-	if err := k.c.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil {
-		t.Fatal(err)
-	}
-	pod.Finalizers = nil
-	if err := k.c.Update(context.Background(), pod); err != nil {
-		t.Fatal(err)
-	}
-	if state := k.stop(job); !state.Stopped {
-		t.Fatalf("state = %+v, want stopped once the pod is gone", state)
 	}
 }

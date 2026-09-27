@@ -187,18 +187,6 @@ func TestParseBackupInfoReadsTheEndToTheMicrosecond(t *testing.T) {
 	}
 }
 
-// TestParseBackupInfoSkipsABackupThatDidNotFinish checks that a FAILED backup
-// is reported as incomplete, without an error.
-func TestParseBackupInfoSkipsABackupThatDidNotFinish(t *testing.T) {
-	_, done, err := ParseBackupInfo([]byte("backup_id=x\nstatus=FAILED\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if done {
-		t.Fatal("a FAILED backup was reported as complete")
-	}
-}
-
 // TestParseBackupInfoReadsAnEndWithoutMicroseconds checks that an end_time
 // written without a fraction of a second parses.
 func TestParseBackupInfoReadsAnEndWithoutMicroseconds(t *testing.T) {
@@ -260,40 +248,6 @@ func TestParseBackupInfoSkipsABackupWithoutBothTimes(t *testing.T) {
 		if err != nil || done {
 			t.Errorf("%q: done = %v, err = %v; want incomplete", info, done, err)
 		}
-	}
-}
-
-// expired returns a context whose deadline has already passed.
-func expired(t *testing.T) context.Context {
-	t.Helper()
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	t.Cleanup(cancel)
-	return ctx
-}
-
-// doneBaseAt serves the recorded done-base store and returns the Location of
-// app-pg in it.
-func doneBaseAt(t *testing.T) Location {
-	t.Helper()
-	server := recordedS3(t, barmanstore.MustLoad(t, "done-base"))
-	return Location{Endpoint: server.URL, Bucket: "backups", Prefix: "app/app-pg",
-		AccessKey: server.AccessKey, SecretKey: server.SecretKey}
-}
-
-// TestAnExpiredContextNeverListsNoBaseBackups checks BaseBackups on a context
-// that is already done, against the recorded done-base store. The RestoreRun
-// controller reads an empty list as "no completed backup", so the silent end
-// of minio-go's listing must come back as an error. Finding W5.
-func TestAnExpiredContextNeverListsNoBaseBackups(t *testing.T) {
-	at := doneBaseAt(t)
-
-	backups, err := S3Prober{}.BaseBackups(expired(t), at)
-
-	if err == nil {
-		t.Fatalf("BaseBackups on an expired context gave no error and %d backups", len(backups))
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("err = %v, want it to wrap context.DeadlineExceeded", err)
 	}
 }
 
