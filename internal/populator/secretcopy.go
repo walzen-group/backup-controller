@@ -79,19 +79,19 @@ func RestoreAsOf(vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolum
 // It returns an error when the original can't be read or the copy can't be
 // checked or created. A copy that already exists is left as it is.
 func (c *Callbacks) copySecret(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim) error {
-	repo, err := c.operations.GetSecret(ctx, claim.Namespace, vr.Spec.Repository)
-	if err != nil {
+	repo := &corev1.Secret{}
+	if err := c.operations.Get(ctx, types.NamespacedName{Namespace: claim.Namespace, Name: vr.Spec.Repository}, repo); err != nil {
 		return fmt.Errorf("get repository Secret %s/%s: %w", claim.Namespace, vr.Spec.Repository, err)
 	}
 	name := SecretCopyName(claim.UID)
-	_, err = c.operations.GetSecret(ctx, c.namespace, name)
+	err := c.operations.Get(ctx, types.NamespacedName{Namespace: c.namespace, Name: name}, &corev1.Secret{})
 	switch {
 	case err == nil:
 		return nil
 	case !apierrors.IsNotFound(err):
 		return fmt.Errorf("check copied repository Secret %s/%s: %w", c.namespace, name, err)
 	}
-	if err := c.operations.CreateSecret(ctx, SecretCopy(repo, claim.UID, c.namespace)); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := c.operations.Create(ctx, SecretCopy(repo, claim.UID, c.namespace)); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create copied repository Secret %s/%s: %w", c.namespace, name, err)
 	}
 	return nil

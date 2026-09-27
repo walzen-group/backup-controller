@@ -91,20 +91,26 @@ func newCluster(t *testing.T, objects ...client.Object) *strictclient.Client {
 }
 
 // fakeOperations is the callbacks' Operations for tests. The restore Jobs,
-// their pods, the namespaces and the claims live in a strict fake API
-// server; the Secrets live in a map, and every Secret create and delete,
-// status write and VolumeRestore update is recorded so the tests can check
-// them. When volumeRestoreGone is true, writes to the VolumeRestore fail with
-// NotFound, as they do once it has been deleted.
+// their pods, the namespaces and the claims live in the API server that
+// Client reaches, a strict fake one in the unit tests; the Secrets live in a
+// map, and every Secret create and delete, status write and VolumeRestore
+// update is recorded so the tests can check them. The VolumeRestore stays in
+// memory unless storeVolumeRestores is true. When volumeRestoreGone is true,
+// writes to the VolumeRestore fail with NotFound, as they do once it has been
+// deleted.
 type fakeOperations struct {
 	Jobs
-	cluster           *strictclient.Client
-	secrets           map[string]*corev1.Secret
-	createdSec        []*corev1.Secret
-	deletedSec        []string
-	statuses          []*backupv1alpha1.VolumeRestore
-	updates           []*backupv1alpha1.VolumeRestore
-	volumeRestoreGone bool
+	client.Client
+	// cluster is Client as the strict fake client, for the tests' own reads
+	// and writes. It is nil when Client is a real API server.
+	cluster             *strictclient.Client
+	secrets             map[string]*corev1.Secret
+	createdSec          []*corev1.Secret
+	deletedSec          []string
+	statuses            []*backupv1alpha1.VolumeRestore
+	updates             []*backupv1alpha1.VolumeRestore
+	volumeRestoreGone   bool
+	storeVolumeRestores bool
 	// jobCreates counts the restore Job creates sent, those the API server
 	// refused included.
 	jobCreates int
@@ -129,7 +135,7 @@ func newFakeOperations(t *testing.T) *fakeOperations {
 
 // fakeOperationsOn returns a fakeOperations over the cluster given.
 func fakeOperationsOn(c *strictclient.Client) *fakeOperations {
-	return &fakeOperations{Jobs: NewJobs(c, c), cluster: c, secrets: make(map[string]*corev1.Secret)}
+	return &fakeOperations{Jobs: NewJobs(c, c), Client: c, cluster: c, secrets: make(map[string]*corev1.Secret)}
 }
 
 // CreateJob counts the create and sends it to the cluster.
@@ -155,46 +161,38 @@ func (f *fakeOperations) ResumeJob(ctx context.Context, job *batchv1.Job) error 
 	return f.Jobs.ResumeJob(ctx, job)
 }
 
-func (f *fakeOperations) GetVolume(ctx context.Context, name string) (*corev1.PersistentVolume, error) {
-	volume := &corev1.PersistentVolume{}
-	return volume, f.cluster.Get(ctx, client.ObjectKey{Name: name}, volume)
-}
-
-func (f *fakeOperations) GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error) {
-	ns := &corev1.Namespace{}
-	return ns, f.cluster.Get(ctx, client.ObjectKey{Name: name}, ns)
-}
-
-func (f *fakeOperations) GetClaim(ctx context.Context, namespace, name string) (*corev1.PersistentVolumeClaim, error) {
-	claim := &corev1.PersistentVolumeClaim{}
-	return claim, f.cluster.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, claim)
-}
-
-func (f *fakeOperations) PatchClaim(ctx context.Context, claim *corev1.PersistentVolumeClaim, patch client.Patch) error {
-	return f.cluster.Patch(ctx, claim, patch)
-}
-
-// ListVolumeRestores lists the VolumeRestores of the fake cluster. A fake with
-// no cluster, as the policy envtest builds one, holds none.
-func (f *fakeOperations) ListVolumeRestores(ctx context.Context, namespace string) ([]backupv1alpha1.VolumeRestore, error) {
-	if f.cluster == nil {
-		return nil, nil
+// Get reads a Secret from secrets and any other object through Client.
+func (f *fakeOperations) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	secret, ok := obj.(*corev1.Secret)
+	if !ok {
+		return f.Client.Get(ctx, key, obj, opts...)
 	}
-	list := &backupv1alpha1.VolumeRestoreList{}
-	err := f.cluster.List(ctx, list, client.InNamespace(namespace))
-	return list.Items, err
-}
-
-func (f *fakeOperations) GetSecret(_ context.Context, namespace, name string) (*corev1.Secret, error) {
-	if secret, ok := f.secrets[namespacedName(namespace, name)]; ok {
-		return secret.DeepCopy(), nil
+	stored, found := f.secrets[namespacedName(key.Namespace, key.Name)]
+	if !found {
+		return apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, key.Name)
 	}
-	return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, name)
+	stored.DeepCopyInto(secret)
+	return nil
 }
 
-func (f *fakeOperations) CreateSecret(_ context.Context, secret *corev1.Secret) error {
+// List lists through Client. A fake over a real API server (cluster nil)
+// keeps the VolumeRestore in memory, so its list of VolumeRestores is empty.
+func (f *fakeOperations) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*backupv1alpha1.VolumeRestoreList); ok && f.cluster == nil {
+		return nil
+	}
+	return f.Client.List(ctx, list, opts...)
+}
+
+// Create keeps a Secret in secrets and records it in createdSec. Any other
+// object goes to Client.
+func (f *fakeOperations) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	secret, ok := obj.(*corev1.Secret)
+	if !ok {
+		return f.Client.Create(ctx, obj, opts...)
+	}
 	key := namespacedName(secret.Namespace, secret.Name)
-	if _, ok := f.secrets[key]; ok {
+	if _, found := f.secrets[key]; found {
 		return apierrors.NewAlreadyExists(schema.GroupResource{Resource: "secrets"}, secret.Name)
 	}
 	f.secrets[key] = secret.DeepCopy()
@@ -202,29 +200,71 @@ func (f *fakeOperations) CreateSecret(_ context.Context, secret *corev1.Secret) 
 	return nil
 }
 
-func (f *fakeOperations) DeleteSecret(_ context.Context, namespace, name string) error {
-	key := namespacedName(namespace, name)
-	if _, ok := f.secrets[key]; !ok {
-		return apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, name)
+// Delete removes a Secret from secrets and records it in deletedSec. Any
+// other object goes to Client.
+func (f *fakeOperations) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if _, ok := obj.(*corev1.Secret); !ok {
+		return f.Client.Delete(ctx, obj, opts...)
+	}
+	key := namespacedName(obj.GetNamespace(), obj.GetName())
+	if _, found := f.secrets[key]; !found {
+		return apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, obj.GetName())
 	}
 	delete(f.secrets, key)
 	f.deletedSec = append(f.deletedSec, key)
 	return nil
 }
 
-func (f *fakeOperations) SetStatus(_ context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	if f.volumeRestoreGone {
-		return apierrors.NewNotFound(schema.GroupResource{Group: "backup.wlz.li", Resource: "volumerestores"}, vr.Name)
+// Update records a VolumeRestore in updates (see writeVolumeRestore). Any
+// other object goes to Client.
+func (f *fakeOperations) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	vr, ok := obj.(*backupv1alpha1.VolumeRestore)
+	if !ok {
+		return f.Client.Update(ctx, obj, opts...)
 	}
-	f.statuses = append(f.statuses, vr.DeepCopy())
+	if err := f.writeVolumeRestore(vr, func() error { return f.Client.Update(ctx, obj, opts...) }); err != nil {
+		return err
+	}
+	f.updates = append(f.updates, vr.DeepCopy())
 	return nil
 }
 
-func (f *fakeOperations) UpdateVolumeRestore(_ context.Context, vr *backupv1alpha1.VolumeRestore) error {
+// Status returns the status writer of Client, which records every
+// VolumeRestore status write in statuses (see writeVolumeRestore).
+func (f *fakeOperations) Status() client.SubResourceWriter {
+	return statusRecorder{SubResourceWriter: f.Client.Status(), ops: f}
+}
+
+// statusRecorder is the status writer of a fakeOperations.
+type statusRecorder struct {
+	client.SubResourceWriter
+	ops *fakeOperations
+}
+
+// Update records a VolumeRestore status write in statuses (see
+// writeVolumeRestore). Any other object goes to the writer of Client.
+func (s statusRecorder) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	vr, ok := obj.(*backupv1alpha1.VolumeRestore)
+	if !ok {
+		return s.SubResourceWriter.Update(ctx, obj, opts...)
+	}
+	if err := s.ops.writeVolumeRestore(vr, func() error { return s.SubResourceWriter.Update(ctx, obj, opts...) }); err != nil {
+		return err
+	}
+	s.ops.statuses = append(s.ops.statuses, vr.DeepCopy())
+	return nil
+}
+
+// writeVolumeRestore answers a write of the VolumeRestore: NotFound when
+// volumeRestoreGone is true, the answer of write when storeVolumeRestores is
+// true, and nil otherwise.
+func (f *fakeOperations) writeVolumeRestore(vr *backupv1alpha1.VolumeRestore, write func() error) error {
 	if f.volumeRestoreGone {
 		return apierrors.NewNotFound(schema.GroupResource{Group: "backup.wlz.li", Resource: "volumerestores"}, vr.Name)
 	}
-	f.updates = append(f.updates, vr.DeepCopy())
+	if f.storeVolumeRestores {
+		return write()
+	}
 	return nil
 }
 

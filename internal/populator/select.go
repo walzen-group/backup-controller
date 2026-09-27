@@ -10,6 +10,8 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // selection is the snapshot a claim is filled from.
@@ -145,16 +147,17 @@ func (c *Callbacks) selectSnapshot(ctx context.Context, vr *backupv1alpha1.Volum
 // restic.NamespaceSnapshots), and an error when the VolumeRestores, a Secret
 // or a repository can not be read.
 func (c *Callbacks) namespaceSnapshots(ctx context.Context, namespace, repository string) (map[string][]restic.Snapshot, error) {
-	restores, err := c.operations.ListVolumeRestores(ctx, namespace)
-	if err != nil {
+	restores := &backupv1alpha1.VolumeRestoreList{}
+	if err := c.operations.List(ctx, restores, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("list the VolumeRestores in %s: %w", namespace, err)
 	}
 	names := []string{repository}
-	for _, vr := range restores {
+	for _, vr := range restores.Items {
 		names = append(names, vr.Spec.Repository)
 	}
 	secret := func(ctx context.Context, name string) (*corev1.Secret, error) {
-		return c.operations.GetSecret(ctx, namespace, name)
+		s := &corev1.Secret{}
+		return s, c.operations.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, s)
 	}
 	return restic.NamespaceSnapshots(ctx, names, secret, c.snapshots)
 }

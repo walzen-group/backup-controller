@@ -92,7 +92,7 @@ func (c *Callbacks) writeChanged(ctx context.Context, vr *backupv1alpha1.VolumeR
 	if equality.Semantic.DeepEqual(before, &vr.Status) {
 		return nil
 	}
-	if err := c.operations.SetStatus(ctx, vr); err != nil {
+	if err := c.operations.Status().Update(ctx, vr); err != nil {
 		return fmt.Errorf("set VolumeRestore status: %w", err)
 	}
 	return nil

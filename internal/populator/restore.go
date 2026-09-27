@@ -136,8 +136,8 @@ func (c *Callbacks) failJob(ctx context.Context, r restore, job *batchv1.Job, fa
 // one never resumed (restorejob.AwaitsResume). The resume carries the Job's
 // UID, so a Job created under the name since the read is left alone.
 func (c *Callbacks) resume(ctx context.Context, r restore, job *batchv1.Job) error {
-	prime, err := c.operations.GetClaim(ctx, r.prime.Namespace, r.prime.Name)
-	if err != nil {
+	prime := &corev1.PersistentVolumeClaim{}
+	if err := c.operations.Get(ctx, client.ObjectKeyFromObject(r.prime), prime); err != nil {
 		return fmt.Errorf("read prime claim %s/%s: %w", r.prime.Namespace, r.prime.Name, err)
 	}
 	if prime.UID != r.prime.UID {
@@ -181,7 +181,7 @@ func (c *Callbacks) recordJob(ctx context.Context, prime *corev1.PersistentVolum
 	if err != nil {
 		return fmt.Errorf("build the record patch: %w", err)
 	}
-	if err := c.operations.PatchClaim(ctx, prime.DeepCopy(), client.RawPatch(types.MergePatchType, patch)); err != nil {
+	if err := c.operations.Patch(ctx, prime.DeepCopy(), client.RawPatch(types.MergePatchType, patch)); err != nil {
 		return fmt.Errorf("record restore Job %s on prime claim %s/%s: %w", uid, prime.Namespace, prime.Name, err)
 	}
 	return nil
@@ -257,8 +257,8 @@ func (c *Callbacks) startJob(ctx context.Context, r restore) error {
 // replicationsource_controller.go:114). The annotation of the controller
 // namespace, where the Job runs, has no effect.
 func (c *Callbacks) createJob(ctx context.Context, r restore, snapshot restic.Snapshot) (*batchv1.Job, error) {
-	ns, err := c.operations.GetNamespace(ctx, r.vr.Namespace)
-	if err != nil {
+	ns := &corev1.Namespace{}
+	if err := c.operations.Get(ctx, types.NamespacedName{Name: r.vr.Namespace}, ns); err != nil {
 		return nil, fmt.Errorf("read namespace %s: %w", r.vr.Namespace, err)
 	}
 	job, err := restorejob.Build(restorejob.Spec{
@@ -388,8 +388,8 @@ func (c *Callbacks) stopEarlierJob(ctx context.Context, r restore, job *batchv1.
 // app claim, and the PV controller then binds the app claim to it. A Job
 // resumed in that window would write the app's volume.
 func (c *Callbacks) mayResume(ctx context.Context, r restore, prime *corev1.PersistentVolumeClaim) (bool, error) {
-	claim, err := c.operations.GetClaim(ctx, r.claim.Namespace, r.claim.Name)
-	if err != nil {
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := c.operations.Get(ctx, client.ObjectKeyFromObject(r.claim), claim); err != nil {
 		return false, fmt.Errorf("read claim %s/%s: %w", r.claim.Namespace, r.claim.Name, err)
 	}
 	if claim.UID != r.claim.UID || claim.DeletionTimestamp != nil || claim.Spec.VolumeName != "" {
@@ -398,8 +398,8 @@ func (c *Callbacks) mayResume(ctx context.Context, r restore, prime *corev1.Pers
 	if prime.Spec.VolumeName == "" {
 		return false, nil
 	}
-	volume, err := c.operations.GetVolume(ctx, prime.Spec.VolumeName)
-	if err != nil {
+	volume := &corev1.PersistentVolume{}
+	if err := c.operations.Get(ctx, types.NamespacedName{Name: prime.Spec.VolumeName}, volume); err != nil {
 		return false, fmt.Errorf("read volume %s of prime claim %s/%s: %w", prime.Spec.VolumeName, prime.Namespace, prime.Name, err)
 	}
 	ref := volume.Spec.ClaimRef

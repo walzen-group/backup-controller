@@ -22,43 +22,34 @@ import (
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// Operations are the Kubernetes API calls the callbacks make. The binary
-// implements them with a client (see NewOperations),
-// and the tests with a strict fake client. Every read goes to the API server
-// directly.
+// Operations are the Kubernetes API calls the callbacks make: the restore
+// Jobs and their pods through Jobs, and every other object through the
+// client. The binary builds them with NewOperations over one client that
+// has no cache, so every read goes to the API server directly, which the
+// restore Job's stop gate needs. The tests build them over a strict fake
+// client.
 type Operations interface {
 	Jobs
-	// GetNamespace reads a namespace, for its privileged-movers annotation.
-	GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error)
-	// GetClaim reads a claim.
-	GetClaim(ctx context.Context, namespace, name string) (*corev1.PersistentVolumeClaim, error)
-	// GetVolume reads a PersistentVolume, the prime claim's, whose claimRef
-	// tells whether the library has handed it to the app claim.
-	GetVolume(ctx context.Context, name string) (*corev1.PersistentVolume, error)
-	// PatchClaim sends a patch to a claim; Populate records the restore
-	// Job's UID on the prime claim with it.
-	PatchClaim(ctx context.Context, claim *corev1.PersistentVolumeClaim, patch client.Patch) error
-	// GetSecret reads a Secret.
-	GetSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error)
-	// CreateSecret creates a Secret.
-	CreateSecret(ctx context.Context, secret *corev1.Secret) error
-	// DeleteSecret deletes a Secret.
-	DeleteSecret(ctx context.Context, namespace, name string) error
-	// SetStatus writes the VolumeRestore's status subresource.
-	SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error
-	// UpdateVolumeRestore writes the VolumeRestore's metadata, which is how
-	// the callbacks add and remove Finalizer. The write carries the
-	// resourceVersion of the object passed, so it fails with a conflict when
-	// the object has changed since it was read.
-	UpdateVolumeRestore(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error
-	// ListVolumeRestores lists the VolumeRestores of a namespace. Their
-	// repositories give the moment of a synced restore (see selectSnapshot).
-	ListVolumeRestores(ctx context.Context, namespace string) ([]backupv1alpha1.VolumeRestore, error)
+	client.Client
+}
+
+// NewOperations returns the populator's operations over one client.
+//
+// Parameters:
+//   - c is the populator's client, built with client.New, which reads from
+//     the API server directly. It serves the reads and the writes of the
+//     restore Jobs too.
+func NewOperations(c client.Client) Operations {
+	return struct {
+		Jobs
+		client.Client
+	}{NewJobs(c, c), c}
 }
 
 // Finalizer is the finalizer the populator keeps on a VolumeRestore while a
@@ -269,7 +260,7 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 	if !state.Stopped {
 		return claimError(claim, &stoppingError{state: state})
 	}
-	if err := c.operations.DeleteSecret(ctx, c.namespace, SecretCopyName(claim.UID)); err != nil && !apierrors.IsNotFound(err) {
+	if err := c.operations.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: c.namespace, Name: SecretCopyName(claim.UID)}}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete copied repository Secret: %w", err)
 	}
 	vr, err := decodeVolumeRestore(params)
@@ -286,7 +277,7 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 	// finalizer stays for that claim.
 	if len(vr.Status.Claims) == 0 && controllerutil.ContainsFinalizer(vr, Finalizer) {
 		controllerutil.RemoveFinalizer(vr, Finalizer)
-		if err := c.operations.UpdateVolumeRestore(ctx, vr); err != nil && !apierrors.IsNotFound(err) {
+		if err := c.operations.Update(ctx, vr); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("remove finalizer %s from VolumeRestore: %w", Finalizer, err)
 		}
 	}
@@ -337,7 +328,7 @@ func (c *Callbacks) holdVolumeRestore(ctx context.Context, vr *backupv1alpha1.Vo
 		return fmt.Errorf("VolumeRestore %s/%s is being deleted, so no restore starts from it", vr.Namespace, vr.Name)
 	}
 	controllerutil.AddFinalizer(vr, Finalizer)
-	if err := c.operations.UpdateVolumeRestore(ctx, vr); err != nil {
+	if err := c.operations.Update(ctx, vr); err != nil {
 		return fmt.Errorf("add finalizer %s to VolumeRestore %s/%s: %w", Finalizer, vr.Namespace, vr.Name, err)
 	}
 	return nil

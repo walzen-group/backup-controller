@@ -17,30 +17,13 @@ import (
 )
 
 // strictOperations is a fakeOperations whose VolumeRestore writes go to the
-// strict fake client that holds its Jobs and claims, as NewOperations sends
-// them: SetStatus updates the status subresource and UpdateVolumeRestore the
-// object. The client keeps the stored VolumeRestore, bumps its
-// resourceVersion on every write, refuses a write whose resourceVersion is
-// stale with a Conflict, and prunes against the pinned CRD. Every successful
-// status write is also recorded in statuses.
+// strict fake client that holds its Jobs and claims (storeVolumeRestores).
+// The client keeps the stored VolumeRestore, bumps its resourceVersion on
+// every write, refuses a write whose resourceVersion is stale with a
+// Conflict, and prunes against the pinned CRD. Every successful status write
+// is also recorded in statuses.
 type strictOperations struct {
 	*fakeOperations
-}
-
-func (s *strictOperations) SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	if err := s.cluster.Status().Update(ctx, vr); err != nil {
-		return err
-	}
-	s.statuses = append(s.statuses, vr.DeepCopy())
-	return nil
-}
-
-func (s *strictOperations) UpdateVolumeRestore(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	if err := s.cluster.Update(ctx, vr); err != nil {
-		return err
-	}
-	s.updates = append(s.updates, vr.DeepCopy())
-	return nil
 }
 
 // stored reads the VolumeRestore notes-data back from the strict client.
@@ -81,6 +64,7 @@ func newStrictOperations(t *testing.T, status backupv1alpha1.VolumeRestoreStatus
 		Status:     status,
 	}
 	ops := fakeOperationsOn(newCluster(t, vr))
+	ops.storeVolumeRestores = true
 	addRepository(ops)
 	for _, uid := range []string{"claim-123", "claim-456"} {
 		ops.secrets[namespacedName(controllerNS, uid)] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: uid, Namespace: controllerNS}}

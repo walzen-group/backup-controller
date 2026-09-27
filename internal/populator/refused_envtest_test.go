@@ -33,31 +33,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
-// policyOperations are the callbacks' operations for the refusal envtest:
-// the Jobs, their pods, the namespace and the claims go to the API server as
-// the controller's ServiceAccount, and the Secrets and the VolumeRestore stay
-// in fakeOperations' memory, where the test reads the status writes.
-type policyOperations struct {
-	*fakeOperations
-	api Operations
-}
-
-func (p policyOperations) GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error) {
-	return p.api.GetNamespace(ctx, name)
-}
-
-func (p policyOperations) GetClaim(ctx context.Context, namespace, name string) (*corev1.PersistentVolumeClaim, error) {
-	return p.api.GetClaim(ctx, namespace, name)
-}
-
-func (p policyOperations) GetVolume(ctx context.Context, name string) (*corev1.PersistentVolume, error) {
-	return p.api.GetVolume(ctx, name)
-}
-
-func (p policyOperations) PatchClaim(ctx context.Context, claim *corev1.PersistentVolumeClaim, patch client.Patch) error {
-	return p.api.PatchClaim(ctx, claim, patch)
-}
-
 // applyDeployManifest creates every object of one of deploy/'s files as the
 // administrator.
 func applyDeployManifest(ctx context.Context, t *testing.T, admin client.Client, name string) {
@@ -155,14 +130,17 @@ func sysctlContext() *corev1.PodSecurityContext {
 func TestEnvtestARefusedMoverSecurityContextShowsOnReady(t *testing.T) {
 	ctx := context.Background()
 	controller := startPolicyEnvtest(ctx, t)
-	ops := policyOperations{fakeOperations: &fakeOperations{Jobs: NewJobs(controller, controller), secrets: map[string]*corev1.Secret{}}, api: NewOperations(controller)}
-	addRepository(ops.fakeOperations)
+	// The Jobs, their pods, the namespace and the claims go to the API server
+	// as the controller's ServiceAccount; the Secrets and the VolumeRestore
+	// stay in memory, where the test reads the status writes.
+	ops := &fakeOperations{Jobs: NewJobs(controller, controller), Client: controller, secrets: map[string]*corev1.Secret{}}
+	addRepository(ops)
 	p := paramsWith(func(vr *backupv1alpha1.VolumeRestore) { vr.Spec.MoverSecurityContext = sysctlContext() })
 
 	if err := New(ops, controllerNS, testImage, fixedSnapshots{monday}).Populate(ctx, p); err == nil {
 		t.Fatal("Populate() returned no error for a refused Job")
 	}
-	phase, reason, message := lastReady(t, ops.fakeOperations)
+	phase, reason, message := lastReady(t, ops)
 	if phase != backupv1alpha1.RestorePhaseFailed || reason != backupv1alpha1.ReasonRestoreJobRefused || !strings.Contains(message, "sets no sysctls") {
 		t.Fatalf("entry %s, Ready %s %q; want Failed and RestoreJobRefused with the policy's message", phase, reason, message)
 	}

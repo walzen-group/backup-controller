@@ -907,8 +907,8 @@ func recordedSuspendedJob(t *testing.T) *fakeOperations {
 func TestNoJobIsResumedOnceTheVolumeIsHandedOver(t *testing.T) {
 	for name, handOver := range map[string]func(*testing.T, *fakeOperations){
 		"the app claim names a volume": func(t *testing.T, ops *fakeOperations) {
-			claim, err := ops.GetClaim(context.Background(), appNS, "notes")
-			if err != nil {
+			claim := &corev1.PersistentVolumeClaim{}
+			if err := ops.cluster.Get(context.Background(), client.ObjectKey{Namespace: appNS, Name: "notes"}, claim); err != nil {
 				t.Fatal(err)
 			}
 			claim.Spec.VolumeName = "pv-123"
@@ -917,8 +917,8 @@ func TestNoJobIsResumedOnceTheVolumeIsHandedOver(t *testing.T) {
 			}
 		},
 		"the volume's claimRef names the app claim": func(t *testing.T, ops *fakeOperations) {
-			volume, err := ops.GetVolume(context.Background(), "pv-123")
-			if err != nil {
+			volume := &corev1.PersistentVolume{}
+			if err := ops.cluster.Get(context.Background(), client.ObjectKey{Name: "pv-123"}, volume); err != nil {
 				t.Fatal(err)
 			}
 			volume.Spec.ClaimRef = &corev1.ObjectReference{Kind: "PersistentVolumeClaim", APIVersion: "v1", Namespace: appNS, Name: "notes", UID: "claim-123"}
@@ -927,8 +927,8 @@ func TestNoJobIsResumedOnceTheVolumeIsHandedOver(t *testing.T) {
 			}
 		},
 		"the volume's claimRef names the prime claim with another UID": func(t *testing.T, ops *fakeOperations) {
-			volume, err := ops.GetVolume(context.Background(), "pv-123")
-			if err != nil {
+			volume := &corev1.PersistentVolume{}
+			if err := ops.cluster.Get(context.Background(), client.ObjectKey{Name: "pv-123"}, volume); err != nil {
 				t.Fatal(err)
 			}
 			volume.Spec.ClaimRef.UID = "prime-uid-OTHER"
