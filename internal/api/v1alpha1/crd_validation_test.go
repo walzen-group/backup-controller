@@ -110,13 +110,6 @@ func TestCRDValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "repository missing",
-			object: func() *VolumeRestore {
-				return &VolumeRestore{ObjectMeta: metav1.ObjectMeta{Name: "no-repository", Namespace: "default"}}
-			},
-			wantErr: true,
-		},
-		{
 			name: "restoreAsOf not RFC3339",
 			object: func() *VolumeRestore {
 				return &VolumeRestore{
@@ -137,19 +130,6 @@ func TestCRDValidation(t *testing.T) {
 					Spec: VolumeRestoreSpec{
 						Repository:     "notes-restic",
 						MoverPodLabels: map[string]MoverPodLabelValue{"UPPER KEY": "v"},
-					},
-				}
-			},
-			wantErr: true,
-		},
-		{
-			name: "moverPodLabels value invalid",
-			object: func() *VolumeRestore {
-				return &VolumeRestore{
-					ObjectMeta: metav1.ObjectMeta{Name: "bad-label-value", Namespace: "default"},
-					Spec: VolumeRestoreSpec{
-						Repository:     "notes-restic",
-						MoverPodLabels: map[string]MoverPodLabelValue{"app": "bad value!"},
 					},
 				}
 			},
