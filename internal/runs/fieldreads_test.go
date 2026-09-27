@@ -258,9 +258,12 @@ func setBackupPhase(t *testing.T, c client.Client, phase string) {
 	}
 }
 
-// A Backup CloudNativePG marks "invalid backup definition" never goes on, so
-// its item fails at once with CloudNativePG's error.
-func TestAnInvalidBackupDefinitionFailsTheItem(t *testing.T) {
+// CloudNativePG 1.30.0 checks a Backup in the phase "invalid backup
+// definition" again on each pass and resets the phase when the definition
+// becomes valid (api/v1/backup_funcs.go:336-342). Only "failed" and
+// "completed" are terminal (internal/controller/backup_controller.go:155-158).
+// Thus the item waits and does not fail.
+func TestAnInvalidBackupDefinitionKeepsTheItemWaiting(t *testing.T) {
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
 	step(t, r)
 	step(t, r)
@@ -273,8 +276,11 @@ func TestAnInvalidBackupDefinitionFailsTheItem(t *testing.T) {
 	}
 	step(t, r)
 
-	item := readBackupRun(t, c).Status.Items[0]
-	if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "no plugin configured") {
-		t.Errorf("item = %+v, want it Failed with CloudNativePG's error", item)
+	run := readBackupRun(t, c)
+	if item := run.Status.Items[0]; item.Phase == backupv1alpha1.ItemFailed {
+		t.Errorf("item = %+v, want it to wait while CloudNativePG checks the Backup again", item)
+	}
+	if run.Status.Phase != backupv1alpha1.RunPhaseRunning {
+		t.Errorf("run phase = %q, want Running", run.Status.Phase)
 	}
 }

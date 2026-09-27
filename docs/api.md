@@ -246,7 +246,7 @@ that ended by a path that records no reason leaves it empty
 | ClusterMissing | both | the Cluster does not exist when the run starts or checks the item |
 | ClusterHibernated | BackupRun | the run skipped a hibernated Cluster |
 | BackupRefused | BackupRun | the API server refused the CloudNativePG Backup as invalid |
-| BackupFailed | BackupRun | the CloudNativePG Backup ended in the phase `failed` or `invalid backup definition`. The message carries the error from CloudNativePG |
+| BackupFailed | BackupRun | the CloudNativePG Backup ended in the phase `failed`. The message carries the error from CloudNativePG. A Backup in the phase `invalid backup definition` is not at its end: CloudNativePG checks it again, and the run waits up to its timeout |
 | RunEnded | both | the run ended before the item finished, for a cause other than the timeout. The run's `status.ending` says why the run ended |
 | CRDOutdated | BackupRun | the installed BackupRun CRD lacks a field the controller writes, or the controller may not read that CRD. The run ended with the Ready reason CRDOutdated before it changed anything |
 | NotStarted | BackupRun | the run did not start the item before the `backup.wlz.li/max-quiesce` limit ran out. The run then gave the workloads back |

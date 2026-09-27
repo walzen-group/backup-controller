@@ -272,13 +272,18 @@ type BackupOutcome struct {
 //
 // The phases are those of CloudNativePG 1.30 (api/v1/backup_types.go:32-58):
 //   - "completed" gives BackupCompleted.
-//   - "failed" and "invalid backup definition" give BackupFailed. The
-//     message is the error from status.error. CloudNativePG does not
-//     continue a Backup with an invalid definition.
-//   - No phase, "pending", "started", "running", "finalizing" and
-//     "walArchivingFailing" give BackupWaiting. In these phases,
-//     CloudNativePG has not reconciled the Backup yet, makes it, or tries it
-//     again. The run waits up to its timeout.
+//   - "failed" gives BackupFailed. The message is the error from
+//     status.error.
+//   - No phase, "pending", "started", "running", "finalizing",
+//     "walArchivingFailing" and "invalid backup definition" give
+//     BackupWaiting. In these phases, CloudNativePG has not reconciled the
+//     Backup yet, makes it, or tries it again. The run waits up to its
+//     timeout.
+//
+// Only "failed" and "completed" are terminal in CloudNativePG 1.30.0
+// (internal/controller/backup_controller.go:155-158). CloudNativePG checks a
+// Backup with an invalid definition again on each pass. When the definition
+// becomes valid, it sets the phase back to "" (api/v1/backup_funcs.go:336-342).
 //   - Any other value gives BackupUnknownPhase. The message names
 //     status.phase and the value (see unknownBackupPhase). A new
 //     CloudNativePG release can add a phase that does not change the
@@ -295,13 +300,13 @@ func BackupResult(ctx context.Context, c client.Reader, mapper meta.RESTMapper, 
 	switch phase {
 	case "completed":
 		return BackupOutcome{Phase: BackupCompleted}, nil
-	case "failed", "invalid backup definition":
+	case "failed":
 		message, _, _ := unstructured.NestedString(backup.Object, "status", "error")
 		if message == "" {
 			message = fmt.Sprintf("the Backup %s/%s reports status.phase %q", namespace, name, phase)
 		}
 		return BackupOutcome{Phase: BackupFailed, Message: message}, nil
-	case "", "pending", "started", "running", "finalizing", "walArchivingFailing":
+	case "", "pending", "started", "running", "finalizing", "walArchivingFailing", "invalid backup definition":
 		return BackupOutcome{Phase: BackupWaiting}, nil
 	}
 	return BackupOutcome{Phase: BackupUnknownPhase, Message: unknownBackupPhase(namespace, name, phase)}, nil
