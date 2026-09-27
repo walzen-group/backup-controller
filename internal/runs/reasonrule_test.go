@@ -1,6 +1,7 @@
 package runs
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/importer"
@@ -218,11 +219,27 @@ func scanReasonRule(t *testing.T, dirs ...string) []reasonFinding {
 // through. It asks go list, once, for the export data file of every package
 // the directories import, directly or not, so the type-check needs no
 // package outside the standard library.
+//
+// Parameters:
+//   - dirs are the package directories, relative to this package, as
+//     scanReasonRule takes them.
+//
+// go list -export compiles every package it lists from the source on disk
+// at that moment, which is later than the test binary was built. It fails
+// when that source doesn't compile, as when someone edits a file of the
+// module while the test runs. The go command locks and renames its build
+// cache entries, so a concurrent build with the same cache is no cause.
+// The failure message therefore carries go list's stderr, which names the
+// package and the compile error.
 func exportLookup(t *testing.T, dirs []string) func(string) (io.ReadCloser, error) {
 	t.Helper()
 	args := append([]string{"list", "-export", "-deps", "-f", "{{.ImportPath}} {{.Export}}"}, dirs...)
 	out, err := exec.CommandContext(t.Context(), "go", args...).Output()
 	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			t.Fatalf("go list the export data of %v: %v\n%s", dirs, err, exit.Stderr)
+		}
 		t.Fatalf("go list the export data of %v: %v", dirs, err)
 	}
 	exports := map[string]string{}
