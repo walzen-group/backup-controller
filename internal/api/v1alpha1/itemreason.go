@@ -129,4 +129,18 @@ const (
 	// before the item finished, for a cause other than the timeout. The
 	// run's status.ending says why the run ended.
 	ItemReasonRunEnded ItemReason = "RunEnded"
+
+	// ItemReasonBackupFailed is a database backup whose CloudNativePG
+	// Backup ended in the phase failed.
+	ItemReasonBackupFailed ItemReason = "BackupFailed"
+
+	// ItemReasonNotStarted is a volume backup the run did not start before
+	// the backup.wlz.li/max-quiesce limit ran out and the run gave the
+	// workloads back.
+	ItemReasonNotStarted ItemReason = "NotStarted"
+
+	// ItemReasonCloneNotCut is a volume backup whose clone VolSync did not
+	// cut before the backup.wlz.li/max-quiesce limit ran out and the run
+	// gave the workloads back.
+	ItemReasonCloneNotCut ItemReason = "CloneNotCut"
 )

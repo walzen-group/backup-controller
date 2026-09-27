@@ -272,8 +272,9 @@ func (r *BackupRunReconciler) restartAfterCut(ctx context.Context, run *backupv1
 	return nil
 }
 
-// collectRunning collects the result of every Running item (see
-// collectItem).
+// collectRunning collects the result of every Running item. A volume item
+// follows its ReplicationSource (see collectVolume), and a database item
+// follows the phase of its CloudNativePG Backup (see collectDatabase).
 //
 // Parameters:
 //   - run is the admitted BackupRun. Its items are changed in place.
@@ -287,8 +288,13 @@ func (r *BackupRunReconciler) collectRunning(ctx context.Context, run *backupv1a
 		if item.Phase != backupv1alpha1.ItemRunning {
 			continue
 		}
-		if note := r.collectItem(ctx, run, item); note != "" {
-			notes = append(notes, note)
+		switch item.Kind {
+		case backupv1alpha1.ItemKindSource:
+			r.collectVolume(ctx, run, item)
+		case backupv1alpha1.ItemKindCluster:
+			if note := r.collectDatabase(ctx, run, item); note != "" {
+				notes = append(notes, note)
+			}
 		}
 	}
 	return notes
@@ -355,7 +361,7 @@ func (r *BackupRunReconciler) finishOrWait(ctx context.Context, run *backupv1alp
 //     caller writes the status.
 //
 // It returns the waits, one sentence for each item that waits for another
-// run (see startItem), and the retries, one line for each item whose start
+// run (see startVolume), and the retries, one line for each item whose start
 // failed with an error a later pass may not get, naming the item and the
 // error.
 //
@@ -372,15 +378,22 @@ func (r *BackupRunReconciler) startPending(ctx context.Context, run *backupv1alp
 		}
 		// A Pending item carries a message only from a failed start.
 		item.LastStartError, item.Message = "", ""
-		wait, err := r.startItem(ctx, run, item)
+		var wait hold
+		var err error
+		switch item.Kind {
+		case backupv1alpha1.ItemKindSource:
+			wait, err = r.startVolume(ctx, run, item)
+		case backupv1alpha1.ItemKindCluster:
+			err = r.startDatabase(ctx, run, item)
+		}
 		if err != nil {
 			item.LastStartError = err.Error()
 			item.Message = "not started yet: " + item.LastStartError
 			retrying = append(retrying, fmt.Sprintf("%s %s: %v", item.Kind, item.Name, err))
 			continue
 		}
-		if wait != "" {
-			waits = append(waits, wait)
+		if wait.held() {
+			waits = append(waits, wait.text)
 		}
 	}
 	return waits, retrying
