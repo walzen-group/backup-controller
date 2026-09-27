@@ -38,6 +38,11 @@ func (o clientOperations) GetClaim(ctx context.Context, namespace, name string) 
 	return claim, o.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, claim)
 }
 
+func (o clientOperations) GetVolume(ctx context.Context, name string) (*corev1.PersistentVolume, error) {
+	volume := &corev1.PersistentVolume{}
+	return volume, o.client.Get(ctx, client.ObjectKey{Name: name}, volume)
+}
+
 func (o clientOperations) PatchClaim(ctx context.Context, claim *corev1.PersistentVolumeClaim, patch client.Patch) error {
 	return o.client.Patch(ctx, claim, patch)
 }

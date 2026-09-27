@@ -35,6 +35,9 @@ type Operations interface {
 	GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error)
 	// GetClaim reads a claim.
 	GetClaim(ctx context.Context, namespace, name string) (*corev1.PersistentVolumeClaim, error)
+	// GetVolume reads a PersistentVolume, the prime claim's, whose claimRef
+	// tells whether the library has handed it to the app claim.
+	GetVolume(ctx context.Context, name string) (*corev1.PersistentVolume, error)
 	// PatchClaim sends a patch to a claim; Populate records the restore
 	// Job's UID on the prime claim with it.
 	PatchClaim(ctx context.Context, claim *corev1.PersistentVolumeClaim, patch client.Patch) error
@@ -119,7 +122,8 @@ func New(operations Operations, namespace, image string, snapshots SnapshotListe
 //     the Job's failure, then stops the Job, and returns an error (see
 //     failJob).
 //   - Any other Job: it records the Job on the prime claim, or resumes it
-//     once recorded (see resume), and marks the claim Restoring.
+//     once recorded while the prime's volume is still the prime's (see
+//     resume), and marks the claim Restoring.
 //
 // Every status write happens only when it changes something.
 func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.PopulatorParams) error {

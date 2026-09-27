@@ -35,14 +35,16 @@ const (
 var serverTime = time.Date(2026, 9, 26, 7, 0, 0, 0, time.UTC)
 
 // The two claims of the callbacks' tests: notes (claim-123) and photos
-// (claim-456), in apps, each with its bound prime claim in backup-system.
+// (claim-456), in apps, each with its prime claim in backup-system bound to
+// its own volume.
 var testClaims = []struct {
 	name     string
 	uid      types.UID
 	primeUID types.UID
+	volume   string
 }{
-	{"notes", "claim-123", "prime-uid-123"},
-	{"photos", "claim-456", "prime-uid-456"},
+	{"notes", "claim-123", "prime-uid-123", "pv-123"},
+	{"photos", "claim-456", "prime-uid-456", "pv-456"},
 }
 
 // testScheme returns a scheme with the core, batch and backup.wlz.li types.
@@ -58,8 +60,8 @@ func testScheme(t *testing.T) *runtime.Scheme {
 }
 
 // newCluster returns a strict fake API server with the garbage collector on,
-// holding the two namespaces, the claims notes and photos and their prime
-// claims, and the objects given.
+// holding the two namespaces, the claims notes and photos, their prime claims
+// and the volumes the prime claims are bound to, and the objects given.
 func newCluster(t *testing.T, objects ...client.Object) *strictclient.Client {
 	t.Helper()
 	seed := []client.Object{
@@ -69,7 +71,16 @@ func newCluster(t *testing.T, objects ...client.Object) *strictclient.Client {
 	for _, c := range testClaims {
 		seed = append(seed,
 			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: c.name, Namespace: appNS, UID: c.uid}},
-			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: PrimeClaimName(c.uid), Namespace: controllerNS, UID: c.primeUID}},
+			&corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: PrimeClaimName(c.uid), Namespace: controllerNS, UID: c.primeUID},
+				Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: c.volume},
+			},
+			&corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: c.volume},
+				Spec: corev1.PersistentVolumeSpec{ClaimRef: &corev1.ObjectReference{
+					Kind: "PersistentVolumeClaim", APIVersion: "v1", Namespace: controllerNS, Name: PrimeClaimName(c.uid), UID: c.primeUID,
+				}},
+			},
 		)
 	}
 	return strictclient.Build(fake.NewClientBuilder().WithObjects(append(seed, objects...)...), testScheme(t), strictclient.Options{
@@ -117,6 +128,11 @@ func fakeOperationsOn(c *strictclient.Client) *fakeOperations {
 func (f *fakeOperations) CreateJob(ctx context.Context, job *batchv1.Job) error {
 	f.jobCreates++
 	return f.Jobs.CreateJob(ctx, job)
+}
+
+func (f *fakeOperations) GetVolume(ctx context.Context, name string) (*corev1.PersistentVolume, error) {
+	volume := &corev1.PersistentVolume{}
+	return volume, f.cluster.Get(ctx, client.ObjectKey{Name: name}, volume)
 }
 
 func (f *fakeOperations) GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error) {

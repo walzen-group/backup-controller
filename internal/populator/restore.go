@@ -115,12 +115,12 @@ func (c *Callbacks) failJob(ctx context.Context, r restore, job *batchv1.Job, fa
 // claim does not record yet, one this pass created or one a create that
 // answered with an error still stored, is recorded here and resumed in a
 // later pass. Only a pass that reads the record back fresh from the API
-// server, with this Job's UID in it, resumes the Job, and only while the app
-// claim, read fresh too, is not being deleted: a deleted claim's Job is
-// Cleanup's or the orphan reconciler's to stop, and a Job their stop
-// suspended looks the same as one never resumed (restorejob.AwaitsResume).
-// The resume carries the Job's UID, so a Job created under the name since
-// the read is left alone.
+// server, with this Job's UID in it, resumes the Job, and only while
+// mayResume, which reads the app claim and the prime's volume fresh too,
+// finds the app claim alive and the volume still the prime's. A Job that
+// Cleanup's or the orphan reconciler's stop suspended looks the same as
+// one never resumed (restorejob.AwaitsResume). The resume carries the Job's
+// UID, so a Job created under the name since the read is left alone.
 func (c *Callbacks) resume(ctx context.Context, r restore, job *batchv1.Job) error {
 	prime, err := c.operations.GetClaim(ctx, r.prime.Namespace, r.prime.Name)
 	if err != nil {
@@ -132,12 +132,8 @@ func (c *Callbacks) resume(ctx context.Context, r restore, job *batchv1.Job) err
 	if !restorejob.AwaitsResume(job) {
 		return nil
 	}
-	claim, err := c.operations.GetClaim(ctx, r.claim.Namespace, r.claim.Name)
-	if err != nil {
-		return fmt.Errorf("read claim %s/%s: %w", r.claim.Namespace, r.claim.Name, err)
-	}
-	if claim.UID != r.claim.UID || claim.DeletionTimestamp != nil {
-		return nil
+	if ok, err := c.mayResume(ctx, r, prime); err != nil || !ok {
+		return err
 	}
 	if err := c.operations.ResumeJob(ctx, job); err != nil {
 		return fmt.Errorf("resume restore Job %s/%s: %w", job.Namespace, job.Name, err)

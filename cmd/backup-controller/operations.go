@@ -50,6 +50,15 @@ func (o *clientOperations) GetClaim(ctx context.Context, namespace, name string)
 	return claim, nil
 }
 
+// GetVolume reads the named PersistentVolume.
+func (o *clientOperations) GetVolume(ctx context.Context, name string) (*corev1.PersistentVolume, error) {
+	volume := new(corev1.PersistentVolume)
+	if err := o.client.Get(ctx, types.NamespacedName{Name: name}, volume); err != nil {
+		return nil, err
+	}
+	return volume, nil
+}
+
 // PatchClaim sends the patch to the claim.
 func (o *clientOperations) PatchClaim(ctx context.Context, claim *corev1.PersistentVolumeClaim, patch client.Patch) error {
 	return o.client.Patch(ctx, claim, patch)
