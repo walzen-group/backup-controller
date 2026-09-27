@@ -128,7 +128,8 @@ func (o runOps) recordPlan(ctx context.Context, f runFields, targets []quiesce.W
 		return true, result, err
 	}
 	if len(targets) == 0 || !anyPendingItem(f.Object) {
-		*f.quiescedAt, *f.restartedAt = o.moment(), o.moment()
+		now := o.moment()
+		*f.quiescedAt, *f.restartedAt = now, newTime(*now)
 		result, err = after(time.Second, o.writeStatus(ctx, f))
 		return true, result, err
 	}
