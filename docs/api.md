@@ -232,6 +232,7 @@ that ended by a path that records no reason leaves it empty
 | Reason | Kind | Item |
 | --- | --- | --- |
 | TimedOut | both | the run's timeout ran out before the item finished. This includes the items of a BackupRun that Kueue did not admit within its timeout |
+| Evicted | BackupRun | Kueue evicted the run's Workload after it admitted the run, before the item finished. See the Ready reason Evicted |
 | MoverFailed | BackupRun | VolSync's backup mover reported the result Failed. The message is `Mover logs: ` and the logs as VolSync kept them |
 | NoMoverSnapshot | BackupRun | the sync completed, but the ReplicationSource status has no `lastSyncTime` or `lastSyncDuration`, or records a negative duration. Thus the run cannot tell which snapshot in the repository the sync wrote |
 | ClaimMissing | both | the claim does not exist when the run checks or starts the item |
@@ -281,6 +282,7 @@ that ended by a path that records no reason leaves it empty
 | CRDOutdated | the run ended before it changed anything. The cause is that the CRD of its kind is not installed, lacks a field the controller writes, or may not be read by the controller. The message names the field or the permission |
 | VolSyncUnsupported | the run ended because the API server no longer serves VolSync's ReplicationSource at v1alpha1. Before that, it gave back the workloads it stopped. The message names the kind and the versions served |
 | Invalid | the spec names something that no retry can fix. Examples are a claim that is not marked `backup.wlz.li/enabled`, or workloads to stop whose Flux Kustomization also applies workloads in another namespace |
+| Evicted | the run ended Failed because Kueue evicted its Workload after it admitted the run: the Workload's Evicted condition is True, or its Admitted condition is no longer True. An example is a Workload with a higher priority that preempts it. The run fails each unfinished item with reason Evicted, gives back the workloads it stopped, and deletes its Workload, so Kueue frees the quota. The next scheduled run tries again. The message is `Kueue evicted the run's Workload <namespace>/<workload> after it admitted the run; the run stopped and gave the app back, and the next scheduled run tries again` |
 | Succeeded | the run finished with every item done |
 | Failed | the run finished with a failed item, or past its timeout. A run that passed its deadline while it waited for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |
 

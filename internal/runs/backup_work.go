@@ -7,6 +7,7 @@ import (
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/kueue"
 	"github.com/walzen-group/backup-controller/internal/quiesce"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -77,6 +78,9 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	if done, err := r.endIfOverdue(ctx, run); done {
 		return ctrl.Result{}, err
 	}
+	if done, err := r.endIfEvicted(ctx, run); done {
+		return ctrl.Result{}, err
+	}
 	r.releaseFinished(ctx, run)
 	if done, result, err := r.quiesceFirst(ctx, run, now); done {
 		return result, err
@@ -98,6 +102,44 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	}
 	notes := r.collectRunning(ctx, run)
 	return r.finishOrWait(ctx, run, waits, retrying, notes)
+}
+
+// endIfEvicted ends the run when Kueue evicted its Workload after it
+// admitted the run.
+//
+// Parameters:
+//   - run is the admitted BackupRun. A run with no status.workload went
+//     through no LocalQueue, and endIfEvicted does nothing for it.
+//
+// It returns done true when the pass must stop here: Kueue evicted the
+// Workload and the run ended, or the read of the Workload failed. The error
+// is the error of that read or of finish.
+//
+// Kueue marks an evicted Workload with Evicted True, and expects the owner
+// to stop the work (see kueue.Evicted). Kueue would start the work again
+// from the start, which on a run with spec.all set would stop the app a
+// second time. So the run fails every unfinished item with reason Evicted,
+// and finish gives the app back and deletes the Workload. A deleted
+// Workload frees its quota in Kueue. The run ends Failed with reason
+// Evicted, and the next scheduled run tries again. A Workload that is gone
+// holds no quota, and the run goes on.
+func (r *BackupRunReconciler) endIfEvicted(ctx context.Context, run *backupv1alpha1.BackupRun) (done bool, err error) {
+	if run.Status.Workload == "" {
+		return false, nil
+	}
+	workload, err := kueue.ReadWorkload(ctx, r.Client, run.Namespace, run.UID)
+	if err != nil {
+		return true, err
+	}
+	if workload == nil || !kueue.Evicted(workload) {
+		return false, nil
+	}
+	message := fmt.Sprintf("Kueue evicted the run's Workload %s/%s after it admitted the run; "+
+		"the run stopped and gave the app back, and the next scheduled run tries again", run.Namespace, workload.GetName())
+	r.failUnfinished(ctx, run, message, func(item *backupv1alpha1.BackupItem, text string) {
+		failBackupItem(item, refuse(backupv1alpha1.ItemReasonEvicted, "%s", text))
+	})
+	return true, r.finish(ctx, run, backupv1alpha1.ReasonEvicted, message)
 }
 
 // endIfOverdue ends the run when its deadline has passed.

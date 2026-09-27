@@ -779,6 +779,7 @@ VolumeRestore has one new reason. api.md has the full table for a
 | CRDOutdated | new: the run ended before it changed anything. The installed CRD of its kind does not have a field that the controller writes, or the controller may not read that CRD |
 | RestartFailed | new: the run could not give its app back. It stays unfinished until it can. The app is still down |
 | ReleaseFailed | new: the app is back. The run stays unfinished until it can release its Leases, its Kueue Workload or a restore Job that it stopped |
+| Evicted | new on a BackupRun: Kueue evicted the Workload of the run after it admitted the run. The run gave the app back, deleted its Workload and ended Failed. The next scheduled run tries again |
 | RestoreJobRefused | new on a VolumeRestore: the API server refused to create or resume the restore Job of a claim. An example is the admission policy that refuses its `moverSecurityContext` |
 | SourceBusy | also these cases: a backup and a restore of the same claim or repository. A Lease that another run holds on the claim or the repository. Another run that stopped the workloads of this namespace. A RestoreRun that deleted a Cluster and waits until the Cluster exists again |
 | NoBackupInReach | also a repository that holds no snapshot with the layout that a VolSync mover writes. Also a RestoreRun in which each item was Skipped |

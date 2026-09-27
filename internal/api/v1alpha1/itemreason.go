@@ -16,6 +16,10 @@ const (
 	// BackupRun that Kueue did not admit within its timeout.
 	ItemReasonTimedOut ItemReason = "TimedOut"
 
+	// ItemReasonEvicted is an item the run failed because Kueue evicted the
+	// run's Workload before the item finished (see ReasonEvicted).
+	ItemReasonEvicted ItemReason = "Evicted"
+
 	// ItemReasonMoverFailed is a volume backup whose VolSync mover reported
 	// the result Failed.
 	ItemReasonMoverFailed ItemReason = "MoverFailed"

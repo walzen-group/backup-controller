@@ -161,6 +161,49 @@ func Admitted(workload *unstructured.Unstructured) bool {
 	return ConditionTrue(workload, "Admitted")
 }
 
+// Evicted reports whether Kueue took back its admission of the Workload.
+//
+// Parameters:
+//   - workload is a Workload that Kueue admitted before.
+//
+// It returns true when the Workload's Evicted condition is True, or when
+// its Admitted condition is no longer True. Kueue 0.19 sets Evicted to True
+// when it evicts an admitted Workload, for example on preemption or
+// deactivation, and expects the owner to stop the work
+// (pkg/controller/jobframework/reconciler.go:586-625). An Admitted
+// condition that is no longer True shows that the admission is gone for any
+// other cause, so the run fails closed and stops too.
+func Evicted(workload *unstructured.Unstructured) bool {
+	return ConditionTrue(workload, "Evicted") || !Admitted(workload)
+}
+
+// ReadWorkload reads the Workload of the run whose UID is given.
+//
+// Parameters:
+//   - namespace is the run's namespace.
+//   - uid is the run's UID, which names the Workload (see WorkloadName).
+//
+// It returns the Workload at the version the API server serves (see
+// served.Kind), or nil when the Workload does not exist. A failed lookup
+// of the served version or a failed get comes back as an error.
+func ReadWorkload(ctx context.Context, c client.Client, namespace string, uid types.UID) (*unstructured.Unstructured, error) {
+	name := WorkloadName(uid)
+	gvk, err := served.Kind(c.RESTMapper(), WorkloadGVK.GroupKind())
+	if err != nil {
+		return nil, fmt.Errorf("get Workload %s: %w", name, err)
+	}
+	workload := &unstructured.Unstructured{}
+	workload.SetGroupVersionKind(gvk)
+	err = served.VersionGone(c.RESTMapper(), gvk, c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, workload))
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get Workload %s: %w", name, err)
+	}
+	return workload, nil
+}
+
 // MarkPodsReady adds a PodsReady condition set to True to the Workload's
 // status, which tells Kueue that the admitted work is running. The
 // condition's lastTransitionTime is the time given in now. When the condition

@@ -91,6 +91,13 @@ const (
 	// ReasonFailed.
 	ReasonTimedOut = "TimedOut"
 
+	// ReasonEvicted reports a BackupRun whose Workload Kueue evicted after
+	// it admitted the run: the Workload's Evicted condition is True, or its
+	// Admitted condition is no longer True. The run stops, gives back the
+	// workloads it stopped, deletes the Workload so that Kueue frees the
+	// quota, and ends Failed. The next scheduled run tries again.
+	ReasonEvicted = "Evicted"
+
 	// ReasonInvalid reports a spec the controller will not act on. The
 	// condition's message names the field at fault.
 	ReasonInvalid = "Invalid"
