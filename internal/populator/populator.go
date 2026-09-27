@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -75,6 +76,11 @@ type Callbacks struct {
 	namespace  string
 	image      string
 	snapshots  SnapshotLister
+	// paused is true when the controller runs with --pause (see Pause).
+	paused bool
+	// pauseNoted holds the UID of each claim whose wait for the pause was
+	// logged, so each claim logs it once.
+	pauseNoted sync.Map
 }
 
 // New returns the callbacks for one controller namespace.
@@ -131,9 +137,15 @@ func New(operations Operations, namespace, image string, snapshots SnapshotListe
 // RestoreJobRefused and the API server's answer, and returns an error, so
 // the next sync tries again (see jobCallError).
 //
+// While the controller runs with --pause, a claim whose restore has not
+// started waits: Populate returns nil and does nothing (see waitsForPause).
+//
 // Every status write happens only when it changes something.
 func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.PopulatorParams) error {
 	if err := validateParams(params); err != nil {
+		return err
+	}
+	if waits, err := c.waitsForPause(ctx, params); waits || err != nil {
 		return err
 	}
 	vr, err := decodeVolumeRestore(params)
@@ -170,8 +182,13 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 // the Job, the repository Secret or the snapshots can't be read. It writes
 // nothing: a Job that failed after Populate read it is Populate's in the
 // next sync.
+// While the controller runs with --pause, it returns false for a claim
+// whose restore has not started (see waitsForPause).
 func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.PopulatorParams) (bool, error) {
 	if err := validateParams(params); err != nil {
+		return false, err
+	}
+	if waits, err := c.waitsForPause(ctx, params); waits || err != nil {
 		return false, err
 	}
 	key := c.jobKey(params.Pvc.UID)
