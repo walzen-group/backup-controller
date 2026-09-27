@@ -317,6 +317,32 @@ func TestABusySourceMakesTheRunWait(t *testing.T) {
 	}
 }
 
+// A namespace run that stops the app looks at each volume before it stops
+// anything. When another live run holds a volume, the run waits SourceBusy
+// with the app still running. If it stopped the app first, the app would stay
+// down until the other backup ends.
+func TestAQuiescedRunWaitsForABusySourceBeforeItStopsTheApp(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false),
+		busySource(TriggerFor(otherRunUID)), otherRun())
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce pre-check
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonSourceBusy {
+		t.Fatalf("phase = %q, reason = %q; want Waiting, SourceBusy", run.Status.Phase, readyReason(run.Status.Conditions))
+	}
+	if len(run.Status.Quiesced) != 0 || run.Status.QuiescedAt != nil {
+		t.Errorf("quiesced = %+v, quiescedAt = %v; want no plan and no stop while the source is busy", run.Status.Quiesced, run.Status.QuiescedAt)
+	}
+	app := &appsv1.Deployment{}
+	get(t, c, ns, appN, app)
+	if *app.Spec.Replicas != 2 {
+		t.Errorf("replicas = %d, want the app left at 2 while the run waits", *app.Spec.Replicas)
+	}
+}
+
 // busySource returns the claim's ReplicationSource with the manual tag open
 // and VolSync retrying its sync after a failed mover.
 func busySource(tag string) *volsyncv1alpha1.ReplicationSource {

@@ -57,8 +57,8 @@ func TestTheControllersDerivationsShareOneGate(t *testing.T) {
 
 // TestAKeyFileIsDerivedOnce checks that a keyDeriver runs scrypt once for a
 // password and a key file, and gives the key it derived to every later Open
-// of the same key file, while a key file with another salt, or another
-// password, gets its own derivation.
+// of the same key file. A key file with another salt, another N, r or p, or
+// another password gets its own derivation.
 //
 // The e2e restore tests opened their repositories 37 times, and each Open
 // allocated scrypt's 32 MiB again. The large spans left the heap at 181 MB
@@ -101,5 +101,42 @@ func TestAKeyFileIsDerivedOnce(t *testing.T) {
 	}
 	if got := calls.Load(); got != 3 {
 		t.Errorf("another salt and another password ran scrypt %d times in all, want 3", got)
+	}
+
+	for name, cost := range map[string]func(*keyFile){
+		"N": func(f *keyFile) { f.N = 4 },
+		"r": func(f *keyFile) { f.R = 2 },
+		"p": func(f *keyFile) { f.P = 2 },
+	} {
+		before := calls.Load()
+		changed := file
+		cost(&changed)
+		if _, err := d.derive("backup", changed); err != nil {
+			t.Fatalf("derive another %s: %v", name, err)
+		}
+		if calls.Load() == before {
+			t.Errorf("the same salt with another %s gave the kept key, want its own derivation", name)
+		}
+	}
+}
+
+// TestTheKeptKeysStayUnderTheCap checks that a keyDeriver never keeps more
+// than maxDerivedKeys keys. When it is full, it forgets them all before it
+// keeps the next one, so its memory does not grow with the number of key
+// files the controller opens.
+func TestTheKeptKeysStayUnderTheCap(t *testing.T) {
+	fake := func(_, _ []byte, _, _, _, keyLen int) ([]byte, error) { return make([]byte, keyLen), nil }
+	d := newKeyDeriver(fake)
+	for i := range maxDerivedKeys + 1 {
+		file := keyFile{KDF: "scrypt", N: 2, R: 1, P: 1, Salt: []byte{byte(i), byte(i >> 8)}}
+		if _, err := d.derive("backup", file); err != nil {
+			t.Fatalf("derive: %v", err)
+		}
+		if len(d.derived) > maxDerivedKeys {
+			t.Fatalf("the keyDeriver keeps %d keys, want at most %d", len(d.derived), maxDerivedKeys)
+		}
+	}
+	if len(d.derived) != 1 {
+		t.Errorf("after the cap, the keyDeriver keeps %d keys, want only the newest one", len(d.derived))
 	}
 }
