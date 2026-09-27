@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -18,7 +19,9 @@ const surveyParallel = 8
 
 // Archive is what Survey found under a database's prefix.
 type Archive struct {
-	// Empty is true when nothing at all exists under the server prefix.
+	// Empty is true when <server>/wals/ holds no WAL file (see walsEmpty).
+	// Other objects under the server prefix, such as failed base backups, do
+	// not count.
 	Empty bool
 	// Found is a complete base backup, one that finished at or before the
 	// target when a target was given. It is nil when none qualifies.
@@ -70,8 +73,7 @@ func (e *OutOfTimeError) Unwrap() error { return e.Err }
 // most surveyParallel GETs in flight. It stops at the first qualifying complete
 // backup; which worker finds it does not matter, since only existence
 // counts. A missing backup.info counts as not complete, as it does for barman.
-// With no backup directory at all, it asks for one key under the server
-// prefix to fill in Empty.
+// It fills in Empty with walsEmpty.
 //
 // It returns an *OutOfTimeError when ctx ends before an answer, during a
 // listing too, so an expired ctx never reads as an empty prefix. It returns
@@ -87,18 +89,18 @@ func (p S3Prober) Survey(ctx context.Context, at Location, target *time.Time) (A
 	if err != nil {
 		return Archive{}, outOfTime(ctx, err, 0, 0)
 	}
+	empty, err := walsEmpty(ctx, client, at)
+	if err != nil {
+		return Archive{}, err
+	}
 
 	if len(ids) == 0 {
-		empty, err := prefixEmpty(ctx, client, at)
-		if err != nil {
-			return Archive{}, err
-		}
 		return Archive{Empty: empty}, nil
 	}
 
 	q := &qualifier{target: target}
 	read, err := readInfos(ctx, client, at, ids, q.visit)
-	out := Archive{Backups: len(ids), Read: read, Found: q.found}
+	out := Archive{Empty: empty, Backups: len(ids), Read: read, Found: q.found}
 	if out.Found != nil {
 		return out, nil
 	}
@@ -109,18 +111,25 @@ func (p S3Prober) Survey(ctx context.Context, at Location, target *time.Time) (A
 	return out, nil
 }
 
-// prefixEmpty tells Survey if nothing exists under the server prefix of a
-// Location. It asks for one key under the prefix.
+// walsEmpty tells Survey if <server>/wals/ of a Location holds no WAL file.
+// This is the test of barman-cloud-check-wal-archive, which CloudNativePG
+// runs before a new database archives. It lists <server>/wals/ with no
+// delimiter and fails on any WAL file (barman 3.20.0
+// clients/cloud_check_wal_archive.py:60-64, cloud.py:2426-2446,
+// xlog.py:572-574). walFile tells which keys are WAL files.
 //
-// It returns true when the store lists no key there. It returns an
-// *OutOfTimeError when ctx ends before the answer, and an error when the
-// listing fails.
-func prefixEmpty(ctx context.Context, client *minio.Client, at Location) (bool, error) {
-	for object := range client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.ServerPrefix(), Recursive: true, MaxKeys: 1}) {
+// It returns true when the listing holds no WAL file, and stops at the first
+// one. It returns an *OutOfTimeError when ctx ends before the answer, and an
+// error when the listing fails.
+func walsEmpty(ctx context.Context, client *minio.Client, at Location) (bool, error) {
+	prefix := at.ServerPrefix() + "wals/"
+	for object := range client.ListObjectsIter(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
 		if object.Err != nil {
-			return false, outOfTime(ctx, fmt.Errorf("list %s/%s: %w", at.Bucket, at.ServerPrefix(), s3Answer(object.Err)), 0, 0)
+			return false, outOfTime(ctx, fmt.Errorf("list %s/%s: %w", at.Bucket, prefix, s3Answer(object.Err)), 0, 0)
 		}
-		return false, nil
+		if walFile(object.Key) {
+			return false, nil
+		}
 	}
 	// minio-go ends the listing with no error item when ctx ends, so
 	// finding nothing proves the prefix empty only while ctx is live.
@@ -371,4 +380,25 @@ func s3Answer(err error) error {
 		return err
 	}
 	return fmt.Errorf("%w (HTTP %d %s)", err, answer.StatusCode, answer.Code)
+}
+
+// walName is barman's pattern for a file in a WAL archive: a WAL segment,
+// optionally with a backup label offset or .partial, or a timeline history
+// file (barman 3.20.0 xlog.py:39-56).
+var walName = regexp.MustCompile(`^[0-9A-Fa-f]{8}(?:[0-9A-Fa-f]{8}[0-9A-Fa-f]{8}(?:\.[0-9A-Fa-f]{8}\.backup|\.partial)?|\.history)$`)
+
+// walCompressions are the suffixes barman allows on a WAL file name
+// (barman 3.20.0 cloud.py:90-97).
+var walCompressions = map[string]bool{".gz": true, ".bz2": true, ".xz": true, ".snappy": true, ".zst": true, ".lz4": true}
+
+// walFile tells if an object key under wals/ is a WAL file by barman's rule
+// (barman 3.20.0 cloud.py:2426-2446): the base name matches walName, or it
+// matches walName after one allowed compression suffix is removed.
+func walFile(key string) bool {
+	base := path.Base(key)
+	if walName.MatchString(base) {
+		return true
+	}
+	ext := path.Ext(base)
+	return walCompressions[ext] && walName.MatchString(strings.TrimSuffix(base, ext))
 }

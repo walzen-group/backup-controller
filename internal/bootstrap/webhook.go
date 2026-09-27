@@ -277,7 +277,8 @@ func (d *Decider) create(ctx context.Context, c creation) admission.Response {
 // An empty database can archive only into an empty prefix. CloudNativePG
 // refuses a prefix that holds WAL, and the skip annotation would let the new
 // database overwrite the segments of the old one. So optOut allows the create
-// when the prefix is empty and refuses it when the prefix holds anything.
+// when <server>/wals/ holds no WAL file and refuses it otherwise (see
+// walsEmpty).
 // It also refuses an empty prefix when the status of the ObjectStore
 // records a completed backup for the server name (see contradicted).
 func (d *Decider) optOut(ctx context.Context, c creation) admission.Response {
@@ -365,11 +366,12 @@ func (d *Decider) recover(ctx context.Context, c creation, run *backupv1alpha1.R
 //     a recovery.
 //   - source names what asks for the recovery, for the message.
 //
-// It refuses the create when something asks for a recovery, when the prefix
-// holds anything, and when the status of the ObjectStore records a completed
-// backup for the server name (see contradicted). It allows the Cluster
-// unchanged when nothing asks for a recovery, the prefix is empty and the
-// status records no backup.
+// It refuses the create when something asks for a recovery, when
+// <server>/wals/ holds a WAL file (see walsEmpty), and when the status of
+// the ObjectStore records a completed backup for the server name (see
+// contradicted). It allows the Cluster unchanged when nothing asks for a
+// recovery, <server>/wals/ holds no WAL file and the status records no
+// backup.
 func withoutBaseBackup(c creation, archive Archive, asked bool, source string) admission.Response {
 	if asked {
 		return admission.Denied(fmt.Sprintf(
@@ -378,9 +380,9 @@ func withoutBaseBackup(c creation, archive Archive, asked bool, source string) a
 		))
 	}
 	// CloudNativePG refuses to archive a new database into a prefix that
-	// holds WAL, so a database started empty over anything at all could
+	// holds WAL, so a database started empty over WAL could
 	// never be backed up, and a recovery has no base backup to start
-	// from. An empty prefix is the only place initdb is safe.
+	// from. A prefix without WAL is the only place initdb is safe.
 	if !archive.Empty {
 		c.logger.Info("refusing the Cluster", "reason", "an archive with no completed base backup", "prefix", c.at.ServerPrefix())
 		return admission.Denied(noDoneBackup(c.at, c.serverName, archive.Backups))

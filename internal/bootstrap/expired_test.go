@@ -208,7 +208,7 @@ func (a armOnClose) Close() error {
 // TestAContextThatEndsAfterTheBaseListingNeverReadsAsAnEmptyPrefix checks
 // Survey on the recorded wal-only store, whose prefix holds WAL and no
 // base/, when the context ends after backupIDs has returned and before the
-// one-key listing of the server prefix. minio-go then ends that listing
+// listing of <server>/wals/. minio-go then ends that listing
 // with no item and no error, and a Survey that took the silence as an empty
 // prefix would let the webhook admit initdb into a prefix that holds WAL.
 // minio.DefaultTransport is swapped for the test so the client minio.New

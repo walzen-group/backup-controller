@@ -253,8 +253,8 @@ timeout and restore nothing.
 
 ## Refuse a new database over an archive it could never archive into
 
-From v0.9.0 the webhook refuses a Cluster that would start empty when anything
-already exists under its prefix. This includes two cases:
+From v0.9.0 the webhook refuses a Cluster that would start empty when a WAL
+file already exists under `<prefix>/wals/`. This includes two cases:
 
 - A Cluster with no completed base backup to recover from and nothing that asks
   for a recovery.
@@ -272,18 +272,14 @@ loudly until that volume was full. The opt-out did this every time. Its
 documented purpose is to discard a database, which is exactly when its prefix
 still holds the old WAL.
 
-A refusal only when a WAL file exists would mirror barman's check exactly. But
-the webhook would have to copy barman's filter for WAL file names and list
-`wals/` until the first match. A future barman that counts one more kind of
-file as WAL would make the two disagree. The webhook would then admit a Cluster
-that never archives, which is the failure this decision prevents. A refusal on
-any object needs one listing call and no knowledge of barman's file names.
-
-The webhook refuses one prefix that barman would accept: a prefix that holds
-only failed base backups and no WAL. Such a store occurs only in two cases. A
-base backup started while the archive held no WAL, or someone deleted the WAL
-by hand. It holds nothing a recovery can use, so its deletion discards nothing.
-The refusal says to delete it.
+The webhook applies barman's own test: it lists `wals/` until the first key
+whose name is a WAL file by barman's filter. Thus the webhook and the plugin
+agree on every prefix. A prefix that holds only failed base backups, or other
+objects, and no WAL is admitted, because the plugin archives into it. An
+earlier draft refused any object under the prefix. It was simpler, but it
+refused prefixes that barman accepts, and the controller applies the rule of
+the pinned upstream source. [compatibility.md](compatibility.md) has the source
+lines. A barman upgrade re-checks the filter there.
 
 v0.7.x recovered whenever anything was under `base/`. That fails loudly in the
 bootstrap Job when no backup is DONE. It still starts a WAL-only prefix and an

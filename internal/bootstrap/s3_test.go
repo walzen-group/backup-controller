@@ -50,18 +50,9 @@ func TestSplitEndpoint(t *testing.T) {
 // archives, and barman fails it on any WAL under the prefix (the recorded
 // verdicts of failed-base, started-base and wal-only), so a Cluster started
 // empty there would never archive. A recovery has nothing to start from
-// either. The failed-base store without its WAL passes barman's check; the
-// webhook refuses it too, since its fix (clearing a prefix that holds nothing
-// recoverable) costs nothing.
+// either.
 func TestAnArchiveWithNoDoneBaseBackupRefusesTheCluster(t *testing.T) {
 	failed := barmanstore.MustLoad(t, "failed-base")
-	failedNoWAL := barmanstore.Store{Manifest: barmanstore.Manifest{Store: "failed-base without WAL"}}
-	for _, o := range failed.Objects {
-		if !strings.Contains(o.Key, "/wals/") {
-			failedNoWAL.Objects = append(failedNoWAL.Objects, o)
-		}
-	}
-
 	for _, tc := range []struct {
 		name  string
 		store barmanstore.Store
@@ -71,7 +62,6 @@ func TestAnArchiveWithNoDoneBaseBackupRefusesTheCluster(t *testing.T) {
 		{"started-base", barmanstore.MustLoad(t, "started-base"), "(1 base backup under base/, not DONE)"},
 		{"wal-only", barmanstore.MustLoad(t, "wal-only"), "no base backup under base/, but other objects, such as WAL, under the prefix"},
 		{"two-servers", barmanstore.MustLoad(t, "two-servers"), "no base backup under base/"},
-		{"failed-base without WAL", failedNoWAL, "(1 base backup under base/, not DONE)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			response := decideOn(t, cluster(t, nil), recordedS3(t, tc.store))
@@ -141,5 +131,45 @@ func TestTheRefusalCountsTheBaseBackups(t *testing.T) {
 	message := noDoneBackup(at, "app-pg", 3)
 	if want := "s3://backups/app/app-pg/ holds an archive with no completed base backup (3 base backups under base/, none DONE)."; !strings.HasPrefix(message, want) {
 		t.Errorf("refusal %q does not start with %q", message, want)
+	}
+}
+
+// withoutWAL returns the recorded failed-base store without the WAL files
+// under wals/, and with other objects in their place: a file under wals/
+// that is not a WAL name and a file beside base/. barman-cloud-check-wal-archive
+// counts only the WAL files under <server>/wals/ (barman 3.20.0
+// clients/cloud_check_wal_archive.py:60-64, cloud.py:2426-2446, xlog.py:39-56,
+// 572-574), so it passes on this store.
+func withoutWAL(t *testing.T) barmanstore.Store {
+	t.Helper()
+	failed := barmanstore.MustLoad(t, "failed-base")
+	store := barmanstore.Store{Manifest: barmanstore.Manifest{Store: "failed-base without WAL"}}
+	for _, o := range failed.Objects {
+		if !strings.Contains(o.Key, "/wals/") {
+			store.Objects = append(store.Objects, o)
+		}
+	}
+	for _, key := range []string{"app-pg/wals/0000000100000000/notes.txt", "app-pg/README"} {
+		body := "not WAL"
+		store.Objects = append(store.Objects, barmanstore.Object{Key: key, Size: int64(len(body)), Body: &body})
+	}
+	return store
+}
+
+// TestAPrefixWithoutWALStartsEmpty checks that a Cluster, opted out or not,
+// starts with initdb over a prefix that holds a FAILED base backup and other
+// objects but no WAL file. barman-cloud-check-wal-archive passes there, so
+// the new database archives.
+func TestAPrefixWithoutWALStartsEmpty(t *testing.T) {
+	for name, c := range map[string]*unstructured.Unstructured{"initdb": cluster(t, nil), "opted out": optedOut(t)} {
+		t.Run(name, func(t *testing.T) {
+			response := decideOn(t, c, recordedS3(t, withoutWAL(t)))
+			if !response.Allowed {
+				t.Fatalf("the cluster was refused over a prefix without WAL: %v", response.Result)
+			}
+			if len(response.Patches) != 0 {
+				t.Fatalf("the cluster was rewritten: %v", response.Patches)
+			}
+		})
 	}
 }

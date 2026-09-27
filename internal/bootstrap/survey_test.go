@@ -165,7 +165,7 @@ func v081BaseBackups(t *testing.T, at Location) []BaseBackup {
 // TestTheNewReaderAgreesWithTheOldOnTheRecordedStores checks, for every
 // recorded store and each server in it, that BaseBackups returns what the
 // v0.8.1 reader did and that Survey finds a DONE backup exactly when that
-// list is not empty, is Empty exactly when nothing lies under the prefix,
+// list is not empty, is Empty exactly when the recorded barman-cloud-check-wal-archive passed,
 // and reports the oldest DONE backup when asked for a target before it.
 func TestTheNewReaderAgreesWithTheOldOnTheRecordedStores(t *testing.T) {
 	names, err := barmanstore.Names()
@@ -202,9 +202,10 @@ func TestTheNewReaderAgreesWithTheOldOnTheRecordedStores(t *testing.T) {
 				if (archive.Found != nil) != (len(want) > 0) {
 					t.Errorf("Survey found %v, the v0.8.1 reader lists %d DONE backups", archive.Found, len(want))
 				}
-				anything := len(server.Keys("backups", at.ServerPrefix())) > 0
-				if archive.Empty == anything {
-					t.Errorf("Survey Empty = %v, the store holds objects under the prefix: %v", archive.Empty, anything)
+				if verdict, ok := recorded.Verdicts[serverName]; ok {
+					if passes := verdict.CheckWalArchive.ExitCode == 0; archive.Empty != passes {
+						t.Errorf("Survey Empty = %v, barman-cloud-check-wal-archive exit code %d", archive.Empty, verdict.CheckWalArchive.ExitCode)
+					}
 				}
 
 				if len(want) == 0 {

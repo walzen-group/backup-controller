@@ -578,20 +578,22 @@ object store through which the Cluster archives:
 | a completed base backup | rewrites the Cluster to recover from it, to the end of the archive |
 | a completed base backup, and a RestoreRun that deleted this Cluster | rewrites it to recover to the run's `restoreAsOf`, and names the run in `backup.wlz.li/restore-run` |
 | a completed base backup, and `backup.wlz.li/restore-as-of` on the Cluster | rewrites it to recover to that moment |
-| objects under the prefix, such as WAL or failed base backups, and no completed base backup | refuses the Cluster: `s3://<bucket>/<prefix>/ holds an archive with no completed base backup ...` (the full text is below) |
+| a WAL file under `<prefix>/wals/`, and no completed base backup | refuses the Cluster: `s3://<bucket>/<prefix>/ holds an archive with no completed base backup ...` (the full text is below) |
 | no completed base backup, and a RestoreRun or the annotation asks for a recovery | refuses the Cluster: `... holds no completed base backup to recover from.` |
 | no base backup finished by the moment a run or the annotation asks for | refuses the Cluster, naming the oldest base backup |
 | the Cluster declares a bootstrap method other than `initdb`, such as `recovery` or `pg_basebackup` | nothing, unless a RestoreRun waits for this Cluster. Then it refuses the Cluster with `declares its own spec.bootstrap.<method>. Remove the declared bootstrap ..., or delete the RestoreRun.`, so two sources cannot race |
-| `backup.wlz.li/bootstrap: initdb`, and nothing under the prefix | nothing. The annotation asks for an empty database on purpose. The ObjectStore status check of the second row applies here too |
-| `backup.wlz.li/bootstrap: initdb`, and anything under the prefix | refuses the Cluster: `The Cluster asks for an empty database (backup.wlz.li/bootstrap: initdb), and s3://<bucket>/<prefix>/ still holds the archive of an earlier one. ...` ([Starting a database empty](#starting-a-database-empty) has the full text) |
+| `backup.wlz.li/bootstrap: initdb`, and no WAL file under `<prefix>/wals/` | nothing. The annotation asks for an empty database on purpose. The ObjectStore status check of the second row applies here too |
+| `backup.wlz.li/bootstrap: initdb`, and a WAL file under `<prefix>/wals/` | refuses the Cluster: `The Cluster asks for an empty database (backup.wlz.li/bootstrap: initdb), and s3://<bucket>/<prefix>/ still holds the archive of an earlier one. ...` ([Starting a database empty](#starting-a-database-empty) has the full text) |
 | the store takes longer than the webhook's 10-second budget to answer | refuses the Cluster with what it read so far ([How long the webhook reads](#how-long-the-webhook-reads)) |
 
-A completed base backup is one whose backup.info says `status: DONE`. barman
+A completed base backup is one whose backup.info sets `begin_time` and
+`end_time`, whatever its status. This is the rule of the plugin's catalog, which
+picks the base backup of a recovery. barman
 writes the directory of a backup under base/ when the backup starts, and marks
 it STARTED. Later, barman marks it DONE or FAILED. barman never deletes a
 failed or unfinished backup on its own. Its retention deletes only DONE backups
-that became obsolete. The checks of a RestoreRun against a store with no DONE
-backup fail before the run deletes anything.
+that became obsolete. The checks of a RestoreRun against a store with no
+completed backup fail before the run deletes anything.
 
 The webhook recovers a Cluster for a RestoreRun only while that run is
 unfinished and not being deleted. A run can time out, fail or be deleted after
@@ -626,8 +628,8 @@ there. Because of the trailing slash, `app/app-pg` does not match
 ### A database that could never archive
 
 With no completed base backup and no request for a recovery, the webhook admits
-a Cluster only when its prefix is empty. If anything is under the prefix, the
-webhook refuses the Cluster:
+a Cluster only when `<prefix>/wals/` holds no WAL file. If a WAL file is
+there, the webhook refuses the Cluster:
 
 ```text
 s3://backups/app/app-pg/ holds an archive with no completed base backup (3
@@ -659,8 +661,9 @@ and never back anything up. The steps are:
 v0.8.x admitted such a Cluster as written.
 [upgrading.md](upgrading.md#v090) tells how to find a Cluster that it admitted.
 
-The webhook also refuses a prefix that holds only failed base backups and no
-WAL, although the check of barman would pass there.
+The webhook applies the WAL file name filter of barman. It admits a prefix that
+holds only failed base backups, or other objects, and no WAL, because the check
+of barman passes there.
 [decisions.md](decisions.md#refuse-a-new-database-over-an-archive-it-could-never-archive-into)
 records why.
 
