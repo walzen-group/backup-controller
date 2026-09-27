@@ -16,7 +16,7 @@ nameOverride: ""
 # Overrides the generated release-qualified name entirely.
 fullnameOverride: ""
 
-# Namespace the controller creates its prime claim and ReplicationDestination
+# Namespace the controller creates its prime claims and restore Jobs
 # in, passed to the container as --namespace. It has to be the namespace the
 # release is installed into, which is backup-system for the install command in
 # the README.

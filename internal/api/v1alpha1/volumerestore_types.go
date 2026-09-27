@@ -8,9 +8,9 @@ import (
 )
 
 // VolumeRestoreSpec names the restic repository a claim is restored from, and
-// says how the mover that runs the restore should be set up. Each field is
-// passed to the field of the same name on the ReplicationDestination the
-// controller creates.
+// says how the restore Job that fills the claim is set up. The controller runs
+// that Job in its own namespace, where it restores one snapshot with restic
+// into the volume that then becomes the claim's.
 type VolumeRestoreSpec struct {
 	// Repository is the name of the Secret in this namespace that holds the
 	// restic repository URL, its password and the object store keys. It is
@@ -30,8 +30,9 @@ type VolumeRestoreSpec struct {
 	// +kubebuilder:validation:Format="date-time"
 	RestoreAsOf *string `json:"restoreAsOf,omitempty"`
 
-	// CacheStorageClassName is the storage class for the claim that holds the
-	// restic mover's metadata cache. When omitted, the cluster's default class
+	// CacheStorageClassName is the storage class of the restore Job's cache
+	// volume, an ephemeral claim that holds restic's metadata cache while the
+	// Job's pod runs. When omitted, the cluster's default class
 	// provisions it. If that class has reclaimPolicy Retain, every restore
 	// leaves a volume behind, so name a class whose reclaimPolicy is Delete.
 	// +optional
@@ -39,13 +40,14 @@ type VolumeRestoreSpec struct {
 	// +kubebuilder:validation:MaxLength=253
 	CacheStorageClassName *string `json:"cacheStorageClassName,omitempty"`
 
-	// CacheCapacity is the size of the cache claim. When omitted, VolSync
-	// picks its own default.
+	// CacheCapacity is the size of the restore Job's cache volume. When
+	// omitted, it is 1Gi.
 	// +optional
 	CacheCapacity *resource.Quantity `json:"cacheCapacity,omitempty"`
 
-	// MoverPodLabels are added to the mover pod, so that the cluster's backup
-	// queue admits the restore the same way it admits every other mover. Keys
+	// MoverPodLabels are added to the restore Job's pod, so that the cluster's
+	// backup queue admits the restore the same way it admits every other
+	// mover. The controller's own pod labels win over a key they share. Keys
 	// and values must be valid label syntax. The map holds at most 8 entries,
 	// because the API server installs the label syntax rules only for a map
 	// whose maximum size is declared.
@@ -55,8 +57,11 @@ type VolumeRestoreSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k].matches('^([a-zA-Z0-9]([-a-zA-Z0-9_.]*[a-zA-Z0-9])?)?$'))",message="moverPodLabels values must be a valid label value"
 	MoverPodLabels map[string]MoverPodLabelValue `json:"moverPodLabels,omitempty"`
 
-	// MoverSecurityContext is copied onto the ReplicationDestination
-	// unchanged.
+	// MoverSecurityContext is the restore Job's pod security context, copied
+	// unchanged. The controller's admission policy refuses a restore Job whose
+	// pod security context sets sysctls, SELinux options or an unconfined
+	// seccomp or AppArmor profile. A claim restored with such a context stays
+	// Pending, and Ready shows reason RestoreJobRefused.
 	// +optional
 	MoverSecurityContext *corev1.PodSecurityContext `json:"moverSecurityContext,omitempty"`
 }
@@ -71,8 +76,8 @@ type VolumeRestoreSpec struct {
 // +kubebuilder:validation:MaxLength=63
 type MoverPodLabelValue string
 
-// MoverLabels returns MoverPodLabels as the plain string map a
-// ReplicationDestination takes. It returns nil when no labels are set.
+// MoverLabels returns MoverPodLabels as the plain string map of pod labels
+// the restore Job takes. It returns nil when no labels are set.
 func (s VolumeRestoreSpec) MoverLabels() map[string]string {
 	if s.MoverPodLabels == nil {
 		return nil
@@ -124,8 +129,9 @@ const (
 	// RestorePhaseRestoring is a claim whose volume is being filled.
 	RestorePhaseRestoring RestorePhase = "Restoring"
 
-	// RestorePhaseFailed is a claim whose restore failed: its mover reported
-	// a failure, or no snapshot reaches its restore-as-of time.
+	// RestorePhaseFailed is a claim whose restore failed: its restore Job
+	// failed, no snapshot reaches its restore-as-of time, or the API server
+	// refused its restore Job.
 	RestorePhaseFailed RestorePhase = "Failed"
 )
 

@@ -153,9 +153,9 @@ const (
 	ReasonReleaseFailed = "ReleaseFailed"
 
 	// ReasonVolSyncUnsupported reports a run that met an API server that
-	// does not serve VolSync's ReplicationSource or ReplicationDestination
-	// at volsync.backube/v1alpha1, the one version this controller reads
-	// and writes, while it serves the kind at another version. The message
+	// does not serve VolSync's ReplicationSource at
+	// volsync.backube/v1alpha1, the one version this controller reads and
+	// writes, while it serves the kind at another version. The message
 	// names the kind, v1alpha1 and the versions served. Giving the app back
 	// needs no VolSync object, so a BackupRun ends Failed with this reason,
 	// after it starts the workloads it stopped. A RestoreRun past its checks

@@ -31,7 +31,7 @@ spec:
       - name: controller
         image: ghcr.io/walzen-group/backup-controller:v0.1.0
         imagePullPolicy: IfNotPresent
-        # The prime claim and the ReplicationDestination live in this
+        # The prime claims, the Secret copies and the restore Jobs live in this
         # namespace, which is the library's namespace setting. The metrics
         # listen address and path keep their defaults, :8080 and /metrics.
         #

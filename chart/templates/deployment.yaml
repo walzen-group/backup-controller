@@ -27,7 +27,7 @@ spec:
       - name: controller
         image: {{ include "backup-controller.image" . }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
-        # The prime claim and the ReplicationDestination live in this
+        # The prime claims, the Secret copies and the restore Jobs live in this
         # namespace, which is the library's namespace setting. The metrics
         # listen address and path keep their defaults, :8080 and /metrics.
         # --restore-image is the image the restore Jobs run restic in. The

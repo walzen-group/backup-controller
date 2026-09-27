@@ -49,23 +49,24 @@ spec:
           spec:
             description: |-
               VolumeRestoreSpec names the restic repository a claim is restored from, and
-              says how the mover that runs the restore should be set up. Each field is
-              passed to the field of the same name on the ReplicationDestination the
-              controller creates.
+              says how the restore Job that fills the claim is set up. The controller runs
+              that Job in its own namespace, where it restores one snapshot with restic
+              into the volume that then becomes the claim's.
             properties:
               cacheCapacity:
                 anyOf:
                 - type: integer
                 - type: string
                 description: |-
-                  CacheCapacity is the size of the cache claim. When omitted, VolSync
-                  picks its own default.
+                  CacheCapacity is the size of the restore Job's cache volume. When
+                  omitted, it is 1Gi.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
               cacheStorageClassName:
                 description: |-
-                  CacheStorageClassName is the storage class for the claim that holds the
-                  restic mover's metadata cache. When omitted, the cluster's default class
+                  CacheStorageClassName is the storage class of the restore Job's cache
+                  volume, an ephemeral claim that holds restic's metadata cache while the
+                  Job's pod runs. When omitted, the cluster's default class
                   provisions it. If that class has reclaimPolicy Retain, every restore
                   leaves a volume behind, so name a class whose reclaimPolicy is Delete.
                 maxLength: 253
@@ -84,8 +85,9 @@ spec:
                   maxLength: 63
                   type: string
                 description: |-
-                  MoverPodLabels are added to the mover pod, so that the cluster's backup
-                  queue admits the restore the same way it admits every other mover. Keys
+                  MoverPodLabels are added to the restore Job's pod, so that the cluster's
+                  backup queue admits the restore the same way it admits every other
+                  mover. The controller's own pod labels win over a key they share. Keys
                   and values must be valid label syntax. The map holds at most 8 entries,
                   because the API server installs the label syntax rules only for a map
                   whose maximum size is declared.
@@ -98,8 +100,11 @@ spec:
                   rule: self.all(k, self[k].matches('^([a-zA-Z0-9]([-a-zA-Z0-9_.]*[a-zA-Z0-9])?)?$'))
               moverSecurityContext:
                 description: |-
-                  MoverSecurityContext is copied onto the ReplicationDestination
-                  unchanged.
+                  MoverSecurityContext is the restore Job's pod security context, copied
+                  unchanged. The controller's admission policy refuses a restore Job whose
+                  pod security context sets sysctls, SELinux options or an unconfined
+                  seccomp or AppArmor profile. A claim restored with such a context stays
+                  Pending, and Ready shows reason RestoreJobRefused.
                 properties:
                   appArmorProfile:
                     description: |-
