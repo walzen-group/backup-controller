@@ -314,17 +314,6 @@ func AtOrBefore(snapshots []Snapshot, t time.Time) (Snapshot, bool) {
 	return found, ok
 }
 
-// ByShortID returns the first snapshot whose ID starts with the prefix in
-// short, and false when none does or the prefix is empty.
-func ByShortID(snapshots []Snapshot, short string) (Snapshot, bool) {
-	for _, s := range snapshots {
-		if short != "" && strings.HasPrefix(s.ID, short) {
-			return s, true
-		}
-	}
-	return Snapshot{}, false
-}
-
 // DirStore keeps a repository in the local directory whose path is its value.
 // The tests use it on a fixture that restic wrote.
 type DirStore string

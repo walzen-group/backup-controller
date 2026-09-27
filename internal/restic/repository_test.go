@@ -157,20 +157,6 @@ func TestAtOrBeforeComparesWholeSecondsAsVolSyncDoes(t *testing.T) {
 	}
 }
 
-// TestByShortIDFindsTheSnapshotTheMoverLogged checks that ByShortID finds a
-// snapshot by the eight-character ID a mover logs, and that an empty ID
-// matches nothing.
-func TestByShortIDFindsTheSnapshotTheMoverLogged(t *testing.T) {
-	snapshots := []Snapshot{{ID: "6e473100aaaa"}, {ID: "2edf5babbbbb"}}
-	got, ok := ByShortID(snapshots, "6e473100")
-	if !ok || got.ID != "6e473100aaaa" {
-		t.Fatalf("ByShortID = %+v, %v", got, ok)
-	}
-	if _, ok := ByShortID(snapshots, ""); ok {
-		t.Fatal("an empty short id matched a snapshot")
-	}
-}
-
 // TestParseRepositoryReadsResticsS3Form checks that ParseRepository reads
 // restic's s3 form with and without a scheme, and rejects another backend,
 // another scheme, and a string that names no bucket.

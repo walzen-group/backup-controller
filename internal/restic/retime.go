@@ -124,28 +124,36 @@ func (r *Repository) Retime(ctx context.Context, id string, at time.Time, tag st
 	return written, err
 }
 
-// retime does the work of Retime once the exclusive lock is held. It takes the
-// same parameters.
+// retime does the work of Retime once the exclusive lock is held.
 //
-// It looks for the snapshot whose ID starts with the prefix in short. If no ID
-// matches, the snapshot may have been rewritten already. retime then looks for
-// a snapshot whose original field starts with that prefix and which carries
-// the tag, and returns it without writing anything. If neither exists, it
-// returns an error.
+// Parameters:
+//   - id is the snapshot's ID, or its start, as Retime got it.
+//   - at is the time the copy carries, already without a fraction of a
+//     second.
+//   - tag is the tag the copy carries.
+//
+// It returns the copy, and an error when the repository holds neither the
+// snapshot nor a copy of it, or when a read, write or removal fails.
+//
+// It looks for the snapshot whose ID starts with the given ID. If none does,
+// the snapshot may have been rewritten already, so retime looks for a
+// snapshot whose original field starts with that ID and which carries the
+// tag, and returns it without writing anything.
 //
 // To rewrite a snapshot, it copies every field of the old snapshot document,
-// sets the time field to the time in at, and adds the tag to the tags when it
-// isn't there yet. It records the old ID in the original field, unless the old
-// snapshot was itself a rewrite and already has one. It saves the copy under
-// its new ID and then removes the old snapshot file. If that removal fails, the
-// copy stays in the repository and the error names both IDs.
+// sets the time field to the new time, and adds the tag to the tags when it
+// isn't there yet. It records the old ID in the original field, unless the
+// old snapshot was itself a rewrite and already has one. It saves the copy
+// under its new ID and then removes the old snapshot file. If that removal
+// fails, the copy stays in the repository and the error names both IDs.
 //
 // When the old snapshot is still there next to a copy an earlier call wrote,
 // that earlier call failed to remove it. retime then removes the old file and
 // returns that copy. It matches the copy's time to the second, so a copy that
-// an older controller stamped with a fraction of a second still counts. Writing the copy again would add a second snapshot under
-// another ID, because every encryption uses a fresh random IV.
-func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag string) (Snapshot, error) {
+// an older controller stamped with a fraction of a second still counts.
+// Writing the copy again would add a second snapshot under another ID,
+// because every encryption uses a fresh random IV.
+func (r *Repository) retime(ctx context.Context, id string, at time.Time, tag string) (Snapshot, error) {
 	files, err := r.snapshotFiles(ctx)
 	if err != nil {
 		return Snapshot{}, err
@@ -153,18 +161,18 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 
 	var old *snapshotFile
 	for i := range files {
-		if strings.HasPrefix(files[i].snapshot.ID, short) {
+		if strings.HasPrefix(files[i].snapshot.ID, id) {
 			old = &files[i]
 			break
 		}
 	}
 	if old == nil {
 		for _, f := range files {
-			if strings.HasPrefix(f.snapshot.Original, short) && slices.Contains(f.snapshot.Tags, tag) {
+			if strings.HasPrefix(f.snapshot.Original, id) && slices.Contains(f.snapshot.Tags, tag) {
 				return f.snapshot, nil
 			}
 		}
-		return Snapshot{}, fmt.Errorf("the repository holds no snapshot %s", short)
+		return Snapshot{}, fmt.Errorf("the repository holds no snapshot %s", id)
 	}
 
 	origin := old.snapshot.Original
@@ -205,14 +213,14 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 	if err != nil {
 		return Snapshot{}, err
 	}
-	id, err := r.save(ctx, "snapshots", document)
+	newID, err := r.save(ctx, "snapshots", document)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	if err := r.store.Remove(ctx, path.Join("snapshots", old.snapshot.ID)); err != nil {
-		return Snapshot{}, fmt.Errorf("remove snapshot %s after writing %s: %w", old.snapshot.ID, id, err)
+		return Snapshot{}, fmt.Errorf("remove snapshot %s after writing %s: %w", old.snapshot.ID, newID, err)
 	}
-	written, err := parseSnapshot(id, document)
+	written, err := parseSnapshot(newID, document)
 	if err != nil {
 		return Snapshot{}, err
 	}

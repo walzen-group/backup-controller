@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -57,19 +58,18 @@ func (r *repositoryCopy) Snapshots(ctx context.Context, _ *corev1.Secret) ([]res
 	return r.repo.Snapshots(ctx)
 }
 
-// forget removes the snapshot whose ID starts with short from the copy, as
+// forget removes the snapshot with the given full ID from the copy, as
 // restic forget does: it deletes the snapshot's file and leaves the data.
-func (r *repositoryCopy) forget(t *testing.T, short string) {
+func (r *repositoryCopy) forget(t *testing.T, id string) {
 	t.Helper()
 	list, err := r.repo.Snapshots(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, ok := restic.ByShortID(list, short)
-	if !ok {
-		t.Fatalf("no snapshot %s to forget", short)
+	if !slices.ContainsFunc(list, func(s restic.Snapshot) bool { return s.ID == id }) {
+		t.Fatalf("no snapshot %s to forget", id)
 	}
-	if err := restic.DirStore(r.dir).Remove(context.Background(), path.Join("snapshots", s.ID)); err != nil {
+	if err := restic.DirStore(r.dir).Remove(context.Background(), path.Join("snapshots", id)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -140,11 +140,12 @@ func TestARestoreWhoseSnapshotWasPrunedFailsBeforeWriting(t *testing.T) {
 			r, c := restoreReconciler(t, nil, restoreRun(shape.mutate), claim(), volumeRestore(), repository())
 			r.Snapshots = repo
 			restoreStep(t, r) // plan
-			if got := readRestoreRun(t, c).Status.Items[0].Snapshot; got != newestTimed {
-				t.Fatalf("the checks selected %s, want %s", got, newestTimed)
+			selected := readRestoreRun(t, c).Status.Items[0]
+			if selected.Snapshot != newestTimed {
+				t.Fatalf("the checks selected %s, want %s", selected.Snapshot, newestTimed)
 			}
 
-			repo.forget(t, newestTimed)
+			repo.forget(t, selected.SnapshotID)
 			restoreStep(t, r)
 			restoreStep(t, r) // the finished run only waits for its expiry
 
@@ -269,7 +270,7 @@ func TestAPassAfterALostWriteTakesTheJobOver(t *testing.T) {
 				t.Fatalf("restore Jobs = %v, want the one the lost pass created", jobs)
 			}
 			if tc.forget {
-				repo.forget(t, newestTimed)
+				repo.forget(t, readRestoreRun(t, c).Status.Items[0].SnapshotID)
 			}
 			if tc.gone != nil {
 				if err := c.Delete(context.Background(), tc.gone); err != nil {
