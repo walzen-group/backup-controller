@@ -1414,20 +1414,24 @@ func (r *BackupRunReconciler) repositorySecret(ctx context.Context, namespace, c
 }
 
 // runningNote returns a sentence for the message of a Running item that
-// abort fails, and "" when there is nothing to add.
+// abort or timeOut fails, and "" when there is nothing to add.
 //
 // Parameters:
 //   - run is the BackupRun that ends.
 //   - item is the Running item.
 //
-// For a volume item it returns what syncGoesOn says of the sync VolSync
-// goes on with. For a database item whose Backup waits in a phase
-// CloudNativePG 1.30 does not have, it returns the sentence of
-// unknownBackupPhase, so a run that times out there says which phase it
-// waited in. A failed read gives "", since the sentence only explains the
-// item's failure.
+// For a volume item that recorded its snapshot and has not moved it yet,
+// it returns the sentence of unmovedNote. For any other volume item it
+// returns what syncGoesOn says of the sync VolSync goes on with. For a
+// database item whose Backup waits in a phase CloudNativePG 1.30 does not
+// have, it returns the sentence of unknownBackupPhase, so a run that times
+// out there says which phase it waited in. A failed read gives "", since the
+// sentence only explains the item's failure.
 func (r *BackupRunReconciler) runningNote(ctx context.Context, run *backupv1alpha1.BackupRun, item backupv1alpha1.BackupItem) string {
 	if item.Kind != "Cluster" {
+		if item.SnapshotID != "" {
+			return unmovedNote(item)
+		}
 		return r.syncGoesOn(ctx, run, item, nil)
 	}
 	done, _, note, err := backupResult(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Backup)
@@ -1494,9 +1498,9 @@ func (r *BackupRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.B
 //
 // A Pending item whose last start attempt failed adds "; last error: " and
 // status.items[].lastStartError to the message. A Running volume item adds
-// what data a snapshot of the sync VolSync goes on with holds (see
-// syncGoesOn), and a Running database item names a Backup phase
-// CloudNativePG 1.30 does not have (see runningNote).
+// the snapshot it recorded and did not move, or what data a snapshot of the
+// sync VolSync goes on with holds, and a Running database item names a
+// Backup phase CloudNativePG 1.30 does not have (see runningNote).
 func (r *BackupRunReconciler) failUnfinished(ctx context.Context, run *backupv1alpha1.BackupRun, message string,
 	fail func(item *backupv1alpha1.BackupItem, text string)) {
 	for i := range run.Status.Items {

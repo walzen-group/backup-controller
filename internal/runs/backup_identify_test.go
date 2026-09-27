@@ -466,3 +466,35 @@ func TestWindowOfTable(t *testing.T) {
 		})
 	}
 }
+
+// A volume item that waits for the restart when the run times out says in
+// its message that its snapshot is saved but was not moved to the restart
+// moment or tagged quiesced, so a person knows a synced restore can't use it.
+func TestATimedOutWaitNamesTheSavedSnapshot(t *testing.T) {
+	objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
+		claim(), volume(), volumeRestore(), repository(), deployment()}, cacheClaim()...)
+	r, c := backupReconciler(t, objects...)
+	step(t, r) // plan
+	step(t, r) // admit, no queue
+	step(t, r) // quiesce
+	step(t, r) // start
+	complete(t, c)
+	step(t, r) // find the first claim's snapshot; the cache's clone is not cut
+
+	r.Now = func() time.Time { return frozen.Add(2 * time.Hour) }
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Fatalf("phase = %q, want Failed after the timeout", run.Status.Phase)
+	}
+	for _, item := range run.Status.Items {
+		if item.Name != claimN {
+			continue
+		}
+		want := "snapshot " + monday.ShortID() + " is saved but was not moved to the restart moment or tagged " + restic.QuiescedTag
+		if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, want) {
+			t.Fatalf("item = %+v, want Failed with a message that says %q", item, want)
+		}
+	}
+}

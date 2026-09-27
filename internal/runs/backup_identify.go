@@ -204,3 +204,19 @@ func noSnapshotListed(item *backupv1alpha1.BackupItem, now time.Time) {
 		item.Message = "the volume held no files, so VolSync took no snapshot"
 	}
 }
+
+// unmovedNote returns the sentence for the message of a volume item that
+// fails with its snapshot recorded but not yet moved to the restart moment,
+// as when the run times out while the item waits for the restart. It is for
+// a person; no decision reads it.
+//
+// Parameters:
+//   - item is the volume item. Its snapshot field holds the short ID the
+//     item recorded when it found the snapshot its sync wrote.
+//
+// The snapshot stays in the repository with the time restic gave it and
+// without the quiesced tag, so a restore with syncDatabaseToVolume does not
+// pick it.
+func unmovedNote(item backupv1alpha1.BackupItem) string {
+	return fmt.Sprintf("snapshot %s is saved but was not moved to the restart moment or tagged %s", item.Snapshot, restic.QuiescedTag)
+}
