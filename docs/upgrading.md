@@ -123,12 +123,14 @@ permissions.
 
 ### Step 4: Apply the CRDs, the RBAC and the image together
 
-Against v0.8.2 the ClusterRole gains five rules. Until the first of them is
-applied, the webhook refuses every Cluster create while any other Cluster
-archives:
+Against v0.8.x the ClusterRole gains four rules and one verb on an existing
+rule. The list holds for v0.8.0, v0.8.1 and v0.8.2, whose rules differ only in
+the `delete` on replicationsources that v0.8.2 dropped. Until the new `list`
+verb is applied, the webhook refuses every Cluster create while any other
+Cluster archives:
 
-- `list` on `objectstores.barmancloud.cnpg.io`, which the webhook's
-  shared-archive check uses to read every ObjectStore in one call;
+- `list` on `objectstores.barmancloud.cnpg.io`, the added verb, which the
+  webhook's shared-archive check uses to read every ObjectStore in one call;
 - `get` on `customresourcedefinitions.apiextensions.k8s.io`, named
   `backupruns.backup.wlz.li` and `restoreruns.backup.wlz.li`, for the CRD
   check below;
@@ -143,7 +145,7 @@ archives:
 - get and update on `deployments/scale` and `statefulsets/scale` in `apps`,
   through which quiesce sets a workload's replica count.
 
-Three rules lose verbs:
+Four rules lose verbs:
 
 - `patch` on `deployments` and `statefulsets` goes; the rule keeps get and
   list, and the controller writes no field of a workload but the replica count
@@ -154,7 +156,9 @@ Three rules lose verbs:
   `into:` no longer creates a VolumeRestore. The VolumeRestores a claim names
   in `dataSourceRef`, such as the one a Flux template writes for each backed-up
   claim, keep working unchanged: the populator fills a new claim from them, and
-  every run reads a claim's repository from its VolumeRestore, as before.
+  every run reads a claim's repository from its VolumeRestore, as before;
+- `delete` on `replicationsources.volsync.backube` goes (v0.8.2 already
+  dropped it), because a failed mover no longer deletes the claim's source.
 
 [packaging.md](packaging.md#rbac-the-controller-needs) lists every rule and its
 caller.
@@ -222,7 +226,11 @@ them.
 ### Step 5: Change the infra units
 
 This step is for the walzen infrastructure repository (~/repos/infra), read at
-its commit 6315b4e; paths below are relative to it. v0.9.0 restores with its
+its commit 6315b4e; paths below are relative to it. Before you edit, run
+`git status` in ~/repos/infra. Someone else's uncommitted edits in the files
+below stay as they are: add your lines next to them, and commit only the
+files you changed. Item 9 replaces the version line whatever it holds, since
+infra moves straight to v0.9.0. v0.9.0 restores with its
 own restic Job, which must run the same restic image VolSync backs up with, so
 the image is declared once, in the volsync unit, and both units read it. The
 controller refuses to start without `--restore-image`, and the release
@@ -241,8 +249,9 @@ manifest leaves the flag out for the installer to append.
 
    Add the same lines below `chart_version` in
    environments/test/cluster/volsync/inputs.yaml (line 5). The test
-   environment is parked (environments/test/.disable; root.hcl:16-20 skips a
-   parked environment), but its volsync unit uses the same module, and
+   environment is parked (environments/test/.disable; root.hcl:16-20 defines
+   `parked`, and the exclude block at root.hcl:86-90 skips a parked
+   environment), but its volsync unit uses the same module, and
    `restic_image` has no default, so without the input the unit would fail the
    moment the environment is unparked.
 
@@ -385,13 +394,30 @@ manifest leaves the flag out for the installer to append.
     volsync unit. The intro and "Restores run as root" say that the
     controller's restore Job writes the claim, still as root in namespaces
     annotated privileged-movers. The volsync module's README documents
-    `restic_image`. flux/templates/backups/pvc/volumerestore.yaml:7-8 says the
-    controller "has VolSync restore into it"; reword it to the restore Job.
+    `restic_image`: add rows to its Interface table for the `restic_image`
+    input and the `restic_image` output, and add a `restore_image` input row
+    to the Interface table of the backup-controller module README. In
+    modules/cluster/volsync/opentofu/README.md, line 24 ("The chart defaults
+    keep ...") needs a sentence saying that the unit sets the chart's
+    restic.image to `restic_image`, and line 199 says backup-controller
+    fills a claim "with a Direct restore into an empty volume"; reword it to
+    the restore Job.
+    flux/templates/backups/pvc/volumerestore.yaml:7-8 says the controller "has
+    VolSync restore into it"; reword it to the restore Job as well.
 
-Apply the volsync unit first, then backup-controller; terragrunt's dependency
-order does this in a run-all.
+Apply the volsync unit first, then backup-controller. CI's apply after the
+merge does this in terragrunt's dependency order, and so does
+`terragrunt run --all apply` from a shell.
 
 #### Check the images and the admission policy
+
+Run the checks from ~/repos/infra with the prod kubeconfig. infra's .envrc sets
+`KUBECONFIG` only in a shell that loads it, and without it kubectl reads
+whatever cluster the current context names:
+
+```
+export KUBECONFIG=.output/prod/kubeconfig
+```
 
 ```
 kubectl -n volsync-system get deploy volsync -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].args}' | tr ',' '\n' | grep restic-container-image
@@ -409,14 +435,17 @@ kubectl get validatingadmissionpolicy,validatingadmissionpolicybinding backup-co
 kubectl get validatingadmissionpolicy backup-controller-restore-jobs -o jsonpath='{.spec.matchConditions[0].expression}{"\n"}'
 ```
 
-Expected result: both images are the `restic_image` value, the second command
-prints exactly one `--restore-image`, both policy objects exist, and the match
-condition names `system:serviceaccount:backup-system:backup-controller`, the
+Expected result: both images are the `restic_image` value (each printed
+line is JSON-quoted), the second command prints exactly one
+`--restore-image`, both policy objects exist, and the match condition names `system:serviceaccount:backup-system:backup-controller`, the
 namespace and ServiceAccount the Deployment runs as. A policy object that is
 missing, or a match condition that names another namespace or ServiceAccount,
 leaves the controller's Job grant as wide as RBAC alone: every Job its
-ServiceAccount creates is admitted. Apply deploy/admissionpolicy.yaml from the
-release, with the username changed to match an install that renamed either.
+ServiceAccount creates is admitted. Apply the backup-controller unit again:
+the release asset carries both objects, and the unit applies them through
+`kubectl_manifest.workload`. Outside infra, apply the release's
+deploy/admissionpolicy.yaml with the username changed to match an install
+that renamed either.
 
 A backup-controller pod in CrashLoopBackOff whose previous log says `refusing
 to start: --restore-image is required` means the append in item 8 is missing:
