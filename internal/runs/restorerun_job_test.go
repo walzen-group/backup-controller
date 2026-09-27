@@ -250,7 +250,7 @@ func TestARestoreRefusesAJobItDidNotCreate(t *testing.T) {
 }
 
 // A Running item whose restore Job someone deleted fails with reason
-// RestoreJobFailed, and the run never creates a second Job for it: Stop
+// RestoreJobDeleted, and the run never creates a second Job for it: Stop
 // gates on the pods of the recorded UID only. The Job's pod, which the
 // delete orphaned and which keeps that UID, holds the app down until it has
 // ended.
@@ -276,9 +276,9 @@ func TestADeletedRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
 	restoreStep(t, r)
 
 	waiting := readRestoreRun(t, c)
-	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobFailed ||
+	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobDeleted ||
 		!strings.Contains(item.Message, "was deleted before it finished") {
-		t.Errorf("item = %+v, want Failed with reason RestoreJobFailed saying the Job was deleted", item)
+		t.Errorf("item = %+v, want Failed with reason RestoreJobDeleted saying the Job was deleted", item)
 	}
 	if creates != 0 || len(restoreJobs(t, c)) != 0 {
 		t.Errorf("Job creates = %d, restore Jobs = %v; want no second Job", creates, restoreJobs(t, c))

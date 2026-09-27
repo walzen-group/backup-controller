@@ -19,14 +19,23 @@ const (
 	// the result Failed.
 	ItemReasonMoverFailed ItemReason = "MoverFailed"
 
-	// ItemReasonRestoreJobFailed is a volume restore whose restore Job ended
-	// with the condition Failed=True. The item's message carries restic's
-	// exit code and what it means.
+	// ItemReasonRestoreJobFailed is a volume restore whose restore Job gave
+	// no success: the Job ended with the condition Failed=True, and the
+	// item's message carries restic's exit code and what it means; or the
+	// run's own Job can't give a result, because it restores another
+	// snapshot than the run selected, or the run no longer controls it.
 	ItemReasonRestoreJobFailed ItemReason = "RestoreJobFailed"
 
-	// ItemReasonRestoreJobRefused is a volume restore whose restore Job the
-	// API server refused to create, as Forbidden or Invalid. Nothing was
-	// written to the claim.
+	// ItemReasonRestoreJobDeleted is a volume restore whose restore Job was
+	// deleted before it finished, or whose name now holds another Job. A
+	// person may stop a restore that way. The run records no result from
+	// the Job and waits until no pod of it can still write.
+	ItemReasonRestoreJobDeleted ItemReason = "RestoreJobDeleted"
+
+	// ItemReasonRestoreJobRefused is a volume restore for which the run
+	// created no restore Job: the API server refused the create as
+	// Forbidden or Invalid, the Job's spec could not be built, or a Job the
+	// run did not create holds its name. Nothing was written to the claim.
 	ItemReasonRestoreJobRefused ItemReason = "RestoreJobRefused"
 
 	// ItemReasonSnapshotChanged is a volume restore whose selected snapshot

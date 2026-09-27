@@ -296,7 +296,7 @@ func intoOnJob(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job) {
 }
 
 // An into restore whose Job someone deleted fails its item with reason
-// RestoreJobFailed, and the run never creates a second Job: Stop gates on
+// RestoreJobDeleted, and the run never creates a second Job: Stop gates on
 // the pods of the recorded UID. The Job's orphaned pod, which keeps that
 // UID, holds the run and its Lease until it has ended.
 func TestADeletedIntoRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
@@ -320,9 +320,9 @@ func TestADeletedIntoRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
 	restoreStep(t, r)
 
 	waiting := readRestoreRun(t, c)
-	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobFailed ||
+	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobDeleted ||
 		!strings.Contains(item.Message, "was deleted before it finished") {
-		t.Errorf("item = %+v, want Failed with reason RestoreJobFailed saying the Job was deleted", item)
+		t.Errorf("item = %+v, want Failed with reason RestoreJobDeleted saying the Job was deleted", item)
 	}
 	if creates != 0 || len(restoreJobs(t, c)) != 0 {
 		t.Errorf("Job creates = %d, restore Jobs = %v; want no second Job", creates, restoreJobs(t, c))

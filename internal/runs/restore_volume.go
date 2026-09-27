@@ -166,19 +166,23 @@ func (r *RestoreRunReconciler) takeOverJob(ctx context.Context, run *backupv1alp
 //
 // A Job that is gone, or whose name now holds a Job with another UID, was
 // deleted before it finished: the run records an item's end before it
-// deletes the Job. The refusal has reason RestoreJobFailed, and the run
+// deletes the Job. The refusal has reason RestoreJobDeleted, and the run
 // stops the Job by its recorded UID like any other, so its pods, which keep
 // that UID, hold the app until they have ended. It never creates a second
-// Job for the item. A Job the run no longer controls is refused the same
-// way. Otherwise the Job's terminal conditions decide (see recordJobEnd).
+// Job for the item. A Job the run no longer controls is refused with reason
+// RestoreJobFailed and stopped the same way. Otherwise the Job's terminal
+// conditions decide (see recordJobEnd).
 func (r *RestoreRunReconciler) followJob(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (*restorejob.Waiting, error) {
 	job, err := r.jobs().GetJob(ctx, types.NamespacedName{Namespace: run.Namespace, Name: item.Job})
 	switch {
-	case apierrors.IsNotFound(err) || err == nil && job.UID != item.JobUID:
-		return nil, refuse(backupv1alpha1.ItemReasonRestoreJobFailed,
+	case apierrors.IsNotFound(err):
+		return nil, refuse(backupv1alpha1.ItemReasonRestoreJobDeleted,
 			"the restore Job %s was deleted before it finished", item.Job)
 	case err != nil:
 		return nil, fmt.Errorf("get restore Job %s: %w", item.Job, err)
+	case job.UID != item.JobUID:
+		return nil, refuse(backupv1alpha1.ItemReasonRestoreJobDeleted,
+			"the restore Job %s was deleted before it finished, and a Job with another UID holds its name now", item.Job)
 	case !metav1.IsControlledBy(job, run):
 		return nil, refuse(backupv1alpha1.ItemReasonRestoreJobFailed,
 			"the restore Job %s is no longer controlled by the run", item.Job)
