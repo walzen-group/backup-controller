@@ -376,6 +376,10 @@ type restoreJobCase struct {
 	item backupv1alpha1.ItemPhase
 	// noRun leaves the RestoreRun out, as after it was deleted.
 	noRun bool
+	// run changes the RestoreRun before the test stores it.
+	run func(run *backupv1alpha1.RestoreRun)
+	// deleting deletes the stored RestoreRun, which a finalizer keeps.
+	deleting bool
 	// job changes the Job before the test stores it.
 	job func(job *batchv1.Job)
 	// pod is the phase of the Job's one pod, or "" for a Job whose pods are
@@ -418,6 +422,11 @@ func TestWhichRestoreJobsHoldABackup(t *testing.T) {
 		{name: "run deleted, Job not finished", noRun: true, holds: true},
 		{name: "run deleted, pod still running", noRun: true, job: suspendedCondition, pod: corev1.PodRunning, holds: true},
 		{name: "run deleted, Job complete, pods gone", noRun: true, job: completeCondition},
+		{name: "run being deleted, item Running, Job complete, pods gone", item: backupv1alpha1.ItemRunning, deleting: true, job: completeCondition},
+		{name: "run finished, item Running, Job complete, pods gone", item: backupv1alpha1.ItemRunning, job: completeCondition,
+			run: func(run *backupv1alpha1.RestoreRun) { run.Status.Phase = backupv1alpha1.RunPhaseFailed }},
+		{name: "item failed without naming its Job, Job suspended since its create", item: backupv1alpha1.ItemFailed, job: suspendedCondition,
+			run: func(run *backupv1alpha1.RestoreRun) { run.Status.Items[0].Job, run.Status.Items[0].JobUID = "", "" }, holds: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			busy := restoreJobHold(t, tc)
@@ -437,11 +446,17 @@ func restoreJobHold(t *testing.T, tc restoreJobCase) string {
 	if tc.job != nil {
 		tc.job(job)
 	}
+	if tc.run != nil {
+		tc.run(run)
+	}
 	objects := []client.Object{job}
 	if !tc.noRun {
 		objects = append(objects, run)
 	}
 	c := newClient(t, objects...)
+	if tc.deleting {
+		deleteKept(t, c, run.Name)
+	}
 	if tc.pod != "" {
 		createPod(t, c, jobPodOf(job, job.Name+"-x7k2p", tc.pod))
 	}
@@ -450,6 +465,21 @@ func restoreJobHold(t *testing.T, tc restoreJobCase) string {
 		t.Fatal(err)
 	}
 	return busy
+}
+
+// deleteKept gives the stored RestoreRun of the given name a finalizer and
+// deletes it, so the run is being deleted and stays.
+func deleteKept(t *testing.T, c client.Client, name string) {
+	t.Helper()
+	stored := &backupv1alpha1.RestoreRun{}
+	get(t, c, ns, name, stored)
+	stored.Finalizers = []string{Finalizer}
+	if err := c.Update(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // A restore Job holds only the claim it writes and the repository it reads,
