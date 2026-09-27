@@ -78,50 +78,63 @@ func FromSecret(secret *corev1.Secret) (Location, error) {
 	return at, nil
 }
 
-// ParseRepository reads a repository string in restic's s3 form. When the
-// string has a scheme, http turns TLS off and https keeps it on. When it has
-// no scheme, the client uses HTTPS, which is also restic's default:
+// ParseRepository reads a repository string in restic's s3 form, with the
+// rule of ParseConfig in restic v0.18.1 (internal/backend/s3/config.go:60-106):
 //
 //	s3:http://host:10172/bucket/some/prefix
+//	s3:https://host/bucket/some/prefix
+//	s3://host/bucket/some/prefix
 //	s3:host/bucket/some/prefix
 //
-// It returns an error for a string without the s3: prefix, for a scheme other
-// than http or https, and for a string that names no endpoint or no bucket.
+// A string that starts with s3:http is a URL: its host is the endpoint, the
+// first part of its path is the bucket and the rest is the prefix. Only the
+// scheme http turns TLS off. Any other string drops s3:// or s3: and splits
+// at the first two "/" into endpoint, bucket and prefix, over HTTPS. A
+// prefix that is not empty is cleaned with path.Clean, so a trailing "/"
+// has no effect.
+//
+// It returns an error for a string without the s3: prefix, for an s3:http
+// URL that does not parse or has no path, and for a string that names no
+// endpoint, as restic does. It also returns an error when the bucket is
+// empty: restic reads such a string, but it cannot open a repository there.
 func ParseRepository(repository string) (Location, error) {
-	rest, ok := strings.CutPrefix(repository, "s3:")
-	if !ok {
-		return Location{}, fmt.Errorf("repository %q is not an s3: repository", repository)
-	}
-
-	at := Location{Secure: true}
-	if strings.Contains(rest, "://") {
-		parsed, err := url.Parse(rest)
+	var endpoint, bucket, prefix string
+	secure := true
+	switch {
+	case strings.HasPrefix(repository, "s3:http"):
+		parsed, err := url.Parse(repository[len("s3:"):])
 		if err != nil {
 			return Location{}, fmt.Errorf("parse repository %q: %w", repository, err)
 		}
-		switch parsed.Scheme {
-		case "http":
-			at.Secure = false
-		case "https":
-		default:
-			return Location{}, fmt.Errorf("repository %q has scheme %q", repository, parsed.Scheme)
+		if parsed.Path == "" {
+			return Location{}, fmt.Errorf("repository %q names no bucket", repository)
 		}
-		at.Endpoint = parsed.Host
-		rest = parsed.Path
-	} else {
-		host, remainder, _ := strings.Cut(rest, "/")
-		at.Endpoint = host
-		rest = remainder
+		endpoint, secure = parsed.Host, parsed.Scheme != "http"
+		bucket, prefix, _ = strings.Cut(parsed.Path[1:], "/")
+	case strings.HasPrefix(repository, "s3://"):
+		endpoint, bucket, prefix = splitRepository(repository[len("s3://"):])
+	case strings.HasPrefix(repository, "s3:"):
+		endpoint, bucket, prefix = splitRepository(repository[len("s3:"):])
+	default:
+		return Location{}, fmt.Errorf("repository %q is not an s3: repository", repository)
 	}
 
-	rest = strings.Trim(rest, "/")
-	bucket, prefix, _ := strings.Cut(rest, "/")
-	if at.Endpoint == "" || bucket == "" {
+	if endpoint == "" || bucket == "" {
 		return Location{}, fmt.Errorf("repository %q names no endpoint or no bucket", repository)
 	}
-	at.Bucket = bucket
-	at.Prefix = prefix
-	return at, nil
+	if prefix != "" {
+		prefix = path.Clean(prefix)
+	}
+	return Location{Endpoint: endpoint, Secure: secure, Bucket: bucket, Prefix: prefix}, nil
+}
+
+// splitRepository splits the part of an s3 repository string after s3: or
+// s3:// at its first two "/" into endpoint, bucket and prefix, as restic
+// v0.18.1 does (internal/backend/s3/config.go:84-88).
+func splitRepository(s string) (endpoint, bucket, prefix string) {
+	endpoint, rest, _ := strings.Cut(s, "/")
+	bucket, prefix, _ = strings.Cut(rest, "/")
+	return endpoint, bucket, prefix
 }
 
 // S3Store keeps a repository's files in the bucket that a Location names,

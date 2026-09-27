@@ -294,3 +294,37 @@ func TestMoverLayoutNeedsHostVolsyncAndOnlyDataButAllowsACopy(t *testing.T) {
 		}
 	}
 }
+
+// TestParseRepositoryReadsEveryFormResticReads checks ParseRepository
+// against the cases of restic v0.18.1 internal/backend/s3/config_test.go:
+// s3://host/bucket/prefix, s3:host/bucket/prefix and s3:http(s)://host/...
+// all name a repository, and a trailing "/" leaves the prefix unchanged.
+// restic reads them with ParseConfig (internal/backend/s3/config.go:60-106).
+func TestParseRepositoryReadsEveryFormResticReads(t *testing.T) {
+	for in, want := range map[string]Location{
+		"s3://eu-central-1/bucketname":                            {Endpoint: "eu-central-1", Secure: true, Bucket: "bucketname"},
+		"s3://eu-central-1/bucketname/":                           {Endpoint: "eu-central-1", Secure: true, Bucket: "bucketname"},
+		"s3://eu-central-1/bucketname/prefix/directory":           {Endpoint: "eu-central-1", Secure: true, Bucket: "bucketname", Prefix: "prefix/directory"},
+		"s3://eu-central-1/bucketname/prefix/directory/":          {Endpoint: "eu-central-1", Secure: true, Bucket: "bucketname", Prefix: "prefix/directory"},
+		"s3:eu-central-1/foobar/prefix/directory/":                {Endpoint: "eu-central-1", Secure: true, Bucket: "foobar", Prefix: "prefix/directory"},
+		"s3:hostname.foo/foobar":                                  {Endpoint: "hostname.foo", Secure: true, Bucket: "foobar"},
+		"s3:https://hostname:9999/foobar/":                        {Endpoint: "hostname:9999", Secure: true, Bucket: "foobar"},
+		"s3:http://hostname:9999/bucket/prefix/directory/":        {Endpoint: "hostname:9999", Secure: false, Bucket: "bucket", Prefix: "prefix/directory"},
+		"s3://rustfs.backup-system.svc:9000/prod-backup/app/data": {Endpoint: "rustfs.backup-system.svc:9000", Secure: true, Bucket: "prod-backup", Prefix: "app/data"},
+	} {
+		got, err := ParseRepository(in)
+		if err != nil {
+			t.Errorf("ParseRepository(%q): %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("ParseRepository(%q) = %+v, want %+v", in, got, want)
+		}
+	}
+	// restic refuses these with "s3: invalid format" (config_test.go:123-132).
+	for _, bad := range []string{"s3://", "s3:///", "s3:////", "s3:///bucket/prefix"} {
+		if _, err := ParseRepository(bad); err == nil {
+			t.Errorf("ParseRepository(%q) accepted it", bad)
+		}
+	}
+}

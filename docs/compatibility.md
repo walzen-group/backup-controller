@@ -181,6 +181,7 @@ code is identical in both.
 
 | Behaviour | Source in 0.18.1 | Source in 0.19.1 |
 | --- | --- | --- |
+| RESTIC_REPOSITORY in the s3 forms: a string that starts with s3:http is a URL, whose host is the endpoint and whose path is bucket and prefix; only the scheme http turns TLS off. Any other string drops s3:// or s3: and splits at the first two "/" into endpoint, bucket and prefix, over HTTPS. A prefix is cleaned with path.Clean. An empty endpoint is an error. ParseRepository (internal/restic/s3.go) applies this rule, and also refuses an empty bucket. | internal/backend/s3/config.go:60-106 | not re-checked: the VolSync mover reads the string with 0.18.1 |
 | backup and restore get a shared lock, and forget gets an exclusive lock. | cmd/restic/cmd_backup.go:513; cmd/restic/cmd_forget.go:189; cmd/restic/cmd_restore.go:134 | cmd/restic/cmd_backup.go:534; cmd/restic/cmd_forget.go:193; cmd/restic/cmd_restore.go:149 |
 | restic refuses an exclusive lock while any other lock exists, stale or not. forget then exits 11 with "repository is already locked". | internal/restic/lock.go:56, 160-216 (the branch at 188); cmd/restic/main.go:211-212 | internal/restic/lock.go:56, 160-216 (the branch at 188); cmd/restic/main.go:231-232 |
 | restic does not retry a lock by default. | cmd/restic/global.go:108 | internal/global/global.go:101 |
