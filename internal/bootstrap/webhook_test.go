@@ -166,16 +166,23 @@ func decide(t *testing.T, c *unstructured.Unstructured, prober ArchiveProber, ex
 // that point the store at another endpoint, such as a fake S3 server.
 func decideWith(t *testing.T, c *unstructured.Unstructured, prober ArchiveProber, objectStore *unstructured.Unstructured, existing ...runtime.Object) admission.Response {
 	t.Helper()
-	raw, err := json.Marshal(c)
-	if err != nil {
-		t.Fatalf("marshal the cluster: %v", err)
-	}
 
 	builder := newBuilder(t).WithObjects(secret())
 	objects := append([]runtime.Object{objectStore}, existing...)
 	builder = builder.WithRuntimeObjects(objects...)
 
 	decider := &Decider{Client: builder.Build(), Prober: prober}
+	return create(t, decider, c)
+}
+
+// create sends decider a create of the Cluster c as app/app-pg, and returns
+// the answer.
+func create(t *testing.T, decider *Decider, c *unstructured.Unstructured) admission.Response {
+	t.Helper()
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal the cluster: %v", err)
+	}
 	return decider.Handle(context.Background(), admission.Request{
 		AdmissionRequest: admissionv1.AdmissionRequest{
 			Operation: admissionv1.Create,
@@ -326,10 +333,6 @@ func TestAnotherPrefixOnTheSameEndpointIsNoCollision(t *testing.T) {
 func TestAnUnreadableHolderStoreRefusesTheCluster(t *testing.T) {
 	other, otherStore := elsewhere(t, nil)
 
-	raw, err := json.Marshal(cluster(t, nil))
-	if err != nil {
-		t.Fatalf("marshal the cluster: %v", err)
-	}
 	c := newBuilder(t).
 		WithObjects(secret()).
 		WithRuntimeObjects(store(), otherStore, other).
@@ -343,14 +346,7 @@ func TestAnUnreadableHolderStoreRefusesTheCluster(t *testing.T) {
 		}).Build()
 
 	decider := &Decider{Client: c, Prober: stubProber{has: false}}
-	response := decider.Handle(context.Background(), admission.Request{
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Operation: admissionv1.Create,
-			Namespace: "app",
-			Name:      "app-pg",
-			Object:    runtime.RawExtension{Raw: raw},
-		},
-	})
+	response := create(t, decider, cluster(t, nil))
 
 	if response.Allowed {
 		t.Fatal("a Cluster was admitted while another Cluster's ObjectStore could not be read")

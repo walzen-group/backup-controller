@@ -1,17 +1,13 @@
 package bootstrap
 
 import (
-	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/walzen-group/backup-controller/internal/testinfra/barmanstore"
 	"github.com/walzen-group/backup-controller/internal/testinfra/s3fault"
-	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -28,21 +24,10 @@ var slowInfo = s3fault.Rule{
 // with the Decider's budget set to budget (zero keeps the default).
 func decideWithin(t *testing.T, c *unstructured.Unstructured, endpoint string, budget time.Duration) admission.Response {
 	t.Helper()
-	raw, err := json.Marshal(c)
-	if err != nil {
-		t.Fatalf("marshal the cluster: %v", err)
-	}
 	client := newBuilder(t).WithObjects(secret()).
 		WithRuntimeObjects(storeAt(endpoint)).Build()
 	decider := &Decider{Client: client, Prober: S3Prober{}, Budget: budget}
-	return decider.Handle(context.Background(), admission.Request{
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Operation: admissionv1.Create,
-			Namespace: "app",
-			Name:      "app-pg",
-			Object:    runtime.RawExtension{Raw: raw},
-		},
-	})
+	return create(t, decider, c)
 }
 
 // TestFailedBackupsBeforeADoneOneDoNotRunTheWebhookOutOfTime checks the

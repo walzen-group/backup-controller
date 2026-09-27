@@ -1,11 +1,8 @@
 package bootstrap
 
 import (
-	"context"
-	"encoding/json"
 	"testing"
 
-	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -63,19 +60,8 @@ func decideAtNext(t *testing.T, prober ArchiveProber, existing ...*unstructured.
 		objects = append(objects, u)
 	}
 	c := fake.NewClientBuilder().WithScheme(s).WithRESTMapper(mapper).WithRuntimeObjects(objects...).Build()
-	raw, err := json.Marshal(cluster(t, nil))
-	if err != nil {
-		t.Fatal(err)
-	}
 	decider := &Decider{Client: c, Mapper: c.RESTMapper(), Prober: prober}
-	return decider.Handle(context.Background(), admission.Request{
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Operation: admissionv1.Create,
-			Namespace: "app",
-			Name:      "app-pg",
-			Object:    runtime.RawExtension{Raw: raw},
-		},
-	})
+	return create(t, decider, cluster(t, nil))
 }
 
 // On a cluster whose CloudNativePG and barman-cloud serve Cluster and

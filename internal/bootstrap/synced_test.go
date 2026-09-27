@@ -2,14 +2,12 @@ package bootstrap
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
-	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -46,16 +44,10 @@ func volumeRestore(name string) []runtime.Object {
 // fake client holds the objects in existing.
 func decideSynced(t *testing.T, c *unstructured.Unstructured, lister restic.SnapshotLister, existing ...runtime.Object) admission.Response {
 	t.Helper()
-	raw, err := json.Marshal(c)
-	if err != nil {
-		t.Fatal(err)
-	}
 	server := recordedS3(t, recordedAt(t, "done-base", sunday))
 	objects := append([]runtime.Object{storeAt(server.URL)}, existing...)
 	decider := &Decider{Client: newBuilder(t).WithObjects(secret()).WithRuntimeObjects(objects...).Build(), Prober: S3Prober{}, Snapshots: lister}
-	return decider.Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
-		Operation: admissionv1.Create, Namespace: "app", Name: "app-pg", Object: runtime.RawExtension{Raw: raw},
-	}})
+	return create(t, decider, c)
 }
 
 // TestAQuiescedNamespaceRecoversToTheQuiescedMoment checks that a Cluster

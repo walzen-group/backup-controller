@@ -2,7 +2,6 @@ package bootstrap
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -14,12 +13,9 @@ import (
 	"github.com/minio/minio-go/v7"
 
 	"github.com/walzen-group/backup-controller/internal/testinfra/barmanstore"
-	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 // expired returns a context whose deadline has already passed.
@@ -91,10 +87,6 @@ func TestAReadThatEndsAtTheDeadlineNeverAdmitsInitdbOverAnArchive(t *testing.T) 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			server := recordedS3(t, barmanstore.MustLoad(t, "done-base"))
-			raw, err := json.Marshal(tc.cluster(t))
-			if err != nil {
-				t.Fatalf("marshal the cluster: %v", err)
-			}
 			kind := tc.kind
 			c := newBuilder(t).
 				WithObjects(secret()).
@@ -111,14 +103,7 @@ func TestAReadThatEndsAtTheDeadlineNeverAdmitsInitdbOverAnArchive(t *testing.T) 
 				}}).Build()
 			decider := &Decider{Client: c, Prober: S3Prober{}, Budget: 300 * time.Millisecond}
 
-			response := decider.Handle(context.Background(), admission.Request{
-				AdmissionRequest: admissionv1.AdmissionRequest{
-					Operation: admissionv1.Create,
-					Namespace: "app",
-					Name:      "app-pg",
-					Object:    runtime.RawExtension{Raw: raw},
-				},
-			})
+			response := create(t, decider, tc.cluster(t))
 
 			if response.Allowed {
 				t.Fatalf("the cluster was admitted over the done-base archive: patches = %d, result = %v", len(response.Patches), response.Result)

@@ -2,14 +2,11 @@ package bootstrap
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
-	admissionv1 "k8s.io/api/admission/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -27,23 +24,12 @@ func stalled(ctx context.Context) error {
 // 300 ms budget whose Kubernetes client stalls on the reads funcs picks.
 func decideStalled(t *testing.T, funcs interceptor.Funcs) admission.Response {
 	t.Helper()
-	raw, err := json.Marshal(cluster(t, nil))
-	if err != nil {
-		t.Fatalf("marshal the cluster: %v", err)
-	}
 	c := newBuilder(t).
 		WithObjects(secret()).
 		WithRuntimeObjects(store()).
 		WithInterceptorFuncs(funcs).Build()
 	decider := &Decider{Client: c, Prober: stubProber{has: false}, Budget: 300 * time.Millisecond}
-	return decider.Handle(context.Background(), admission.Request{
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Operation: admissionv1.Create,
-			Namespace: "app",
-			Name:      "app-pg",
-			Object:    runtime.RawExtension{Raw: raw},
-		},
-	})
+	return create(t, decider, cluster(t, nil))
 }
 
 // TestAStalledKubernetesReadNamesTheBudgetAndTheStep checks that when the
