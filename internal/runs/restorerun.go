@@ -2417,13 +2417,15 @@ func finished(item backupv1alpha1.RestoreItem) bool {
 	return false
 }
 
-// restoreItemDone reports whether the run's item named name has finished (see
-// finished) and names no restore Job, or the run has no such item. An item
-// keeps its Job's UID until Stop reports the Job stopped (see stopJobs), so
-// until then the Job may still write, and the item keeps its Leases.
+// restoreItemDone reports whether the run's claim item named name has
+// finished (see finished) and names no restore Job, or the run has no such
+// item. An item keeps its Job's UID until Stop reports the Job stopped (see
+// stopJobs), so until then the Job may still write, and the item keeps its
+// Leases. Only a claim item counts, as in holderLive: a Cluster item takes
+// no Lease, and one of the same name says nothing about the claim.
 func restoreItemDone(run *backupv1alpha1.RestoreRun, name string) bool {
 	for _, item := range run.Status.Items {
-		if item.Name == name {
+		if item.Kind == backupv1alpha1.ItemKindClaim && item.Name == name {
 			return finished(item) && item.JobUID == ""
 		}
 	}

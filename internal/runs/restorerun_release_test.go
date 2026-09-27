@@ -177,3 +177,18 @@ func TestARestoreThatCannotDeleteItsJobSaysWhatFailed(t *testing.T) {
 		}
 	}
 }
+
+// restoreItemDone looks only at the claim item of the name it is given, as
+// holderLive does: a Cluster that shares the claim's name and has finished
+// never lets the claim's Leases go while the claim's restore runs.
+func TestRestoreItemDoneLooksOnlyAtTheClaimItem(t *testing.T) {
+	run := restoreRun(func(r *backupv1alpha1.RestoreRun) {
+		r.Status.Items = []backupv1alpha1.RestoreItem{
+			{Kind: backupv1alpha1.ItemKindCluster, Name: claimN, Phase: backupv1alpha1.ItemSucceeded},
+			{Kind: backupv1alpha1.ItemKindClaim, Name: claimN, Phase: backupv1alpha1.ItemRunning, Job: jobName(restoreUID, 1), JobUID: jobUID},
+		}
+	})
+	if restoreItemDone(run, claimN) {
+		t.Error("restoreItemDone = true while the claim's restore Job runs, want false")
+	}
+}
