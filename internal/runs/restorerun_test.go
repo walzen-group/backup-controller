@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/restic"
@@ -351,7 +350,7 @@ func TestAQuiescedRestoreStopsTheAppUntilTheDatabaseIsDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoreStep(t, r) // restore the volume
-	completeVolume(t, c)
+	completeJob(t, c)
 	if got := replicasOf(t, c); got != 0 {
 		t.Fatalf("replicas = %d while the volume restored, want 0", got)
 	}
@@ -401,7 +400,7 @@ func TestAQuiescedRestoreWaitsForTheOldInstanceToShutDown(t *testing.T) {
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // quiesce
 	restoreStep(t, r) // restore the volume
-	completeVolume(t, c)
+	completeJob(t, c)
 
 	restoreStep(t, r) // volume done, database deleted
 	restoreStep(t, r) // the old instance is still shutting down
@@ -731,7 +730,7 @@ func TestADatabaseRestoreSeesAnInstanceTheCacheHasNotSeenYet(t *testing.T) {
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // quiesce
 	restoreStep(t, r) // restore the volume
-	completeVolume(t, c)
+	completeJob(t, c)
 	restoreStep(t, r) // volume done, database deleted
 
 	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonShutdown {
@@ -929,25 +928,6 @@ func optedOut(u *unstructured.Unstructured) {
 	u.SetAnnotations(annotations)
 }
 
-// completeVolume ends the restore of the run's first item: it marks the
-// item's restore Job Complete, or, for an into restore, its
-// ReplicationDestination as having completed the run's trigger with a mover
-// log that names the item's snapshot (see restoredStatus).
-func completeVolume(t *testing.T, c client.Client) {
-	t.Helper()
-	item := readRestoreRun(t, c).Status.Items[0]
-	if item.Job != "" {
-		completeJob(t, c)
-		return
-	}
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, item.Destination, rd)
-	rd.Status = restoredStatus(item.Snapshot)
-	if err := c.Status().Update(context.Background(), rd); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // A namespace restore skips a Cluster that opts out of the bootstrap webhook
 // with backup.wlz.li/bootstrap: initdb, names the annotation in the item's
 // message, and never deletes it. The webhook would let the Cluster come back
@@ -967,7 +947,7 @@ func TestANamespaceRestoreLeavesAnOptedOutClusterAlone(t *testing.T) {
 				t.Fatalf("database item = %+v (%s), want Skipped naming %s", item, readyMessage(run.Status.Conditions), bootstrap.OptOutAnnotation)
 			}
 			restoreStep(t, r) // restore the volume
-			completeVolume(t, c)
+			completeJob(t, c)
 			restoreStep(t, r)
 			restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 
@@ -1098,7 +1078,7 @@ func TestAVolumeRestoreWhoseSuccessWasNotRecordedFinishes(t *testing.T) {
 		claim(), volumeRestore(), repository())
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // restore
-	completeVolume(t, c)
+	completeJob(t, c)
 
 	r.Client = loseNextStatusWrite(c)
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
@@ -1124,8 +1104,8 @@ func previousOne(r *backupv1alpha1.RestoreRun) {
 }
 
 // An into restore with spec.previous fills its claim from the snapshot it
-// recorded. Its destination carries that snapshot's time as restoreAsOf and
-// no previous, so the mover does not step back again from a newer snapshot.
+// recorded: its restore Job restores that snapshot's full ID, so nothing
+// steps back again from a newer snapshot.
 func TestAnIntoRestoreWithPreviousRestoresTheSnapshotItRecorded(t *testing.T) {
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "notes-data-monday" }, previousOne),
@@ -1137,11 +1117,9 @@ func TestAnIntoRestoreWithPreviousRestoresTheSnapshotItRecorded(t *testing.T) {
 	if run.Status.Items[0].Snapshot != sunday.ShortID() {
 		t.Fatalf("snapshot = %q, want %s, one before the newest", run.Status.Items[0].Snapshot, sunday.ShortID())
 	}
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-20T05:00:02Z" || rd.Spec.Restic.Previous != nil {
-		t.Errorf("destination restoreAsOf = %v, previous = %v; want 2026-09-20T05:00:02Z, the time of the snapshot the run recorded, and none",
-			rd.Spec.Restic.RestoreAsOf, rd.Spec.Restic.Previous)
+	job := itemJob(t, c)
+	if got := job.Annotations[restorejob.AnnotationSnapshotID]; got != sunday.ID || !slices.Contains(job.Spec.Template.Spec.Containers[0].Args, sunday.ID) {
+		t.Errorf("restore Job snapshot = %s, args = %v; want sunday's full ID %s", got, job.Spec.Template.Spec.Containers[0].Args, sunday.ID)
 	}
 }
 
@@ -1179,10 +1157,10 @@ func fromRepository(r *backupv1alpha1.RestoreRun) {
 // An into restore from a repository no claim backs up to has no source claim
 // to take a node from, and a claim on a WaitForFirstConsumer class gets one
 // only from the pod that first uses it. So the run creates a plain claim of
-// spec.intoSize and a ReplicationDestination whose mover writes the selected
-// snapshot into it. The mover pod is the claim's first consumer, and the
-// scheduler places the claim with it. The run succeeds once the mover has
-// completed the run's trigger, and deletes the destination.
+// spec.intoSize and a restore Job that writes the selected snapshot into
+// it. The Job's pod is the claim's first consumer, and the scheduler places
+// the claim with it. The run succeeds once the Job is Complete, and deletes
+// the Job.
 func TestAnIntoRestoreFromARepositoryFillsAClaimTheMoverPlaces(t *testing.T) {
 	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
 	restoreStep(t, r) // plan
@@ -1190,26 +1168,24 @@ func TestAnIntoRestoreFromARepositoryFillsAClaimTheMoverPlaces(t *testing.T) {
 
 	scratch := &corev1.PersistentVolumeClaim{}
 	get(t, c, ns, "scratch", scratch)
-	if request := scratch.Spec.Resources.Requests[corev1.ResourceStorage]; request.Cmp(resource.MustParse("2Gi")) != 0 || scratch.Spec.DataSourceRef != nil {
-		t.Fatalf("claim request = %s, dataSourceRef = %v; want 2Gi and none", request.String(), scratch.Spec.DataSourceRef)
+	if request := scratch.Spec.Resources.Requests[corev1.ResourceStorage]; request.Cmp(resource.MustParse("2Gi")) != 0 ||
+		scratch.Spec.DataSourceRef != nil || scratch.Annotations[selectedNodeAnnotation] != "" {
+		t.Fatalf("claim request = %s, dataSourceRef = %v, annotations = %v; want 2Gi, none and no node", request.String(), scratch.Spec.DataSourceRef, scratch.Annotations)
 	}
-	run := readRestoreRun(t, c)
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, run.Status.Items[0].Destination, rd)
-	if *rd.Spec.Restic.DestinationPVC != "scratch" || rd.Spec.Restic.Repository != repoN ||
-		rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-21T05:00:02Z" {
-		t.Fatalf("destination = %+v, want it writing monday's snapshot into scratch", rd.Spec.Restic)
+	job := itemJob(t, c)
+	pod := job.Spec.Template.Spec
+	if jobClaim(job) != "scratch" || job.Annotations[restorejob.AnnotationSnapshotID] != monday.ID || pod.NodeName != "" || len(pod.NodeSelector) != 0 {
+		t.Fatalf("Job claim = %q, annotations = %v, node %q, selector %v; want monday's snapshot written into scratch with no placement of its own",
+			jobClaim(job), job.Annotations, pod.NodeName, pod.NodeSelector)
 	}
 
-	completeVolume(t, c)
-	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
-	run = readRestoreRun(t, c)
+	completeJob(t, c)
+	run := stepUntilFinished(t, r, c, 3)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
 		t.Fatalf("phase = %q, item = %+v; want Succeeded", run.Status.Phase, run.Status.Items[0])
 	}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: rd.Name}, rd); err == nil {
-		t.Error("the destination outlived the run")
+	if jobs := restoreJobs(t, c); len(jobs) != 0 {
+		t.Errorf("restore Jobs = %v, want the Job gone with the run's end", jobs)
 	}
 }
 
@@ -1288,7 +1264,7 @@ func TestANamespaceRestoreLeavesAClusterWithADeclaredBootstrapAlone(t *testing.T
 				t.Fatalf("database item = %+v (%s), want Skipped naming spec.bootstrap.%s", item, readyMessage(run.Status.Conditions), name)
 			}
 			restoreStep(t, r) // restore the volume
-			completeVolume(t, c)
+			completeJob(t, c)
 			restoreStep(t, r)
 			restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 

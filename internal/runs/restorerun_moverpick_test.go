@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
@@ -18,12 +17,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// The tests in this file check that an into restore's checks refuse a
-// snapshot that VolSync's mover can't be pinned to. The run hands the mover
-// the snapshot's time in whole seconds as restoreAsOf, and the mover restores
-// the snapshot it picks for that second (restic.MoverPick), which is not
-// always the one the checks selected. An in-place restore restores by full ID
-// through its own restore Job and refuses none of these.
+// The tests in this file check that an into restore's checks still refuse a
+// snapshot that VolSync's mover, pinned to the snapshot's time in whole
+// seconds, would not restore (restic.MoverPick). Every restore now restores
+// by full ID through its own restore Job, so the refusal only refuses more
+// than it has to; an in-place restore refuses none of these.
 
 // recordedSnapshots caches the snapshot lists read from the recorded
 // repositories, keyed by directory, so each repository's key is derived once.
@@ -118,18 +116,17 @@ func TestARestoreRefusesASnapshotSharingItsSecond(t *testing.T) {
 }
 
 // An into restore of a snapshot that is alone in its second, or the last in
-// it, passes the checks and pins the mover to that second, from the same
-// recorded repository.
+// it, passes the checks, and its restore Job restores that snapshot by its
+// full ID, from the same recorded repository.
 func TestARestoreOfTheLastSnapshotInItsSecondGoesAhead(t *testing.T) {
 	for _, c := range []struct {
 		name     string
 		mutate   []func(*backupv1alpha1.RestoreRun)
 		snapshot string
-		pin      string
 	}{
-		{"the last in its second", []func(*backupv1alpha1.RestoreRun){asOf("2026-09-25T21:22:16Z")}, "2d35d9a8", "2026-09-25T21:22:16Z"},
-		{"alone in its second", []func(*backupv1alpha1.RestoreRun){asOf("2026-09-25T21:22:15Z")}, "2c2a4ea2", "2026-09-25T21:22:15Z"},
-		{"the newest", nil, "2d35d9a8", "2026-09-25T21:22:16Z"},
+		{"the last in its second", []func(*backupv1alpha1.RestoreRun){asOf("2026-09-25T21:22:16Z")}, "2d35d9a8"},
+		{"alone in its second", []func(*backupv1alpha1.RestoreRun){asOf("2026-09-25T21:22:15Z")}, "2c2a4ea2"},
+		{"the newest", nil, "2d35d9a8"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			r, cl := restoreReconciler(t, nil, restoreRun(append([]func(*backupv1alpha1.RestoreRun){fromRepository}, c.mutate...)...), repository())
@@ -141,10 +138,8 @@ func TestARestoreOfTheLastSnapshotInItsSecondGoesAhead(t *testing.T) {
 			if run.Status.Phase != backupv1alpha1.RunPhaseRunning || run.Status.Items[0].Snapshot != c.snapshot {
 				t.Fatalf("phase = %q, item = %+v; want Running with %s", run.Status.Phase, run.Status.Items[0], c.snapshot)
 			}
-			rd := &volsyncv1alpha1.ReplicationDestination{}
-			get(t, cl, ns, run.Status.Items[0].Destination, rd)
-			if rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != c.pin {
-				t.Errorf("destination restoreAsOf = %v, want %s", rd.Spec.Restic.RestoreAsOf, c.pin)
+			if id := itemJob(t, cl).Annotations[restorejob.AnnotationSnapshotID]; id != run.Status.Items[0].SnapshotID || !strings.HasPrefix(id, c.snapshot) {
+				t.Errorf("restore Job snapshot = %s, want %s's full ID", id, c.snapshot)
 			}
 		})
 	}

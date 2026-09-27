@@ -151,42 +151,16 @@ func destinationGone(c client.Client) client.Client {
 	})
 }
 
-// An into restore's ReplicationDestination read at a version the API
-// server has stopped serving never reads as a destination someone deleted:
-// the run keeps its item Running and retries, since the mover may still be
-// writing.
-func TestARestoreNeverTakesAVersionGoneForADeletedDestination(t *testing.T) {
-	r, c := restoreReconciler(t, nil,
-		restoreRun(fromRepository, asOf("2026-09-21T04:00:00Z")), repository())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // restore: the destination exists, the item runs
-	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
-		t.Fatalf("item = %+v, want Running", item)
-	}
-
-	gone := destinationGone(c)
-	r.Client, r.Reader = gone, gone
-	r.serve()
-	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
-	if err == nil {
-		t.Error("the pass returned no error, want the unserved version retried")
-	}
-	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
-		t.Errorf("item = %+v, want it still Running", item)
-	}
-}
-
-// An into RestoreRun deleted while the API server answers its
-// ReplicationDestination read with the 404 of a version it no longer serves
-// keeps its finalizer and its destination: finalize never counts the mover
-// gone on that answer, and retries.
+// A RestoreRun deleted while the API server answers the read of the
+// ReplicationDestination its item names with the 404 of a version it no
+// longer serves keeps its finalizer and its destination: finalize never
+// counts the mover gone on that answer, and retries. No restore writes
+// through a destination any more, but finish and finalize still stop one an
+// item names.
 func TestADeletedRestoreNeverTakesAVersionGoneForADeletedDestination(t *testing.T) {
-	r, c := restoreReconciler(t, nil,
-		restoreRun(fromRepository, asOf("2026-09-21T04:00:00Z")), repository())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // restore: the destination exists, the item runs
-	run := readRestoreRun(t, c)
-	if err := c.Delete(context.Background(), run); err != nil {
+	run, destination := quiescedDestinationRestore()
+	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true), destination)
+	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -200,8 +174,7 @@ func TestADeletedRestoreNeverTakesAVersionGoneForADeletedDestination(t *testing.
 	if after := readRestoreRun(t, c); len(after.Finalizers) == 0 || after.Status.Items[0].Destination == "" {
 		t.Errorf("finalizers = %v, item = %+v; want the finalizer and the item's destination kept", after.Finalizers, after.Status.Items[0])
 	}
-	destination := &volsyncv1alpha1.ReplicationDestination{}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: run.Status.Items[0].Destination}, destination); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: destination.Name}, &volsyncv1alpha1.ReplicationDestination{}); err != nil {
 		t.Errorf("get the destination: %v, want it left alone", err)
 	}
 }

@@ -120,7 +120,7 @@ func TestANamespaceBackupAndARestoreNeverStopTheAppTogether(t *testing.T) {
 
 	// The restore gives the app back when its volume is restored.
 	restoreStep(t, rr)
-	completeVolume(t, c)
+	completeJob(t, c)
 	restoreStep(t, rr)
 	restoreStep(t, rr) // the pass after the stop finds the restore Job stopped
 	if restore := readRestoreRun(t, c); restore.Status.Phase != backupv1alpha1.RunPhaseSucceeded {

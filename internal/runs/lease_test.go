@@ -278,7 +278,7 @@ func TestARestoreReleasesItsLeasesWhenItFinishes(t *testing.T) {
 		t.Fatalf("claim Lease holder = %q, repository Lease holder = %q; want the restore to hold both before its destination",
 			leaseHolderOf(t, c, claimLease), leaseHolderOf(t, c, repoLease))
 	}
-	completeVolume(t, c)
+	completeJob(t, c)
 	restoreStep(t, r)
 	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
 

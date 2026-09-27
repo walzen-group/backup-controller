@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -48,7 +47,7 @@ func TestAnInPlaceRestoreIntoADeletedClaimFails(t *testing.T) {
 	if err := c.Delete(context.Background(), pvc); err != nil {
 		t.Fatal(err)
 	}
-	completeVolume(t, c)
+	completeJob(t, c)
 
 	restoreStep(t, r)
 
@@ -70,7 +69,7 @@ func TestAnInPlaceRestoreIntoAReplacedClaimFails(t *testing.T) {
 	if err := c.Create(context.Background(), replacement); err != nil {
 		t.Fatal(err)
 	}
-	completeVolume(t, c)
+	completeJob(t, c)
 
 	restoreStep(t, r)
 
@@ -87,7 +86,7 @@ func TestAnInPlaceRestoreWithoutItsClaimLeaseFails(t *testing.T) {
 	if err := c.Delete(context.Background(), lease); err != nil {
 		t.Fatal(err)
 	}
-	completeVolume(t, c)
+	completeJob(t, c)
 
 	restoreStep(t, r)
 
@@ -98,7 +97,7 @@ func TestAnInPlaceRestoreWithoutItsClaimLeaseFails(t *testing.T) {
 // succeeds.
 func TestAnInPlaceRestoreIntoItsOwnClaimSucceeds(t *testing.T) {
 	r, c := startedRestore(t, inPlace)
-	completeVolume(t, c)
+	completeJob(t, c)
 
 	restoreStep(t, r)
 
@@ -108,12 +107,13 @@ func TestAnInPlaceRestoreIntoItsOwnClaimSucceeds(t *testing.T) {
 }
 
 // A restore's mover gets the cache capacity of the claim's VolumeRestore,
-// as a backup's ReplicationSource and the populator's destination do: an
-// in-place restore's Job sizes its cache volume with it, together with the
-// VolumeRestore's cache class and pod labels, and an into restore's
-// ReplicationDestination carries it. Without it VolSync sizes the mover's cache at its default
-// of 1Gi, which a large repository outgrows. A restore from a repository
-// alone has no VolumeRestore to copy from and leaves the field unset.
+// as a backup's ReplicationSource and the populator's destination do: the
+// restore Job, in place and into a new claim from the claim's backups,
+// sizes its cache volume with it, together with the VolumeRestore's cache
+// class and pod labels. Without it the cache would get the default of 1Gi,
+// which a large repository outgrows. A restore from a repository alone has
+// no VolumeRestore to copy from, and its Job's cache keeps the default size
+// and no class.
 func TestARestoreDestinationGetsTheCacheCapacity(t *testing.T) {
 	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
@@ -124,21 +124,19 @@ func TestARestoreDestinationGetsTheCacheCapacity(t *testing.T) {
 			restoreStep(t, r) // plan
 			restoreStep(t, r) // create
 
-			if shape.into == "" {
-				expectJobCache(t, itemJob(t, c), capacity)
+			job := itemJob(t, c)
+			if shape.name != "into from a repository" {
+				expectJobCache(t, job, capacity)
 				return
 			}
-			rd := &volsyncv1alpha1.ReplicationDestination{}
-			get(t, c, ns, readRestoreRun(t, c).Status.Items[0].Destination, rd)
-			got := rd.Spec.Restic.CacheCapacity
-			if shape.into != "" && shape.name == "into from a repository" {
-				if got != nil {
-					t.Errorf("cacheCapacity = %v, want it unset with no VolumeRestore", got)
+			for _, v := range job.Spec.Template.Spec.Volumes {
+				if v.Ephemeral == nil {
+					continue
 				}
-				return
-			}
-			if got == nil || got.Cmp(capacity) != 0 {
-				t.Errorf("cacheCapacity = %v, want %s", got, capacity.String())
+				spec := v.Ephemeral.VolumeClaimTemplate.Spec
+				if got := spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(resource.MustParse("1Gi")) != 0 || spec.StorageClassName != nil {
+					t.Errorf("cache volume = %+v, want the default 1Gi and no class with no VolumeRestore", spec)
+				}
 			}
 		})
 	}

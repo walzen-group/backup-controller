@@ -22,26 +22,9 @@ import (
 )
 
 // The tests in this file check that a restore stops a mover the way rule X2
-// (rework-plan.md) requires: an in-place restore's Job is suspended, or an
-// into restore's ReplicationDestination deleted, first; its pods are waited
-// for; and only then does the run give the app back, release the Leases or
-// continue.
-
-// intoRestoring returns the RestoreRun back-to-monday in the middle of an
-// into restore of the claim notes-data-monday (see intoMonday), with its
-// item Running and naming the ReplicationDestination the run created, and
-// that destination, which the run's mover writes the claim through. The
-// claim itself comes from intoClaim.
-func intoRestoring() (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.ReplicationDestination) {
-	run := restoreRun(intoMonday, func(r *backupv1alpha1.RestoreRun) {
-		r.Finalizers = []string{Finalizer}
-		r.Status.Phase = backupv1alpha1.RunPhaseRunning
-		r.Status.Target = r.Spec.Into
-		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: r.Spec.Into,
-			Phase: backupv1alpha1.ItemRunning, Destination: destinationName(restoreUID, 0), Snapshot: monday.ShortID()}}
-	})
-	return run, destinationFor(run, run.Spec.Into)
-}
+// (rework-plan.md) requires: the restore Job, in place or into a new claim,
+// is suspended first; its pods are waited for; and only then does the run
+// give the app back, release the Leases or continue.
 
 // destinationFor returns the ReplicationDestination the run back-to-monday
 // created for its first item, writing into the claim named claim: the run's
@@ -81,20 +64,6 @@ func intoClaim(run *backupv1alpha1.RestoreRun) *corev1.PersistentVolumeClaim {
 	}
 }
 
-// moverPod returns a pod of the VolSync mover that wrote through the
-// ReplicationDestination named destination, in the phase given. VolSync runs
-// that mover as the Job volsync-dst-<destination> in the run's namespace, and
-// the Job's pods carry the label job-name.
-func moverPod(destination string, phase corev1.PodPhase) *corev1.Pod {
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "volsync-dst-" + destination + "-abcde", Namespace: ns,
-			Labels: map[string]string{"job-name": "volsync-dst-" + destination},
-		},
-		Status: corev1.PodStatus{Phase: phase},
-	}
-}
-
 // A mover that is still restoring has a pod that belongs there. The run does
 // not wait for it: it would never finish the restore it started, and it goes
 // on with the pass.
@@ -123,14 +92,14 @@ func heldClaimLease(run *backupv1alpha1.RestoreRun, item string) *coordinationv1
 	return lease
 }
 
-// An into restore whose claim is gone records the item's end before finish
-// deletes the ReplicationDestination. A pass that loses that write leaves the
-// destination in place, and the pass after it deletes it, so the mover never
-// starts again on a claim that is gone.
+// An into restore whose claim is gone records the item's end, with reason
+// ClaimLost, before finish stops its restore Job. A pass that loses that
+// write leaves the Job as it was, and the pass after it stops the Job, so a
+// restore into a claim that is gone never counts as done.
 func TestAnIntoRestoreWhoseClaimIsLostRecordsTheEndBeforeTheMoverGoes(t *testing.T) {
-	run, destination := intoRestoring()
+	run, job := intoOnJob(t)
 	claim := intoClaim(run)
-	r, c := restoreReconciler(t, nil, run, claim, destination)
+	r, c := restoreReconciler(t, nil, run, claim, sourceOnNode(), volumeRestore(), repository(), job)
 	if err := c.Delete(context.Background(), claim); err != nil {
 		t.Fatal(err)
 	}
@@ -139,52 +108,53 @@ func TestAnIntoRestoreWhoseClaimIsLostRecordsTheEndBeforeTheMoverGoes(t *testing
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
 		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
 	}
-	if names := destinations(t, c); len(names) != 1 {
-		t.Fatalf("destinations = %v after the lost write, want %s still there", names, destination.Name)
+	if suspendedJob(t, c, job.Name) {
+		t.Fatalf("Job %s suspended after the lost write, want it left as it was until the end is recorded", job.Name)
 	}
 
+	r.Client = c
 	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
-
-	after := readRestoreRun(t, c)
-	if after.Status.Phase != backupv1alpha1.RunPhaseFailed || after.Status.Items[0].Phase != backupv1alpha1.ItemFailed {
-		t.Errorf("phase = %q, item = %+v; want Failed with the item Failed", after.Status.Phase, after.Status.Items[0])
+	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonClaimLost {
+		t.Fatalf("item = %+v, want Failed with reason ClaimLost", item)
 	}
-	if names := destinations(t, c); len(names) != 0 {
-		t.Errorf("destinations = %v, want the run's deleted", names)
+	markSuspended(t, c, job)
+	after := stepUntilFinished(t, r, c, 2)
+
+	if after.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Errorf("phase = %q, want Failed", after.Status.Phase)
+	}
+	if jobs := restoreJobs(t, c); len(jobs) != 0 {
+		t.Errorf("restore Jobs = %v, want the run's deleted", jobs)
 	}
 }
 
-// The same holds for an item whose mover failed: the end goes into the status
-// before the destination is deleted, so a lost write leaves a record that
-// stops the next pass from starting the mover again.
+// The same holds for an item whose restore Job failed: the end goes into the
+// status before the Job is deleted, so a lost write leaves a record that
+// stops the next pass from starting a restore again.
 func TestAnIntoRestoreWhoseMoverFailedRecordsTheEndBeforeTheMoverGoes(t *testing.T) {
-	run, destination := intoRestoring()
-	destination.Status = &volsyncv1alpha1.ReplicationDestinationStatus{
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "restic: repository is already locked"},
-	}
-	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), destination)
+	run, job := intoOnJob(t)
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"}}
+	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), job)
 
 	r.Client = loseNextStatusWrite(c)
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
 		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
 	}
-	if names := destinations(t, c); len(names) != 1 {
-		t.Fatalf("destinations = %v after the lost write, want %s still there", names, destination.Name)
+	if jobs := restoreJobs(t, c); len(jobs) != 1 {
+		t.Fatalf("restore Jobs = %v after the lost write, want %s still there", jobs, job.Name)
 	}
 
-	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the destination's delete finds its mover gone
-
-	after := readRestoreRun(t, c)
-	if item := after.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, "repository is already locked") {
-		t.Errorf("item = %+v, want it Failed with the mover's log", item)
+	r.Client = c
+	after := stepUntilFinished(t, r, c, 3)
+	if item := after.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonRestoreJobFailed ||
+		!strings.Contains(item.Message, "BackoffLimitExceeded") {
+		t.Errorf("item = %+v, want it Failed with reason RestoreJobFailed and the Job's condition", item)
 	}
 	if after.Status.Phase != backupv1alpha1.RunPhaseFailed {
 		t.Errorf("phase = %q, want Failed", after.Status.Phase)
 	}
-	if names := destinations(t, c); len(names) != 0 {
-		t.Errorf("destinations = %v, want the run's deleted", names)
+	if jobs := restoreJobs(t, c); len(jobs) != 0 {
+		t.Errorf("restore Jobs = %v, want the run's deleted", jobs)
 	}
 }
 
@@ -242,11 +212,11 @@ func quiescedMidRestore(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job)
 }
 
 // quiescedDestinationRestore returns quiescedMidRestore's run in the shape
-// a run had while an in-place restore still wrote through a
-// ReplicationDestination: the item names the destination and no Job. An into
-// restore still has that shape, so the tests of the destination stop and of
-// the failures to put back use it until restic-jobs step 7b moves them to
-// Jobs.
+// a run had while a restore still wrote through a ReplicationDestination:
+// the item names the destination and no Job. No restore takes that shape
+// any more, but finish and finalize still stop a destination an item names,
+// so the tests of the destination stop and of the failures to put back use
+// it until restic-jobs step 7b moves them to Jobs.
 func quiescedDestinationRestore() (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.ReplicationDestination) {
 	started := metav1.NewTime(frozen)
 	run := restoreRun(quiescedInPlace, func(r *backupv1alpha1.RestoreRun) {
@@ -803,67 +773,63 @@ func TestWorkStoresItsItemsWhenTheMoverWaitIsUnchanged(t *testing.T) {
 	}
 }
 
-// An into restore whose claim is deleted while its mover writes stops the
-// mover, and keeps its Leases until that mover's pod is gone. The run ends
-// Failed only once the pod has left.
+// An into restore whose claim is deleted while its Job writes stops the Job,
+// and keeps its Leases until that Job's pod has ended. The run ends Failed
+// only once the pod has.
 func TestAnIntoRestoreWhoseClaimIsLostWaitsForItsStoppedMoversPod(t *testing.T) {
-	run, destination := intoRestoring()
+	run, job := intoOnJob(t)
 	claim := intoClaim(run)
-	pod := moverPod(destination.Name, corev1.PodRunning)
+	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
 	lease := heldClaimLease(run, run.Spec.Into)
-	r, c := restoreReconciler(t, nil, run, claim, sourceOnNode(), volumeRestore(), repository(), destination, pod, lease)
+	r, c := restoreReconciler(t, nil, run, claim, sourceOnNode(), volumeRestore(), repository(), job, pod, lease)
 	if err := c.Delete(context.Background(), claim); err != nil {
 		t.Fatal(err)
 	}
 
 	restoreStep(t, r)
+	markSuspended(t, c, job)
+	restoreStep(t, r)
 
-	if names := destinations(t, c); len(names) != 0 {
-		t.Errorf("destinations = %v, want the mover's deleted", names)
-	}
 	stopping := readRestoreRun(t, c)
-	if stopping.Status.Phase.Finished() {
-		t.Errorf("phase = %q while the mover pod was still there, want the run unfinished", stopping.Status.Phase)
+	if !suspendedJob(t, c, job.Name) || stopping.Status.Phase.Finished() {
+		t.Errorf("Job suspended = %t, phase = %q while its pod ran; want the Job stopped and the run unfinished", suspendedJob(t, c, job.Name), stopping.Status.Phase)
 	}
-	if item := stopping.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed {
-		t.Errorf("item = %+v, want it Failed with its end recorded", item)
+	if item := stopping.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonClaimLost {
+		t.Errorf("item = %+v, want it Failed with reason ClaimLost", item)
 	}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, &coordinationv1.Lease{}); err != nil {
-		t.Errorf("get the claim Lease = %v, want it held while the mover pod was still there", err)
+		t.Errorf("get the claim Lease = %v, want it held while the Job's pod ran", err)
 	}
 
-	if err := c.Delete(context.Background(), pod); err != nil {
-		t.Fatal(err)
-	}
+	setPodPhase(t, c, pod, corev1.PodFailed)
 	restoreStep(t, r)
 
 	done := readRestoreRun(t, c)
 	if done.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Errorf("phase = %q once the mover pod was gone, want Failed", done.Status.Phase)
+		t.Errorf("phase = %q once the pod had ended, want Failed", done.Status.Phase)
 	}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: lease.Name}, &coordinationv1.Lease{}); !apierrors.IsNotFound(err) {
-		t.Errorf("get the claim Lease = %v, want it released once the mover pod was gone", err)
+		t.Errorf("get the claim Lease = %v, want it released once the pod had ended", err)
 	}
 }
 
-// An into restore past its timeout stops its mover and waits for that mover's
-// pod. The pass that finds the pod gone ends the run with reason TimedOut,
-// the reason the timeout gave it, and not with the Failed of an item that
-// failed on its own. It goes by the ending the timeout recorded, so an item
-// message edited during the wait changes nothing.
+// An into restore past its timeout stops its restore Job and waits for the
+// Job's pod. The pass that finds the pod ended ends the run with reason
+// TimedOut, the reason the timeout gave it, and not with the Failed of an
+// item that failed on its own. It goes by the ending the timeout recorded,
+// so an item message edited during the wait changes nothing.
 func TestATimedOutIntoRestoreEndsTimedOutAfterItsMoverWait(t *testing.T) {
-	run, destination := intoRestoring()
-	started := metav1.NewTime(frozen)
-	run.Status.StartedAt = &started
-	pod := moverPod(destination.Name, corev1.PodRunning)
-	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), destination, pod)
+	run, job := intoOnJob(t)
+	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
+	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), job, pod)
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
 
 	restoreStep(t, r)
 
 	waiting := readRestoreRun(t, c)
-	if waiting.Status.Phase.Finished() {
-		t.Fatalf("phase = %q with the mover pod still there, want the run unfinished", waiting.Status.Phase)
+	if waiting.Status.Phase.Finished() || !suspendedJob(t, c, job.Name) {
+		t.Fatalf("phase = %q, Job suspended = %t with the Job's pod running; want the run unfinished and the Job stopped",
+			waiting.Status.Phase, suspendedJob(t, c, job.Name))
 	}
 	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonTimedOut {
 		t.Errorf("item = %+v, want it Failed with reason TimedOut", item)
@@ -873,9 +839,8 @@ func TestATimedOutIntoRestoreEndsTimedOutAfterItsMoverWait(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := c.Delete(context.Background(), pod); err != nil {
-		t.Fatal(err)
-	}
+	markSuspended(t, c, job)
+	setPodPhase(t, c, pod, corev1.PodFailed)
 	restoreStep(t, r)
 
 	done := readRestoreRun(t, c)
@@ -885,27 +850,21 @@ func TestATimedOutIntoRestoreEndsTimedOutAfterItsMoverWait(t *testing.T) {
 	}
 }
 
-// An into restore whose mover failed before the timeout keeps reason Failed
-// when its mover's pod outlives the deadline: the item failed on its own.
+// An into restore whose Job failed before the timeout keeps reason Failed
+// when the Job's pod outlives the deadline: the item failed on its own.
 func TestAnIntoRestoreWhoseMoverFailedKeepsFailedPastTheTimeout(t *testing.T) {
-	run, destination := intoRestoring()
-	started := metav1.NewTime(frozen)
-	run.Status.StartedAt = &started
-	destination.Status = &volsyncv1alpha1.ReplicationDestinationStatus{
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "restic: repository is already locked"},
-	}
-	pod := moverPod(destination.Name, corev1.PodRunning)
-	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), destination, pod)
+	run, job := intoOnJob(t)
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"}}
+	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
+	r, c := restoreReconciler(t, nil, run, intoClaim(run), sourceOnNode(), volumeRestore(), repository(), job, pod)
 
 	restoreStep(t, r)
 	if readRestoreRun(t, c).Status.Phase.Finished() {
-		t.Fatal("the run finished with the mover pod still there, want it waiting")
+		t.Fatal("the run finished with the Job's pod still running, want it waiting")
 	}
 
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-	if err := c.Delete(context.Background(), pod); err != nil {
-		t.Fatal(err)
-	}
+	setPodPhase(t, c, pod, corev1.PodFailed)
 	restoreStep(t, r)
 
 	done := readRestoreRun(t, c)

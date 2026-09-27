@@ -129,7 +129,7 @@ func unpinnable(all []restic.Snapshot, s restic.Snapshot, quiescedOnly bool) str
 // reason too, since the run can't pin the mover to anything. The run records
 // both with its plan, so such an item holds a status the run did not write.
 // It does not change all.
-func changedSince(all []restic.Snapshot, item backupv1alpha1.RestoreItem, quiescedOnly bool) (restic.Snapshot, string) {
+func changedSince(all []restic.Snapshot, item backupv1alpha1.RestoreItem, quiescedOnly bool) (restic.Snapshot, string) { //nolint:unused // deleted in restic-jobs step 7b
 	id := item.Snapshot
 	if id == "" {
 		return restic.Snapshot{}, "the item records no snapshot, so the run can't pin the mover to one"
@@ -220,7 +220,7 @@ func restoredSnapshots(logs string) (ids []string, noneEligible bool) {
 // restic that prints the line in another form fails the same way. An item
 // whose recorded short ID is empty or shorter than restic's eight characters
 // fails too, since no log can confirm it.
-func unconfirmedRestore(destination *volsyncv1alpha1.ReplicationDestination, recorded, claim string, created bool) string {
+func unconfirmedRestore(destination *volsyncv1alpha1.ReplicationDestination, recorded, claim string, created bool) string { //nolint:unused // deleted in restic-jobs step 7b
 	logs := ""
 	if destination.Status != nil && destination.Status.LatestMoverStatus != nil {
 		logs = destination.Status.LatestMoverStatus.Logs

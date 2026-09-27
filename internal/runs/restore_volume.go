@@ -11,9 +11,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// The code in this file moves an in-place volume item a step further on
-// its restore Job: it starts the Job once nothing holds the item back, and
-// records how the Job ended.
+// The code in this file moves a volume item a step further on its restore
+// Job: it starts an in-place item's Job once nothing holds the item back,
+// and records how the Job of an in-place or an into item ended.
 
 // settled reports whether a step of a volume restore ends the pass.
 //
@@ -101,13 +101,15 @@ func (r *RestoreRunReconciler) startJob(ctx context.Context, run *backupv1alpha1
 	return "", "", err
 }
 
-// takeOverJob gives a Pending item the restore Job an earlier pass created
+// takeOverJob gives an item the restore Job an earlier pass created
 // for it, when there is one.
 //
 // Parameters:
 //   - run is the RestoreRun the item belongs to.
 //   - index is the item's position in status.items.
-//   - item is the Pending volume item, which takeOverJob updates in place.
+//   - item is the volume item that has no Job yet: a Pending in-place item,
+//     or the Running item of an into restore. takeOverJob updates it in
+//     place.
 //
 // It returns true when a Job holds the item's name or the item already
 // records one, so the pass starts nothing for it, and false when no Job
@@ -148,8 +150,8 @@ func (r *RestoreRunReconciler) takeOverJob(ctx context.Context, run *backupv1alp
 	return true, nil
 }
 
-// followJob reads a Running in-place item's restore Job and records how it
-// ended.
+// followJob reads a Running volume item's restore Job, in place or into a
+// new claim, and records how it ended.
 //
 // Parameters:
 //   - run is the RestoreRun the item belongs to.
@@ -188,7 +190,7 @@ func (r *RestoreRunReconciler) followJob(ctx context.Context, run *backupv1alpha
 	return r.recordJobEnd(ctx, run, item, restorejob.Read(job, pods))
 }
 
-// recordJobEnd records on an in-place item how its restore Job stands.
+// recordJobEnd records on a volume item how its restore Job stands.
 //
 // Parameters:
 //   - run is the RestoreRun the item belongs to.
@@ -204,7 +206,7 @@ func (r *RestoreRunReconciler) followJob(ctx context.Context, run *backupv1alpha
 // Only the Job's terminal conditions decide. Complete=True means restic
 // exited 0 for exactly the item's snapshot, and the Job controller adds it
 // only once the pod has ended; the item succeeds when the claim is still the
-// one the run checked (see inPlaceClaimLost), and fails with reason
+// one the run checked or created (see claimLostError), and fails with reason
 // ClaimLost otherwise. Failed=True fails it with the
 // *restorejob.FailureError, reason RestoreJobFailed, whose message carries
 // restic's exit code, its meaning and restic's last lines. A Job that has
@@ -213,12 +215,8 @@ func (r *RestoreRunReconciler) followJob(ctx context.Context, run *backupv1alpha
 func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, outcome restorejob.Outcome) (*restorejob.Waiting, error) {
 	switch outcome.State {
 	case restorejob.Succeeded:
-		lost, err := r.inPlaceClaimLost(ctx, run, item.Name)
-		if err != nil {
+		if err := r.claimLostError(ctx, run, *item); err != nil {
 			return nil, err
-		}
-		if lost != "" {
-			return nil, refuse(backupv1alpha1.ItemReasonClaimLost, "%s", lost)
 		}
 		item.Phase, item.Message = backupv1alpha1.ItemSucceeded, ""
 	case restorejob.Failed:
@@ -231,4 +229,38 @@ func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1al
 		return outcome.Waiting, nil
 	}
 	return nil, nil
+}
+
+// claimLostError checks that the claim a volume item's restore Job wrote
+// into is still the one the run restored into.
+//
+// Parameters:
+//   - run is the RestoreRun the item belongs to. spec.into says which rule
+//     applies.
+//   - item is the volume item; its name is the claim's.
+//
+// It returns nil while the claim is the run's, a *refusalError with reason
+// ClaimLost when it is not, and a plain error from a failed read of the
+// claim or the Leases, which leaves the item as it was.
+//
+// An in-place item's claim is the one the run checked and took its claim
+// Lease on (see inPlaceClaimLost). An into item's claim is the one the run
+// created and controls (see claimLost). The run took its claim Lease before
+// it created that claim, on the source claim when there is one, so the
+// in-place rule would take the run's own new claim for a replaced one.
+func (r *RestoreRunReconciler) claimLostError(ctx context.Context, run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem) error {
+	var lost string
+	var err error
+	if run.Spec.Into != "" {
+		lost, err = r.claimLost(ctx, run)
+	} else {
+		lost, err = r.inPlaceClaimLost(ctx, run, item.Name)
+	}
+	switch {
+	case err != nil:
+		return err
+	case lost != "":
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "%s", lost)
+	}
+	return nil
 }

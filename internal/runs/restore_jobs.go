@@ -16,10 +16,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// The code in this file runs an in-place volume restore through the
-// controller's own restore Job (internal/restorejob): it creates the Job for
-// the snapshot the run's checks selected, reads how the Job ended, and stops
-// it. An into restore still writes through a ReplicationDestination.
+// The code in this file runs a volume restore, in place or into a new
+// claim, through the controller's own restore Job (internal/restorejob): it
+// creates the Job for the snapshot the run's checks selected, reads how the
+// Job ended, and stops it.
 
 // jobs returns the API the run's restore Jobs are created, read and stopped
 // through. Its reads go through the reconciler's Reader, which reads the API
@@ -66,7 +66,7 @@ func (r *RestoreRunReconciler) lostJob(ctx context.Context, run *backupv1alpha1.
 }
 
 // recheckJobSnapshot lists the repository again right before the run
-// creates an in-place item's restore Job, and refuses the item when the
+// creates a volume item's restore Job, and refuses the item when the
 // snapshot its checks recorded is no longer there.
 //
 // Parameters:
@@ -117,15 +117,16 @@ func (r *RestoreRunReconciler) recheckJobSnapshot(ctx context.Context, run *back
 		item.Snapshot, taken)
 }
 
-// createJob creates an in-place item's restore Job and moves the item to
-// Running.
+// createJob creates a volume item's restore Job, in place or into the claim
+// an into restore created, and moves the item to Running.
 //
 // Parameters:
 //   - run is the RestoreRun, which controls the Job.
 //   - index is the item's position in status.items, which names the Job.
 //   - item is the volume item. The Job restores item.SnapshotID into the
 //     claim item.Name, and createJob records the Job's name and UID on it.
-//   - settings are the repository and mover settings from startRefusal.
+//   - settings are the repository and mover settings, from startRefusal
+//     or intoChecks.
 //
 // It returns nil once the Job exists and the item names it. It returns the
 // *restorejob.SpecError of a spec Build refuses, and a *refusalError with
@@ -176,7 +177,7 @@ func (r *RestoreRunReconciler) createJob(ctx context.Context, run *backupv1alpha
 	return nil
 }
 
-// settleJobs reads the restore Job of each Running in-place item of a run
+// settleJobs reads the restore Job of each Running volume item of a run
 // that ends early, so each item records how its Job really ended.
 //
 // Parameters:
@@ -241,7 +242,7 @@ func (l jobList) message() string {
 		"The run gives the app back and lets other runs at the claim only after that", j.item, j.state)
 }
 
-// stopJobs stops the restore Jobs of the in-place items a run is done with,
+// stopJobs stops the restore Jobs of the volume items a run is done with,
 // and reports those that may still write (rule X2).
 //
 // Parameters:
@@ -328,7 +329,7 @@ func jobReleaseError(name string, err error) error {
 }
 
 // moverStops is what a run's stop of its movers left: the movers of its
-// ReplicationDestinations, which into restores still use, and its restore
+// ReplicationDestinations, which an item may still name, and its restore
 // Jobs.
 type moverStops struct {
 	// destinations are the destinations' movers that are not gone yet.

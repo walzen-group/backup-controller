@@ -94,7 +94,7 @@ func stepUntilFinished(t *testing.T, r *RestoreRunReconciler, c client.Client, n
 }
 
 // An into restore from a repository whose spec.into names the app's live
-// claim ends Invalid at its checks. It writes nothing: no destination, and
+// claim ends Invalid at its checks. It writes nothing: no mover, and
 // the claim is as it was. Before, the run created a Direct destination with
 // enableFileDeletion on the mounted claim and ended Succeeded.
 func TestAnIntoRestoreRefusesAnExistingClaim(t *testing.T) {
@@ -103,11 +103,11 @@ func TestAnIntoRestoreRefusesAnExistingClaim(t *testing.T) {
 	get(t, c, ns, claimN, before)
 
 	restoreStep(t, r) // plan
-	if names := destinations(t, c); len(names) == 0 {
+	if names := movers(t, c); len(names) == 0 {
 		restoreStep(t, r)
 	}
-	if names := destinations(t, c); len(names) > 0 {
-		completeVolume(t, c)
+	if names := movers(t, c); len(names) > 0 {
+		completeJob(t, c)
 	}
 	run := stepUntilFinished(t, r, c, 3)
 
@@ -116,8 +116,8 @@ func TestAnIntoRestoreRefusesAnExistingClaim(t *testing.T) {
 		t.Fatalf("phase = %q, reason = %q, message = %q; want Invalid saying the claim exists",
 			run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
 	}
-	if names := destinations(t, c); len(names) > 0 {
-		t.Errorf("destinations = %v, want none", names)
+	if names := movers(t, c); len(names) > 0 {
+		t.Errorf("movers = %v, want none", names)
 	}
 	after := &corev1.PersistentVolumeClaim{}
 	get(t, c, ns, claimN, after)
@@ -149,8 +149,8 @@ func TestAnIntoRestoreFromAClaimRefusesAnExistingClaimOrVolumeRestore(t *testing
 				t.Fatalf("phase = %q, reason = %q, message = %q; want Invalid saying %q",
 					run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions), want)
 			}
-			if names := destinations(t, c); len(names) != 0 {
-				t.Errorf("destinations = %v, want none", names)
+			if names := movers(t, c); len(names) != 0 {
+				t.Errorf("movers = %v, want none", names)
 			}
 			key := types.NamespacedName{Namespace: ns, Name: "notes-data-monday"}
 			if name == "claim" {
@@ -165,7 +165,7 @@ func TestAnIntoRestoreFromAClaimRefusesAnExistingClaimOrVolumeRestore(t *testing
 }
 
 // A claim with the spec.into name that appears between the checks and the
-// create ends the run Failed, with no destination and no VolumeRestore
+// create ends the run Failed, with no mover and no VolumeRestore
 // written against it. Before, the run adopted it.
 func TestAnIntoRestoreRefusesAClaimCreatedAfterItsChecks(t *testing.T) {
 	for name, mutate := range map[string]func(*backupv1alpha1.RestoreRun){
@@ -178,7 +178,7 @@ func TestAnIntoRestoreRefusesAClaimCreatedAfterItsChecks(t *testing.T) {
 			if err := c.Create(context.Background(), boundClaim("scratch")); err != nil {
 				t.Fatal(err)
 			}
-			if names := destinations(t, c); len(names) == 0 {
+			if names := movers(t, c); len(names) == 0 {
 				restoreStep(t, r)
 			}
 			run := stepUntilFinished(t, r, c, 3)
@@ -188,8 +188,8 @@ func TestAnIntoRestoreRefusesAClaimCreatedAfterItsChecks(t *testing.T) {
 				t.Fatalf("phase = %q, reason = %q, message = %q; want Failed saying the claim exists",
 					run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
 			}
-			if names := destinations(t, c); len(names) > 0 {
-				t.Errorf("destinations = %v, want none", names)
+			if names := movers(t, c); len(names) > 0 {
+				t.Errorf("movers = %v, want none", names)
 			}
 			vr := &backupv1alpha1.VolumeRestore{}
 			if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "scratch"}, vr); err == nil {
@@ -212,11 +212,11 @@ func TestARetriedIntoRestoreDoesNotAdoptTheOldRunsClaim(t *testing.T) {
 			r, c := restoreReconciler(t, nil, restoreRun(mutate), claim(), volumeRestore(), repository(),
 				boundClaim("scratch", oldRestoreRef()))
 			restoreStep(t, r)
-			if names := destinations(t, c); len(names) == 0 {
+			if names := movers(t, c); len(names) == 0 {
 				restoreStep(t, r)
 			}
-			if names := destinations(t, c); len(names) > 0 {
-				completeVolume(t, c)
+			if names := movers(t, c); len(names) > 0 {
+				completeJob(t, c)
 			}
 			run := stepUntilFinished(t, r, c, 3)
 
@@ -225,8 +225,8 @@ func TestARetriedIntoRestoreDoesNotAdoptTheOldRunsClaim(t *testing.T) {
 				t.Fatalf("phase = %q, reason = %q, message = %q; want Invalid naming RestoreRun old-restore",
 					run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
 			}
-			if names := destinations(t, c); len(names) > 0 {
-				t.Errorf("destinations = %v, want none", names)
+			if names := movers(t, c); len(names) > 0 {
+				t.Errorf("movers = %v, want none", names)
 			}
 		})
 	}
@@ -234,7 +234,7 @@ func TestARetriedIntoRestoreDoesNotAdoptTheOldRunsClaim(t *testing.T) {
 
 // A pass whose claim create went through but came back as an error is
 // retried, and the next pass finds the claim the run created and goes on
-// to create the destination. The ownership check must not refuse the run's
+// to create the restore Job. The ownership check must not refuse the run's
 // own claim.
 func TestAnIntoRestoreWhoseClaimCreateWasLostContinues(t *testing.T) {
 	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
@@ -258,48 +258,37 @@ func TestAnIntoRestoreWhoseClaimCreateWasLostContinues(t *testing.T) {
 	}
 	restoreStep(t, r)
 
-	if names := destinations(t, c); len(names) != 1 {
-		t.Fatalf("destinations = %v, want the run's one (run %+v)", names, readRestoreRun(t, c).Status)
+	if jobs := restoreJobs(t, c); len(jobs) != 1 {
+		t.Fatalf("restore Jobs = %v, want the run's one (run %+v)", jobs, readRestoreRun(t, c).Status)
 	}
-	completeVolume(t, c)
+	completeJob(t, c)
 	run := stepUntilFinished(t, r, c, 2)
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q, message = %q; want Succeeded", run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
 }
 
-// A ReplicationDestination with the name the run would give its own, whose
-// trigger is another run's UID, ends an into restore's item Failed at
-// once. The run never deletes it: it did not create it. An in-place restore
-// writes through a restore Job (see
-// TestARestoreRefusesAJobItDidNotCreate).
-// Before, the run adopted it and waited for it until its timeout, and then
-// deleted it.
+// A ReplicationDestination with the name the run's first item had while an
+// into restore wrote through destinations, whose trigger is another run's
+// UID, is left alone: the into restore writes through its own restore Job,
+// succeeds, and never touches or deletes that destination. An existing
+// Job under the restore Job's name is refused instead (see
+// TestAnIntoTakeoverChecksTheJob).
 func TestARestoreRefusesADestinationItDidNotCreate(t *testing.T) {
-	for name, tc := range map[string]struct {
-		mutate func(*backupv1alpha1.RestoreRun)
-		claim  string
-	}{
-		"from a repository": {fromRepository, "scratch"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			foreign := foreignDestination(tc.claim)
-			r, c := restoreReconciler(t, nil, restoreRun(tc.mutate), claim(), volumeRestore(), repository(), foreign)
-			restoreStep(t, r) // plan
-			restoreStep(t, r) // create
-			run := stepUntilFinished(t, r, c, 2)
+	foreign := foreignDestination("scratch")
+	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), claim(), volumeRestore(), repository(), foreign)
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // create
+	completeJob(t, c)
+	run := stepUntilFinished(t, r, c, 3)
 
-			if run.Status.Phase != backupv1alpha1.RunPhaseFailed ||
-				!strings.Contains(readyMessage(run.Status.Conditions), "does not carry this run's trigger") {
-				t.Fatalf("phase = %q, message = %q; want Failed naming the foreign destination",
-					run.Status.Phase, readyMessage(run.Status.Conditions))
-			}
-			kept := &volsyncv1alpha1.ReplicationDestination{}
-			get(t, c, ns, foreign.Name, kept)
-			if kept.Spec.Trigger.Manual != string(oldRestoreUID) {
-				t.Errorf("destination trigger = %q, want the other run's untouched", kept.Spec.Trigger.Manual)
-			}
-		})
+	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+		t.Fatalf("phase = %q, message = %q; want Succeeded", run.Status.Phase, readyMessage(run.Status.Conditions))
+	}
+	kept := &volsyncv1alpha1.ReplicationDestination{}
+	get(t, c, ns, foreign.Name, kept)
+	if kept.Spec.Trigger.Manual != string(oldRestoreUID) || kept.DeletionTimestamp != nil {
+		t.Errorf("destination = %+v, want the other run's untouched", kept.ObjectMeta)
 	}
 }
 
@@ -335,7 +324,7 @@ func TestAnIntoRestoreWhoseClaimIsReplacedFails(t *testing.T) {
 	if err := c.Create(context.Background(), boundClaim("scratch")); err != nil {
 		t.Fatal(err)
 	}
-	completeVolume(t, c)
+	completeJob(t, c)
 	run := stepUntilFinished(t, r, c, 2)
 
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed ||

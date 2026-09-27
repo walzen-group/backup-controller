@@ -144,7 +144,7 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 // that, so it takes the selected one. It returns nil for an item with no
 // recorded snapshot time, which recheckSnapshot refuses before any
 // destination is built.
-func selectedMoment(item backupv1alpha1.RestoreItem) *string {
+func selectedMoment(item backupv1alpha1.RestoreItem) *string { //nolint:unused // deleted in restic-jobs step 7b
 	if item.SnapshotTime == nil {
 		return nil
 	}
@@ -176,7 +176,7 @@ func selectedMoment(item backupv1alpha1.RestoreItem) *string {
 // since the checks would shift what the newest snapshot, or the one before
 // it, is. The callers run recheckSnapshot first, which refuses an item with
 // no recorded time.
-func directDestination(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem, settings restoreSettings, name string) *volsyncv1alpha1.ReplicationDestination {
+func directDestination(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem, settings restoreSettings, name string) *volsyncv1alpha1.ReplicationDestination { //nolint:unused // deleted in restic-jobs step 7b
 	claim := item.Name
 	return &volsyncv1alpha1.ReplicationDestination{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: run.Namespace},

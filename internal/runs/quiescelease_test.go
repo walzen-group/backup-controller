@@ -153,7 +153,7 @@ func TestARestoreAndANamespaceBackupNeverStopTheAppTogether(t *testing.T) {
 	// Drive the restore to its restart: its mover finishes, so the run gives
 	// the app back and ends.
 	restoreStep(t, rr)
-	completeVolume(t, c)
+	completeJob(t, c)
 	restoreStep(t, rr)
 	restoreStep(t, rr) // the pass after the stop finds the restore Job stopped
 	restore = readRestoreRun(t, c)

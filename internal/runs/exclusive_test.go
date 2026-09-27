@@ -259,7 +259,7 @@ func TestAFinishedOrDeletedRunDoesNotBlock(t *testing.T) {
 func frozenNow() time.Time { return frozen }
 
 // A restore into a new claim from a repository that a backup started writing
-// after the checks waits, creates neither the claim nor the destination, and
+// after the checks waits, creates neither the claim nor the restore Job, and
 // goes on once the backup has finished.
 func TestAnIntoRestoreWaitsWhileItsRepositoryIsBackedUp(t *testing.T) {
 	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
@@ -271,8 +271,8 @@ func TestAnIntoRestoreWaitsWhileItsRepositoryIsBackedUp(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseWaiting || !strings.Contains(readyMessage(run.Status.Conditions), "BackupRun manual-notes") {
 		t.Fatalf("phase = %q, message = %q; want Waiting for the BackupRun manual-notes", run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
-	if names := destinations(t, c); len(names) != 0 {
-		t.Fatalf("destinations = %v, want none while the backup runs", names)
+	if names := movers(t, c); len(names) != 0 {
+		t.Fatalf("movers = %v, want none while the backup runs", names)
 	}
 	if err := c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "scratch"}, &corev1.PersistentVolumeClaim{}); err == nil {
 		t.Fatal("the claim was created while the backup ran")
@@ -293,8 +293,8 @@ func TestAnIntoRestoreWaitsWhileItsRepositoryIsBackedUp(t *testing.T) {
 	}
 	restoreStep(t, r)
 	run = readRestoreRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseRunning || len(destinations(t, c)) != 1 {
-		t.Fatalf("phase = %q, destinations = %v; want Running with its destination", run.Status.Phase, destinations(t, c))
+	if run.Status.Phase != backupv1alpha1.RunPhaseRunning || len(restoreJobs(t, c)) != 1 {
+		t.Fatalf("phase = %q, restore Jobs = %v; want Running with its restore Job", run.Status.Phase, restoreJobs(t, c))
 	}
 }
 
@@ -322,19 +322,19 @@ func TestANamespaceRunWaitsForARestoreBeforeItQuiesces(t *testing.T) {
 	}
 }
 
-// A restore of the claim's backups into a new claim writes through its own
-// ReplicationDestination, which names the claim's repository: a backup of the
-// claim waits while it is there.
+// A restore of the claim's backups into a new claim holds the Leases of the
+// claim and its repository while its restore Job writes: a backup of the
+// claim waits while it runs.
 func TestABackupWaitsWhileAnIntoRestoreFromTheClaimRuns(t *testing.T) {
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" }, asOf("2026-09-21T04:00:00Z")),
 		claim(), volume(), volumeRestore(), repository())
 	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
-	rr := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
+	rr := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, RestoreImage: testImage, Now: frozenNow}
 	restoreStep(t, rr) // plan
-	restoreStep(t, rr) // creates the claim and the destination
-	if names := destinations(t, c); len(names) != 1 {
-		t.Fatalf("destinations = %v, want the restore's", names)
+	restoreStep(t, rr) // creates the claim and the restore Job
+	if jobs := restoreJobs(t, c); len(jobs) != 1 {
+		t.Fatalf("restore Jobs = %v, want the restore's", jobs)
 	}
 	step(t, br)
 	step(t, br)

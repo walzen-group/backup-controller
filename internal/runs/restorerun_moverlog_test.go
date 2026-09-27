@@ -3,23 +3,18 @@ package runs
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// The tests in this file check that an into restore reports a volume
-// restored only when the mover's log names the snapshot the checks recorded
-// (designs/restorerun.md C5). VolSync marks the run's trigger complete
-// whatever the mover restored, including nothing at all. An in-place restore
-// reads its own restore Job's result instead.
+// The tests in this file check how the controller reads a VolSync restore
+// mover's log. No restore reads one any more: in place and into a new claim,
+// a RestoreRun reads its own restore Job's result instead, and the reader
+// goes with the destination code.
 
 // recordedRestoreLog and recordedNoEligibleLog are the status.latestMoverStatus.logs
 // VolSync 0.16.0 wrote on two ReplicationDestinations built like
@@ -40,52 +35,9 @@ const (
 
 // restoreLogFor returns the recorded restore log with the restored
 // snapshot's short ID replaced by short.
-func restoreLogFor(short string) string {
-	return strings.ReplaceAll(recordedRestoreLog, recordedRestoreID, short)
-}
-
-// truncatedLog returns the last limit bytes of logs, the way VolSync's
-// TruncateString (internal/controller/utils/podlogs.go:219-227 at v0.16.0)
-// keeps the filtered log within MOVER_LOG_MAX_BYTES.
-func truncatedLog(logs string, limit int) string {
-	if limit <= 0 {
-		return ""
-	}
-	if len(logs) > limit {
-		return logs[len(logs)-limit:]
-	}
-	return logs
-}
-
-// restoredStatus returns the status VolSync writes on a ReplicationDestination
-// whose mover completed the run's trigger and restored the snapshot whose
-// short ID is short: lastManualSync, and a Successful latestMoverStatus with
-// the recorded log naming that snapshot.
-func restoredStatus(short string) *volsyncv1alpha1.ReplicationDestinationStatus {
-	return &volsyncv1alpha1.ReplicationDestinationStatus{
-		LastManualSync:    string(restoreUID),
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultSuccessful, Logs: restoreLogFor(short)},
-	}
-}
-
-// finishMover marks the ReplicationDestination of the run's first item as
-// VolSync marks one whose mover succeeded: the run's trigger completed, and
-// latestMoverStatus Successful with the given logs, in one status write.
-func finishMover(t *testing.T, c client.Client, logs string) {
-	t.Helper()
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, readRestoreRun(t, c).Status.Items[0].Destination, rd)
-	rd.Status = &volsyncv1alpha1.ReplicationDestinationStatus{
-		LastManualSync:    string(restoreUID),
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultSuccessful, Logs: logs},
-	}
-	if err := c.Status().Update(context.Background(), rd); err != nil {
-		t.Fatal(err)
-	}
-}
 
 // startedRestore returns a reconciler whose run of the given shape selected
-// monday and created its destination, and the client.
+// monday and created its restore Job, and the client.
 func startedRestore(t *testing.T, mutate func(*backupv1alpha1.RestoreRun)) (*RestoreRunReconciler, client.Client) {
 	t.Helper()
 	r, c := restoreReconciler(t, nil, restoreRun(mutate), claim(), volumeRestore(), repository())
@@ -96,14 +48,6 @@ func startedRestore(t *testing.T, mutate func(*backupv1alpha1.RestoreRun)) (*Res
 		t.Fatalf("item = %+v; want Running on monday's snapshot", item)
 	}
 	return r, c
-}
-
-// targetClaim is the claim a restore of the given shape writes into.
-func targetClaim(into string) string {
-	if into != "" {
-		return into
-	}
-	return claimN
 }
 
 // The recorded logs read as what the movers did: the first restored
@@ -124,115 +68,6 @@ func TestTheRecordedMoverLogsSayWhatTheMoverRestored(t *testing.T) {
 	}
 }
 
-// A restore whose mover's log names the snapshot the checks recorded
-// succeeds.
-func TestARestoreConfirmsTheSnapshotFromTheMoversLog(t *testing.T) {
-	for _, shape := range intoShapes {
-		t.Run(shape.name, func(t *testing.T) {
-			r, c := startedRestore(t, shape.mutate)
-			finishMover(t, c, restoreLogFor(monday.ShortID()))
-			restoreStep(t, r)
-			restoreStep(t, r)
-
-			run := readRestoreRun(t, c)
-			if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded || run.Status.Items[0].Phase != backupv1alpha1.ItemSucceeded {
-				t.Fatalf("phase = %q, item = %+v (%s); want Succeeded", run.Status.Phase, run.Status.Items[0], readyMessage(run.Status.Conditions))
-			}
-		})
-	}
-}
-
-// A mover that found no snapshot at or before its pin prints "No eligible
-// snapshots found", restores nothing and exits 0, and VolSync completes the
-// trigger. The item fails and says what the claim holds.
-func TestARestoreThatRestoredNothingFails(t *testing.T) {
-	for _, shape := range intoShapes {
-		t.Run(shape.name, func(t *testing.T) {
-			r, c := startedRestore(t, shape.mutate)
-			finishMover(t, c, recordedNoEligibleLog)
-			restoreStep(t, r)
-			restoreStep(t, r)
-
-			holds := "claim " + claimN + " holds what it held before"
-			if shape.into != "" {
-				holds = "claim " + shape.into + " is empty"
-			}
-			expectItemFailed(t, c, "the mover found no snapshot at or before 2026-09-21T05:00:02Z and wrote nothing; "+holds)
-			if names := destinations(t, c); len(names) != 0 {
-				t.Errorf("destinations = %v, want the failed item's deleted", names)
-			}
-		})
-	}
-}
-
-// A mover that restored another snapshot than the one the checks recorded
-// fails the item, naming both.
-func TestARestoreThatRestoredAnotherSnapshotFails(t *testing.T) {
-	for _, shape := range intoShapes {
-		t.Run(shape.name, func(t *testing.T) {
-			r, c := startedRestore(t, shape.mutate)
-			finishMover(t, c, restoreLogFor(sunday.ShortID()))
-			restoreStep(t, r)
-			restoreStep(t, r)
-
-			expectItemFailed(t, c, "the mover restored snapshot 2edf5bab where the checks selected 6e473100; claim "+
-				targetClaim(shape.into)+" now holds 2edf5bab")
-		})
-	}
-}
-
-// A mover whose log names no snapshot fails the item: the log is empty when
-// VolSync can't read the pod's logs or MOVER_LOG_MAX_BYTES is 0, and cut
-// when the filtered log is longer than that setting. The run can't tell what
-// the claim holds then.
-func TestARestoreWithoutLogsFails(t *testing.T) {
-	logs := map[string]string{
-		"empty":     "",
-		"truncated": truncatedLog(restoreLogFor(monday.ShortID()), 64),
-	}
-	for _, shape := range intoShapes {
-		for name, log := range logs {
-			t.Run(shape.name+"/"+name, func(t *testing.T) {
-				r, c := startedRestore(t, shape.mutate)
-				finishMover(t, c, log)
-				restoreStep(t, r)
-				restoreStep(t, r)
-
-				expectItemFailed(t, c, "the mover finished, but its logs name no snapshot, so the run cannot confirm what claim "+
-					targetClaim(shape.into)+" holds", "MOVER_LOG_MAX_BYTES bytes (1024 by default)", "Logs: "+log)
-			})
-		}
-	}
-}
-
-// A pass that failed an item on its mover's log and lost the status write
-// leaves the item Running and the destination in place. The next pass reads
-// the same log, fails the item again, and only then deletes the destination.
-func TestAMoverLogFailureSurvivesALostStatusWrite(t *testing.T) {
-	for _, shape := range intoShapes {
-		t.Run(shape.name, func(t *testing.T) {
-			r, c := startedRestore(t, shape.mutate)
-			finishMover(t, c, recordedNoEligibleLog)
-
-			r.Client = loseNextStatusWrite(c)
-			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-				t.Fatal("the pass whose status write was lost succeeded, want the error returned")
-			}
-			if names := destinations(t, c); len(names) != 1 {
-				t.Fatalf("destinations = %v, want the item's kept while its end is not recorded", names)
-			}
-			r.Client = c
-			restoreStep(t, r)
-			restoreStep(t, r)
-
-			expectItemFailed(t, c, "the mover found no snapshot")
-			if names := destinations(t, c); len(names) != 0 {
-				t.Errorf("destinations = %v, want it deleted once the end is recorded", names)
-			}
-		})
-	}
-}
-
 // loseFailedRunWrite returns a client over c that fails, with a conflict,
 // the first status write that ends a RestoreRun Failed: finish's write,
 // which comes after it deleted the run's destinations.
@@ -247,28 +82,4 @@ func loseFailedRunWrite(c client.Client) client.Client {
 			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
-}
-
-// An into restore failed on its mover's log whose final write is lost after
-// the destination was deleted ends Failed on the next pass. It does not take
-// the missing destination for one never created, and creates no new mover.
-func TestAnIntoRestoreFailedOnItsLogIsNotStartedAgain(t *testing.T) {
-	r, c := startedRestore(t, fromRepository)
-	finishMover(t, c, recordedNoEligibleLog)
-	restoreStep(t, r) // deletes the destination, and waits a pass for its mover
-
-	r.Client = loseFailedRunWrite(c)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass whose final write was lost succeeded, want the error returned")
-	}
-	if names := destinations(t, c); len(names) != 0 {
-		t.Fatalf("destinations = %v, want the item's deleted before the lost write", names)
-	}
-	r.Client = c
-	restoreStep(t, r)
-
-	expectItemFailed(t, c, "the mover found no snapshot")
-	if names := destinations(t, c); len(names) != 0 {
-		t.Errorf("destinations = %v, want no new mover", names)
-	}
 }

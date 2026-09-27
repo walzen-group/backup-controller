@@ -17,11 +17,11 @@ import (
 // lists them. It covers what restic-jobs steps 3 and 4 left free of message
 // reads, internal/restorejob from step 5, whose Read renders the
 // termination message restic leaves and must never decide on it, and the
-// RestoreRun's restore Job code from step 7a; steps 7b and 10 widen it
+// RestoreRun's restore Job code from steps 7a and 8; steps 7b and 10 widen it
 // until it holds every non-test file of internal/runs and
 // internal/populator.
 var messageRuleScope = []messageRuleDir{
-	{dir: ".", files: []string{"backuprun.go", "restorerun.go", "restore_jobs.go", "restore_volume.go"}},
+	{dir: ".", files: []string{"backuprun.go", "restorerun.go", "restore_into.go", "restore_jobs.go", "restore_volume.go"}},
 	{dir: "../populator"},
 	{dir: "../restorejob"},
 }
