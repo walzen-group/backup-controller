@@ -109,7 +109,8 @@ func (c *Callbacks) failJob(ctx context.Context, r restore, job *batchv1.Job, fa
 //   - r is the claim's restore.
 //   - job is the claim's running Job, as Populate just read it.
 //
-// It returns an error from a read, from the record or from the resume.
+// It returns an error from a read, from the record or from the resume; a
+// resume the API server refuses returns what jobCallError returns.
 //
 // restorejob.Build creates every Job suspended. A Job whose UID the prime
 // claim does not record yet, one this pass created or one a create that
@@ -136,7 +137,7 @@ func (c *Callbacks) resume(ctx context.Context, r restore, job *batchv1.Job) err
 		return err
 	}
 	if err := c.operations.ResumeJob(ctx, job); err != nil {
-		return fmt.Errorf("resume restore Job %s/%s: %w", job.Namespace, job.Name, err)
+		return c.jobCallError(ctx, r, fmt.Errorf("resume restore Job %s/%s: %w", job.Namespace, job.Name, err))
 	}
 	return nil
 }
@@ -219,6 +220,7 @@ func (c *Callbacks) startJob(ctx context.Context, r restore) error {
 // It returns the created Job, with its UID, and an error from the namespace
 // read, from restorejob.Build or from the create. A create that finds the
 // name taken returns its AlreadyExists error; the next pass follows that Job.
+// A create the API server refuses returns what jobCallError returns.
 //
 // Every Job restores with --delete. A Job that replaces a failed or deleted
 // one selects the snapshot again, perhaps a newer one, and restores it over
@@ -253,7 +255,7 @@ func (c *Callbacks) createJob(ctx context.Context, r restore, snapshot restic.Sn
 		return nil, claimError(r.claim, err)
 	}
 	if err := c.operations.CreateJob(ctx, job); err != nil {
-		return nil, fmt.Errorf("create restore Job %s/%s: %w", job.Namespace, job.Name, err)
+		return nil, c.jobCallError(ctx, r, fmt.Errorf("create restore Job %s/%s: %w", job.Namespace, job.Name, err))
 	}
 	return job, nil
 }

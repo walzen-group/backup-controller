@@ -20,9 +20,19 @@ const (
 	// ReasonRestoring reports a claim that is being populated now.
 	ReasonRestoring = "Restoring"
 
-	// ReasonRestoreFailed reports a claim whose mover failed. The claim's
-	// volume stays unfilled until something about the restore changes.
+	// ReasonRestoreFailed reports a claim whose restore Job failed. The
+	// claim's volume stays unfilled until something about the restore
+	// changes.
 	ReasonRestoreFailed = "RestoreFailed"
+
+	// ReasonRestoreJobRefused reports a claim whose restore Job the API
+	// server refused to create or to resume, with 403 Forbidden or 422
+	// Invalid: for example the controller's admission policy refuses a
+	// moverSecurityContext that sets sysctls, SELinux options or an
+	// unconfined profile. The message carries the API server's answer. The
+	// claim stays Pending, and every sync tries again, so the restore goes
+	// on once the VolumeRestore or the cluster is fixed.
+	ReasonRestoreJobRefused = "RestoreJobRefused"
 
 	// ReasonRestored reports that nothing is being populated from this object.
 	ReasonRestored = "Restored"

@@ -108,6 +108,11 @@ type fakeOperations struct {
 	// jobCreates counts the restore Job creates sent, those the API server
 	// refused included.
 	jobCreates int
+	// refuseCreate and refuseResume, when set, are the API server's answer
+	// to every restore Job create and every resume, as an admission policy
+	// or a missing grant gives it.
+	refuseCreate error
+	refuseResume error
 }
 
 var _ Operations = (*fakeOperations)(nil)
@@ -127,7 +132,18 @@ func fakeOperationsOn(c *strictclient.Client) *fakeOperations {
 // CreateJob counts the create and sends it to the cluster.
 func (f *fakeOperations) CreateJob(ctx context.Context, job *batchv1.Job) error {
 	f.jobCreates++
+	if f.refuseCreate != nil {
+		return f.refuseCreate
+	}
 	return f.Jobs.CreateJob(ctx, job)
+}
+
+// ResumeJob sends the resume to the cluster, unless refuseResume is set.
+func (f *fakeOperations) ResumeJob(ctx context.Context, job *batchv1.Job) error {
+	if f.refuseResume != nil {
+		return f.refuseResume
+	}
+	return f.Jobs.ResumeJob(ctx, job)
 }
 
 func (f *fakeOperations) GetVolume(ctx context.Context, name string) (*corev1.PersistentVolume, error) {

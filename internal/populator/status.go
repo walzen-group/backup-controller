@@ -42,7 +42,8 @@ func (c *Callbacks) markRestoring(ctx context.Context, vr *backupv1alpha1.Volume
 //   - claim is the claim whose restore failed. The message starts with
 //     "claim <name>: ", so a VolumeRestore that fills several claims says
 //     which one failed.
-//   - reason is the Ready reason: RestoreFailed or NoBackupInReach.
+//   - reason is the Ready reason: RestoreFailed, NoBackupInReach or
+//     RestoreJobRefused.
 //   - cause is the typed failure, rendered into the message here and read
 //     by nothing else.
 //

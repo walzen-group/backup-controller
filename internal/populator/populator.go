@@ -125,6 +125,12 @@ func New(operations Operations, namespace, image string, snapshots SnapshotListe
 //     once recorded while the prime's volume is still the prime's (see
 //     resume), and marks the claim Restoring.
 //
+// A Job create or resume that the API server refuses with 403 Forbidden or
+// 422 Invalid, such as the admission policy refusing the VolumeRestore's
+// moverSecurityContext, marks the claim Failed with reason
+// RestoreJobRefused and the API server's answer, and returns an error, so
+// the next sync tries again (see jobCallError).
+//
 // Every status write happens only when it changes something.
 func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.PopulatorParams) error {
 	if err := validateParams(params); err != nil {
