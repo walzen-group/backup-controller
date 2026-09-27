@@ -5,6 +5,7 @@ resources:
   - namespace.yaml
   - serviceaccount.yaml
   - rbac.yaml
+  - admissionpolicy.yaml
   - deployment.yaml
   - webhook.yaml
   # kubectl kustomize refuses to load files outside the deploy/ tree, and
