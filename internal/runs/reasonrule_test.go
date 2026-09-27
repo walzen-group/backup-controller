@@ -227,10 +227,12 @@ func scanReasonRule(t *testing.T, dirs ...string) []reasonFinding {
 // go list -export compiles every package it lists from the source on disk
 // at that moment, which is later than the test binary was built. It fails
 // when that source doesn't compile, as when someone edits a file of the
-// module while the test runs. The go command locks and renames its build
-// cache entries, so a concurrent build with the same cache is no cause.
-// The failure message therefore carries go list's stderr, which names the
-// package and the compile error.
+// module while the test runs. A concurrent build with the same cache is no
+// cause: the go command writes each build cache entry in place with its
+// last byte last, and another go command uses the entry only once its size
+// matches, so none uses it before it is complete. The failure message
+// therefore carries go list's stderr, which names the package and the
+// compile error.
 func exportLookup(t *testing.T, dirs []string) func(string) (io.ReadCloser, error) {
 	t.Helper()
 	args := append([]string{"list", "-export", "-deps", "-f", "{{.ImportPath}} {{.Export}}"}, dirs...)

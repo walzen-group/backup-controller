@@ -95,7 +95,7 @@ var messageComparisonAllowlist = []messageRuleEntry{
 //   - A helper in a file the scope does not read yet, or in another
 //     package, can match a message the scope passes to it. The scope
 //     shrinks this as later steps widen it; a helper in another package,
-//     such as internal/volsync, is never seen.
+//     such as one in internal/restorejob, is never seen.
 //   - A helper in the scope that compares its own string parameters, as in
 //     sameText(a, b string) bool { return a == b }, is not seen, because a
 //     parameter is never taken for a message.
