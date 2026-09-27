@@ -58,6 +58,7 @@ func stepUntilFinished(t *testing.T, r *RestoreRunReconciler, c client.Client, n
 // Before, the run found the claim Bound and ended Succeeded with nothing
 // restored.
 func TestAnIntoRestoreFromAClaimRefusesAnExistingClaimOrVolumeRestore(t *testing.T) {
+	t.Parallel()
 	for name, existing := range map[string]client.Object{
 		"claim": boundClaim("notes-data-monday"),
 		"VolumeRestore": &backupv1alpha1.VolumeRestore{
@@ -94,6 +95,7 @@ func TestAnIntoRestoreFromAClaimRefusesAnExistingClaimOrVolumeRestore(t *testing
 // the name taken, and the run creates no restore Job, whose --delete would
 // empty that claim. The foreign claim is left as it was.
 func TestAnIntoRestoreRefusesAClaimCreatedAtItsCreate(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
 	restoreStep(t, r) // plan
 	foreign := boundClaim("scratch")

@@ -100,6 +100,7 @@ func clusterUID(t *testing.T, c client.Client) types.UID {
 // fails the item saying so and leaves the Cluster alone, instead of deleting
 // it each time Flux creates it again until the timeout.
 func TestAClusterCreatedAgainWithoutArchivingIsNotDeleted(t *testing.T) {
+	t.Parallel()
 	r, c := databaseRestore(t)
 	recreated := createCluster(t, c, archivingNowhere)
 	restoreStep(t, r)
@@ -125,6 +126,7 @@ func TestAClusterCreatedAgainWithoutArchivingIsNotDeleted(t *testing.T) {
 // recovers only for a run whose item says Deleted. The run fails instead of
 // reporting Succeeded once either Cluster is healthy.
 func TestARecoveredClusterReplacedDuringRecoveryFailsTheRun(t *testing.T) {
+	t.Parallel()
 	recovering := func(t *testing.T) (*RestoreRunReconciler, client.Client, *unstructured.Unstructured) {
 		t.Helper()
 		r, c := databaseRestore(t)
@@ -187,6 +189,7 @@ func TestARecoveredClusterReplacedDuringRecoveryFailsTheRun(t *testing.T) {
 // deletes nothing. The first run deletes the Cluster, the webhook recovers
 // it for that run, and the first run succeeds with its recovery untouched.
 func TestTwoRunsWaitingOnOneClusterDoNotDeleteEachOthersRecovery(t *testing.T) {
+	t.Parallel()
 	second := restoreRun(func(r *backupv1alpha1.RestoreRun) {
 		r.Name, r.UID, r.Spec.Database = "second", "9b7d4e21-0000-4000-8000-00000000000a", pgN
 	})
@@ -229,6 +232,7 @@ func TestTwoRunsWaitingOnOneClusterDoNotDeleteEachOthersRecovery(t *testing.T) {
 // it deleted the Cluster, and second's later delete would have reached
 // back-to-monday's recovery.
 func TestARunChecksForAnotherRunAgainBeforeItDeletesTheCluster(t *testing.T) {
+	t.Parallel()
 	planned := func(r *backupv1alpha1.RestoreRun) {
 		r.Spec.Database = pgN
 		r.Finalizers = []string{Finalizer}
@@ -274,6 +278,7 @@ const endedBeforeRecreate = "recovers it to the end of its archive, or to the ti
 // the run has ended, no run waits for the Cluster, so its next creation
 // recovers to the end of its archive or to its own annotation.
 func TestATimedOutRunSaysHowItsDeletedClusterComesBack(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday}, restoreRun(deletedDatabaseRun), objectStore(), storeSecret())
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
 

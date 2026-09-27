@@ -145,6 +145,7 @@ func suspendedJob(t *testing.T, c client.Client, name string) bool {
 // the pod has ended the Job is deleted, the app comes back and the run ends
 // TimedOut.
 func TestATimedOutRestoreWaitsForItsStoppedMoversPod(t *testing.T) {
+	t.Parallel()
 	run, job := quiescedMidRestore(t)
 	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
@@ -202,6 +203,7 @@ func TestATimedOutRestoreWaitsForItsStoppedMoversPod(t *testing.T) {
 // that Job's pod, and only then releases its Leases and gives the app back.
 // It keeps its finalizer until this is done.
 func TestADeletedRestoreWaitsForItsStoppedMoversPod(t *testing.T) {
+	t.Parallel()
 	run, job := quiescedMidRestore(t)
 	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
 	lease := heldClaimLease(run, claimN)
@@ -265,6 +267,7 @@ func quiescedRestoreDone(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job
 // come: that pod may still write into the claim the app would mount (rule
 // X2).
 func TestARestoreDoesNotGiveTheAppBackWhileAFinishedItemsMoverIsThere(t *testing.T) {
+	t.Parallel()
 	run, job := quiescedRestoreDone(t)
 	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
@@ -300,6 +303,7 @@ func advance(r *RestoreRunReconciler, d time.Duration) {
 // of the Job when the deadline passes. Before, the pass after the deadline
 // timed the run out, and it ended Failed although it restored everything.
 func TestAFinishedRestoreEndsAsItsItemsSayWhenTheDeadlinePassesInItsMoverWait(t *testing.T) {
+	t.Parallel()
 	run, job := quiescedRestoreDone(t)
 	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
@@ -355,6 +359,7 @@ func endsAfterFirstRead(t *testing.T, c client.Client, name string) client.WithW
 // it Failed. Before, the lost write left the item Running on a Job that was
 // gone, and the next pass failed it as a Job deleted before it finished.
 func TestATimeoutWhoseStopEndsInOnePassKeepsItsEnding(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		shape  func(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job, []client.Object)

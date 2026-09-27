@@ -41,6 +41,7 @@ func onlyJob(t *testing.T, c client.Client) *batchv1.Job {
 // records it and still leaves it suspended; the pass after that resumes it.
 // That holds for an in-place and an into restore.
 func TestARestoreJobIsResumedOnlyOnceTheRunRecordedIt(t *testing.T) {
+	t.Parallel()
 	inPlace := func(t *testing.T) (*RestoreRunReconciler, client.Client) {
 		r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
 			claim(), volumeRestore(), repository())

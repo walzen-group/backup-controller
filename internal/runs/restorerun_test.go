@@ -104,6 +104,7 @@ func readRestoreRun(t *testing.T, c client.Client) *backupv1alpha1.RestoreRun {
 // A restore to a moment before the oldest snapshot fails with reason
 // NoBackupInReach, names the oldest snapshot, and creates no restore Job.
 func TestARestoreBeforeEverySnapshotFailsBeforeTouchingAnything(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-01T00:00:00Z")),
 		claim(), volumeRestore(), repository())
@@ -127,6 +128,7 @@ func TestARestoreBeforeEverySnapshotFailsBeforeTouchingAnything(t *testing.T) {
 // ID into the claim. Once the Job is Complete the run succeeds, and the Job
 // does not outlive it.
 func TestAClaimRestoreSelectsTheSnapshotBeforeItsMoment(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
 		claim(), volumeRestore(), repository())
@@ -166,6 +168,7 @@ var quiet = restic.Snapshot{ID: fullID("c0ffee00"), Time: time.Date(2026, 9, 21,
 // and the volume's restore Job restores exactly that snapshot by its full
 // ID.
 func TestASyncedRestoreRestoresEverythingToTheQuiescedMoment(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true }),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
@@ -192,6 +195,7 @@ func TestASyncedRestoreRestoresEverythingToTheQuiescedMoment(t *testing.T) {
 // snapshot was taken while the app ran, so no moment makes the database match
 // it.
 func TestASyncedRestoreRefusesUntaggedSnapshots(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All, r.Spec.SyncDatabaseToVolume = true, true }),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
@@ -213,6 +217,7 @@ func TestASyncedRestoreRefusesUntaggedSnapshots(t *testing.T) {
 // A restore in place waits with reason ClaimInUse while a pod mounts the
 // claim, because two writers on one filesystem corrupt the volume.
 func TestAMountedClaimMakesTheRestoreWait(t *testing.T) {
+	t.Parallel()
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "notes-5d9f", Namespace: ns},
 		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
@@ -234,6 +239,7 @@ func TestAMountedClaimMakesTheRestoreWait(t *testing.T) {
 // again. It follows the Cluster the webhook marked as its recovery until the
 // Cluster is healthy, then succeeds.
 func TestADatabaseRestoreDeletesAndFollowsTheCluster(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }, asOf("2026-09-22T00:00:00Z")),
 		cluster(), objectStore(), storeSecret())
@@ -325,6 +331,7 @@ func suspended(t *testing.T, c client.Client) bool {
 // while its pod is still there, and gives the app back once the volume is
 // restored and the database deleted, so Flux can create the Cluster again.
 func TestAQuiescedRestoreStopsTheAppUntilTheDatabaseIsDeleted(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
 		deployment(), kustomization(false), writerPod())
@@ -395,6 +402,7 @@ func oldInstance() (*corev1.Pod, *corev1.PersistentVolumeClaim) {
 // pod and its PVC are gone, so the app never reaches the old Postgres and the
 // new Cluster never waits behind the old one's names.
 func TestAQuiescedRestoreWaitsForTheOldInstanceToShutDown(t *testing.T) {
+	t.Parallel()
 	pod, pvc := oldInstance()
 	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
@@ -442,6 +450,7 @@ func TestAQuiescedRestoreWaitsForTheOldInstanceToShutDown(t *testing.T) {
 // A quiesced restore that times out starts the app again and resumes the
 // Kustomization it suspended.
 func TestATimedOutQuiescedRestoreGivesTheAppBack(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
 		deployment(), kustomization(false), writerPod())
@@ -466,6 +475,7 @@ func TestATimedOutQuiescedRestoreGivesTheAppBack(t *testing.T) {
 // A spec.quiesce entry naming a workload the namespace does not hold fails
 // the run at the checks, before it stops anything or deletes a database.
 func TestAQuiescedRestoreOfAMissingWorkloadFailsBeforeStoppingAnything(t *testing.T) {
+	t.Parallel()
 	run := quiescedRestore()
 	run.Spec.Quiesce = append(run.Spec.Quiesce, backupv1alpha1.WorkloadRef{Kind: "StatefulSet", Name: "notes-worker"})
 	r, c := restoreReconciler(t, prober{saturday}, run,
@@ -487,6 +497,7 @@ func TestAQuiescedRestoreOfAMissingWorkloadFailsBeforeStoppingAnything(t *testin
 // The run scales them to zero before it creates a restore Job, and gives
 // them back once the restore is done.
 func TestARestoreStopsTheMarkedAppBeforeItsJob(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday}, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
 		deployment(), kustomization(false), writerPod())
@@ -526,6 +537,7 @@ func TestARestoreStopsTheMarkedAppBeforeItsJob(t *testing.T) {
 // A restore stops the workloads spec.quiesce lists together with the ones
 // marked backup.wlz.li/quiesce, and gives each back its own count.
 func TestARestoreStopsTheListedAndTheMarkedWorkloads(t *testing.T) {
+	t.Parallel()
 	worker := deployment()
 	worker.Name, worker.Annotations, worker.Labels = "notes-worker", nil, nil
 	run := restoreRun(func(r *backupv1alpha1.RestoreRun) {
@@ -561,6 +573,7 @@ func TestARestoreStopsTheListedAndTheMarkedWorkloads(t *testing.T) {
 // NoBackupInReach and leaves the Cluster in place. Deleting it would bring it
 // back empty.
 func TestADatabaseWithoutABaseBackupIsNotDeleted(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }, asOf("2026-09-01T00:00:00Z")),
 		cluster(), objectStore(), storeSecret())
@@ -579,6 +592,7 @@ func TestADatabaseWithoutABaseBackupIsNotDeleted(t *testing.T) {
 // A namespace restore restores the volumes before the databases. When a volume
 // restore fails, the run fails and skips the Cluster, which keeps running.
 func TestANamespaceRestoreLeavesTheDatabasesWhenAVolumeFails(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())
@@ -622,6 +636,7 @@ func refuseDeploymentScales(c client.Client) client.Client {
 // BackupRun does the same. Waiting would leave the app running beside the
 // restore until the timeout.
 func TestAQuiescedRestoreThatCannotStopTheAppFailsAtOnce(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
 		deployment(), kustomization(false), writerPod())
@@ -649,6 +664,7 @@ func TestAQuiescedRestoreThatCannotStopTheAppFailsAtOnce(t *testing.T) {
 // first pass recorded, so a run that then times out gives the app its 2
 // replicas back and resumes the Kustomization.
 func TestAQuiescedRestoreRetriedAfterALostStatusWriteGivesTheAppBack(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
 		deployment(), kustomization(false), writerPod())
@@ -696,6 +712,7 @@ func staleCache(c client.Client) client.Client {
 // with reason ClaimInUse, because without spec.quiesce that check is the only
 // thing that keeps a second writer off the volume.
 func TestARestoreSeesAPodTheCacheHasNotSeenYet(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
 		claim(), volumeRestore(), repository(), writerPod())
 	r.Client = staleCache(c)
@@ -714,6 +731,7 @@ func TestARestoreSeesAPodTheCacheHasNotSeenYet(t *testing.T) {
 // that must not count as the recovery. Only a Cluster created again, with
 // another UID, does.
 func TestADatabaseRestoreWhoseDeleteFailedDeletesTheOldClusterAgain(t *testing.T) {
+	t.Parallel()
 	old := cluster(func(u *unstructured.Unstructured) {
 		annotations := u.GetAnnotations()
 		annotations[backupv1alpha1.AnnotationRestoreRun] = "back-to-monday"
@@ -763,6 +781,7 @@ func optedOut(u *unstructured.Unstructured) {
 // empty, and the run would delete it again and again. The volumes restore as
 // usual, with and without syncDatabaseToVolume.
 func TestANamespaceRestoreLeavesAnOptedOutClusterAlone(t *testing.T) {
+	t.Parallel()
 	for _, sync := range []bool{false, true} {
 		t.Run(map[bool]string{false: "plain", true: "synced"}[sync], func(t *testing.T) {
 			r, c := restoreReconciler(t, prober{saturday},
@@ -796,6 +815,7 @@ func TestANamespaceRestoreLeavesAnOptedOutClusterAlone(t *testing.T) {
 // each item's reason. Before, it ended Succeeded saying every item holds the
 // restored data (finding H).
 func TestARestoreThatSkippedEveryItemFails(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }), cluster(optedOut), objectStore(), storeSecret())
 	restoreStep(t, r) // plan
@@ -835,6 +855,7 @@ func loseNextStatusWrite(c client.Client) client.Client {
 // Job's Complete condition, and the item does not fail as a Job deleted
 // before it finished.
 func TestAVolumeRestoreWhoseSuccessWasNotRecordedFinishes(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
 		claim(), volumeRestore(), repository())
 	restoreStep(t, r) // plan
@@ -872,6 +893,7 @@ func fromRepository(r *backupv1alpha1.RestoreRun) {
 // the claim with it. The run succeeds once the Job is Complete, and deletes
 // the Job.
 func TestAnIntoRestoreFromARepositoryFillsAClaimTheMoverPlaces(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // create
@@ -903,6 +925,7 @@ func TestAnIntoRestoreFromARepositoryFillsAClaimTheMoverPlaces(t *testing.T) {
 // its checks. With no source claim there is no size to copy, and the API
 // server refuses a claim without a storage request.
 func TestAnIntoRestoreFromARepositoryNeedsASize(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(fromRepository, func(r *backupv1alpha1.RestoreRun) { r.Spec.IntoSize = nil }), repository())
 	restoreStep(t, r)
 
@@ -926,6 +949,7 @@ func declaring(method string, content map[string]any) func(*unstructured.Unstruc
 // the webhook wrote, with source backup-controller. That recovery is the
 // controller's own, so a later restore restores the Cluster as usual.
 func TestARestoreOfAClusterTheWebhookRecoveredBeforeDeletesIt(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday},
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }),
 		cluster(declaring("recovery", map[string]any{"source": bootstrap.RecoverySource})), objectStore(), storeSecret())

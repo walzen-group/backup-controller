@@ -25,6 +25,7 @@ import (
 // its deletion completes. Before, the finalizer stayed and every retry
 // failed the same way.
 func TestAFailedClusterReadDoesNotBlockTheFinalizer(t *testing.T) {
+	t.Parallel()
 	for name, readErr := range map[string]error{
 		"NoKindMatch": &meta.NoKindMatchError{GroupKind: cnpg.ClusterGVK.GroupKind(), SearchedVersions: []string{"v1"}},
 		"Forbidden": apierrors.NewForbidden(schema.GroupResource{Group: cnpg.ClusterGVK.Group, Resource: "clusters"}, pgN,

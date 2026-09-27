@@ -77,6 +77,7 @@ func recordedInto(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job) {
 // claim lost. The run ends with the reason of its ending, and the Job
 // stays suspended until the run deletes it.
 func TestARunThatEndsNeverResumesItsJob(t *testing.T) {
+	t.Parallel()
 	late := func() time.Time { return frozen.Add(5 * time.Hour) }
 	for name, tc := range map[string]struct {
 		setup  func(t *testing.T) ([]client.Object, *batchv1.Job)
@@ -153,6 +154,7 @@ func staleRuns(c client.Client, stale *backupv1alpha1.RestoreRun) client.Client 
 // ending, is being deleted, has failed the item, or records another Job.
 // The pass returns an error for a retry and the Job stays suspended.
 func TestAStaleCachedRunResumesNothing(t *testing.T) {
+	t.Parallel()
 	for name, change := range map[string]func(t *testing.T, c client.Client, stored *backupv1alpha1.RestoreRun){
 		"ending recorded": func(t *testing.T, c client.Client, stored *backupv1alpha1.RestoreRun) {
 			stored.Status.Ending = &backupv1alpha1.RunEnding{Reason: backupv1alpha1.ReasonFailed, Message: "spec.quiesce lists Deployment notes"}

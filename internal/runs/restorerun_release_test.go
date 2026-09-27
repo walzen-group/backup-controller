@@ -22,6 +22,7 @@ import (
 // Warning event, and the workload with the replicas a person can set by hand.
 // Nothing is released: the app is still down.
 func TestARestoreThatCannotGiveTheAppBackSaysWhatFailed(t *testing.T) {
+	t.Parallel()
 	run, job := quiescedMidRestore(t)
 	lease := heldClaimLease(run, claimN)
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),

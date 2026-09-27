@@ -25,6 +25,7 @@ import (
 // and a message with restic's exit code, its meaning and restic's last
 // lines, read from the Job's own pod. Nothing decides on that message.
 func TestAFailedRestoreJobFailsTheItemWithTheExitCode(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(inPlace), claim(), volumeRestore(), repository())
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // restore
@@ -60,6 +61,7 @@ func TestAFailedRestoreJobFailsTheItemWithTheExitCode(t *testing.T) {
 // stops that Job like any other: the Job is suspended, and the app stays down
 // until the Job controller reports it suspended.
 func TestTakeoverChecksTheSnapshotIDAnnotation(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct {
 		snapshotID string
 		takenOver  bool
@@ -113,6 +115,7 @@ func TestTakeoverChecksTheSnapshotIDAnnotation(t *testing.T) {
 // delete orphaned and which keeps that UID, holds the app down until it has
 // ended.
 func TestADeletedRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
+	t.Parallel()
 	run, job := quiescedMidRestore(t)
 	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
@@ -158,6 +161,7 @@ func TestADeletedRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
 // timeout reads each Running item's Job before it fails what is left (P11).
 // The run still ends TimedOut.
 func TestAbortRecordsAJobThatCompleted(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct {
 		condition batchv1.JobConditionType
 		phase     backupv1alpha1.ItemPhase
@@ -191,6 +195,7 @@ func TestAbortRecordsAJobThatCompleted(t *testing.T) {
 // whose Job had not ended gets the abort's message, followed by why the
 // Job's pod waits.
 func TestAnAbortStopsTheJobAndSaysWhyItsPodWaited(t *testing.T) {
+	t.Parallel()
 	run, job := quiescedMidRestore(t)
 	pod := jobPodOf(job, "restore-pod", corev1.PodPending)
 	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: "unlock", State: corev1.ContainerState{
@@ -229,6 +234,7 @@ func TestAnAbortStopsTheJobAndSaysWhyItsPodWaited(t *testing.T) {
 // and a repository with none of the mover's layout fails the item naming
 // each snapshot it passed over, with its host and paths.
 func TestOnlyMoverSnapshotsAreCandidates(t *testing.T) {
+	t.Parallel()
 	other := moverSnapshot("5e1f0000", monday.Time)
 	other.Paths = []string{"/srv/notes"}
 	stranger := moverSnapshot("77770000", monday.Time.Add(time.Hour))
@@ -262,6 +268,7 @@ func TestOnlyMoverSnapshotsAreCandidates(t *testing.T) {
 // quiesced snapshot by its full ID, so the untagged one can't take its
 // place, as it could when VolSync's mover picked by the second.
 func TestASyncedRestoreRestoresAQuiescedSnapshotAnUntaggedOneShares(t *testing.T) {
+	t.Parallel()
 	quiesced := moverSnapshot("c0ffee00", time.Date(2026, 9, 21, 3, 0, 5, 200e6, time.UTC), restic.QuiescedTag)
 	untagged := moverSnapshot("7a11ce00", time.Date(2026, 9, 21, 3, 0, 5, 800e6, time.UTC))
 	r, c := restoreReconciler(t, prober{saturday},

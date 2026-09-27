@@ -29,6 +29,7 @@ import (
 // end, which took the Job over, and when the end came on the very next pass,
 // which finds the Job under the item's name.
 func TestALostJobCreateIsStoppedAtTheEnd(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct {
 		passBetween bool
 		timeout     bool
@@ -159,6 +160,7 @@ func createLandsLater(t *testing.T, c client.Client) (client.Client, func() *bat
 // on the failed item, suspends it and keeps the app down while its pod runs
 // (rule X2), and gives the app back once the pod has ended.
 func TestAJobCreateThatLandsAfterATimeoutIsStopped(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, quiescedRestore(), claim(), volumeRestore(), repository(),
 		deployment(), kustomization(false))
 	restoreStep(t, r) // plan

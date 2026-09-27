@@ -76,6 +76,7 @@ func startedInto(t *testing.T, mutate func(*backupv1alpha1.RestoreRun)) (*Restor
 // cache class and queue label. Before, the run wrote through a
 // ReplicationDestination pinned to the snapshot's second.
 func TestAnIntoRestoreCreatesAJobForTheFullSnapshotID(t *testing.T) {
+	t.Parallel()
 	for _, shape := range intoShapesOnJob {
 		t.Run(shape.name, func(t *testing.T) {
 			_, c := startedInto(t, shape.mutate)
@@ -150,6 +151,7 @@ func intoOnJob(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job) {
 // one that completes into a claim replaced by one the run did not create
 // fails with reason ClaimLost.
 func TestAnIntoRestoreChecksItsOwnClaimWhenItsJobCompletes(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct {
 		replace bool
 		late    bool
@@ -193,6 +195,7 @@ func TestAnIntoRestoreChecksItsOwnClaimWhenItsJobCompletes(t *testing.T) {
 // restore refused every one of them but the recorded later snapshot, since
 // VolSync's mover pinned to their second could restore another.
 func TestTwoSnapshotsInOneSecondRestoreByID(t *testing.T) {
+	t.Parallel()
 	twin := time.Date(2026, 9, 25, 21, 22, 16, 500e6, time.UTC)
 	repositories := []struct {
 		name  string

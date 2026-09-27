@@ -133,6 +133,7 @@ func expectItemFailed(t *testing.T, c client.Client, want ...string) {
 // Pinned to the snapshot's second, the mover would have restored the next
 // older snapshot, or nothing, and reported success.
 func TestARestoreWhoseSnapshotWasPrunedFailsBeforeWriting(t *testing.T) {
+	t.Parallel()
 	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			repo := copyRecorded(t, "timed")
@@ -165,6 +166,7 @@ func TestARestoreWhoseSnapshotWasPrunedFailsBeforeWriting(t *testing.T) {
 // then on the item is followed like any other Running item, and the run
 // stops that Job when it ends (UFR1). No second Job is created.
 func TestAPassAfterALostWriteTakesTheJobOver(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct {
 		forget bool
 		gone   client.Object
@@ -215,6 +217,7 @@ func TestAPassAfterALostWriteTakesTheJobOver(t *testing.T) {
 // records no snapshot. That holds while VolSync syncs the backup, and after
 // the sync while the quiesced BackupRun has yet to retime its snapshot.
 func TestARestoreSelectsItsSnapshotOnlyOnceABackupOfItsRepositoryHasFinished(t *testing.T) {
+	t.Parallel()
 	for _, shape := range restoreShapes {
 		for _, synced := range []bool{false, true} {
 			name := shape.name + ", syncing"

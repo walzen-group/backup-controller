@@ -49,6 +49,7 @@ func readRun(t *testing.T, r *RestoreRunReconciler, name string) *backupv1alpha1
 // first run has stopped its Job and finished does the second create its own
 // Job.
 func TestTwoInPlaceRestoresOfOneClaimRunOneAtATime(t *testing.T) {
+	t.Parallel()
 	second := secondClaimRestore()
 	second.Spec.Timeout = &metav1.Duration{Duration: 24 * time.Hour}
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
@@ -118,6 +119,7 @@ func TestTwoInPlaceRestoresOfOneClaimRunOneAtATime(t *testing.T) {
 // still get one (rule X2). That holds for an in-place and for an into
 // restore holding the Lease, and the waiting run creates no Job.
 func TestAFinishedItemNamingAJobKeepsTheClaimLease(t *testing.T) {
+	t.Parallel()
 	for name, into := range map[string]string{"in place": "", "into": "notes-data-second"} {
 		t.Run(name, func(t *testing.T) {
 			other := secondClaimRestore()
@@ -156,6 +158,7 @@ func TestAFinishedItemNamingAJobKeepsTheClaimLease(t *testing.T) {
 // ReplicationSource, so only the Lease keeps the two movers apart, and the
 // waiting run creates no Job.
 func TestARestoreWaitsForTheClaimLeaseOfARunThatHasNotStarted(t *testing.T) {
+	t.Parallel()
 	other := secondClaimRestore()
 	other.Status.Phase = backupv1alpha1.RunPhaseRunning
 	other.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN, Phase: backupv1alpha1.ItemPending}}

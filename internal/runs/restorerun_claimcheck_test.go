@@ -36,6 +36,7 @@ func expectVolumeFailed(t *testing.T, run *backupv1alpha1.RestoreRun, want ...st
 // while the Job's pod mounts it, and the Job finishes writing into a claim
 // that is about to go. The message names the restore Job as the writer.
 func TestAnInPlaceRestoreIntoADeletedClaimFails(t *testing.T) {
+	t.Parallel()
 	r, c := startedRestore(t, inPlace)
 	pvc := &corev1.PersistentVolumeClaim{}
 	get(t, c, ns, claimN, pvc)
@@ -58,6 +59,7 @@ func TestAnInPlaceRestoreIntoADeletedClaimFails(t *testing.T) {
 // claim by name, so it may have written into the new claim as well; the
 // message says so and asks for the claim's data to be checked.
 func TestAnInPlaceRestoreIntoAReplacedClaimFails(t *testing.T) {
+	t.Parallel()
 	r, c := startedRestore(t, inPlace)
 	if err := c.Delete(context.Background(), claim()); err != nil {
 		t.Fatal(err)
@@ -85,6 +87,7 @@ func TestAnInPlaceRestoreIntoAReplacedClaimFails(t *testing.T) {
 // no VolumeRestore to copy from, and its Job's cache keeps the default size
 // and no class.
 func TestARestoreJobGetsTheCacheCapacity(t *testing.T) {
+	t.Parallel()
 	for _, shape := range restoreShapes {
 		t.Run(shape.name, func(t *testing.T) {
 			vr := volumeRestore()
