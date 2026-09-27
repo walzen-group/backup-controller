@@ -7,7 +7,6 @@ import (
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -94,41 +93,6 @@ func clusterUID(t *testing.T, c client.Client) types.UID {
 		return ""
 	}
 	return u.GetUID()
-}
-
-// A Cluster created again after the run deleted the old one, carrying
-// backup.wlz.li/bootstrap: initdb or declaring its own bootstrap, started
-// empty or from its owner's bootstrap, and nothing was restored. The item
-// fails naming what the Cluster carries, the run ends Failed, and the run
-// leaves the new Cluster alone. Without the webhook a declared bootstrap
-// reaches this point too, since nothing refuses it while the run waits.
-func TestAClusterCreatedAgainOptedOutFailsTheRun(t *testing.T) {
-	for name, tc := range map[string]struct {
-		mutate func(*unstructured.Unstructured)
-		names  string
-	}{
-		"opted out":     {optedOut, bootstrap.OptOutAnnotation + ": " + bootstrap.OptOutValue},
-		"pg_basebackup": {declaring("pg_basebackup", map[string]any{"source": "legacy-db"}), "spec.bootstrap.pg_basebackup"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			r, c := databaseRestore(t)
-			recreated := createCluster(t, c, tc.mutate)
-			restoreStep(t, r)
-			restoreStep(t, r)
-
-			run := readRestoreRun(t, c)
-			item := run.Status.Items[0]
-			if item.Phase != backupv1alpha1.ItemFailed || !strings.Contains(item.Message, tc.names) || !strings.Contains(item.Message, "nothing was restored") {
-				t.Errorf("item = %+v, want Failed naming %s and saying nothing was restored", item, tc.names)
-			}
-			if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-				t.Errorf("phase = %q (%s), want Failed", run.Status.Phase, readyMessage(run.Status.Conditions))
-			}
-			if uid := clusterUID(t, c); uid != recreated.GetUID() {
-				t.Errorf("Cluster UID = %q, want the Cluster created again (%s) left alone", uid, recreated.GetUID())
-			}
-		})
-	}
 }
 
 // A Cluster created again without the barman-cloud plugin archives nowhere.

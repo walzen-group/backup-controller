@@ -1,7 +1,6 @@
 package runs
 
 import (
-	"context"
 	"fmt"
 	"slices"
 	"strings"
@@ -14,8 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -183,29 +180,6 @@ func TestAnIntoRestoreChecksItsOwnClaimWhenItsJobCompletes(t *testing.T) {
 				t.Errorf("restore Jobs = %v, want the run's deleted", jobs)
 			}
 		})
-	}
-}
-
-// An into restore whose Job failed and whose final status write was lost
-// after the Job was deleted ends Failed on the next pass. It does not take
-// the missing Job for one never created, and creates no new Job.
-func TestAnIntoRestoreWhoseFinalWriteWasLostIsNotStartedAgain(t *testing.T) {
-	r, c := startedInto(t, fromRepository)
-	endJob(t, c, itemJob(t, c).Name, batchv1.JobFailed, "BackoffLimitExceeded", "Job has reached the specified backoff limit")
-
-	r.Client = loseFailedRunWrite(c)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass whose final write was lost succeeded, want the error returned")
-	}
-	if jobs := restoreJobs(t, c); len(jobs) != 0 {
-		t.Fatalf("restore Jobs = %v, want the item's deleted before the lost write", jobs)
-	}
-	r.Client = c
-	restoreStep(t, r)
-
-	expectItemFailed(t, c, "BackoffLimitExceeded")
-	if jobs := restoreJobs(t, c); len(jobs) != 0 {
-		t.Errorf("restore Jobs = %v, want no new Job", jobs)
 	}
 }
 

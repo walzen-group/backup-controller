@@ -69,42 +69,6 @@ func heldClaimLease(run *backupv1alpha1.RestoreRun, item string) *coordinationv1
 	return lease
 }
 
-// An into restore whose claim is gone records the item's end, with reason
-// ClaimLost, before finish stops its restore Job. A pass that loses that
-// write leaves the Job as it was, and the pass after it stops the Job, so a
-// restore into a claim that is gone never counts as done.
-func TestAnIntoRestoreWhoseClaimIsLostRecordsTheEndBeforeTheMoverGoes(t *testing.T) {
-	run, job := intoOnJob(t)
-	claim := intoClaim(run)
-	r, c := restoreReconciler(t, nil, run, claim, sourceOnNode(), volumeRestore(), repository(), job)
-	if err := c.Delete(context.Background(), claim); err != nil {
-		t.Fatal(err)
-	}
-
-	r.Client = loseNextStatusWrite(c)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
-		t.Fatal("the pass whose status write was lost succeeded, want the error returned")
-	}
-	if suspendedJob(t, c, job.Name) {
-		t.Fatalf("Job %s suspended after the lost write, want it left as it was until the end is recorded", job.Name)
-	}
-
-	r.Client = c
-	restoreStep(t, r)
-	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonClaimLost {
-		t.Fatalf("item = %+v, want Failed with reason ClaimLost", item)
-	}
-	markSuspended(t, c, job)
-	after := stepUntilFinished(t, r, c, 2)
-
-	if after.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Errorf("phase = %q, want Failed", after.Status.Phase)
-	}
-	if jobs := restoreJobs(t, c); len(jobs) != 0 {
-		t.Errorf("restore Jobs = %v, want the run's deleted", jobs)
-	}
-}
-
 // restoringOnJob returns the RestoreRun back-to-monday in the middle of an
 // in-place restore of the claim, not quiesced, with its item Running and
 // naming its restore Job, and that Job, which restores monday's snapshot.

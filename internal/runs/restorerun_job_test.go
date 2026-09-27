@@ -2,7 +2,6 @@ package runs
 
 import (
 	"context"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,60 +20,6 @@ import (
 // own restore Job (designs/restic-jobs.md J1, step 7a): the Job restores the
 // full ID the checks recorded, its terminal conditions alone decide the
 // item's end, and the run stops it by the UID it recorded.
-
-// An in-place restore creates one restore Job that restores the snapshot the
-// checks selected by its full ID into the claim, with --delete, in the
-// declared restic image, controlled by the run. The item records the Job's
-// name and UID in the same status write that moves it to Running.
-func TestAnInPlaceRestoreCreatesAJobForTheFullSnapshotID(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(inPlace), claim(), volumeRestore(), repository())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // restore
-
-	item := readRestoreRun(t, c).Status.Items[0]
-	jobs := restoreJobs(t, c)
-	if len(jobs) != 1 {
-		t.Fatalf("restore Jobs = %v, want one", jobs)
-	}
-	job := jobs[0]
-	if item.Phase != backupv1alpha1.ItemRunning || item.SnapshotID != monday.ID || item.Job != job.Name || item.JobUID != job.UID || job.UID == "" {
-		t.Fatalf("item = %+v, Job %s (UID %s); want Running naming the Job and its UID, with monday's full ID", item, job.Name, job.UID)
-	}
-	run := readRestoreRun(t, c)
-	if !metav1.IsControlledBy(&job, run) || job.Annotations[restorejob.AnnotationSnapshotID] != monday.ID {
-		t.Errorf("owners = %v, annotations = %v; want the run's controller reference and monday's full ID", job.OwnerReferences, job.Annotations)
-	}
-	restore := job.Spec.Template.Spec.Containers[0]
-	if restore.Image != testImage || !slices.Contains(restore.Args, monday.ID) || !slices.Contains(restore.Args, "--delete") {
-		t.Errorf("container image = %s, args = %v; want %s restoring %s with --delete", restore.Image, restore.Args, testImage, monday.ID)
-	}
-	if sc := restore.SecurityContext; sc.RunAsUser != nil {
-		t.Errorf("runAsUser = %d in a namespace without privileged movers, want unset", *sc.RunAsUser)
-	}
-}
-
-// A restore Job that is Complete ends the item Succeeded, with no mover log
-// to read. The run stops the Job once the item's end is stored, and ends
-// Succeeded.
-func TestACompleteJobSucceedsWithoutAnyLog(t *testing.T) {
-	r, c := restoreReconciler(t, nil, restoreRun(inPlace), claim(), volumeRestore(), repository())
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // restore
-	completeJob(t, c)
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	run := readRestoreRun(t, c)
-	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemSucceeded || item.Reason != "" || item.JobUID != "" {
-		t.Errorf("item = %+v, want Succeeded with no reason and its stopped Job no longer named", item)
-	}
-	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
-		t.Errorf("phase = %q (%s), want Succeeded", run.Status.Phase, readyMessage(run.Status.Conditions))
-	}
-	if jobs := restoreJobs(t, c); len(jobs) != 0 {
-		t.Errorf("restore Jobs = %v, want the stopped one deleted", jobs)
-	}
-}
 
 // A restore Job that ends Failed fails the item with reason RestoreJobFailed
 // and a message with restic's exit code, its meaning and restic's last

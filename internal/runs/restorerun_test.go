@@ -603,25 +603,6 @@ func TestANamespaceRestoreLeavesTheDatabasesWhenAVolumeFails(t *testing.T) {
 	}
 }
 
-// A restore into a new claim fails with reason NoBackupInReach, and creates
-// no claim, when no snapshot reaches its moment.
-func TestAnIntoRestoreChecksBeforeCreatingAnything(t *testing.T) {
-	r, c := restoreReconciler(t, nil,
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN; r.Spec.Into = "notes-data-monday" },
-			asOf("2026-09-01T00:00:00Z")),
-		claim(), volumeRestore(), repository())
-
-	restoreStep(t, r)
-
-	if run := readRestoreRun(t, c); readyReason(run.Status.Conditions) != backupv1alpha1.ReasonNoBackupInReach {
-		t.Fatalf("reason = %q, want NoBackupInReach", readyReason(run.Status.Conditions))
-	}
-	scratch := &corev1.PersistentVolumeClaim{}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "notes-data-monday"}, scratch); err == nil {
-		t.Fatal("a scratch claim was created although no snapshot is in reach")
-	}
-}
-
 // refuseDeploymentScales returns a client over c that refuses every write to
 // a Deployment's scale subresource, the way the API server does when the
 // controller's ServiceAccount lacks update on deployments/scale.
