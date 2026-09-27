@@ -311,6 +311,9 @@ func TestParseRepositoryReadsEveryFormResticReads(t *testing.T) {
 		"s3:https://hostname:9999/foobar/":                        {Endpoint: "hostname:9999", Secure: true, Bucket: "foobar"},
 		"s3:http://hostname:9999/bucket/prefix/directory/":        {Endpoint: "hostname:9999", Secure: false, Bucket: "bucket", Prefix: "prefix/directory"},
 		"s3://rustfs.backup-system.svc:9000/prod-backup/app/data": {Endpoint: "rustfs.backup-system.svc:9000", Secure: true, Bucket: "prod-backup", Prefix: "app/data"},
+		// restic cuts at the first two "/" and cleans the rest with path.Clean
+		// (config.go:84-88 and createConfig), which keeps the leading "/".
+		"s3:host/bucket//a//b": {Endpoint: "host", Secure: true, Bucket: "bucket", Prefix: "/a/b"},
 	} {
 		got, err := ParseRepository(in)
 		if err != nil {
