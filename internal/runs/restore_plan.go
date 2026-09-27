@@ -49,7 +49,7 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 //
 // For a volume, the check selects the snapshot the restore would use and
 // records its full ID, its short ID and its time on the item (see
-// checkVolume and recordSnapshot). For a database, it selects the base
+// checkVolumeItem and recordSnapshot). For a database, it selects the base
 // backup the recovery would start from and records its ID (see
 // checkDatabase). plan marks an item with nothing in reach Failed with the
 // reason and the message of the refusal (see checkItems). If any item
@@ -62,7 +62,7 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 // BackupRun retimes its snapshot after the mover, so a snapshot selected
 // during a backup may be gone by the time the restore's mover starts. Before
 // it checks a volume, plan therefore looks for a backup of the claim or its
-// repository in progress (see volumeBackedUp), and while there is one it
+// repository in progress (see checkVolumeItem), and while there is one it
 // waits with reason SourceBusy and leaves the run unplanned (see
 // waitAtChecks), until spec.timeout from the run's creation ends it TimedOut.
 //
@@ -147,7 +147,7 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 // It returns the synced moment of a run with spec.syncDatabaseToVolume (see
 // syncedMoment), or nil when no volume selected a snapshot. It returns the
 // hold of the first volume whose claim or repository a backup in progress
-// holds (see volumeBackedUp), and then it checks no further item. It
+// holds (see checkVolumeItem), and then it checks no further item. It
 // returns a plain error when a check fails in a way a retry may fix.
 //
 // A synced run takes its databases' moment from the volumes' quiesced
@@ -189,20 +189,27 @@ func (r *RestoreRunReconciler) checkItems(ctx context.Context, run *backupv1alph
 //     of a run with spec.syncDatabaseToVolume.
 //
 // It returns the hold of a backup in progress of the claim or its
-// repository (see volumeBackedUp), and then it checks nothing. It returns
-// the synced moment after this volume (see syncedMoment), or synced as it
-// was when the run is not synced. It returns the refusal of checkVolume or
-// syncedMoment, which fails the item, and a plain error when a read fails.
+// repository (see otherMover), and then it checks nothing. It returns the
+// synced moment after this volume (see syncedMoment), or synced as it was
+// when the run is not synced. It returns the refusal of repositoryFor (the
+// claim or its VolumeRestore is missing), selectSnapshot or syncedMoment,
+// which fails the item, and a plain error when a read or the listing of the
+// repository fails.
 //
 // The snapshot is selected once no backup of the repository is in
-// progress, so after that backup's forget and retime.
+// progress, so after that backup's forget and retime. This is the only
+// place a missing snapshot is caught before anything is changed.
 func (r *RestoreRunReconciler) checkVolumeItem(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, at, synced *time.Time) (hold, *time.Time, error) {
-	busy, err := r.volumeBackedUp(ctx, run, item.Name)
+	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, item.Name, run.Spec.Repository, run.Spec.MoverSecurityContext)
+	if err != nil {
+		return hold{}, synced, err
+	}
+	busy, err := otherMover(ctx, r.Reader, run.Namespace, item.Name, settings.Secret, backupMover)
 	if err != nil || busy.held() {
 		return busy, synced, err
 	}
 	sync := run.Spec.SyncDatabaseToVolume
-	snapshot, err := r.checkVolume(ctx, run, item.Name, at, sync)
+	snapshot, err := r.selectSnapshot(ctx, run, settings.Secret, at, sync)
 	recordSnapshot(item, snapshot)
 	if err != nil || !sync {
 		return hold{}, synced, err

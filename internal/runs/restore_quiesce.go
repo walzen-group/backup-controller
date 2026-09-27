@@ -263,14 +263,14 @@ func (r *RestoreRunReconciler) precheckItems(ctx context.Context, run *backupv1a
 		if item.Kind != backupv1alpha1.ItemKindClaim || item.Phase != backupv1alpha1.ItemPending {
 			continue
 		}
-		_, err := r.startRefusal(ctx, run, item.Name)
+		settings, err := r.startRefusal(ctx, run, item.Name)
 		if failRestoreItem(item, err) {
 			continue
 		}
 		if err != nil {
 			return hold{}, err
 		}
-		held, err := r.backupHeldElsewhere(ctx, run, item.Name)
+		held, err := r.backupHeldElsewhere(ctx, run, item.Name, settings.Secret)
 		if failRestoreItem(item, nothingWrittenTo(item.Name, err)) {
 			continue
 		}
@@ -288,14 +288,12 @@ func (r *RestoreRunReconciler) precheckItems(ctx context.Context, run *backupv1a
 // the app down.
 //
 // Parameters:
-//   - run is the asking run; its namespace and UID are read. spec.repository
-//     and spec.moverSecurityContext are used the way repositoryFor uses them.
+//   - run is the asking run; its namespace and UID are read.
 //   - claimName names the claim the item restores.
+//   - secret names the repository Secret, from the settings startRefusal
+//     read for the item.
 //
-// A refusal from repositoryFor, for a claim or a VolumeRestore that is gone,
-// gives the zero hold. quiesce already failed such an item with startRefusal
-// just before, and restoreVolume fails an item that became one since. A
-// repository Secret that does not exist comes back as the refusal that
+// A repository Secret that does not exist comes back as the refusal that
 // leaseNamesFor gives, and quiesce fails the item with it (see
 // failRestoreItem) before it stops anything. Any other failed read comes
 // back as an error, and the pass retries with nothing stopped.
@@ -303,22 +301,12 @@ func (r *RestoreRunReconciler) precheckItems(ctx context.Context, run *backupv1a
 // The check is advisory. A run that starts its mover between this read and
 // the stop still goes first under the Leases and otherMover, which run right
 // before the mover object is written.
-func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (hold, error) {
-	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
-	if err != nil {
-		if _, refused := asItemFailure(err); refused {
-			return hold{}, nil
-		}
-		return hold{}, err
+func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName, secret string) (hold, error) {
+	backing, err := otherMover(ctx, r.Reader, run.Namespace, claimName, secret, backupMover)
+	if err != nil || backing.held() {
+		return backing, err
 	}
-	backing, err := otherMover(ctx, r.Reader, run.Namespace, claimName, settings.Secret, backupMover)
-	if err != nil {
-		return hold{}, err
-	}
-	if backing.held() {
-		return backing, nil
-	}
-	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, settings.Secret)
+	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, secret)
 }
 
 // restart gives the stopped workloads their replicas back, resumes the

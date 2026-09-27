@@ -19,50 +19,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// checkVolume finds the snapshot that a restore of the claim named claimName
-// would select.
-//
-// Parameters:
-//   - at is the moment to restore to, or nil for the newest snapshot.
-//   - quiescedOnly limits the choice to snapshots tagged quiesced. plan sets
-//     it on a run with spec.syncDatabaseToVolume.
-//
-// It returns the snapshot. When there is none, it returns the
-// *refusalError of selectSnapshot. When repositoryFor refuses the claim,
-// because the claim or its VolumeRestore is missing, it returns that
-// *refusalError. plan fails the item with a refusal (see failRestoreItem).
-// It returns a plain error when listing the repository fails, and when a
-// read fails for any other reason.
-//
-// This is the only place a missing snapshot is caught. VolSync restores
-// nothing and still reports success when no snapshot matches.
-func (r *RestoreRunReconciler) checkVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string, at *time.Time, quiescedOnly bool) (restic.Snapshot, error) {
-	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
-	if err != nil {
-		return restic.Snapshot{}, err
-	}
-	return r.selectSnapshot(ctx, run, settings.Secret, at, quiescedOnly)
-}
-
-// volumeBackedUp returns the hold from otherMover that names a backup in
-// progress of the claim named claimName, or of the repository it restores
-// from. It returns the zero hold when there is no such backup.
-//
-// It reads the repository the way checkVolume does. When repositoryFor
-// refuses the claim, it returns the zero hold, so that checkVolume returns
-// the refusal and plan fails the item with it. Any other failed read comes
-// back as an error.
-func (r *RestoreRunReconciler) volumeBackedUp(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (hold, error) {
-	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
-	if err != nil {
-		if _, refused := asItemFailure(err); refused {
-			return hold{}, nil
-		}
-		return hold{}, err
-	}
-	return otherMover(ctx, r.Reader, run.Namespace, claimName, settings.Secret, backupMover)
-}
-
 // selectSnapshot returns the snapshot the run would restore, picked from
 // restoreAsOf and previous.
 //

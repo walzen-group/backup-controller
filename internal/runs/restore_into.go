@@ -86,7 +86,15 @@ func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1al
 		return r.endInto(ctx, run, err)
 	}
 	if taken {
-		return r.takeOverInto(ctx, run, item)
+		// The Job is still suspended, because only a pass that recorded its
+		// UID resumes it. A claim of the spec.into name that the run did not
+		// create can be there in place of the claim of the lost pass: the
+		// item then fails with reason IntoClaimTaken, and the run stops the
+		// Job before it writes.
+		if done, err := settled(item, r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, kindClaim)); done {
+			return r.endInto(ctx, run, err)
+		}
+		return after(pollInterval, r.recordJob(ctx, run))
 	}
 	if deadline, over := r.overdue(run); over {
 		return r.timeOut(ctx, run, intoTimedOut(run.Spec.Into, deadline, run.Status.Conditions))
@@ -101,28 +109,6 @@ func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1al
 	return r.createInto(ctx, run, item, settings)
 }
 
-// takeOverInto records the restore Job that an into restore took over from
-// a pass that lost its status write.
-//
-// Parameters:
-//   - run is the RestoreRun.
-//   - item is its single item, which now records the Job's name and UID.
-//     takeOverInto updates it in place.
-//
-// It returns what the pass returns (see restoreIntoEmptyClaim).
-//
-// The Job is still suspended, because only a pass that recorded its UID
-// resumes it. A claim of the spec.into name that the run did not create
-// can be there in place of the claim of the lost pass. Then the item fails
-// with reason IntoClaimTaken (see intoTaken), and the run stops the Job
-// before it writes. Otherwise the status write records the Job.
-func (r *RestoreRunReconciler) takeOverInto(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (ctrl.Result, error) {
-	if done, err := settled(item, r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, kindClaim)); done {
-		return r.endInto(ctx, run, err)
-	}
-	return after(pollInterval, r.recordJob(ctx, run))
-}
-
 // intoChecks runs the checks an into restore makes right before it creates
 // anything, and takes the Leases.
 //
@@ -130,9 +116,10 @@ func (r *RestoreRunReconciler) takeOverInto(ctx context.Context, run *backupv1al
 //   - run is the RestoreRun, with no restore Job yet.
 //
 // It returns the repository and mover settings, and whether the run waits.
-// It returns true, with the run moved to Waiting with reason SourceBusy,
-// while a backup of the source claim or the repository is in progress (see
-// waitForBackup); the caller creates nothing in that pass. It returns a
+// It returns true, with the run moved to Waiting with reason SourceBusy and
+// a message naming the other run, while another run holds the Lease of the
+// source claim or the repository (see acquireLeases) or a backup of either
+// is in progress (see otherMover); the caller creates nothing in that pass. It returns a
 // *refusalError, which the caller fails the item with (see settled), for a
 // source claim, VolumeRestore or repository Secret that is gone, each
 // saying nothing was written to the claim spec.into names, and for a claim
@@ -159,8 +146,19 @@ func (r *RestoreRunReconciler) intoChecks(ctx context.Context, run *backupv1alph
 	if leased == "" {
 		leased = run.Spec.Into
 	}
-	waiting, err := r.waitForBackup(ctx, run, leased, settings.Secret)
-	return settings, waiting, nothingWrittenTo(run.Spec.Into, err)
+	// The Leases are taken first; otherMover then catches a backup whose
+	// mover object is written already.
+	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseRequest{
+		holder:    leaseHolder{kind: backupv1alpha1.KindRestoreRun, run: run, item: run.Status.Items[0].Name},
+		namespace: run.Namespace, claim: leased, secret: settings.Secret,
+	})
+	if err == nil && !busy.held() {
+		busy, err = otherMover(ctx, r.Reader, run.Namespace, leased, settings.Secret, backupMover)
+	}
+	if err != nil || !busy.held() {
+		return settings, false, nothingWrittenTo(run.Spec.Into, err)
+	}
+	return settings, true, r.waitFor(ctx, run, busy.readyReason(), busy.text)
 }
 
 // createInto lists the repository again, then creates an into restore's
@@ -489,43 +487,6 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 		return &claimLostError{claim: run.Spec.Into, loss: lossNotOwned, unstarted: unstarted}
 	}
 	return nil
-}
-
-// waitForBackup keeps an into restore from creating anything while a backup
-// of its claim or its repository is in progress.
-//
-// Parameters:
-//   - claim is the name of the claim the run takes a Lease on: the source
-//     claim, or the new claim for a restore from spec.repository alone.
-//   - secret is the name of the repository Secret.
-//
-// The run calls it right before it creates its first object. It first takes
-// the Leases of the claim and the repository for the run's item (see
-// acquireLeases), then looks for a backup's mover object (see otherMover),
-// which catches a backup started before the controller took Leases.
-//
-// It returns true when the run has to wait. It has then moved the run to
-// Waiting with reason SourceBusy and a message naming the run that holds a
-// Lease or the BackupRun. A repository Secret that does not exist comes back
-// as the refusal acquireLeases gives, and the caller ends the run. A failed
-// read, write or status write comes back as an error, which the caller
-// retries.
-func (r *RestoreRunReconciler) waitForBackup(ctx context.Context, run *backupv1alpha1.RestoreRun, claim, secret string) (bool, error) {
-	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseRequest{
-		holder:    leaseHolder{kind: backupv1alpha1.KindRestoreRun, run: run, item: run.Status.Items[0].Name},
-		namespace: run.Namespace, claim: claim, secret: secret,
-	})
-	if err != nil {
-		return false, err
-	}
-	if busy.held() {
-		return true, r.waitFor(ctx, run, busy.readyReason(), busy.text)
-	}
-	backing, err := otherMover(ctx, r.Reader, run.Namespace, claim, secret, backupMover)
-	if err != nil || !backing.held() {
-		return false, err
-	}
-	return true, r.waitFor(ctx, run, backing.readyReason(), backing.text)
 }
 
 // notCreatedByRun refuses an object named spec.into that the run does not
