@@ -13,6 +13,12 @@
 # and the step that removes it (nolintlint enforces the form).
 version: "2"
 run:
+  # The envtest and e2e suites are linted with the rest, so make lint and
+  # CI's golangci-lint step, which both run golangci-lint with no flags,
+  # cover every file those tags build. The demo file (e2e && demo) is not.
+  build-tags:
+    - envtest
+    - e2e
   relative-path-mode: gitroot
 linters:
   default: standard

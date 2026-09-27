@@ -245,8 +245,9 @@ spec:
 			return true, "succeeded", nil
 		case corev1.PodFailed:
 			return false, "failed", fmt.Errorf("the reader failed")
+		default:
+			return false, string(pod.Status.Phase), nil
 		}
-		return false, string(pod.Status.Phase), nil
 	}, evidence)
 	out, err := kubectlQuick(ns.Name, "logs", "reader")
 	if err != nil || strings.TrimSpace(out) != "restored" {

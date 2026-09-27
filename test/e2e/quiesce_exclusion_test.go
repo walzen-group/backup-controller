@@ -434,11 +434,13 @@ spec:
 		if quiesceLeaseHolder(t, ns.Name) != "BackupRun second" {
 			return nil
 		}
+		// A failed read of the restore proves nothing, so only a read that
+		// shows the restart not yet recorded fails the poll.
 		restore, err := readRestoreRun(t, ns.Name, "restore")
-		if err != nil || restore == nil || restore.Status.RestartedAt != nil {
-			return nil
+		if err == nil && restore != nil && restore.Status.RestartedAt == nil {
+			return fmt.Errorf("the second BackupRun holds the quiesce Lease while the restore has not given the app back (phase %s)", restore.Status.Phase)
 		}
-		return fmt.Errorf("the second BackupRun holds the quiesce Lease while the restore has not given the app back (phase %s)", restore.Status.Phase)
+		return nil
 	}
 	waited := false
 	waitFor(t, "the second BackupRun to report the restore's wait", 3*time.Minute, 2*time.Second, func() (bool, string, error) {

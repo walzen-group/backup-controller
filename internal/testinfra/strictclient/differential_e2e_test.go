@@ -123,13 +123,13 @@ func strictClient() client.Client {
 
 func TestDifferentialAgainstCluster(t *testing.T) {
 	ctx := context.Background()
-	real := realClient(t)
+	server := realClient(t)
 	ns := "strictclient-diff-" + rand.String(5)
-	if err := real.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+	if err := server.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = real.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		_ = server.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 	})
 
 	for _, tc := range diffCases() {
@@ -139,9 +139,9 @@ func TestDifferentialAgainstCluster(t *testing.T) {
 			if tc.settle != nil {
 				maps.Copy(want, tc.settle(t, strict, ns))
 			}
-			got := tc.setup(t, real, ns)
+			got := tc.setup(t, server, ns)
 			if tc.settle != nil {
-				maps.Copy(got, settleReal(t, tc, real, ns))
+				maps.Copy(got, settleReal(t, tc, server, ns))
 			}
 			for _, k := range slices.Sorted(maps.Keys(merge(want, got))) {
 				if want[k] != got[k] {
@@ -306,7 +306,7 @@ func generationCases[T client.Object](kind string, build func(ns, name string) T
 
 func waitGone(t *testing.T, c client.Client, obj client.Object) {
 	t.Helper()
-	for i := 0; i < 60; i++ {
+	for range 60 {
 		err := c.Get(context.Background(), client.ObjectKeyFromObject(obj), obj)
 		if apierrors.IsNotFound(err) {
 			return
@@ -352,7 +352,7 @@ func deleteCases() []diffCase {
 		return owner
 	}
 	state := func(prefix string) func(t *testing.T, c client.Client, ns string) obs {
-		return func(t *testing.T, c client.Client, ns string) obs {
+		return func(_ *testing.T, c client.Client, ns string) obs {
 			o := obs{}
 			for _, n := range []string{"owner", "blocking", "plain"} {
 				o[n] = objExists(ctx, c, configMap(ns, prefix+"-"+n))
@@ -360,7 +360,7 @@ func deleteCases() []diffCase {
 			return o
 		}
 	}
-	release := func(t *testing.T, c client.Client, ns, name string) {
+	release := func(_ *testing.T, c client.Client, ns, name string) {
 		cm := configMap(ns, name)
 		if err := c.Get(ctx, client.ObjectKeyFromObject(cm), cm); err == nil {
 			cm.Finalizers = nil
@@ -408,7 +408,7 @@ func deleteCases() []diffCase {
 				t.Cleanup(func() { _ = c.Delete(ctx, pod, client.GracePeriodSeconds(0)) })
 				return obs{"delete": errReason(c.Delete(ctx, j))}
 			},
-			settle: func(t *testing.T, c client.Client, ns string) obs {
+			settle: func(_ *testing.T, c client.Client, ns string) obs {
 				return obs{
 					"job": objExists(ctx, c, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "orphaning"}}),
 					"pod": objExists(ctx, c, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "orphaning-pod"}}),
