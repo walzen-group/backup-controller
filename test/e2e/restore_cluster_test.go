@@ -231,7 +231,9 @@ func prodPostgresImage(t *testing.T) string {
 // hack/e2e/flux/flux.sh check does, and points an OCIRepository and a
 // Kustomization at it. It gives the Cluster an ObjectStore and marks it
 // backup.wlz.li/enabled, writes a row into it, and takes a base backup with a
-// BackupRun on spec.database.
+// BackupRun on spec.database. Before the backup, it creates a second Cluster
+// that would archive into the same bucket and prefix through another
+// ObjectStore, and checks that the bootstrap webhook refuses it.
 //
 // A RestoreRun on spec.database then deletes the Cluster and waits for its
 // owner to create it again. Flux creates it, the bootstrap webhook recovers it
@@ -263,6 +265,12 @@ func TestARecoveredClusterSurvivesAFluxReconcile(t *testing.T) {
 		// row is the row the test writes before the base backup and reads
 		// back from the recovered database.
 		row = "written before the restore"
+
+		// twinName is the second Cluster the webhook has to refuse, and
+		// twinStore the ObjectStore it archives through: another name, the
+		// same destination.
+		twinName  = "pg-twin"
+		twinStore = "store-twin"
 	)
 	prefix := cnpgBucket + "/" + ns.Name
 	evidence := func() string {
@@ -323,7 +331,20 @@ spec:
     s3Credentials:
       accessKeyId: {name: %[2]s, key: AWS_ACCESS_KEY_ID}
       secretAccessKey: {name: %[2]s, key: AWS_SECRET_ACCESS_KEY}
-`, ns.Name, s3Secret, accessKey, secretKey, storeName, cnpgBucket, rustfsInCluster))
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: %[8]s
+  namespace: %[1]s
+spec:
+  configuration:
+    destinationPath: s3://%[6]s/%[1]s
+    endpointURL: %[7]s
+    s3Credentials:
+      accessKeyId: {name: %[2]s, key: AWS_ACCESS_KEY_ID}
+      secretAccessKey: {name: %[2]s, key: AWS_SECRET_ACCESS_KEY}
+`, ns.Name, s3Secret, accessKey, secretKey, storeName, cnpgBucket, rustfsInCluster, twinStore))
 
 	// The Cluster Flux applies. spec.bootstrap.initdb is there on purpose:
 	// prod's source holds initdb, so every reconcile of a recovered Cluster
@@ -453,6 +474,47 @@ spec:
 		t.Fatalf("before the restore, Cluster %s spec.bootstrap = %v, want initdb alone\n%s", clusterName, applied.Spec.Bootstrap, evidence())
 	}
 	t.Logf("Cluster %s (UID %s) runs on its own initdb, Flux applied it; the webhook has not recovered it", clusterName, applied.Metadata.UID)
+
+	// Two databases never archive into one prefix. A second Cluster that
+	// names another ObjectStore with the same destination, and serverName
+	// pg, would archive into the prefix of the running Cluster, so the
+	// webhook refuses its create (sharedArchive). twinStore was created with
+	// the first ObjectStore, long before this create.
+	twin := fmt.Sprintf(`apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: %[1]s
+  namespace: %[2]s
+spec:
+  instances: 1
+  imageName: %[3]s
+  storage:
+    storageClass: standard
+    size: 512Mi
+  bootstrap:
+    initdb: {}
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: %[4]s
+        serverName: %[5]s
+`, twinName, ns.Name, prodPostgresImage(t), twinStore, clusterName)
+	twinCtx, twinCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	_, err := kubectl(twinCtx, twin, "apply", "-f", "-")
+	twinCancel()
+	if err == nil {
+		t.Fatalf("the API server created Cluster %s, which archives to s3://%s/%s/%s like Cluster %s\n%s",
+			twinName, cnpgBucket, ns.Name, clusterName, clusterName, evidence())
+	}
+	if !strings.Contains(err.Error(), `admission webhook "bootstrap.backup.wlz.li"`) {
+		t.Fatalf("the create of Cluster %s failed, but the bootstrap webhook did not refuse it: %v", twinName, err)
+	}
+	out := mustKubectl(t, "", "-n", ns.Name, "get", "clusters.postgresql.cnpg.io", twinName, "--ignore-not-found", "-o", "name")
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("Cluster %s exists after the webhook refused it: %s", twinName, out)
+	}
+	t.Logf("the webhook refused Cluster %s, which would archive into the prefix of Cluster %s", twinName, clusterName)
 
 	// A row written before the base backup, so the recovered database can be
 	// read back for it.
