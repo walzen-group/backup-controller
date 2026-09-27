@@ -1,9 +1,9 @@
 # API
 
-Three kinds, all `backup.wlz.li/v1alpha1` and namespaced. The annotations a
-namespace declares its backups with are in
-[namespace-backups.md](namespace-backups.md), and which restore to reach for is
-in [restores.md](restores.md).
+The API has three kinds. All three are `backup.wlz.li/v1alpha1` and
+namespaced. [namespace-backups.md](namespace-backups.md) lists the annotations
+that a namespace uses to declare its backups.
+[restores.md](restores.md) tells which restore to use.
 
 | Kind | Short name | Is |
 | --- | --- | --- |
@@ -11,9 +11,9 @@ in [restores.md](restores.md).
 | BackupRun | `brun` | one backup now, of a volume, a database or the namespace, and the record of every scheduled one |
 | RestoreRun | `rrun` | one restore, of a volume, a database or the namespace, to the newest backup or a chosen moment |
 
-The group matches the convention kuport set with `kuport.wlz.li`. v0.1.0 shipped
-the VolumeRestore CRD under that group, so changing the group or a kind now
-changes every claim in the infrastructure repository with it.
+The group follows the convention that kuport set with `kuport.wlz.li`. v0.1.0
+shipped the VolumeRestore CRD under that group. A change to the group or to a
+kind now changes every claim in the infrastructure repository with it.
 
 ## VolumeRestore
 
@@ -54,22 +54,22 @@ spec:
     fsGroup: 26
 ```
 
-The populator reads it when a claim naming it is created, and every BackupRun
-and RestoreRun reads it for the claim it belongs to. A claim with no
-`dataSourceRef`, bound to a volume by name, is described by the VolumeRestore
-carrying the claim's own name.
+The populator reads the VolumeRestore when someone creates a claim that names
+it. Every BackupRun and RestoreRun reads it for the claim it belongs to. A claim
+with no `dataSourceRef` binds to a volume by name. The VolumeRestore with the
+claim's own name describes that claim.
 
 | Field | Required | Reaches |
 | --- | --- | --- |
-| `repository` | yes | `spec.restic.repository` of the claim's ReplicationSource, and the Secret every restore Job for the claim reads its environment from; the populator copies the Secret into its own namespace first |
-| `restoreAsOf` | no | the moment the populator selects its snapshot by, unless the claim carries `backup.wlz.li/restore-as-of`, which wins |
+| `repository` | yes | `spec.restic.repository` of the claim's ReplicationSource. It is also the Secret that every restore Job for the claim reads its environment from. The populator first copies the Secret into its own namespace |
+| `restoreAsOf` | no | the moment the populator uses to select its snapshot. If the claim carries `backup.wlz.li/restore-as-of`, the annotation wins |
 | `cacheStorageClassName` | no | `cacheStorageClassName` of the ReplicationSource and the source's clone class, and the class of each restore Job's ephemeral cache volume |
-| `cacheCapacity` | no | `cacheCapacity` of the claim's ReplicationSource, and the size of the cache volume of the populator's restore Job and of the Job of a RestoreRun that names the claim in `claim`; unset, 1Gi |
-| `moverPodLabels` | no | labels on the pod of every restore Job for the claim; the controller's own labels win over a key they share. A source carries none, because its run was admitted as a whole |
+| `cacheCapacity` | no | `cacheCapacity` of the claim's ReplicationSource. It is also the size of the cache volume of the populator's restore Job, and of the Job of a RestoreRun that names the claim in `claim`. Unset, it is 1Gi |
+| `moverPodLabels` | no | labels on the pod of every restore Job for the claim. The controller's own labels win over a key they share. A source carries none, because Kueue admitted its run as a whole |
 | `moverSecurityContext` | no | `moverSecurityContext` of the ReplicationSource, and the pod `securityContext` of every restore Job for the claim. The [admission policy](packaging.md#admission-policy-on-the-restore-jobs) refuses a restore Job whose pod security context sets sysctls, SELinux options or an unconfined seccomp or AppArmor profile |
 
-Add a field only when a setting of the backup mover or the restore Job has to
-be reachable from a claim, and name it after the VolSync field it matches.
+Add a field only when a claim must reach a setting of the backup mover or the
+restore Job. Name the field after the VolSync field it matches.
 
 ### Status
 
@@ -89,48 +89,60 @@ status:
 
 | Field | Holds |
 | --- | --- |
-| `conditions[type=Ready]` | False while any claim naming this object is being filled, True when none is |
-| `claims[]` | one entry per claim currently being filled from this object, with the phase, Restoring or Failed, and when it started |
+| `conditions[type=Ready]` | False while the populator fills any claim that names this object. True when it fills none |
+| `claims[]` | one entry for each claim that the populator fills from this object now. The entry holds the phase, Restoring or Failed, and the time the fill started |
 
-A finished fill leaves no entry. What a reader wants from the status is whether
-something is happening now and where to look.
+A finished fill leaves no entry. A reader wants two things from the status:
+whether something happens now, and where to look.
 
 | Ready reason | When |
 | --- | --- |
-| Restoring | claims are being filled and none of them has failed; the message lists the restore Job `restore-<claim uid>` of every claim in `status.claims`, in that order, with the short ID of the snapshot it restores and, while the Job's newest pod waits, why, then the controller's namespace: `waiting for restore Jobs restore-<uid> (snapshot 6e473100), restore-<uid> (snapshot 2edf5bab; waiting: restore: ImagePullBackOff: "...") in backup-system` |
-| RestoreFailed | a claim's restore Job failed; the message is `claim <name>: ` followed by `the restore Job failed (<condition reason>): restic exited <code> (<meaning>) in container <unlock or restore>: "<restic's last lines>"` |
-| RestoreJobRefused | the API server refused to create or resume a claim's restore Job with 403 Forbidden or 422 Invalid, such as the admission policy refusing the VolumeRestore's `moverSecurityContext`; the message is `claim <name>: ` followed by the API server's answer. The claim stays Pending, and every sync tries again |
-| NoBackupInReach | the moment the claim's `backup.wlz.li/restore-as-of` or `spec.restoreAsOf` asks for is older than every snapshot, or the repository holds snapshots and none has the layout a VolSync mover writes (host `volsync`, paths exactly `[/data]`); the message is `claim <name>: ` followed by the reason, which names where the moment came from or the snapshots it passed over. The claim stays Pending, and the controller creates no restore Job |
-| Restored | no claim is being filled |
+| Restoring | the populator fills claims, and none of them failed. The message lists the restore Job `restore-<claim uid>` of every claim in `status.claims`, in that order. Each Job has the short ID of the snapshot it restores and, while the Job's newest pod waits, the reason. The controller's namespace comes last: `waiting for restore Jobs restore-<uid> (snapshot 6e473100), restore-<uid> (snapshot 2edf5bab; waiting: restore: ImagePullBackOff: "...") in backup-system` |
+| RestoreFailed | a claim's restore Job failed. The message is `claim <name>: ` and then `the restore Job failed (<condition reason>): restic exited <code> (<meaning>) in container <unlock or restore>: "<restic's last lines>"` |
+| RestoreJobRefused | the API server refused to create or resume a claim's restore Job with 403 Forbidden or 422 Invalid. An example is the admission policy that refuses the VolumeRestore's `moverSecurityContext`. The message is `claim <name>: ` and then the API server's answer. The claim stays Pending, and every sync tries again |
+| NoBackupInReach | one of two conditions is true. The moment that the claim's `backup.wlz.li/restore-as-of` or `spec.restoreAsOf` asks for is older than every snapshot. Or the repository holds snapshots and none has the layout a VolSync mover writes (host `volsync`, paths exactly `[/data]`). The message is `claim <name>: ` and then the reason. The reason names where the moment came from or the snapshots it passed over. The claim stays Pending, and the controller creates no restore Job |
+| Restored | the populator fills no claim |
 
-The populator sets Ready from every entry in `status.claims`, so all the claims
-that fill from one VolumeRestore report the same condition. While any entry is
-Failed, a pass for another claim leaves Ready as it is. A RestoreFailed or
-NoBackupInReach therefore stays on the VolumeRestore while its other claims
-restore or finish. After a RestoreFailed the populator stops the failed Job,
-and once it is gone selects the snapshot again and creates a new Job, and the
-claim's entry goes back to Restoring. A repository that keeps failing, such as
-one behind an S3 outage, is retried that way until it answers, and the claim
-stays Pending all along.
+The populator sets Ready from every entry in `status.claims`. Thus all the
+claims that fill from one VolumeRestore report the same condition. While any
+entry is Failed, a pass for another claim leaves Ready as it is. A
+RestoreFailed or NoBackupInReach therefore stays on the VolumeRestore while its
+other claims restore or finish.
 
-While any claim is listed in `status.claims`, the VolumeRestore carries the
-finalizer `backup.wlz.li/volume-populator`. The library calls the populator for
-a claim only once the claim's prime claim, `prime-<uid>` in the controller's
-namespace, is bound. On that first call the populator adds the finalizer,
-before it copies the Secret or creates the restore Job, and it removes the
-finalizer once `status.claims` is empty. A VolumeRestore deleted mid-restore
-therefore stays Terminating until its claims finish or are deleted. Each
-claim's cleanup stops that claim's restore Job, waits until no pod of it can
-still write, and deletes the Secret copy, and the cleanup that empties
-`status.claims` removes the finalizer, which lets the deletion finish. A VolumeRestore that is already being deleted without the
+After a RestoreFailed, the populator does these steps:
+
+1. It stops the failed Job.
+2. When the Job is gone, it selects the snapshot again and creates a new Job.
+3. The claim's entry goes back to Restoring.
+
+The populator retries a repository that continues to fail in that way until the
+repository answers. An example is a repository behind an S3 outage. The claim
+stays Pending all the time.
+
+While `status.claims` lists any claim, the VolumeRestore carries the finalizer
+`backup.wlz.li/volume-populator`. The library calls the populator for a claim
+only when the claim's prime claim, `prime-<uid>` in the controller's namespace,
+is bound. On that first call, the populator adds the finalizer before it copies
+the Secret or creates the restore Job. It removes the finalizer when
+`status.claims` is empty. Thus a VolumeRestore that someone deletes during a
+restore stays Terminating until its claims finish or someone deletes them.
+
+The cleanup of each claim does three things:
+
+1. It stops that claim's restore Job.
+2. It waits until no pod of the Job can still write.
+3. It deletes the Secret copy.
+
+The cleanup that empties `status.claims` removes the finalizer, and then the
+deletion can finish. A VolumeRestore that is already in deletion without the
 finalizer starts no new restore.
 
 Until the prime claim binds, the VolumeRestore carries no finalizer, and a
-delete removes it at once. The library looks a claim's VolumeRestore up before
-it cleans up after the claim, and it stops when the VolumeRestore is gone. A
-claim deleted after its VolumeRestore would then keep the library's finalizer
-`backup.wlz.li/populate-target-protection` and stay Terminating. The
-controller's orphan reconciler releases such a claim;
+delete removes it immediately. Before the library cleans up after a claim, it
+gets the claim's VolumeRestore. If the VolumeRestore is gone, the library
+stops. A claim that someone deletes after its VolumeRestore then keeps the
+library's finalizer `backup.wlz.li/populate-target-protection` and stays
+Terminating. The controller's orphan reconciler releases such a claim.
 [architecture.md](architecture.md#a-claim-whose-volumerestore-is-gone) lists its
 steps and the events it records on the claim.
 
@@ -139,9 +151,9 @@ steps and the events it records on the claim.
 | Rule | Why |
 | --- | --- |
 | `repository` is a required, non-empty DNS-1123 name | a missing repository leaves claims Pending with nothing to read |
-| `restoreAsOf` is an RFC 3339 date-time when present | the populator would otherwise refuse it later, on each claim, with NoBackupInReach |
-| `cacheStorageClassName` is a non-empty name of at most 253 characters when present | an empty string is a class name no provisioner answers, and the cache claim of the mover or the restore Job stays Pending |
-| `moverPodLabels` holds at most 8 entries, each with label syntax | the API server installs the label rules only for a map whose size is declared |
+| `restoreAsOf` is an RFC 3339 date-time when present | otherwise the populator refuses it later, on each claim, with NoBackupInReach |
+| `cacheStorageClassName` is a non-empty name of at most 253 characters when present | an empty string is a class name that no provisioner answers, and the cache claim of the mover or the restore Job stays Pending |
+| `moverPodLabels` holds at most 8 entries, each with label syntax | the API server installs the label rules only for a map with a declared size |
 
 ## BackupRun
 
@@ -157,70 +169,70 @@ spec:
 
 | Field | Required | Holds |
 | --- | --- | --- |
-| `source` | one of the three | the claim to back up, which has to carry `backup.wlz.li/enabled: "true"`; its ReplicationSource has the same name |
+| `source` | one of the three | the claim to back up. The claim must carry `backup.wlz.li/enabled: "true"`. Its ReplicationSource has the same name |
 | `database` | one of the three | the CloudNativePG Cluster to take a base backup of |
-| `all` | one of the three | every enabled claim and Cluster in the namespace, with the workloads marked `backup.wlz.li/quiesce` stopped until the clones are cut, one run at a time in the namespace, and for at most the namespace's `backup.wlz.li/max-quiesce`, ten minutes by default |
-| `timeout` | no | how long the run may work once admitted, e.g. `10h`. Omitted, the namespace's `backup.wlz.li/timeout`, and 6h without one |
+| `all` | one of the three | every enabled claim and Cluster in the namespace. The run stops the workloads marked `backup.wlz.li/quiesce` until it cuts the clones. Only one run at a time in the namespace stops its workloads. The stop lasts at most the namespace's `backup.wlz.li/max-quiesce`, ten minutes by default |
+| `timeout` | no | how long the run may work after admission, e.g. `10h`. Omitted, the namespace's `backup.wlz.li/timeout`, and 6h without one |
 | `ttlSecondsAfterFinished` | no | delete the run that long after it finishes. Omitted, it stays as the record |
 
 A CEL rule on the CRD accepts exactly one of `source`, `database` and `all`. A
-scheduled run is an ordinary BackupRun named `scheduled-<yyyymmdd-hhmm>` with
-`all: true` and a 30-day TTL.
+scheduled run is an ordinary BackupRun with the name
+`scheduled-<yyyymmdd-hhmm>`, `all: true` and a 30-day TTL.
 
 | Status field | Holds |
 | --- | --- |
-| `phase` | Queued, Running, Waiting, Succeeded or Failed; the column `kubectl get brun` prints |
-| `workload` | the Kueue Workload admitting the run, while it exists |
+| `phase` | Queued, Running, Waiting, Succeeded or Failed. `kubectl get brun` prints it as a column |
+| `workload` | the Kueue Workload that admits the run, while it exists |
 | `startedAt`, `completedAt` | when Kueue admitted the run, and when it finished |
 | `quiescedAt`, `restartedAt` | when the run stopped and restarted the quiesced workloads, in whole seconds |
-| `restartPending` | true from the moment the run records `restartedAt` until it has given every workload its replicas back and resumed every Kustomization; a pass that finds it set repeats the restart and keeps the recorded `restartedAt`. Once `restartedAt` is set and this field is false, the run never restarts the workloads again |
-| `quiesced[]` | the workloads the run stops, each with the replica count it had before the run touched it, which the run gives back |
-| `suspendedKustomizations[]` | the Flux Kustomizations the run suspends, as namespace/name; it resumes exactly these |
-| `items[]` | one per volume and database: kind, name, phase, message, the manual `trigger`, the restic snapshot's short ID in `snapshot`, its full ID in `snapshotID` and its `snapshotTime`, `empty` for a volume with no files, `noSnapshotListedAt` while an empty volume waits for its second listing, the CloudNativePG `backup`, the item's `reason`, and `lastStartError` |
-| `ending` | the Ready reason and message the run ends with, recorded in the status write that decides to end it, such as a timeout; every later pass, one that retries a restart included, ends the run with them |
-| `conditions[type=Ready]` | the reason and message, kstatus-compatible, so a Flux Kustomization with `wait: true` can gate on the run |
+| `restartPending` | true from the moment the run records `restartedAt`. It stays true until the run gives every workload its replicas back and resumes every Kustomization. A pass that finds it set repeats the restart and keeps the recorded `restartedAt`. When `restartedAt` is set and this field is false, the run never restarts the workloads again |
+| `quiesced[]` | the workloads the run stops. Each has the replica count it had before the run touched it, which the run gives back |
+| `suspendedKustomizations[]` | the Flux Kustomizations the run suspends, as namespace/name. The run resumes exactly these |
+| `items[]` | one for each volume and database. Each item holds these fields: kind, name, phase, message, the manual `trigger`, the restic snapshot's short ID in `snapshot`, its full ID in `snapshotID` and its `snapshotTime`. It also holds `empty` for a volume with no files, `noSnapshotListedAt` while an empty volume waits for its second listing, the CloudNativePG `backup`, the item's `reason`, and `lastStartError` |
+| `ending` | the Ready reason and message the run ends with. The status write that decides to end the run records them, for example after a timeout. Every later pass ends the run with them, also a pass that retries a restart |
+| `conditions[type=Ready]` | the reason and message, kstatus-compatible. A Flux Kustomization with `wait: true` can thus gate on the run |
 
 The run writes `quiesced[]` and `suspendedKustomizations[]` as its plan, before
-it suspends or scales anything, so both lists can name a workload that is still
-running for the length of one pass. When a stop fails partway, the run cuts both
-lists down to what is in effect, the workloads standing at zero replicas and the
-Kustomizations that are suspended, and then gives those back. Which
-Kustomizations a run suspends at all is in
-[namespace-backups.md](namespace-backups.md#which-kustomization-a-run-suspends).
+it suspends or scales anything. Thus for the length of one pass, both lists can
+name a workload that still runs. If a stop fails partway, the run cuts both
+lists to what is in effect. These are the workloads at zero replicas and the
+suspended Kustomizations. The run then gives those back.
+[namespace-backups.md](namespace-backups.md#which-kustomization-a-run-suspends)
+tells which Kustomizations a run suspends.
 
-The run finds each volume's snapshot in the repository: the newest snapshot a
-VolSync mover wrote (host `volsync`, paths exactly `[/data]`, no original)
-whose time lies in the window of the sync that completed the run's trigger.
-[namespace-backups.md](namespace-backups.md#what-a-run-with-all-set-does) has
-the window. A run that stopped workloads rewrites that snapshot to its
-`restartedAt` and tags it `quiesced`, so `items[].snapshot` and `snapshotID`
-name the rewritten snapshot and `snapshotTime` equals `restartedAt`. Without
-stopped workloads, `snapshotTime` is the time restic stamped when it started
-reading the clone.
+The run finds the snapshot of each volume in the repository. It is the newest
+snapshot that a VolSync mover wrote (host `volsync`, paths exactly `[/data]`,
+no original) with a time in the window of the sync that completed the run's
+trigger. [namespace-backups.md](namespace-backups.md#what-a-run-with-all-set-does)
+gives the window. A run that stopped workloads rewrites that snapshot to its
+`restartedAt` and tags it `quiesced`. Then `items[].snapshot` and `snapshotID`
+name the rewritten snapshot, and `snapshotTime` equals `restartedAt`. Without
+stopped workloads, `snapshotTime` is the time that restic stamped when it
+started to read the clone.
 [namespace-backups.md](namespace-backups.md#quiesced-snapshots) shows a run
-doing it.
+that does this.
 
 `items[].lastStartError` holds the error of the item's last failed start while
-the item stays Pending and the run tries again; a start that succeeds clears
-it, and the run adds it to the item's message when it gives the item up.
+the item stays Pending and the run tries again. A start that succeeds clears
+it. When the run gives the item up, it adds the error to the item's message.
 `items[].noSnapshotListedAt` is when the run first listed the repository after
-the sync completed and found no snapshot of it. An S3 listing can lag a write,
-so the item succeeds with `empty: true` only when a second listing, at least 11
-seconds later, finds none either.
+the sync completed and found no snapshot of it. An S3 listing can lag a write.
+Thus the item succeeds with `empty: true` only when a second listing, at least
+11 seconds later, also finds none.
 
 ### Item reasons
 
 `items[].reason`, on a BackupRun and on a RestoreRun, is a one-word cause for
-the item's phase, for display and alerting. The item's message says the same
-in a sentence. The CRD declares no enum, so a release can add a reason; an
-item that ended by a path that records none leaves it empty
+the item's phase, for display and alerts. The item's message says the same in
+a sentence. The CRD declares no enum, thus a release can add a reason. An item
+that ended by a path that records no reason leaves it empty
 (internal/api/v1alpha1/itemreason.go).
 
 | Reason | Kind | Item |
 | --- | --- | --- |
 | TimedOut | both | the run's timeout ran out before the item finished |
-| MoverFailed | BackupRun | VolSync's backup mover reported the result Failed; the message is `Mover logs: ` and the logs as VolSync kept them |
-| NoMoverSnapshot | BackupRun | the sync completed, but the ReplicationSource status lacks `lastSyncTime` or `lastSyncDuration`, or records a negative duration, so the run can't tell which snapshot in the repository the sync wrote |
+| MoverFailed | BackupRun | VolSync's backup mover reported the result Failed. The message is `Mover logs: ` and the logs as VolSync kept them |
+| NoMoverSnapshot | BackupRun | the sync completed, but the ReplicationSource status has no `lastSyncTime` or `lastSyncDuration`, or records a negative duration. Thus the run cannot tell which snapshot in the repository the sync wrote |
 | ClaimMissing | both | the claim does not exist when the run checks or starts the item |
 | ClaimNotBound | BackupRun | the claim is not bound to a volume yet, so there is no node to place the mover on |
 | VolumeMissing | BackupRun | the claim is bound to a PersistentVolume that does not exist |
@@ -230,43 +242,47 @@ item that ended by a path that records none leaves it empty
 | SettingsInvalid | BackupRun | a retention annotation on the claim, or a setting on the namespace, does not parse |
 | SourceNotManaged | BackupRun | the claim has a ReplicationSource the controller did not write |
 | SourceRefused | BackupRun | the API server refused the ReplicationSource as invalid |
-| SourceAbandoned | BackupRun | the ReplicationSource is still retrying a backup no run waits for |
+| SourceAbandoned | BackupRun | the ReplicationSource still retries a backup that no run waits for |
 | ClusterMissing | BackupRun | the Cluster does not exist when the run starts the item |
 | ClusterHibernated | BackupRun | the run skipped a hibernated Cluster |
 | BackupRefused | BackupRun | the API server refused the CloudNativePG Backup as invalid |
-| RestoreJobFailed | RestoreRun | the restore Job ended with `Failed=True`, and the message carries restic's exit code and what it means; or the run's own Job restores another snapshot than the run selected, or the run no longer controls it |
-| RestoreJobDeleted | RestoreRun | the restore Job was deleted before it finished, or its name now holds a Job with another UID; the run records no result from it and gives nothing back until no pod of it can still write |
-| RestoreJobRefused | RestoreRun | the run created no restore Job, or it never ran: the API server refused the create or the resume as Forbidden or Invalid, the Job's spec could not be built, or a Job the run did not create holds its name. Nothing was written to the claim |
-| SnapshotChanged | RestoreRun | the selected snapshot was no longer in the repository when the run listed it again right before it created the Job |
-| ClaimLost | RestoreRun | the claim stopped being the run's while the restore ran: deleted, replaced, or taken by something else |
-| ClaimDeleting | RestoreRun | the claim was being deleted when the run would start the restore |
+| RestoreJobFailed | RestoreRun | the restore Job ended with `Failed=True`, and the message carries restic's exit code and its meaning. The reason also applies in two other cases. The run's own Job restores a snapshot other than the one the run selected, or the run no longer controls the Job |
+| RestoreJobDeleted | RestoreRun | someone deleted the restore Job before it finished, or its name now holds a Job with another UID. The run records no result from it. The run gives nothing back until no pod of the Job can still write |
+| RestoreJobRefused | RestoreRun | the run created no restore Job, or the Job never ran. The API server refused the create or the resume as Forbidden or Invalid. Or the controller could not build the Job's spec. Or a Job that the run did not create holds its name. The run wrote nothing to the claim |
+| SnapshotChanged | RestoreRun | the selected snapshot was no longer in the repository when the run listed it again immediately before it created the Job |
+| ClaimLost | RestoreRun | the claim stopped being the run's while the restore ran: someone deleted it, replaced it, or took it |
+| ClaimDeleting | RestoreRun | the claim was in deletion when the run was about to start the restore |
 | IntoClaimTaken | RestoreRun | the claim `spec.into` names holds a claim the run did not create |
-| ClusterRestoredElsewhere | RestoreRun | another unfinished RestoreRun is restoring the Cluster |
+| ClusterRestoredElsewhere | RestoreRun | another unfinished RestoreRun restores the Cluster |
 
 ### Ready reasons
 
 | Ready reason | When |
 | --- | --- |
 | Queued | the run waits for Kueue to admit it |
-| Running | work is under way; the message is `backing up`, or `waiting for pod <pod> to stop before the clones are cut` while a pod of a workload the run stopped is still terminating |
-| SourceBusy | another run holds the run's claim or repository, holds this namespace's quiesce Lease, or has deleted a Cluster this run waits to see created again; the message names that run, what it holds, and every wait |
-| Retrying | an item could not start with an error a retry may fix, such as a Backup a CloudNativePG webhook refuses; the message names every such item and its error |
-| RestartFailed | the run could not give a stopped workload its replicas back or resume a Kustomization it suspended, so the app is still down; when the Lease release failed as well, the reason stays RestartFailed and the message names both. The run deletes its Kueue Workload only once the restart has gone through, so it keeps its place in the queue while the app is down |
-| ReleaseFailed | the app is back, and the run cannot finish because it could not release its Leases or delete its Kueue Workload |
-| CRDOutdated | the run ended before it changed anything, because the CRD of its kind lacks a field the controller writes, is not installed, or may not be read by the controller; the message names the field or the permission |
-| VolSyncUnsupported | the run ended because the API server no longer serves VolSync's ReplicationSource at v1alpha1; it gave back the workloads it stopped first, and the message names the kind and the versions served |
-| Invalid | the spec names something no retry can fix, such as a claim that is not marked `backup.wlz.li/enabled`, or workloads to stop whose Flux Kustomization also applies workloads in another namespace |
+| Running | the run does its work. The message is `backing up`, or `waiting for pod <pod> to stop before the clones are cut` while a pod of a workload the run stopped still terminates |
+| SourceBusy | another run holds one of these: the run's claim or repository, or this namespace's quiesce Lease. Or another run deleted a Cluster that this run waits to see again. The message names that run, what it holds, and every wait |
+| Retrying | an item could not start, with an error that a retry may fix. An example is a Backup that a CloudNativePG webhook refuses. The message names every such item and its error |
+| RestartFailed | the run could not give a stopped workload its replicas back or resume a Kustomization it suspended. Thus the app is still down. If the Lease release also failed, the reason stays RestartFailed and the message names both. The run deletes its Kueue Workload only after the restart succeeds. Thus it keeps its place in the queue while the app is down |
+| ReleaseFailed | the app is back. The run cannot finish because it could not release its Leases or delete its Kueue Workload |
+| CRDOutdated | the run ended before it changed anything. The cause is that the CRD of its kind is not installed, lacks a field the controller writes, or may not be read by the controller. The message names the field or the permission |
+| VolSyncUnsupported | the run ended because the API server no longer serves VolSync's ReplicationSource at v1alpha1. Before that, it gave back the workloads it stopped. The message names the kind and the versions served |
+| Invalid | the spec names something that no retry can fix. Examples are a claim that is not marked `backup.wlz.li/enabled`, or workloads to stop whose Flux Kustomization also applies workloads in another namespace |
 | Succeeded | the run finished with every item done |
-| Failed | the run finished with a failed item, or past its timeout; a run that passed its deadline while waiting for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |
+| Failed | the run finished with a failed item, or past its timeout. A run that passed its deadline while it waited for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>` |
 
-Whenever a run's Ready condition moves to a new reason, the controller records
-an event on the run with that reason, and the condition's message as its note.
-A run that has finished with any reason but Succeeded, such as Invalid or
-Failed, records a Warning, and so do RestartFailed and ReleaseFailed, which the
-run reports while it is unfinished; Queued, Running, SourceBusy, Retrying and
-Succeeded record Normal events. `kubectl describe brun <name>` lists them under
-Events. Because events.k8s.io/v1 rejects a note over 1024 bytes, the controller
-cuts a longer message at that length, and the full text stays on the condition.
+When a run's Ready condition changes to a new reason, the controller records an
+event on the run. The event has that reason, and the condition's message as its
+note. These reasons record a Warning:
+
+- Any reason but Succeeded on a finished run, such as Invalid or Failed.
+- RestartFailed and ReleaseFailed, which the run reports while it is not
+  finished.
+
+Queued, Running, SourceBusy, Retrying and Succeeded record Normal events.
+`kubectl describe brun <name>` lists them under Events. events.k8s.io/v1
+rejects a note over 1024 bytes. Thus the controller cuts a longer message at
+that length, and the full text stays on the condition.
 
 ## RestoreRun
 
@@ -283,100 +299,118 @@ spec:
 
 | Field | Required | Holds |
 | --- | --- | --- |
-| `claim` | one of `claim`/`repository`, `database` and `all` | the claim whose repository to restore from, and the claim to write into unless `into` names another |
-| `repository` | the same | the restic Secret in this namespace to restore from, in place of the one the claim's VolumeRestore names. With `claim` as well, the run restores that claim in place from this repository; without `claim`, the run needs `into` and `intoSize` and fills a new claim |
-| `into` | no | a claim to create and fill, leaving the source untouched; only with `claim` or `repository`. No claim of that name may exist yet, and with `claim` no VolumeRestore of that name either, since a VolumeRestore describes the backups of the claim of its name; the run creates no VolumeRestore for it. The run creates it empty and writes the selected snapshot into it with its own restore Job, which restores that snapshot by its full ID. With `claim` the run copies the source claim's size and the node its volume is on, and the scheduler places the Job's pod with that volume; with `repository` there is no source node, and the Job's pod is the claim's first consumer |
-| `intoSize` | with `repository` and `into` | the size of that claim; omitted with `claim`, the source claim's request |
-| `database` | one of the three | the Cluster to restore; the run deletes it and it recovers when it is created again. A Cluster carrying `backup.wlz.li/bootstrap: initdb`, or declaring its own bootstrap method such as `pg_basebackup`, ends the run Invalid, and so does a Cluster another unfinished RestoreRun is restoring |
-| `all` | one of the three | every enabled claim in place, then every enabled Cluster; a Cluster carrying `backup.wlz.li/bootstrap: initdb`, or declaring its own bootstrap method, gets a Skipped item. A Cluster another unfinished RestoreRun is restoring ends the run Invalid, and a run whose every item is Skipped ends Failed with reason NoBackupInReach |
+| `claim` | one of `claim`/`repository`, `database` and `all` | the claim whose repository to restore from. It is also the claim to write into, unless `into` names another |
+| `repository` | the same | the restic Secret in this namespace to restore from, in place of the one the claim's VolumeRestore names. With `claim` as well, the run restores that claim in place from this repository. Without `claim`, the run needs `into` and `intoSize` and fills a new claim |
+| `into` | no | a claim to create and fill, and the source stays untouched. Only with `claim` or `repository`. No claim of that name may exist yet. With `claim`, no VolumeRestore of that name may exist either. The reason is that a VolumeRestore describes the backups of the claim with its name. The run creates no VolumeRestore for it. The run creates the claim empty. Its own restore Job then writes the selected snapshot into it and restores that snapshot by its full ID. With `claim`, the run copies the source claim's size and the node its volume is on, and the scheduler places the Job's pod with that volume. With `repository` there is no source node, and the Job's pod is the claim's first consumer |
+| `intoSize` | with `repository` and `into` | the size of that claim. Omitted with `claim`, the source claim's request |
+| `database` | one of the three | the Cluster to restore. The run deletes it, and it recovers when its owner creates it again. The run ends Invalid for a Cluster that carries `backup.wlz.li/bootstrap: initdb` or declares its own bootstrap method such as `pg_basebackup`. It also ends Invalid for a Cluster that another unfinished RestoreRun restores |
+| `all` | one of the three | every enabled claim in place, then every enabled Cluster. A Cluster that carries `backup.wlz.li/bootstrap: initdb`, or declares its own bootstrap method, gets a Skipped item. A Cluster that another unfinished RestoreRun restores ends the run Invalid. A run whose every item is Skipped ends Failed with reason NoBackupInReach |
 | `restoreAsOf` | no | the moment to restore to. A volume restores the newest snapshot at or before it, a database replays WAL to it exactly. Omitted, the newest snapshot and the end of the archive |
-| `previous` | no | how many snapshots further back than the selected one; one volume only |
-| `syncDatabaseToVolume` | no | with `all` only: recover the databases to the moment of the volumes' newest `quiesced` snapshot at or before `restoreAsOf`, so the files and the rows agree. Refused when a volume has no such snapshot, or two volumes' snapshots are from different moments |
-| `quiesce` | no | Deployments and StatefulSets, as `{kind, name}`, to stop while the run restores; not with `into`. The run waits, with the workloads still running, while a backup of one of its claims uploads, another run holds the Lease of one of its claims, or another run has stopped this namespace's workloads. A volume item whose repository Secret is gone fails before anything is stopped, and a run left with no item to restore stops nothing; it gives the workloads back once the volumes are restored and the databases deleted. A workload whose Flux Kustomization also applies workloads in another namespace ends the run Invalid before anything is stopped |
-| `timeout` | no | how long to wait for the restore Jobs and the recovered databases, counted from when the run passes its checks, or from its creation while its checks keep failing or while it waits for a backup of its repository; defaults to `4h` |
-| `moverSecurityContext` | no | the pod `securityContext` of the run's restore Jobs; omitted, the source claim's VolumeRestore supplies it. The admission policy refuses one that sets sysctls, SELinux options or an unconfined profile, and the item fails with reason RestoreJobRefused |
-| `ttlSecondsAfterFinished` | no | delete the run that long after it finishes; an `into` claim goes with it |
+| `previous` | no | how many snapshots further back than the selected one. One volume only |
+| `syncDatabaseToVolume` | no | with `all` only. The run recovers the databases to the moment of the volumes' newest `quiesced` snapshot at or before `restoreAsOf`, so the files and the rows agree. It is refused when a volume has no such snapshot, or when the snapshots of two volumes are from different moments |
+| `quiesce` | no | Deployments and StatefulSets, as `{kind, name}`, to stop while the run restores. Not with `into`. The run waits, with the workloads still running, in three cases. A backup of one of its claims uploads. Another run holds the Lease of one of its claims. Or another run stopped this namespace's workloads. A volume item whose repository Secret is gone fails before the run stops anything. A run with no item left to restore stops nothing. The run gives the workloads back after it restores the volumes and deletes the databases. A workload whose Flux Kustomization also applies workloads in another namespace ends the run Invalid before the run stops anything |
+| `timeout` | no | how long to wait for the restore Jobs and the recovered databases. The time counts from when the run passes its checks. While its checks continue to fail, or while it waits for a backup of its repository, the time counts from its creation. Defaults to `4h` |
+| `moverSecurityContext` | no | the pod `securityContext` of the run's restore Jobs. Omitted, the source claim's VolumeRestore supplies it. The admission policy refuses one that sets sysctls, SELinux options or an unconfined profile, and the item fails with reason RestoreJobRefused |
+| `ttlSecondsAfterFinished` | no | delete the run that long after it finishes. An `into` claim goes with it |
 
 | Status field | Holds |
 | --- | --- |
-| `phase` | Queued, Running, Waiting, Succeeded or Failed; the column `kubectl get rrun` prints |
+| `phase` | Queued, Running, Waiting, Succeeded or Failed. `kubectl get rrun` prints it as a column |
 | `target` | the claim an `into` restore creates and fills |
 | `startedAt`, `completedAt` | when the run passed its checks and began, and when it finished |
 | `syncedTo` | the moment a `syncDatabaseToVolume` run restores the volumes and recovers the databases to |
-| `quiescedAt`, `restartedAt`, `quiesced[]`, `suspendedKustomizations[]` | when the run stopped and gave back the workloads `quiesce` lists, the replicas it gave each back, and the Flux Kustomizations it suspended and resumed |
-| `items[]` | one per volume and per database: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message, the item's `reason`, the `snapshot` (short ID), `snapshotID` (full ID) and `snapshotTime` a volume restores, the restore `job` and its `jobUID`, the `baseBackup` a recovery starts from, the `clusterUID` of the Cluster a database item deletes, and `clusterLeftDeleted` |
-| `ending` | the Ready reason and message the run ends with, recorded in the status write that decides to end it; every later pass, one that waits for a restore Job to stop or retries a restart included, ends the run with them |
-| `conditions[type=Ready]` | the reason and message, kstatus-compatible; [Ready reasons of a RestoreRun](#ready-reasons-of-a-restorerun) lists them |
+| `quiescedAt`, `restartedAt`, `quiesced[]`, `suspendedKustomizations[]` | when the run stopped and gave back the workloads `quiesce` lists, the replicas it gave back to each, and the Flux Kustomizations it suspended and resumed |
+| `items[]` | one for each volume and each database. Each item holds these fields: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message and the item's `reason`. It also holds the `snapshot` (short ID), `snapshotID` (full ID) and `snapshotTime` a volume restores, and the restore `job` and its `jobUID`. For a database, it holds the `baseBackup` a recovery starts from, the `clusterUID` of the Cluster the item deletes, and `clusterLeftDeleted` |
+| `ending` | the Ready reason and message the run ends with. The status write that decides to end the run records them. Every later pass ends the run with them, also a pass that waits for a restore Job to stop or retries a restart |
+| `conditions[type=Ready]` | the reason and message, kstatus-compatible. [Ready reasons of a RestoreRun](#ready-reasons-of-a-restorerun) lists them |
 
-`items[].snapshotID` is the full ID of the snapshot the run's checks selected,
-and the restore Job restores exactly that ID; `snapshot` keeps the short form
-and `snapshotTime` the snapshot's time, for display.
-[restores.md](restores.md#which-snapshot-a-run-restores) says how the run
-selects and how a run that lost its selection before it created anything ends.
+`items[].snapshotID` is the full ID of the snapshot that the run's checks
+selected. The restore Job restores exactly that ID. For display, `snapshot`
+keeps the short form and `snapshotTime` the time of the snapshot.
+[restores.md](restores.md#which-snapshot-a-run-restores) tells how the run
+selects. It also tells how a run ends if it lost its selection before it
+created anything.
+
 `items[].job` names the item's restore Job in the run's namespace,
-`restore-<run uid>-<item index>`, and stays once the run has stopped the Job,
-as the record that the item had one. `items[].jobUID` is that Job's UID. The
-run stops the Job by it, and a pod of a Job someone deleted keeps the UID in
-its `batch.kubernetes.io/controller-uid` label, so the run gives nothing back
-until each such pod has ended; the run clears `jobUID` once the Job is stopped.
-`items[].clusterLeftDeleted` is true on a database item whose Cluster was
-deleted and not created again when the run ended.
-`items[].clusterUID` is the UID of the Cluster a database item deletes, written
-with the Deleted mark; [architecture.md](architecture.md#a-database-restore)
-shows how the run tells the old Cluster from the recovered one by it. Ready
-reason Retrying marks a run whose checks keep failing with an error a retry may
-fix, such as a repository with the wrong password, with the phase still empty;
+`restore-<run uid>-<item index>`. The name stays after the run stops the Job,
+as the record that the item had a Job. `items[].jobUID` is the UID of that Job,
+and the run stops the Job by it. A pod of a Job that someone deleted keeps the
+UID in its `batch.kubernetes.io/controller-uid` label. Thus the run gives
+nothing back until each such pod has ended. The run clears `jobUID` when the
+Job is stopped.
+
+`items[].clusterLeftDeleted` is true on a database item if the run deleted its
+Cluster and nothing created the Cluster again before the run ended.
+`items[].clusterUID` is the UID of the Cluster that a database item deletes.
+The run writes it with the Deleted mark.
+[architecture.md](architecture.md#a-database-restore) shows how the run uses it
+to tell the old Cluster from the recovered one.
+
+Ready reason Retrying marks a run whose checks continue to fail with an error
+that a retry may fix. An example is a repository with the wrong password. The
+phase stays empty.
 [namespace-backups.md](namespace-backups.md#checks-before-anything-is-touched)
-has how long it retries.
+tells how long the run retries.
 
 A volume item succeeds only when its restore Job has the condition
-`Complete=True`, which the Job controller adds once restic exited 0 for the
-item's snapshot and the pod has ended. `Failed=True` fails the item with
-reason RestoreJobFailed and restic's exit code;
+`Complete=True`. The Job controller adds that condition after restic exited 0
+for the item's snapshot and the pod has ended. `Failed=True` fails the item with
+reason RestoreJobFailed and restic's exit code.
 [restores.md](restores.md#how-a-restore-job-ends) lists the messages. An
-in-place item also fails when its claim was deleted or replaced while the Job
-wrote, and that section lists those messages too. A run writes only into a
-claim it created itself: a claim named `spec.into` that the run does not
-control fails the run with reason IntoClaimTaken, and a Job under the item's
-Job name that the run did not create fails the item with reason
-RestoreJobRefused and is left alone.
+in-place item also fails if someone deleted or replaced its claim while the Job
+wrote. That section lists those messages too.
+
+A run writes only into a claim that it created itself:
+
+- A claim named `spec.into` that the run does not control fails the run with
+  reason IntoClaimTaken.
+- A Job with the item's Job name that the run did not create fails the item
+  with reason RestoreJobRefused. The run does not touch that Job.
 
 ### Ready reasons of a RestoreRun
 
 | Ready reason | When |
 | --- | --- |
-| Retrying | the checks failed with an error a retry may fix, such as a repository with the wrong password; the phase stays empty and the message holds the error |
-| Running | work is under way; the message is `restoring`, `restoring into claim <into>` for an `into` restore, or `waiting for pod <pod> to stop before anything is restored` while a pod of a workload the run stopped is still terminating |
-| SourceBusy | a backup of the run's claim or repository is in progress, another run holds the Lease of either, another run has stopped this namespace's workloads, or a RestoreRun has deleted a Cluster in this namespace and waits for it to be created again; the message names that run and what it holds |
+| Retrying | the checks failed with an error that a retry may fix, such as a repository with the wrong password. The phase stays empty, and the message holds the error |
+| Running | the run does its work. The message is `restoring`, `restoring into claim <into>` for an `into` restore, or `waiting for pod <pod> to stop before anything is restored` while a pod of a workload the run stopped still terminates |
+| SourceBusy | a backup of the run's claim or repository is in progress. Or another run holds the Lease of either. Or another run stopped this namespace's workloads. It is also true if a RestoreRun deleted a Cluster in this namespace and waits for its owner to create it again. The message names that run and what it holds |
 | ClaimInUse | an in-place restore waits for its claim: `claim <claim> is mounted by pod <pod>; stop the workload and this restore starts on its own`. The pod can be the restore Job pod of another run that still writes into the claim |
-| WaitingForShutdown | the run waits for something to be gone before it goes on: the instance pods and PVCs of a Cluster it deleted, or the pods of a restore Job it stopped: `waiting for the restore Job of claim <claim>, which the run stopped, to end: restore Job <job>: waiting for pods <pod> to end. The run gives the app back and lets other runs at the claim only after that`; the app stays stopped and the run keeps its Leases until then |
+| WaitingForShutdown | the run waits for something to be gone before it continues. That is the instance pods and PVCs of a Cluster it deleted, or the pods of a restore Job it stopped: `waiting for the restore Job of claim <claim>, which the run stopped, to end: restore Job <job>: waiting for pods <pod> to end. The run gives the app back and lets other runs at the claim only after that`. Until then, the app stays stopped and the run keeps its Leases |
 | WaitingForRecreate | the run deleted a Cluster and waits for its owner to create it again: `recreate <cluster> to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it` |
-| VolSyncUnsupported | the API server no longer serves VolSync's ReplicationSource at v1alpha1; the run changes nothing and retries every pass, and at `timeout` ends TimedOut and gives the app back ([compatibility.md](compatibility.md#following-the-versions-the-api-server-serves)) |
-| ClusterVersionUnsupported | the API server no longer serves CloudNativePG's Cluster at v1, so the bootstrap webhook would not see a new Cluster; a run that deleted no Cluster ends with it, and one that already deleted one waits with it |
-| RestartFailed | the run could not give a workload it stopped its replicas back, could not resume a Kustomization it suspended, or could not stop a restore Job while the app is down; the message names what failed and what to scale, resume or delete by hand |
-| ReleaseFailed | the app is back, and the run cannot finish because it could not release its Leases or stop a restore Job; the message says what to delete by hand |
-| CRDOutdated | the same as on a [BackupRun](#ready-reasons): the CRD of its kind lacks a field the controller writes, is not installed, or may not be read by the controller |
-| Invalid | the spec names something no retry can fix, such as an `into` claim that already exists, a Cluster carrying `backup.wlz.li/bootstrap: initdb` named in `database`, or a Cluster another unfinished RestoreRun is restoring |
-| NoBackupInReach | the run ended before it deleted or wrote anything, because an item has no backup at or before `restoreAsOf`, or its repository holds no snapshot with the layout a VolSync mover writes; also a run that restored nothing because every item was Skipped |
-| TimedOut | the run had not finished by its `timeout`, had not passed its checks by then (`the run had not passed its checks by <deadline>: <message>`), or its `into` claim had not been restored by then (`claim <into> had not been restored by <deadline>`); a run that was waiting for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>`. An item whose restore Job still ran gets the timeout's message and, when the Job's newest pod waited, `; the restore Job's pod was waiting: <container>: <reason>: "<message>"` |
+| VolSyncUnsupported | the API server no longer serves VolSync's ReplicationSource at v1alpha1. The run changes nothing and retries every pass. At `timeout` it ends TimedOut and gives the app back ([compatibility.md](compatibility.md#following-the-versions-the-api-server-serves)) |
+| ClusterVersionUnsupported | the API server no longer serves CloudNativePG's Cluster at v1, so the bootstrap webhook would not see a new Cluster. A run that deleted no Cluster ends with this reason. A run that already deleted one waits with it |
+| RestartFailed | the run could not give a workload it stopped its replicas back. Or it could not resume a Kustomization it suspended. Or it could not stop a restore Job while the app is down. The message names what failed and what to scale, resume or delete by hand |
+| ReleaseFailed | the app is back. The run cannot finish because it could not release its Leases or stop a restore Job. The message tells what to delete by hand |
+| CRDOutdated | the same as on a [BackupRun](#ready-reasons): the CRD of its kind is not installed, lacks a field the controller writes, or may not be read by the controller |
+| Invalid | the spec names something that no retry can fix. Examples are an `into` claim that already exists, a Cluster carrying `backup.wlz.li/bootstrap: initdb` named in `database`, or a Cluster that another unfinished RestoreRun restores |
+| NoBackupInReach | the run ended before it deleted or wrote anything. An item has no backup at or before `restoreAsOf`. Or the repository of an item holds no snapshot with the layout a VolSync mover writes. The reason also applies to a run that restored nothing because every item was Skipped |
+| TimedOut | the run had not finished by its `timeout`. Or it had not passed its checks by then (`the run had not passed its checks by <deadline>: <message>`). Or its `into` claim had not been restored by then (`claim <into> had not been restored by <deadline>`). A run that waited for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>`. An item whose restore Job still ran gets the timeout's message. When the Job's newest pod waited, the message also gets `; the restore Job's pod was waiting: <container>: <reason>: "<message>"` |
 | Succeeded | every item holds the restored data |
-| Failed | an item failed; the message names each failed item and its message |
+| Failed | an item failed. The message names each failed item and its message |
 
-A RestoreRun records an event at each new Ready reason, the same way a
-[BackupRun](#backuprun) does. A run deleted after it deleted a Cluster also
-records a Warning event with reason ClusterLeftDeleted, right before it drops
-its finalizer, for each such Cluster its owner has not created again yet. The
-note says the webhook now recovers that Cluster to the end of its archive, or
-to the time in its own `backup.wlz.li/restore-as-of` annotation.
+A RestoreRun records an event at each new Ready reason, the same as a
+[BackupRun](#backuprun). A run that deleted a Cluster can itself be deleted.
+It then records a Warning event with reason ClusterLeftDeleted for each such
+Cluster that its owner has not created again yet. It records the event
+immediately before it removes its finalizer. The note says that the webhook
+now recovers that Cluster to the end of its archive, or to the time in its own
+`backup.wlz.li/restore-as-of` annotation.
 [restores.md](restores.md#databases-restore-themselves) quotes it.
 
-Six CEL rules on the CRD: exactly one of `claim` or `repository`, `database`
-and `all`; `previous` only with one volume; `into` only with `claim` or
-`repository`; `intoSize` with `repository` and `into`; `syncDatabaseToVolume`
-only with `all`; `quiesce` not with `into`. The fourth rejects a run without
-`intoSize` with `into from a repository needs intoSize, because there is no
-source claim to copy a size from`.
+The CRD has six CEL rules:
+
+1. Exactly one of `claim` or `repository`, `database` and `all`.
+2. `previous` only with one volume.
+3. `into` only with `claim` or `repository`.
+4. `intoSize` with `repository` and `into`.
+5. `syncDatabaseToVolume` only with `all`.
+6. `quiesce` not with `into`.
+
+The fourth rule rejects a run without `intoSize` with this message: `into from a
+repository needs intoSize, because there is no source claim to copy a size
+from`.
 
 The `quiesced[]` and `suspendedKustomizations[]` of a RestoreRun follow the
-same rules as a [BackupRun's](#backuprun): written as the plan before anything
-is suspended or scaled, and cut down to what is in effect after a failed stop.
+same rules as those of a [BackupRun](#backuprun). The run writes them as the
+plan before it suspends or scales anything. After a failed stop, it cuts them
+to what is in effect.
