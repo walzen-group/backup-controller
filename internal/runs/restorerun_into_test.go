@@ -11,6 +11,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -348,7 +349,10 @@ func TestADeletedIntoRestoreJobFailsTheItemAndHoldsForItsPods(t *testing.T) {
 // RestoreJobFailed. The run never creates a second Job, and Stop gates on
 // the recorded UID: a Job with another UID is neither suspended nor
 // deleted, and the pod of the recorded UID holds the run and its Lease
-// until it has ended.
+// until it has ended. The first release of the Lease after that fails, so
+// finish runs again once the stop has cleared the recorded UID: an into
+// run gets no second stop otherwise, and that pass must still leave the
+// Job under the name alone, since the item names the Job it stopped.
 func TestAReplacedOrUncontrolledIntoRestoreJobFailsTheItem(t *testing.T) {
 	for _, tc := range swappedJobs {
 		t.Run(tc.name, func(t *testing.T) {
@@ -381,6 +385,14 @@ func TestAReplacedOrUncontrolledIntoRestoreJobFailsTheItem(t *testing.T) {
 			}
 
 			setPodPhase(t, c, pod, corev1.PodFailed)
+			r.Client = refuseLeaseDeletes(c)
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+				t.Fatal("the pass whose Lease release was refused succeeded, want the refusal returned")
+			}
+			if item := readRestoreRun(t, c).Status.Items[0]; item.JobUID != "" || item.Job != job.Name {
+				t.Fatalf("item = %+v after the stop, want no UID and the stopped Job's name %s", item, job.Name)
+			}
+			r.Client = c
 			if done := stepUntilFinished(t, r, c, 2); done.Status.Phase != backupv1alpha1.RunPhaseFailed {
 				t.Errorf("phase = %q once the pod had ended, want Failed", done.Status.Phase)
 			}
@@ -501,4 +513,17 @@ func TestAnIntoRestoreWhoseFinalWriteWasLostIsNotStartedAgain(t *testing.T) {
 	if jobs := restoreJobs(t, c); len(jobs) != 0 {
 		t.Errorf("restore Jobs = %v, want no new Job", jobs)
 	}
+}
+
+// refuseLeaseDeletes returns a client over c that refuses every delete of a
+// Lease as Forbidden, so a run can't release its Leases.
+func refuseLeaseDeletes(c client.Client) client.Client {
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if _, ok := obj.(*coordinationv1.Lease); ok {
+				return apierrors.NewForbidden(coordinationv1.Resource("leases"), obj.GetName(), errors.New("delete refused"))
+			}
+			return cl.Delete(ctx, obj, opts...)
+		},
+	})
 }
