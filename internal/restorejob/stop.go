@@ -47,6 +47,10 @@ type StopState struct {
 	// not show both spec.suspend true and Suspended=True, so the Job
 	// controller may still start a pod. It is for the wait message.
 	Suspending bool
+	// Deleting is true when the last read showed the Job with a
+	// deletionTimestamp, deleted by someone else and waiting for the garbage
+	// collector. It is for the wait message.
+	Deleting bool
 	// Pods are the names of the Job's pods that may still write, for the
 	// wait message.
 	Pods []string
@@ -59,6 +63,8 @@ func (s StopState) String() string {
 		return fmt.Sprintf("restore Job %s stopped", s.Job)
 	case s.Suspending:
 		return fmt.Sprintf("restore Job %s: waiting for the Job controller to suspend it", s.Job)
+	case len(s.Pods) > 0 && s.Deleting:
+		return fmt.Sprintf("restore Job %s is being deleted: waiting for pods %s to end", s.Job, strings.Join(s.Pods, ", "))
 	case len(s.Pods) > 0:
 		return fmt.Sprintf("restore Job %s: waiting for pods %s to end", s.Job, strings.Join(s.Pods, ", "))
 	default:
@@ -100,6 +106,18 @@ func (s StopState) String() string {
 // pods keep running, and with Background they are stopped within their
 // grace period. The pods keep their controller-uid label either way, so the
 // gate holds until each of them has ended.
+//
+// A Job with a deletionTimestamp, which someone deleted with Foreground
+// propagation, also goes straight to the gate on the ref's UID, with no
+// suspend patch and no delete of its own. The Job controller creates no pod
+// for a Job that is being deleted and never marks it Suspended (kubernetes
+// v1.36.3 pkg/controller/job/job_controller.go:1138), so a suspend would
+// only leave Stop waiting for a condition that never comes.
+//
+// One window stays open: the Job controller reads the Job from its informer
+// cache (job_controller.go:940), so a cache that has not yet seen the delete
+// of a Job can still create a pod after Stop's pod list ran, and the garbage
+// collector deletes such a pod as soon as it finds its owner gone.
 func Stop(ctx context.Context, api API, ref Ref) (StopState, error) {
 	state := StopState{Job: ref.Name}
 	if ref.UID == "" {
@@ -108,6 +126,10 @@ func Stop(ctx context.Context, api API, ref Ref) (StopState, error) {
 	job, err := readOwn(ctx, api, ref)
 	if err != nil {
 		return state, err
+	}
+	if job != nil && job.DeletionTimestamp != nil {
+		state.Deleting = true
+		job = nil
 	}
 	if job != nil && !finished(job) {
 		suspended, err := suspend(ctx, api, job)
@@ -133,15 +155,17 @@ func Stop(ctx context.Context, api API, ref Ref) (StopState, error) {
 	return state, nil
 }
 
-// readOwn reads the Job a ref names.
+// readOwn reads the Job a ref names, so that Stop only writes the Job its
+// caller recorded.
 //
 // Parameters:
 //   - ctx bounds the API call.
 //   - api makes the call.
 //   - ref names the Job and carries its UID.
 //
-// It returns the Job, or nil when no Job of that name exists or the one that
-// does has another UID, and an error from any other failed read.
+// It returns the Job, or nil when the Job is not Stop's to touch: no Job of
+// that name exists, or the one that does has another UID. It returns an
+// error from any other failed read.
 func readOwn(ctx context.Context, api API, ref Ref) (*batchv1.Job, error) {
 	job, err := api.GetJob(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name})
 	switch {
