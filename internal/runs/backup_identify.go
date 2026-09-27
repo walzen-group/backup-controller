@@ -283,13 +283,9 @@ func (r *BackupRunReconciler) identifySnapshot(ctx context.Context, run *backupv
 //   - claimName names the claim whose repository is listed.
 //   - window is the sync's window (see windowOf).
 //
-// It returns what identify found. It returns an error when the reconciler
-// has no Snapshots lister, and when the repository Secret, the repository or
+// It returns what identify found. It returns an error when the repository Secret, the repository or
 // the namespace's BackupRuns can't be read.
 func (r *BackupRunReconciler) findSnapshot(ctx context.Context, run *backupv1alpha1.BackupRun, claimName string, window syncWindow) (identified, error) {
-	if r.Snapshots == nil {
-		return identified{}, errors.New("the controller has no repository lister")
-	}
 	secret, err := r.repositorySecret(ctx, run.Namespace, claimName)
 	if err != nil {
 		return identified{}, err
@@ -396,17 +392,14 @@ func stoppedWorkloads(run *backupv1alpha1.BackupRun) bool {
 //     status.restartedAt.
 //
 // It returns the rewritten snapshot, which has a new ID. It returns an error
-// when no ID is given, when the reconciler has no Retimer, when the Secret
-// can't be read, and when the rewrite fails. A *restic.LockedError means
-// another process holds a lock on the repository, and the caller tries again
-// on its next pass. A snapshot an earlier call already rewrote comes back as
-// that copy (see restic.Repository.Retime).
+// when no ID is given, when the Secret can't be read, and when the rewrite
+// fails. A *restic.LockedError means another process holds a lock on the
+// repository, and the caller tries again on its next pass. A snapshot an
+// earlier call already rewrote comes back as that copy (see
+// restic.Repository.Retime).
 func (r *BackupRunReconciler) retime(ctx context.Context, namespace, claimName, id string, at time.Time) (restic.Snapshot, error) {
 	if id == "" {
 		return restic.Snapshot{}, errors.New("no snapshot is recorded to move")
-	}
-	if r.Retimer == nil {
-		return restic.Snapshot{}, errors.New("the controller has no snapshot retimer")
 	}
 	secret, err := r.repositorySecret(ctx, namespace, claimName)
 	if err != nil {

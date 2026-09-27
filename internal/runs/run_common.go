@@ -313,3 +313,28 @@ func (o runOps) pass(ctx context.Context, f runFields, steps passSteps) (ctrl.Re
 	}
 	return steps.work(ctx)
 }
+
+// releaseFinished releases the Leases that the run no longer needs.
+//
+// Parameters:
+//   - f is the run in its work pass.
+//   - done reports whether the run has finished with the item a Lease
+//     names (see backupItemDone and restoreItemDone).
+//
+// It returns the error of the release of an item's Leases. A failed release
+// of the quiesce Leases is only logged.
+//
+// The Leases of an item that finished in an earlier pass go now, so another
+// run of that claim need not wait for the rest of the run. The quiesce
+// Leases go once the stored status shows every workload back, since the run
+// then never touches them again. Best effort: a Lease left behind is stale
+// under holderLive's rule and the next run takes it over.
+func (o runOps) releaseFinished(ctx context.Context, f runFields, done func(item string) bool) error {
+	if err := releaseLeases(ctx, o.c, o.reader, f.Object, done); err != nil {
+		return err
+	}
+	if durablyRestarted(f.Object) {
+		releaseQuiesceLeases(ctx, o.c, o.reader, f.Object)
+	}
+	return nil
+}
