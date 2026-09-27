@@ -65,13 +65,15 @@ var unstructuredKinds = []schema.GroupVersionKind{
 	{Group: "barmancloud.cnpg.io", Version: "v2", Kind: "ObjectStore"},
 }
 
-// scheme returns a scheme that holds the typed kinds the package uses and the
-// kinds in unstructuredKinds.
+// scheme returns a scheme that holds the typed kinds the package uses, as
+// runScheme in cmd/backup-controller registers them, and the kinds in
+// unstructuredKinds.
 func scheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{
-		corev1.AddToScheme, appsv1.AddToScheme, batchv1.AddToScheme, volsyncv1alpha1.AddToScheme, backupv1alpha1.AddToScheme, coordinationv1.AddToScheme,
+		corev1.AddToScheme, appsv1.AddToScheme, autoscalingv1.AddToScheme, batchv1.AddToScheme, volsyncv1alpha1.AddToScheme,
+		backupv1alpha1.AddToScheme, coordinationv1.AddToScheme,
 	} {
 		if err := add(s); err != nil {
 			t.Fatalf("register types: %v", err)

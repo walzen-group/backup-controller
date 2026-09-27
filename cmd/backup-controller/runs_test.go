@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	batchv1 "k8s.io/api/batch/v1"
 )
 
@@ -104,6 +105,21 @@ func TestTheRunSchemeKnowsTheMoverJob(t *testing.T) {
 	}
 	if job := batchv1.SchemeGroupVersion.WithKind("Job"); !scheme.Recognizes(job) {
 		t.Errorf("the run manager's scheme does not hold %s", job)
+	}
+}
+
+// TestTheRunSchemeKnowsTheScale checks that the scheme of the run manager
+// holds autoscaling/v1 Scale, the body quiesce reads and writes through a
+// workload's scale subresource. The serializers decode into it without the
+// registration, but runScheme lists every kind a reconciler reads through
+// its typed client, and the Scale is one.
+func TestTheRunSchemeKnowsTheScale(t *testing.T) {
+	scheme, err := runScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind := autoscalingv1.SchemeGroupVersion.WithKind("Scale"); !scheme.Recognizes(kind) {
+		t.Errorf("the run manager's scheme does not hold %s", kind)
 	}
 }
 

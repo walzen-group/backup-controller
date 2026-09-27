@@ -13,6 +13,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/runs"
 	"github.com/walzen-group/backup-controller/internal/served"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -82,12 +83,14 @@ type BootstrapWebhook struct {
 // A kind missing here makes every read of it fail at run time, so each kind
 // a reconciler reads through its typed client must be listed. batch/v1 is
 // here for the Job of a restore mover the run has stopped, which a RestoreRun
-// waits for before it gives the app back.
+// waits for before it gives the app back. autoscaling/v1 is here for the
+// Scale quiesce reads and writes through a workload's scale subresource.
 func runScheme() (*runtime.Scheme, error) {
 	scheme := runtime.NewScheme()
 	for name, add := range map[string]func(*runtime.Scheme) error{
 		"core":                corev1.AddToScheme,
 		"apps":                appsv1.AddToScheme,
+		"autoscaling":         autoscalingv1.AddToScheme,
 		"batch":               batchv1.AddToScheme,
 		"coordination.k8s.io": coordinationv1.AddToScheme,
 		"volsync":             volsyncv1alpha1.AddToScheme,
