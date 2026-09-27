@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -200,8 +201,9 @@ func TestABackupRunPausedPastItsTimeoutWaitsForAdmissionAfterThePause(t *testing
 
 	r.Now = func() time.Time { return resumed.Add(2 * time.Hour) }
 	step(t, r)
-	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Fatalf("phase = %q past the timeout after the pause, want Failed", run.Status.Phase)
+	run := readBackupRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(readyMessage(run.Status.Conditions), "from the end of the pause") {
+		t.Fatalf("phase = %q, Ready = %q past the timeout after the pause; want Failed, counted from the end of the pause", run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
 }
 
