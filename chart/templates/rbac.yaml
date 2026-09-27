@@ -135,8 +135,10 @@ rules:
   # the controller's restore Jobs by label for its exclusion check. Reads go
   # through the uncached reader, so no watch. The Job's pods are listed by
   # their controller-uid label under the pods rule above.
-  # RBAC cannot scope the rule to the controller's own Jobs; create and delete
-  # cover every Job in the cluster.
+  # RBAC cannot scope the rule to the controller's own Jobs, so the restore Job
+  # admission policy (admissionpolicy.yaml) narrows it:
+  # the ServiceAccount may create and change only Jobs of the restore Job's
+  # shape, and delete only its own labelled Jobs.
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "create", "patch", "delete"]
