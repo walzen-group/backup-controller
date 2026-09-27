@@ -64,7 +64,7 @@ func restoreRunNew(run *backupv1alpha1.RestoreRun) bool {
 //     restoreRunNew.
 //   - conditions is the run's condition list, which holdNew changes.
 //
-// It returns the error of the status write. holdNew writes the status only
+// It returns the error of the status write, with the run named. holdNew writes the status only
 // when the Ready condition changes to reason Paused, so a later pass writes
 // nothing. The run keeps its phase and changes no other object.
 func holdNew(ctx context.Context, c client.Client, run client.Object, conditions *[]metav1.Condition) error {
@@ -74,23 +74,8 @@ func holdNew(ctx context.Context, c client.Client, run client.Object, conditions
 		return nil
 	}
 	backupv1alpha1.SetReady(conditions, run.GetGeneration(), metav1.ConditionFalse, backupv1alpha1.ReasonPaused, pausedMessage)
-	return c.Status().Update(ctx, run)
-}
-
-// holdForPause keeps a new BackupRun waiting with reason Paused (see
-// holdNew), and returns the error of the status write with the run named.
-func (r *BackupRunReconciler) holdForPause(ctx context.Context, run *backupv1alpha1.BackupRun) error {
-	if err := holdNew(ctx, r.Client, run, &run.Status.Conditions); err != nil {
-		return fmt.Errorf("set BackupRun %s/%s status: %w", run.Namespace, run.Name, err)
-	}
-	return nil
-}
-
-// holdForPause keeps a new RestoreRun waiting with reason Paused (see
-// holdNew), and returns the error of the status write with the run named.
-func (r *RestoreRunReconciler) holdForPause(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
-	if err := holdNew(ctx, r.Client, run, &run.Status.Conditions); err != nil {
-		return fmt.Errorf("set RestoreRun %s/%s status: %w", run.Namespace, run.Name, err)
+	if err := c.Status().Update(ctx, run); err != nil {
+		return fmt.Errorf("set the Paused status of %s/%s: %w", run.GetNamespace(), run.GetName(), err)
 	}
 	return nil
 }

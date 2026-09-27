@@ -97,7 +97,7 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	before := readyReason(run.Status.Conditions)
 	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Backup") }()
 	if r.Paused && backupRunNew(run) {
-		return ctrl.Result{}, r.holdForPause(ctx, run)
+		return ctrl.Result{}, holdNew(ctx, r.Client, run, &run.Status.Conditions)
 	}
 	if err := markResumed(ctx, r.Client, run, run.Status.Conditions, &run.Status.ResumedAt, r.Now()); err != nil {
 		return ctrl.Result{}, err
