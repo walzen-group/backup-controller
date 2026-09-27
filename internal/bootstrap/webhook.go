@@ -127,8 +127,9 @@ const DefaultBudget = 10 * time.Second
 //   - A create is refused when a RestoreRun or the restore-as-of annotation
 //     asks for a recovery and the store holds no completed base backup, or
 //     none finished by the requested moment.
-//   - With no RestoreRun waiting, a create is refused when the repositories
-//     of the namespace's VolumeRestores give two moments for their newest
+//   - With no RestoreRun waiting and no Bound claim that a VolumeRestore
+//     filled (see liveVolume), a create is refused when the repositories of
+//     the namespace's VolumeRestores give two moments for their newest
 //     quiesced snapshots, and it recovers to their one moment when they give
 //     one (see automaticTarget). The moment is refused like a pin when no
 //     base backup finished by it.

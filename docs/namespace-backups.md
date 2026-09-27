@@ -1063,6 +1063,15 @@ function, `restic.SyncedMoment` (internal/restic/synced.go):
    (internal/bootstrap/synced.go `automaticTarget`). If no base backup
    finished by then, it refuses the Cluster, as it does for a pin.
 
+The webhook uses the moment only when the volumes come back with the
+Cluster. If a claim whose `dataSourceRef` names a VolumeRestore is Bound, the
+volumes are live, and only the Cluster comes back. The populator library binds
+such a claim only after its restore Job filled it, so a claim that is absent or
+still Pending comes back with the Cluster. With a live volume, the webhook
+recovers the Cluster to the end of its archive, or to its
+`backup.wlz.li/restore-as-of`. A moment older than the live volumes would lose
+database writes.
+
 If two repositories give two different times, a quiesced run did not rewrite
 every snapshot. Then nothing picks a moment. The claim stays Pending with reason
 NoBackupInReach, and the webhook refuses the Cluster. Both messages name the two

@@ -96,3 +96,26 @@ func TestTwoQuiescedMomentsRefuseTheCluster(t *testing.T) {
 		t.Errorf("the refusal does not name both repositories: %q", response.Result.Message)
 	}
 }
+
+// TestLiveVolumesKeepTheNewestRecovery checks that a Cluster created while a
+// claim that its VolumeRestore filled is Bound recovers to the end of its
+// archive, as with no quiesced snapshots. Only the Cluster comes back, so a
+// quiesced moment older than the live volume would lose database writes.
+func TestLiveVolumesKeepTheNewestRecovery(t *testing.T) {
+	moment := sunday.Add(24 * time.Hour)
+	lister := snapshotsBySecret{"data-repo": {moverAt("aa", moment, restic.QuiescedTag)}}
+	live := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "app"},
+		Spec: corev1.PersistentVolumeClaimSpec{DataSourceRef: &corev1.TypedObjectReference{
+			APIGroup: &backupv1alpha1.GroupVersion.Group, Kind: "VolumeRestore", Name: "data",
+		}},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+	original := cluster(t, nil)
+
+	patched := applied(t, original, decideSynced(t, original, lister, append(volumeRestore("data"), live)...))
+
+	if _, found, _ := unstructured.NestedMap(patched, "spec", "bootstrap", "recovery", "recoveryTarget"); found {
+		t.Error("a Cluster beside a live volume got a recovery target")
+	}
+}
