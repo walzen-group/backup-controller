@@ -41,9 +41,9 @@ rules:
   # (populator-machinery/controller.go:289 and :542). Without this rule the
   # reflector fails every few seconds, the cache never syncs, and every claim
   # stays Pending with nothing on it saying why. The populator orphan
-  # reconciler (internal/populator/orphans.go) and a RestoreRun that stops
-  # a restore mover (moverRemains in internal/runs/restorerun.go) list the
-  # pods of that mover's Job, and wait while one is still there.
+  # reconciler (internal/populator/orphans.go) lists the pods of a VolSync
+  # mover's Job, and a RestoreRun that stops a restore Job (restorejob.Stop)
+  # lists that Job's pods; each waits while one is still there.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
@@ -123,9 +123,10 @@ rules:
   - apiGroups: ["kueue.x-k8s.io"]
     resources: ["localqueues"]
     verbs: ["list"]
-  # One destination per restore, created and removed by the callbacks and by a
-  # RestoreRun. The populator orphan reconciler deletes the destination of a
-  # claim whose VolumeRestore is gone.
+  # One destination per populator restore, created and removed by the
+  # callbacks. A RestoreRun lists destinations for its exclusion check. The
+  # populator orphan reconciler deletes the destination of a claim whose
+  # VolumeRestore is gone.
   - apiGroups: ["volsync.backube"]
     resources: ["replicationdestinations"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -134,11 +135,10 @@ rules:
   # merge patch and deletes it with Foreground propagation, and a RestoreRun
   # lists its own restore Jobs by label for the exclusion check. Reads go
   # through the uncached reader, so no watch. The Job's pods are listed by
-  # their controller-uid label under the pods rule above. A RestoreRun that
-  # stops a VolSync mover (moverRemains in internal/runs/restorerun.go) and
-  # the populator orphan reconciler (internal/populator/orphans.go) read the
-  # mover's Job by name with get, until the restore moves to the Job. RBAC
-  # cannot scope the rule to the controller's own Jobs; create and delete
+  # their controller-uid label under the pods rule above. The populator
+  # orphan reconciler (internal/populator/orphans.go) reads a VolSync
+  # mover's Job by name with get, until the populator moves to the Job.
+  # RBAC cannot scope the rule to the controller's own Jobs; create and delete
   # cover every Job in the cluster.
   - apiGroups: ["batch"]
     resources: ["jobs"]

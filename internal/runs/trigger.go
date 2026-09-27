@@ -29,7 +29,7 @@ const FieldOwner = client.FieldOwner(backupv1alpha1.FieldManager)
 
 // Finalizer keeps a deleted run in place until the controller has put back
 // whatever the run changed: a stopped workload, a suspended Kustomization, or
-// a ReplicationDestination it created.
+// a restore Job it created.
 const Finalizer = "backup.wlz.li/run-cleanup"
 
 // pollInterval is how long a waiting run waits before it checks again. The

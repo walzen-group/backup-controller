@@ -244,7 +244,7 @@ func TestARestoreWhoseSnapshotIsStillThereGoesAhead(t *testing.T) {
 // whose write went through does, and the Job's pod may already write. From
 // then on the item is followed like any other Running item, and the run
 // stops that Job when it ends (UFR1). No second Job is created.
-func TestAPassAfterALostWriteTakesTheDestinationOver(t *testing.T) {
+func TestAPassAfterALostWriteTakesTheJobOver(t *testing.T) {
 	for name, tc := range map[string]struct {
 		forget bool
 		gone   client.Object

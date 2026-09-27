@@ -168,7 +168,7 @@ linters:
         source: '^func releaseFailure\('
       - path: '^internal/runs/restorerun\.go$'
         linters: [funlen, gocognit]
-        source: '^func \(r \*RestoreRunReconciler\) (plan|items|clustersRestoredElsewhere|work|restoreDatabase|quiesce|finalize|removeDestinations)\('
+        source: '^func \(r \*RestoreRunReconciler\) (plan|items|clustersRestoredElsewhere|work|restoreDatabase|quiesce|finalize)\('
       - path: '^internal/runs/restorerun\.go$'
         linters: [revive]
         text: '^confusing-results:'

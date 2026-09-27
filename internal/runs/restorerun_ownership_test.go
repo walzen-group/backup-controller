@@ -4,9 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -59,24 +57,6 @@ func boundClaim(name string, owners ...metav1.OwnerReference) *corev1.Persistent
 			},
 		},
 		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
-	}
-}
-
-// foreignDestination returns a ReplicationDestination with the name the run
-// back-to-monday gives its first item's destination, whose manual trigger
-// is another run's UID.
-func foreignDestination(claimName string) *volsyncv1alpha1.ReplicationDestination {
-	return &volsyncv1alpha1.ReplicationDestination{
-		ObjectMeta: metav1.ObjectMeta{Name: destinationName(restoreUID, 0), Namespace: ns},
-		Spec: volsyncv1alpha1.ReplicationDestinationSpec{
-			Trigger: &volsyncv1alpha1.ReplicationDestinationTriggerSpec{Manual: string(oldRestoreUID)},
-			Restic: &volsyncv1alpha1.ReplicationDestinationResticSpec{
-				ReplicationDestinationVolumeOptions: volsyncv1alpha1.ReplicationDestinationVolumeOptions{
-					CopyMethod: volsyncv1alpha1.CopyMethodDirect, DestinationPVC: &claimName,
-				},
-				Repository: repoN,
-			},
-		},
 	}
 }
 
@@ -267,47 +247,6 @@ func TestAnIntoRestoreWhoseClaimCreateWasLostContinues(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q, message = %q; want Succeeded", run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
-}
-
-// A ReplicationDestination with the name the run's first item had while an
-// into restore wrote through destinations, whose trigger is another run's
-// UID, is left alone: the into restore writes through its own restore Job,
-// succeeds, and never touches or deletes that destination. An existing
-// Job under the restore Job's name is refused instead (see
-// TestAnIntoTakeoverChecksTheJob).
-func TestARestoreRefusesADestinationItDidNotCreate(t *testing.T) {
-	foreign := foreignDestination("scratch")
-	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), claim(), volumeRestore(), repository(), foreign)
-	restoreStep(t, r) // plan
-	restoreStep(t, r) // create
-	completeJob(t, c)
-	run := stepUntilFinished(t, r, c, 3)
-
-	if run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
-		t.Fatalf("phase = %q, message = %q; want Succeeded", run.Status.Phase, readyMessage(run.Status.Conditions))
-	}
-	kept := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, foreign.Name, kept)
-	if kept.Spec.Trigger.Manual != string(oldRestoreUID) || kept.DeletionTimestamp != nil {
-		t.Errorf("destination = %+v, want the other run's untouched", kept.ObjectMeta)
-	}
-}
-
-// A destination the run's status names but whose trigger is another run's
-// is never deleted when the run ends: removeDestinations reads the trigger
-// first. Before, a run that timed out deleted it.
-func TestRemovingDestinationsLeavesAnotherRunsDestination(t *testing.T) {
-	restore, _ := restoring()
-	restore.Status.StartedAt = &metav1.Time{Time: frozen}
-	foreign := foreignDestination(claimN)
-	r, c := restoreReconciler(t, nil, restore, claim(), volumeRestore(), repository(), foreign)
-	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-	if run := stepUntilFinished(t, r, c, 3); run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Fatalf("phase = %q, want the run timed out", run.Status.Phase)
-	}
-
-	kept := &volsyncv1alpha1.ReplicationDestination{}
-	get(t, c, ns, foreign.Name, kept)
 }
 
 // An into restore from a repository whose claim is deleted, or replaced by

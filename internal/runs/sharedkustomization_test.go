@@ -115,7 +115,7 @@ func TestANamespaceBackupRefusesAKustomizationSharedAcrossNamespaces(t *testing.
 }
 
 // A quiesced RestoreRun refuses the same Kustomization before it stops
-// anything, and creates no ReplicationDestination.
+// anything, and creates no mover.
 func TestAQuiescedRestoreRefusesAKustomizationSharedAcrossNamespaces(t *testing.T) {
 	r, c := restoreReconciler(t, nil, quiescedRestoreOf(),
 		deploymentApplying(ns, appN), deploymentApplying(wikiNS, "wiki"), sharedKustomization(false),
@@ -124,8 +124,8 @@ func TestAQuiescedRestoreRefusesAKustomizationSharedAcrossNamespaces(t *testing.
 
 	run := readRestoreRun(t, c)
 	expectSharedRefusal(t, c, run.Status.Phase, run.Status.Conditions, false)
-	if names := destinations(t, c); len(names) != 0 {
-		t.Errorf("destinations = %v, want none", names)
+	if names := movers(t, c); len(names) != 0 {
+		t.Errorf("movers = %v, want none", names)
 	}
 }
 

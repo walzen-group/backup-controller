@@ -14,6 +14,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// restoringDestination is the name of the ReplicationDestination of
+// restoring's item: restore-, the first eight characters of the run's UID, a
+// dash and the item's position, as runs named their destinations before
+// they restored through their own Jobs. restoreInProgress matches such a
+// destination until restic-jobs step 7c moves it to Jobs.
+const restoringDestination = "restore-9b7d4e21-0"
+
 // restoring returns the RestoreRun back-to-monday in the middle of an
 // in-place restore of the claim, and the ReplicationDestination its mover
 // writes the claim from.
@@ -22,11 +29,11 @@ func restoring() (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.ReplicationDestin
 		r.Spec.Claim = claimN
 		r.Status.Phase = backupv1alpha1.RunPhaseRunning
 		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN,
-			Phase: backupv1alpha1.ItemRunning, Destination: destinationName(restoreUID, 0)}}
+			Phase: backupv1alpha1.ItemRunning, Destination: restoringDestination}}
 	})
 	claimName := claimN
 	destination := &volsyncv1alpha1.ReplicationDestination{
-		ObjectMeta: metav1.ObjectMeta{Name: destinationName(restoreUID, 0), Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: restoringDestination, Namespace: ns},
 		Spec: volsyncv1alpha1.ReplicationDestinationSpec{
 			Trigger: &volsyncv1alpha1.ReplicationDestinationTriggerSpec{Manual: string(restoreUID)},
 			Restic: &volsyncv1alpha1.ReplicationDestinationResticSpec{

@@ -275,7 +275,7 @@ func TestARestoreReleasesItsLeasesWhenItFinishes(t *testing.T) {
 
 	claimLease, repoLease := leaseNames(t, c)
 	if leaseHolderOf(t, c, claimLease) != string(restoreUID) || leaseHolderOf(t, c, repoLease) != string(restoreUID) {
-		t.Fatalf("claim Lease holder = %q, repository Lease holder = %q; want the restore to hold both before its destination",
+		t.Fatalf("claim Lease holder = %q, repository Lease holder = %q; want the restore to hold both before its restore Job",
 			leaseHolderOf(t, c, claimLease), leaseHolderOf(t, c, repoLease))
 	}
 	completeJob(t, c)
@@ -410,7 +410,7 @@ func TestABackupWithoutItsRepositorySecretStartsNoMover(t *testing.T) {
 }
 
 // A restore whose repository Secret is deleted after its checks fails its
-// item before it creates a ReplicationDestination, and names the Secret.
+// item before it creates a restore Job, and names the Secret.
 func TestARestoreWhoseRepositorySecretIsGoneStartsNoMover(t *testing.T) {
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
 		claim(), volumeRestore(), repository())

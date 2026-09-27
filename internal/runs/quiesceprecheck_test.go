@@ -171,7 +171,7 @@ func TestThePreCheckFailsClosed(t *testing.T) {
 	}
 }
 
-// A claim whose Lease a live RestoreRun holds, and no ReplicationDestination
+// A claim whose Lease a live RestoreRun holds, and no restore Job
 // yet, makes a namespace BackupRun wait before it stops anything.
 func TestThePreCheckSeesAClaimLeaseHeldByARestore(t *testing.T) {
 	restoring := restoreRun(func(r *backupv1alpha1.RestoreRun) {
@@ -445,7 +445,7 @@ func TestAnItemStartItemWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
 }
 
 // A quiesced RestoreRun fails an item restoreVolume would refuse before its
-// ReplicationDestination exists in its pre-check, with the message
+// restore Job exists in its pre-check, with the message
 // restoreVolume gives, and with no item left to restore it never stops the
 // app. The refusals it can know before the stop are a claim that is gone or
 // being deleted, and a claim whose VolumeRestore is gone, which repositoryFor
@@ -503,7 +503,7 @@ func TestAnItemRestoreVolumeWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
 }
 
 // A RestoreRun without spec.quiesce fails an item whose claim is being
-// deleted before it creates a ReplicationDestination, with the message the
+// deleted before it creates a restore Job, with the message the
 // pre-check gives: the mover would write into a claim that is about to go,
 // and the scheduler does not place a pod whose claim is being deleted.
 func TestARestoreIntoAClaimBeingDeletedFailsBeforeTheMoverStarts(t *testing.T) {
@@ -526,11 +526,10 @@ func TestARestoreIntoAClaimBeingDeletedFailsBeforeTheMoverStarts(t *testing.T) {
 	run := readRestoreRun(t, c)
 	want := "claim " + claimN + " is being deleted" + nothingWritten(claimN)
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || run.Status.Items[0].Phase != backupv1alpha1.ItemFailed ||
-		run.Status.Items[0].Message != want || run.Status.Items[0].Destination != "" {
-		t.Fatalf("phase = %q, items = %+v; want Failed with the item message %q and no destination", run.Status.Phase, run.Status.Items, want)
+		run.Status.Items[0].Message != want || run.Status.Items[0].Job != "" {
+		t.Fatalf("phase = %q, items = %+v; want Failed with the item message %q and no restore Job", run.Status.Phase, run.Status.Items, want)
 	}
-	destinations := &volsyncv1alpha1.ReplicationDestinationList{}
-	if err := c.List(context.Background(), destinations); err != nil || len(destinations.Items) != 0 {
-		t.Errorf("ReplicationDestinations = %d (err %v); want none", len(destinations.Items), err)
+	if names := movers(t, c); len(names) != 0 {
+		t.Errorf("movers = %v, want none", names)
 	}
 }

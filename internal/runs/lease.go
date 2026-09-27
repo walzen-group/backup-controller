@@ -308,9 +308,9 @@ func leaseItems(lease *coordinationv1.Lease) []string {
 // A claim or repository Lease is live while the run exists with the UID the
 // Lease names, has not finished, and has an item the Lease names that is
 // Pending or Running. A RestoreRun's item also keeps it live once it has
-// finished, for as long as it names its ReplicationDestination or its
-// restore Job: the run has stopped that mover and not yet seen it gone (rule
-// X2, see stopMovers). Only an item of the kind that takes Leases counts, a
+// finished, for as long as it records the UID of its restore Job: the run
+// has stopped that Job and not yet seen that no pod of it can write (rule
+// X2, see stopJobs). Only an item of the kind that takes Leases counts, a
 // BackupRun's ReplicationSource item or a RestoreRun's PersistentVolumeClaim
 // item: a Lease names its items by name alone, and a Cluster item with the
 // claim's name does not keep the claim's Lease. A quiesce Lease is live
@@ -361,11 +361,11 @@ func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1
 			return !durablyRestarted(run), nil
 		}
 		for _, item := range run.Status.Items {
-			// A finished item that still names its ReplicationDestination
-			// or its restore Job has a mover the run has stopped and not yet
-			// seen gone (rule X2), and that mover may still write.
+			// A finished item that still records its restore Job's UID has
+			// a Job the run has stopped and not yet seen stopped (rule X2),
+			// and a pod of that Job may still write.
 			if item.Kind == backupv1alpha1.ItemKindClaim && slices.Contains(items, item.Name) &&
-				(!finished(item) || item.Destination != "" || item.JobUID != "") {
+				(!finished(item) || item.JobUID != "") {
 				return true, nil
 			}
 		}

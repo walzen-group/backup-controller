@@ -3,9 +3,7 @@ package runs
 import (
 	"context"
 	"fmt"
-	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -137,80 +135,6 @@ func repositoryFor(ctx context.Context, c client.Reader, namespace, claimName, r
 	return settings, nil
 }
 
-// selectedMoment returns the restoreAsOf that makes a mover restore the
-// snapshot a run's checks selected for an item: the snapshot's time in whole
-// seconds, as RFC 3339. The mover takes the newest snapshot at or before
-// restoreAsOf, comparing whole seconds, and every newer snapshot is later than
-// that, so it takes the selected one. It returns nil for an item with no
-// recorded snapshot time, which recheckSnapshot refuses before any
-// destination is built.
-func selectedMoment(item backupv1alpha1.RestoreItem) *string { //nolint:unused // deleted in restic-jobs step 7b
-	if item.SnapshotTime == nil {
-		return nil
-	}
-	moment := item.SnapshotTime.UTC().Format(time.RFC3339)
-	return &moment
-}
-
-// directDestination builds the ReplicationDestination through which every
-// volume restore writes straight into a claim: an in-place restore, whose
-// claim is the one the app uses, and an into restore, whose claim the run
-// created (see scratchClaim). Its mover mounts the claim and writes the
-// chosen snapshot into it.
-//
-// Parameters:
-//   - run is the RestoreRun. Its UID becomes the manual trigger.
-//   - item is the volume item. The destination writes into the claim it
-//     names, and restores the snapshot the run's checks selected for it.
-//   - settings are the repository and mover settings from repositoryFor.
-//   - name is the name to give the ReplicationDestination.
-//
-// enableFileDeletion makes the mover remove the files the snapshot lacks, so
-// the volume ends up holding exactly the snapshot. cleanupCachePVC drops the
-// mover's cache claim when the run ends. The manual trigger is the run's UID,
-// so a controller that restarts mid-restore recognises its own work.
-//
-// The mover gets the selected snapshot's time as restoreAsOf and gets no
-// previous (see selectedMoment). Handing it spec.restoreAsOf and
-// spec.previous would make it choose again when it starts, and a backup taken
-// since the checks would shift what the newest snapshot, or the one before
-// it, is. The callers run recheckSnapshot first, which refuses an item with
-// no recorded time.
-func directDestination(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem, settings restoreSettings, name string) *volsyncv1alpha1.ReplicationDestination { //nolint:unused // deleted in restic-jobs step 7b
-	claim := item.Name
-	return &volsyncv1alpha1.ReplicationDestination{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: run.Namespace},
-		Spec: volsyncv1alpha1.ReplicationDestinationSpec{
-			Trigger: &volsyncv1alpha1.ReplicationDestinationTriggerSpec{Manual: string(run.UID)},
-			Restic: &volsyncv1alpha1.ReplicationDestinationResticSpec{
-				ReplicationDestinationVolumeOptions: volsyncv1alpha1.ReplicationDestinationVolumeOptions{
-					CopyMethod:     volsyncv1alpha1.CopyMethodDirect,
-					DestinationPVC: &claim,
-				},
-				Repository:            settings.Secret,
-				RestoreAsOf:           selectedMoment(item),
-				CacheStorageClassName: settings.CacheStorageClassName,
-				CacheCapacity:         settings.CacheCapacity,
-				EnableFileDeletion:    true,
-				CleanupCachePVC:       true,
-				MoverConfig: volsyncv1alpha1.MoverConfig{
-					MoverPodLabels:       settings.MoverPodLabels,
-					MoverSecurityContext: settings.MoverSecurityContext,
-				},
-			},
-		},
-	}
-}
-
-// ownsDestination reports whether the run created the ReplicationDestination:
-// its manual trigger is the run's UID, as directDestination sets it. A run
-// created again under the same name has another UID, so it does not own the
-// destinations of the run it replaces. A run writes, waits on and deletes
-// only destinations it owns.
-func ownsDestination(run *backupv1alpha1.RestoreRun, destination *volsyncv1alpha1.ReplicationDestination) bool {
-	return destination.Spec.Trigger != nil && destination.Spec.Trigger.Manual == string(run.UID)
-}
-
 // notCreatedByRun refuses an object named spec.into that the run does not
 // control.
 //
@@ -260,10 +184,10 @@ func notCreatedByRun(run *backupv1alpha1.RestoreRun, kind string, object metav1.
 //   - settings are the source claim's settings from repositoryFor. A
 //     restore from spec.repository alone has none.
 //
-// The claim has no data source: the run's ReplicationDestination writes the
-// selected snapshot into it (see directDestination). It takes the source
-// claim's size and class, so the copy is provisioned the way the original
-// was. It is an ordinary dynamic claim. Deleting it deletes its dataset too,
+// The claim has no data source: the run's restore Job writes the selected
+// snapshot into it (see createInto). It takes the source claim's size and
+// class, so the copy is provisioned the way the original was. It is an
+// ordinary dynamic claim. Deleting it deletes its dataset too,
 // which makes a scratch copy cheap to throw away. The run is its controller
 // owner.
 //

@@ -92,9 +92,11 @@ func (r *BackupRunReconciler) serve() {
 }
 
 // serve wraps the reconciler's client and reader as
-// BackupRunReconciler.serve does. A ReplicationDestination read at a version
-// VolSync no longer serves would otherwise read as a destination someone
-// deleted, and the run would take its mover for stopped.
+// BackupRunReconciler.serve does. A request for a VolSync object at a
+// version VolSync no longer serves then fails with an error that names the
+// kind and v1alpha1, which the run retries and shows on its Ready
+// condition, and no caller that checks for NotFound reads it as an object
+// that is gone.
 func (r *RestoreRunReconciler) serve() {
 	r.Client = served.Client(r.Client)
 	r.Reader = served.Reader(r.Reader, r.Client)

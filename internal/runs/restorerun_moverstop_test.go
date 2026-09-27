@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -28,24 +27,6 @@ import (
 // is suspended first; its pods are waited for; and only then does the run
 // give the app back, release the Leases or continue.
 
-// destinationFor returns the ReplicationDestination the run back-to-monday
-// created for its first item, writing into the claim named claim: the run's
-// trigger, a Direct restic mover, and the claim's repository Secret.
-func destinationFor(run *backupv1alpha1.RestoreRun, claim string) *volsyncv1alpha1.ReplicationDestination {
-	return &volsyncv1alpha1.ReplicationDestination{
-		ObjectMeta: metav1.ObjectMeta{Name: destinationName(run.UID, 0), Namespace: run.Namespace},
-		Spec: volsyncv1alpha1.ReplicationDestinationSpec{
-			Trigger: &volsyncv1alpha1.ReplicationDestinationTriggerSpec{Manual: string(run.UID)},
-			Restic: &volsyncv1alpha1.ReplicationDestinationResticSpec{
-				ReplicationDestinationVolumeOptions: volsyncv1alpha1.ReplicationDestinationVolumeOptions{
-					CopyMethod: volsyncv1alpha1.CopyMethodDirect, DestinationPVC: &claim,
-				},
-				Repository: repoN,
-			},
-		},
-	}
-}
-
 // intoClaim returns the plain claim an into restore creates for spec.into,
 // controlled by the run.
 func intoClaim(run *backupv1alpha1.RestoreRun) *corev1.PersistentVolumeClaim {
@@ -65,10 +46,6 @@ func intoClaim(run *backupv1alpha1.RestoreRun) *corev1.PersistentVolumeClaim {
 		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
 	}
 }
-
-// A mover that is still restoring has a pod that belongs there. The run does
-// not wait for it: it would never finish the restore it started, and it goes
-// on with the pass.
 
 // quiescedInPlace is a mutate function for restoreRun that makes it a
 // namespace restore which stops the app's Deployment (see quiescedRestore).
@@ -160,12 +137,6 @@ func TestAnIntoRestoreWhoseMoverFailedRecordsTheEndBeforeTheMoverGoes(t *testing
 	}
 }
 
-// A run past its timeout stops its mover before it gives the app back: the
-// ReplicationDestination goes, and while a pod of that mover is still there
-// the run waits instead of restarting the app, however far past the timeout
-// the clock has moved. Once the pod is gone the app comes back and the run
-// ends TimedOut.
-
 // restoringOnJob returns the RestoreRun back-to-monday in the middle of an
 // in-place restore of the claim, not quiesced, with its item Running and
 // naming its restore Job, and that Job, which restores monday's snapshot.
@@ -211,27 +182,6 @@ func quiescedMidRestore(t *testing.T) (*backupv1alpha1.RestoreRun, *batchv1.Job)
 		r.Status.Items = []backupv1alpha1.RestoreItem{runningOnJob(claimN, 0)}
 	})
 	return run, restoreJobFor(t, run, claimN, monday.ID)
-}
-
-// quiescedDestinationRestore returns quiescedMidRestore's run in the shape
-// a run had while a restore still wrote through a ReplicationDestination:
-// the item names the destination and no Job. No restore takes that shape
-// any more, but finish and finalize still stop a destination an item names,
-// so the tests of the destination stop and of the failures to put back use
-// it until restic-jobs step 7b moves them to Jobs.
-func quiescedDestinationRestore() (*backupv1alpha1.RestoreRun, *volsyncv1alpha1.ReplicationDestination) {
-	started := metav1.NewTime(frozen)
-	run := restoreRun(quiescedInPlace, func(r *backupv1alpha1.RestoreRun) {
-		r.Finalizers = []string{Finalizer}
-		r.Status.Phase = backupv1alpha1.RunPhaseRunning
-		r.Status.StartedAt = &started
-		r.Status.QuiescedAt = &started
-		r.Status.Quiesced = []backupv1alpha1.QuiescedWorkload{{Kind: "Deployment", Name: appN, Replicas: 2}}
-		r.Status.SuspendedKustomizations = []string{"flux-system/" + appN}
-		r.Status.Items = []backupv1alpha1.RestoreItem{{Kind: "PersistentVolumeClaim", Name: claimN,
-			Phase: backupv1alpha1.ItemRunning, Destination: destinationName(restoreUID, 0), Snapshot: monday.ShortID()}}
-	})
-	return run, destinationFor(run, claimN)
 }
 
 // markSuspended gives the stored Job the condition Suspended=True, as the

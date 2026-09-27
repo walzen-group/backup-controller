@@ -797,8 +797,8 @@ func (e *restartError) Error() string { return "could not " + e.action + ": " + 
 func (e *restartError) Unwrap() error { return e.err }
 
 // releaseError is a failure of a step that releases or deletes something a
-// run holds: its Leases, its Kueue Workload, or a restore mover it stops (the
-// ReplicationDestination, and the wait for the mover's Job and pods). The
+// run holds: its Leases, its Kueue Workload, or a restore Job it stops (the
+// suspend, the delete, and the wait until no pod of the Job can write). The
 // step can come before the workloads are back, as a RestoreRun stops its
 // movers first, or after them; releasePlan.appDown tells releaseFailure
 // which. The error says what the run could not do and what a person can do

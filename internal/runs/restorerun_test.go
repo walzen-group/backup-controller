@@ -27,8 +27,8 @@ import (
 )
 
 // restoreUID is the UID of the RestoreRun back-to-monday. The run's
-// ReplicationDestinations use it as their manual trigger, so a test marks a
-// restore done by writing it to the destination's lastManualSync.
+// restore Jobs take their names from it and carry it as their controller
+// reference, so a test builds the Job a run would create.
 const restoreUID = types.UID("9b7d4e21-0000-4000-8000-000000000002")
 
 // restoreRun returns the RestoreRun back-to-monday with a four-hour timeout,
@@ -1223,10 +1223,6 @@ func TestAnIntoRestoreTimesOutWhileItsClaimIsRefused(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err != nil {
 		t.Fatalf("reconcile past the timeout returned %v, want the run ended", err)
 	}
-	// The run named its destination at the checks, so it looks for that
-	// destination's mover a poll interval later before it ends.
-	advance(r, pollInterval)
-	restoreStep(t, r)
 	run := readRestoreRun(t, c)
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
 		t.Fatalf("phase = %q, reason = %q; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))
