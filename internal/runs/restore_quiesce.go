@@ -13,12 +13,14 @@ import (
 // backup.wlz.li/quiesce, which a BackupRun of the namespace stops (see
 // quiesce.NamedAndMarked). A volume restored into its own claim and a
 // Cluster that the restore deletes both change the data under the running
-// app. An into restore does not come here (see restoreIntoEmptyClaim).
+// app. An into restore writes only into a claim it creates, so it stops
+// nothing.
 //
 // Parameters:
 //   - run is the RestoreRun in its work pass.
 //
-// It returns done false when the run has recorded status.quiescedAt, and
+// It returns done false for an into restore, when the run has recorded
+// status.quiescedAt, and
 // when it has no plan and nothing to stop: that run restores with the app
 // as it is, and looks again at the next pass. It returns done true, with
 // what quiesce returns, while the run has workloads to stop. A spec.quiesce
@@ -26,7 +28,7 @@ import (
 // Invalid before anything is stopped. Any other failed read comes back as
 // an error, and the pass is retried.
 func (r *RestoreRunReconciler) quiesceFirst(ctx context.Context, run *backupv1alpha1.RestoreRun) (done bool, result ctrl.Result, err error) {
-	if run.Status.QuiescedAt != nil {
+	if run.Spec.Into != "" || run.Status.QuiescedAt != nil {
 		return false, ctrl.Result{}, nil
 	}
 	var targets []quiesce.Workload

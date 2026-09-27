@@ -13,8 +13,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// work makes one pass over an in-place run that plan has checked, and
-// returns when to look again.
+// work makes one pass over a run that plan or planIntoNewClaim has checked,
+// and returns when to look again. An into restore has one volume item and
+// stops no workload.
 //
 // Parameters:
 //   - run is the RestoreRun, in phase Running or Waiting with its items
@@ -26,7 +27,7 @@ import (
 //
 // A run past spec.timeout with an item still unfinished ends with reason
 // TimedOut (see timeOut), and a message that names the SourceBusy wait it
-// was in. A run whose items have all finished only waits for its stopped
+// was in (intoTimedOut for an into restore). A run whose items have all finished only waits for its stopped
 // movers to go before it gives the app back, so a deadline that passes
 // during that wait leaves it waiting, and it ends as its items say. The
 // first passes call quiesce to stop the workloads spec.quiesce lists and the
@@ -140,7 +141,11 @@ func (r *RestoreRunReconciler) endIfOverdue(ctx context.Context, run *backupv1al
 	if !over || restoreDone(run.Status.Items) {
 		return false, ctrl.Result{}, nil
 	}
-	result, err = r.timeOut(ctx, run, timedOutMessage(deadline, run.Status.Conditions))
+	message := timedOutMessage(deadline, run.Status.Conditions)
+	if run.Spec.Into != "" {
+		message = intoTimedOut(run.Spec.Into, deadline, run.Status.Conditions)
+	}
+	result, err = r.timeOut(ctx, run, message)
 	return true, result, err
 }
 
@@ -350,7 +355,7 @@ func (r *RestoreRunReconciler) finishOrWait(ctx context.Context, run *backupv1al
 	case restoreDone(items) && !anyItemIn(items, backupv1alpha1.ItemSucceeded):
 		return r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, nothingRestored(items))
 	case restoreDone(items):
-		return r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, "every item holds the restored data")
+		return r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, succeededMessage(run))
 	case len(databases.shuttingDown) > 0:
 		return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonShutdown,
 			fmt.Sprintf("waiting for %s of the deleted Cluster to be gone before anything creates it again", strings.Join(databases.shuttingDown, ", "))))
@@ -364,6 +369,6 @@ func (r *RestoreRunReconciler) finishOrWait(ctx context.Context, run *backupv1al
 		return after(pollInterval, r.waitFor(ctx, run, volumes.wait.readyReason(), volumes.wait.text))
 	}
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "restoring")
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, runningMessage(run))
 	return after(pollInterval, r.writeStatus(ctx, run))
 }

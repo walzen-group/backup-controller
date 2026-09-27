@@ -1,6 +1,7 @@
 package runs
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -38,8 +39,9 @@ func settled(item *backupv1alpha1.RestoreItem, err error) (bool, error) {
 	return err != nil, err
 }
 
-// startJob moves a Pending in-place volume item a step further, and starts
-// its restore Job once nothing holds it back.
+// startJob moves a volume item that has no restore Job a step further, and
+// starts its Job once nothing holds it back: a Pending in-place item, or
+// the Running item of an into restore.
 //
 // Parameters:
 //   - run is the RestoreRun the item belongs to.
@@ -48,37 +50,48 @@ func settled(item *backupv1alpha1.RestoreItem, err error) (bool, error) {
 //   - item is the volume item, which startJob updates in place.
 //
 // It returns the hold of the item while it waits, and the zero hold
-// otherwise: a hold of kind holdClaimInUse that names the pod while a pod
-// mounts the claim, and a hold of kind holdSourceBusy that names the other
-// run while another run holds the Lease of the claim or its repository (see
-// acquireLeases) or a backup of either is in progress (see otherMover). The item stays Pending in each of these
-// waits. It returns an error, and leaves the item as it was, when an API
-// call or the listing fails for a reason a retry may fix.
+// otherwise (see startChecks and takeSource). The item stays as it is in
+// each of these waits. It returns an error, and leaves the item as it was,
+// when an API call or the listing fails for a reason a retry may fix.
 //
 // A Job the run created under the item's name is taken over before
-// anything else (see takeOverJob). Any other Pending item waits until no pod
-// mounts the claim, then passes the start checks (see startRefusal), takes
-// the Leases, and lists the repository again (see recheckJobSnapshot). A
-// refusal from any of them fails the item with its reason and says that
-// nothing was written to the claim. Then the run creates the Job (see
-// createJob).
+// anything else (see takeOverJob). For an into restore the Job is then
+// still suspended, because only a pass that recorded its UID resumes it,
+// and a claim of the spec.into name that the run did not create can be
+// there in place of the claim of the lost pass: the item then fails with
+// reason IntoClaimTaken, and the run stops the Job before it writes. Any
+// other item passes the start checks (see startChecks), takes the Leases,
+// and lists the repository again (see recheckJobSnapshot). A refusal from
+// any of them fails the item with its reason and says that nothing was
+// written to the claim. Then an into restore creates its claim (see
+// scratchClaim), and a claim of that name the run did not create fails the
+// item with reason IntoClaimTaken (see createOwned). The claim is created
+// only once it is known to be the run's, since the Job restores with
+// --delete. Last the run creates the Job (see createJob), which mounts the
+// claim by name and is its first consumer, so on a WaitForFirstConsumer
+// class the scheduler places the volume where the Job's pod runs when no
+// node was copied.
 func (r *RestoreRunReconciler) startJob(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (hold, error) {
-	if taken, err := r.takeOverJob(ctx, run, index, item); taken || err != nil {
+	taken, err := r.takeOverJob(ctx, run, index, item)
+	if taken && err == nil && run.Spec.Into != "" {
+		err = r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, kindClaim)
+	}
+	if taken || err != nil {
 		_, err = settled(item, err)
 		return hold{}, err
 	}
-	holder, err := claimHolder(ctx, r.Reader, run.Namespace, item.Name)
-	if err != nil {
-		return hold{}, fmt.Errorf("look for a pod holding claim %s: %w", item.Name, err)
+	settings, wait, err := r.startChecks(ctx, run, item.Name)
+	if done, err := settled(item, err); done || wait.held() {
+		return wait, err
 	}
-	if holder != "" {
-		return claimInUse("claim %s is mounted by pod %s; stop the workload and this restore starts on its own", item.Name, holder), nil
+	leased := item.Name
+	if run.Spec.Into != "" {
+		// An into restore takes the Leases on its source claim, which the
+		// plan's checks covered, and on the new claim when it restores from
+		// spec.repository alone.
+		leased = cmp.Or(run.Spec.Claim, run.Spec.Into)
 	}
-	settings, err := r.startRefusal(ctx, run, item.Name)
-	if done, err := settled(item, err); done {
-		return hold{}, err
-	}
-	busy, err := r.takeSource(ctx, run, item.Name, item.Name, settings.Secret)
+	busy, err := r.takeSource(ctx, run, item.Name, leased, settings.Secret)
 	if done, err := settled(item, nothingWrittenTo(item.Name, err)); done {
 		return hold{}, err
 	}
@@ -89,8 +102,44 @@ func (r *RestoreRunReconciler) startJob(ctx context.Context, run *backupv1alpha1
 	if done, err := settled(item, err); done {
 		return hold{}, err
 	}
+	if run.Spec.Into != "" {
+		err = r.createOwned(ctx, run, scratchClaim(run, settings), &corev1.PersistentVolumeClaim{}, kindClaim)
+		if done, err := settled(item, err); done {
+			return hold{}, err
+		}
+	}
 	_, err = settled(item, r.createJob(ctx, run, index, item, settings))
 	return hold{}, err
+}
+
+// startChecks runs the checks a volume item makes right before the run
+// takes its Leases.
+//
+// Parameters:
+//   - run is the RestoreRun the item belongs to.
+//   - claim names the item's claim, which is also the item's name.
+//
+// It returns the repository and mover settings, and the hold of an item
+// that waits. An into restore makes its
+// own checks (see intoChecks). An in-place item waits, with a hold of kind
+// holdClaimInUse that names the pod, while a pod mounts its claim, and then
+// passes startRefusal. A refusal comes
+// back as the error the caller fails the item with (see settled), and a
+// failed read as a plain error.
+func (r *RestoreRunReconciler) startChecks(ctx context.Context, run *backupv1alpha1.RestoreRun, claim string) (restoreSettings, hold, error) {
+	if run.Spec.Into != "" {
+		settings, err := r.intoChecks(ctx, run)
+		return settings, hold{}, err
+	}
+	holder, err := claimHolder(ctx, r.Reader, run.Namespace, claim)
+	if err != nil {
+		return restoreSettings{}, hold{}, fmt.Errorf("look for a pod holding claim %s: %w", claim, err)
+	}
+	if holder != "" {
+		return restoreSettings{}, claimInUse("claim %s is mounted by pod %s; stop the workload and this restore starts on its own", claim, holder), nil
+	}
+	settings, err := r.startRefusal(ctx, run, claim)
+	return settings, hold{}, err
 }
 
 // takeSource takes the Leases of the claim and the repository a volume
@@ -415,8 +464,8 @@ func (r *RestoreRunReconciler) checkClaimKept(ctx context.Context, run *backupv1
 	return r.inPlaceClaimLost(ctx, run, item.Name)
 }
 
-// restoreVolume moves one in-place volume restore a step further, through
-// the item's restore Job.
+// restoreVolume moves one volume restore, in place or into a new claim, a
+// step further through the item's restore Job.
 //
 // Parameters:
 //   - run is the RestoreRun the item belongs to.
@@ -424,29 +473,27 @@ func (r *RestoreRunReconciler) checkClaimKept(ctx context.Context, run *backupv1
 //     the item's restore Job (see jobName).
 //   - item is the volume item, which restoreVolume updates in place.
 //
-// It returns the hold of a Pending item that waits (see startJob), and the
-// zero hold otherwise. It returns an error, which leaves the item as it
-// was, when an API call fails for a reason a retry may fix.
+// It returns the hold of an item that waits for its start (see startJob),
+// and the zero hold otherwise. It returns an error, which leaves the item as
+// it was, when an API call fails for a reason a retry may fix.
 //
-// A Pending item starts its restore Job once nothing holds it back (see
-// startJob). A Running item follows its Job to its end (see followVolume).
-// The run stops the Job once the item's end is in the status (see
-// stopJobs).
+// A Pending item, and an unfinished item that records no Job UID (the
+// Running item of an into restore, which planIntoNewClaim starts Running),
+// starts its restore Job once nothing holds it back (see startJob). Any
+// other unfinished item follows its Job to its end (see followVolume). The
+// run stops the Job once the item's end is in the status (see stopJobs).
 func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (hold, error) {
-	switch item.Phase {
-	case backupv1alpha1.ItemPending:
-		return r.startJob(ctx, run, index, item)
-	case backupv1alpha1.ItemRunning:
-		return hold{}, r.followVolume(ctx, run, index, item)
-	default:
-		// An item in any other phase has finished, so there is nothing
-		// left to restore.
+	switch {
+	case finished(*item):
 		return hold{}, nil
+	case item.Phase == backupv1alpha1.ItemPending || item.JobUID == "":
+		return r.startJob(ctx, run, index, item)
 	}
+	return hold{}, r.followVolume(ctx, run, index, item)
 }
 
-// followVolume moves a Running in-place volume item a step further on its
-// restore Job.
+// followVolume moves a Running volume item a step further on its restore
+// Job.
 //
 // Parameters:
 //   - run is the RestoreRun the item belongs to.
@@ -457,12 +504,19 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 // (see settled). It returns an error, which leaves the item as it was, when
 // an API call fails for a reason a retry may fix.
 //
-// The item follows its Job to its end (see followJob). Its Job, created
-// suspended, is resumed in a pass that does not end the run, once the
-// stored run, read again right before the resume, has the item Running on
-// that Job (see resumeJob).
+// The item follows its Job to its end (see followJob). While the Job of an
+// into restore runs, every pass also checks that the claim is still the
+// run's (see claimLost), so a claim deleted or replaced mid-restore fails
+// the item with reason ClaimLost and the run stops the Job. The Job,
+// created suspended, is resumed in a pass that does not end the run, once
+// the stored run, read again right before the resume, has the item Running
+// on that Job (see resumeJob). A refused resume fails the item with reason
+// RestoreJobRefused.
 func (r *RestoreRunReconciler) followVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) error {
 	seen, err := r.followJob(ctx, run, item)
+	if err == nil && run.Spec.Into != "" && !finished(*item) {
+		err = r.claimLost(ctx, run, seen.unresumed != nil)
+	}
 	if done, err := settled(item, err); done || seen.unresumed == nil {
 		return err
 	}

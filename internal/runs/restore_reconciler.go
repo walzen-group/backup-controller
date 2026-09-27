@@ -87,8 +87,8 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // before anything is changed, or in planIntoNewClaim when spec.into is set. An
 // error that either of them returns for a retry goes through planFailed,
 // which reports it on the Ready condition and ends the run once spec.timeout
-// has passed since its creation. A run past its checks continues in work, or in
-// restoreIntoEmptyClaim for an into restore (see restore).
+// has passed since its creation. A run past its checks continues in work
+// (see restore).
 //
 // While VolSync serves its kinds only at a version other than v1alpha1, a
 // pass that reads a VolSync object, such as the ReplicationSources a volume
@@ -123,8 +123,7 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	})
 }
 
-// restore makes one pass over a RestoreRun past its checks: through
-// restoreIntoEmptyClaim for an into restore, and through work otherwise.
+// restore makes one pass over a RestoreRun past its checks, through work.
 //
 // Parameters:
 //   - run is the RestoreRun, with a phase, no ending recorded, and not
@@ -140,11 +139,7 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // check at the start of each pass needs no VolSync object, so the run then
 // ends TimedOut, stops its restore Jobs and gives the app back.
 func (r *RestoreRunReconciler) restore(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	pass := r.work
-	if run.Spec.Into != "" {
-		pass = r.restoreIntoEmptyClaim
-	}
-	result, err := pass(ctx, run)
+	result, err := r.work(ctx, run)
 	kind, unserved := volsyncUnserved(err)
 	if !unserved {
 		return result, err

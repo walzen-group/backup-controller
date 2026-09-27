@@ -364,7 +364,7 @@ func (e *claimLostError) Error() string {
 
 // beforeJob returns the sentence for a claim that the run lost before its
 // restore Job ran. Only an into item checks its claim before the resume of
-// the Job (see followIntoJob), so the three losses of an into item have
+// the Job (see followVolume), so the three losses of an into item have
 // their own sentence.
 func (e *claimLostError) beforeJob() string {
 	switch e.loss {
