@@ -8,18 +8,17 @@ import (
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/restorejob"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
-	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -31,35 +30,26 @@ const (
 	orphanNamespace     = "app"
 	orphanControllerNS  = "backup-system"
 	orphanClaimUID      = types.UID("6f1d2c3a-0000-4000-8000-000000000001")
+	orphanPrimeUID      = types.UID("6f1d2c3a-0000-4000-8000-0000000000f1")
+	orphanJobUID        = types.UID("6f1d2c3a-0000-4000-8000-0000000000a1")
 	orphanVolumeRestore = "nightly"
 	pvcProtection       = "kubernetes.io/pvc-protection"
 )
 
 // orphanCRDs are the pinned CRDs of the custom kinds the orphan reconciler
-// reads or deletes.
+// reads.
 var orphanCRDs = []string{
 	"../testinfra/crds/backup-controller/v0.8.1/backup.wlz.li_volumerestores.yaml",
-	"../testinfra/crds/volsync/volsync.backube_replicationdestinations.yaml",
 }
 
-func orphanScheme(t *testing.T) *runtime.Scheme {
+// newOrphanClient builds a strict fake client, with the garbage collector
+// on, holding objects.
+func newOrphanClient(t *testing.T, objects ...client.Object) *strictclient.Client {
 	t.Helper()
-	s := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, batchv1.AddToScheme, volsyncv1alpha1.AddToScheme, backupv1alpha1.AddToScheme} {
-		if err := add(s); err != nil {
-			t.Fatalf("register types: %v", err)
-		}
-	}
-	return s
-}
-
-// newOrphanClient builds a strict fake client holding objects.
-func newOrphanClient(t *testing.T, objects ...client.Object) client.WithWatch {
-	t.Helper()
-	now := time.Date(2026, 9, 26, 7, 0, 0, 0, time.UTC)
-	return strictclient.Build(fake.NewClientBuilder().WithObjects(objects...), orphanScheme(t), strictclient.Options{
-		Clock: func() time.Time { return now },
-		CRDs:  orphanCRDs,
+	return strictclient.Build(fake.NewClientBuilder().WithObjects(objects...), testScheme(t), strictclient.Options{
+		Clock:          func() time.Time { return serverTime },
+		CRDs:           orphanCRDs,
+		GarbageCollect: true,
 	})
 }
 
@@ -80,43 +70,61 @@ func stuckClaim() *corev1.PersistentVolumeClaim {
 	}
 }
 
+// orphanJob is stuckClaim's restore Job as Populate creates it, owned by the
+// prime claim, in the state the Job controller leaves it in right after the
+// create: suspended, with Suspended=True, never resumed.
+func orphanJob(t *testing.T) *batchv1.Job {
+	t.Helper()
+	job, err := restorejob.Build(restorejob.Spec{
+		Name: JobName(orphanClaimUID), Namespace: orphanControllerNS,
+		Origin:     restorejob.Origin{Kind: restorejob.OriginClaim, UID: orphanClaimUID},
+		Owner:      metav1.OwnerReference{APIVersion: "v1", Kind: "PersistentVolumeClaim", Name: PrimeClaimName(orphanClaimUID), UID: orphanPrimeUID},
+		SnapshotID: monday.ID, Claim: PrimeClaimName(orphanClaimUID), Repository: string(orphanClaimUID), Image: testImage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.UID = orphanJobUID
+	withCondition(job, batchv1.JobSuspended)
+	return job
+}
+
 // leftovers are the library's and Populate's objects for stuckClaim in the
-// controller namespace: the destination, the Secret copy and the prime.
-func leftovers() []client.Object {
+// controller namespace: the Secret copy, the prime and the restore Job.
+func leftovers(t *testing.T) []client.Object {
+	t.Helper()
 	return []client.Object{
-		&volsyncv1alpha1.ReplicationDestination{ObjectMeta: metav1.ObjectMeta{Name: DestinationName(orphanClaimUID), Namespace: orphanControllerNS}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: string(orphanClaimUID), Namespace: orphanControllerNS}},
-		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: PrimeClaimName(orphanClaimUID), Namespace: orphanControllerNS}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: PrimeClaimName(orphanClaimUID), Namespace: orphanControllerNS, UID: orphanPrimeUID}},
+		orphanJob(t),
 	}
 }
 
-func moverPod(phase corev1.PodPhase) *corev1.Pod {
+// restorePod is a pod of the restore Job with the UID given, filling
+// stuckClaim, as the Job controller creates it, on the node given (none for
+// an unscheduled pod), in the phase given.
+func restorePod(t *testing.T, jobUID types.UID, name, node string, phase corev1.PodPhase) *corev1.Pod {
+	t.Helper()
+	labels := map[string]string{batchv1.ControllerUidLabel: string(jobUID), batchv1.JobNameLabel: JobName(orphanClaimUID)}
+	for key, value := range orphanJob(t).Spec.Template.Labels {
+		labels[key] = value
+	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: internalvolsync.MoverJobName(DestinationName(orphanClaimUID)) + "-x7k2p", Namespace: orphanControllerNS,
-			Labels: map[string]string{"job-name": internalvolsync.MoverJobName(DestinationName(orphanClaimUID))},
+			Name: name, Namespace: orphanControllerNS, Labels: labels,
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: JobName(orphanClaimUID), UID: jobUID,
+				Controller: ptr.To(true), BlockOwnerDeletion: ptr.To(true)}},
 		},
+		Spec:   corev1.PodSpec{NodeName: node, Containers: []corev1.Container{{Name: "restore", Image: testImage}}},
 		Status: corev1.PodStatus{Phase: phase},
 	}
 }
 
 func newOrphanReconciler(c client.Client, reader client.Reader) (*OrphanReconciler, *events.FakeRecorder) {
 	recorder := events.NewFakeRecorder(20)
-	now := time.Date(2026, 9, 26, 7, 0, 0, 0, time.UTC)
-	return &OrphanReconciler{Client: c, Reader: reader, Recorder: recorder, Namespace: orphanControllerNS,
-		Now: func() time.Time { return now }}, recorder
+	return &OrphanReconciler{Client: c, Reader: reader, Recorder: recorder, Namespace: orphanControllerNS}, recorder
 }
 
-// advancePoll moves the reconciler's clock forward by its mover poll, the
-// time a pass after the destination's delete waits before it looks for the
-// mover.
-func advancePoll(r *OrphanReconciler) {
-	now, poll := r.Now, r.MoverPoll
-	if poll <= 0 {
-		poll = defaultMoverPoll
-	}
-	r.Now = func() time.Time { return now().Add(poll) }
-}
 func reconcileClaim(t *testing.T, r *OrphanReconciler) (ctrl.Result, error) {
 	t.Helper()
 	return r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: orphanNamespace, Name: "data"}})
@@ -152,45 +160,47 @@ func drain(recorder *events.FakeRecorder) []string {
 	}
 }
 
-// deleteDestinationPass runs the pass that deletes the ReplicationDestination
-// of stuckClaim, and checks that it requeues and goes no further. It drops
-// the events that pass recorded, so a test reads only those of the passes
-// after it, and moves the clock forward by the mover poll the pass asked
-// to be requeued after, so the next pass may look for the mover.
-func deleteDestinationPass(t *testing.T, r *OrphanReconciler, recorder *events.FakeRecorder) {
-	t.Helper()
-	res, err := reconcileClaim(t, r)
-	if err != nil {
-		t.Fatalf("reconcile that deletes the destination: %v", err)
-	}
-	if res.RequeueAfter <= 0 {
-		t.Fatalf("result of the pass that deletes the destination = %+v, want a requeue", res)
-	}
-	drain(recorder)
-	advancePoll(r)
-}
-
 func assertLeftovers(t *testing.T, c client.Reader, want bool) {
 	t.Helper()
-	for _, obj := range leftovers() {
+	for _, obj := range leftovers(t) {
 		if got := present(t, c, obj); got != want {
 			t.Errorf("%T %s present = %v, want %v", obj, obj.GetName(), got, want)
 		}
 	}
 }
 
-// A claim being deleted whose VolumeRestore is gone gets the destination, the
-// Secret copy and the prime deleted, then loses the library's finalizer, and
-// a Warning event says so. The destination goes in the first pass, and the
-// rest in the pass after it. Before the reconciler the claim stayed
+// assertHeld checks that a pass requeued and left the Secret copy, the
+// prime claim and the library's finalizer in place, with one Normal
+// WaitingForMover event that holds the text given.
+func assertHeld(t *testing.T, c client.Reader, recorder *events.FakeRecorder, res ctrl.Result, err error, text string) {
+	t.Helper()
+	if err != nil || res.RequeueAfter <= 0 {
+		t.Fatalf("reconcile = %+v, %v; want a requeue", res, err)
+	}
+	for _, obj := range leftovers(t)[:2] {
+		if !present(t, c, obj) {
+			t.Errorf("%T %s deleted while a restore pod may write", obj, obj.GetName())
+		}
+	}
+	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
+		t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
+	}
+	got := drain(recorder)
+	if len(got) != 1 || !strings.HasPrefix(got[0], "Normal WaitingForMover") || !strings.Contains(got[0], text) {
+		t.Errorf("events = %q, want one Normal WaitingForMover with %q", got, text)
+	}
+}
+
+// A claim being deleted whose VolumeRestore is gone gets its restore Job,
+// its Secret copy and its prime deleted, then loses the library's finalizer,
+// and a Warning event says so. Before the reconciler the claim stayed
 // Terminating for good, because the library returns on the data source's
 // NotFound before its cleanup (lib-volume-populator v3.3.0
 // controller.go:661-671).
 func TestAClaimWhoseVolumeRestoreIsGoneIsCleanedUp(t *testing.T) {
-	c := newOrphanClient(t, append(leftovers(), stuckClaim())...)
+	c := newOrphanClient(t, append(leftovers(t), stuckClaim())...)
 	r, recorder := newOrphanReconciler(c, c)
 
-	deleteDestinationPass(t, r, recorder)
 	if _, err := reconcileClaim(t, r); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -212,12 +222,6 @@ func TestTheLastFinalizerRemovedDeletesTheClaim(t *testing.T) {
 	c := newOrphanClient(t, claim)
 	r, _ := newOrphanReconciler(c, c)
 
-	// The destination is gone at the first look, deleted at a time the
-	// reconciler does not know, so it waits a mover poll from that look.
-	if res, err := reconcileClaim(t, r); err != nil || res.RequeueAfter <= 0 {
-		t.Fatalf("first reconcile = %v, %v; want a requeue", res, err)
-	}
-	advancePoll(r)
 	if _, err := reconcileClaim(t, r); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -230,7 +234,7 @@ func TestTheLastFinalizerRemovedDeletesTheClaim(t *testing.T) {
 }
 
 // A VolumeRestore that still exists, in any state, leaves the cleanup to the
-// library: nothing is deleted and the finalizer stays.
+// library: nothing is stopped or deleted and the finalizer stays.
 func TestAClaimWhoseVolumeRestoreExistsIsLeftToTheLibrary(t *testing.T) {
 	deleted := metav1.NewTime(time.Date(2026, 9, 26, 6, 30, 0, 0, time.UTC))
 	for name, vr := range map[string]*backupv1alpha1.VolumeRestore{
@@ -238,7 +242,7 @@ func TestAClaimWhoseVolumeRestoreExistsIsLeftToTheLibrary(t *testing.T) {
 		"terminating": {ObjectMeta: metav1.ObjectMeta{Name: orphanVolumeRestore, Namespace: orphanNamespace, DeletionTimestamp: &deleted, Finalizers: []string{Finalizer}}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			c := newOrphanClient(t, append(leftovers(), stuckClaim(), vr)...)
+			c := newOrphanClient(t, append(leftovers(t), stuckClaim(), vr)...)
 			r, recorder := newOrphanReconciler(c, c)
 			if _, err := reconcileClaim(t, r); err != nil {
 				t.Fatalf("reconcile: %v", err)
@@ -254,10 +258,10 @@ func TestAClaimWhoseVolumeRestoreExistsIsLeftToTheLibrary(t *testing.T) {
 	}
 }
 
-// A live read that fails for any reason but NotFound deletes nothing and
-// returns the error for a retry.
+// A live read that fails for any reason but NotFound stops and deletes
+// nothing and returns the error for a retry.
 func TestAFailedVolumeRestoreReadDeletesNothing(t *testing.T) {
-	c := newOrphanClient(t, append(leftovers(), stuckClaim())...)
+	c := newOrphanClient(t, append(leftovers(t), stuckClaim())...)
 	reader := interceptor.NewClient(c, interceptor.Funcs{
 		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*backupv1alpha1.VolumeRestore); ok {
@@ -277,151 +281,82 @@ func TestAFailedVolumeRestoreReadDeletesNothing(t *testing.T) {
 	}
 }
 
-// X2: the destination is deleted, and while its mover pod is still there the
-// Secret copy, the prime and the finalizer stay and the claim is requeued
-// with a WaitingForMover event naming the pod. Once the pod is gone the
-// cleanup finishes.
-func TestAMoverStillThereIsWaitedFor(t *testing.T) {
-	for _, phase := range []corev1.PodPhase{corev1.PodRunning, corev1.PodPending, corev1.PodSucceeded} {
-		t.Run(string(phase), func(t *testing.T) {
-			pod := moverPod(phase)
-			c := newOrphanClient(t, append(leftovers(), stuckClaim(), pod)...)
+// X2: a restore Job that runs is suspended, and while its pod may still
+// write the Secret copy, the prime and the finalizer stay and the claim is
+// requeued with a WaitingForMover event that says what the stop waits for.
+// Once the pod has ended the Job is deleted and the cleanup finishes.
+func TestARunningRestoreJobIsStoppedAndWaitedFor(t *testing.T) {
+	job := orphanJob(t)
+	job.Spec.Suspend = ptr.To(false)
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobSuspended, Status: corev1.ConditionFalse, Reason: "JobResumed"}}
+	pod := restorePod(t, orphanJobUID, "restore-x7k2p", "node-a", corev1.PodRunning)
+	c := newOrphanClient(t, append(leftovers(t)[:2], job, stuckClaim(), pod)...)
+	r, recorder := newOrphanReconciler(c, c)
+	ctx := context.Background()
+
+	res, err := reconcileClaim(t, r)
+	assertHeld(t, c, recorder, res, err, "waiting for the Job controller to suspend it")
+	stored := &batchv1.Job{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(job), stored); err != nil || !ptr.Deref(stored.Spec.Suspend, false) {
+		t.Fatalf("Job after the first pass: %v, suspend %v; want it suspended", err, stored.Spec.Suspend)
+	}
+	stored.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobSuspended, Status: corev1.ConditionTrue, Reason: "JobSuspended"}}
+	if err := c.Status().Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err = reconcileClaim(t, r)
+	assertHeld(t, c, recorder, res, err, pod.Name)
+
+	pod.Status.Phase = corev1.PodFailed
+	if err := c.Status().Update(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcileClaim(t, r); err != nil {
+		t.Fatalf("reconcile after the pod ended: %v", err)
+	}
+	assertLeftovers(t, c, false)
+	if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
+		t.Errorf("claim finalizers = %v, want %s removed", got, ClaimFinalizer)
+	}
+}
+
+// A pod of a restore Job that a person deleted with its pods orphaned still
+// holds the cleanup: the reconciler finds it by the claim's label and waits
+// until it has ended, as Populate and Cleanup do. An unscheduled pod that is
+// not being deleted could still be bound to a node, so it holds too.
+func TestAPodOfADeletedJobHoldsTheCleanup(t *testing.T) {
+	for name, pod := range map[string]*corev1.Pod{
+		"running":     restorePod(t, "gone-job-uid", "restore-x7k2p", "node-a", corev1.PodRunning),
+		"unscheduled": restorePod(t, "gone-job-uid", "restore-x7k2p", "", corev1.PodPending),
+	} {
+		t.Run(name, func(t *testing.T) {
+			pod.OwnerReferences = nil
+			c := newOrphanClient(t, append(leftovers(t)[:2], stuckClaim(), pod)...)
 			r, recorder := newOrphanReconciler(c, c)
 
-			deleteDestinationPass(t, r, recorder)
 			res, err := reconcileClaim(t, r)
-			if err != nil {
-				t.Fatalf("reconcile: %v", err)
-			}
-			if res.RequeueAfter <= 0 {
-				t.Errorf("result = %+v, want a requeue", res)
-			}
-			objs := leftovers()
-			if present(t, c, objs[0]) {
-				t.Error("the ReplicationDestination is still there")
-			}
-			for _, obj := range objs[1:] {
-				if !present(t, c, obj) {
-					t.Errorf("%T %s deleted while the mover pod is there", obj, obj.GetName())
-				}
-			}
-			if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
-				t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
-			}
-			got := drain(recorder)
-			if len(got) != 1 || !strings.HasPrefix(got[0], "Normal WaitingForMover") || !strings.Contains(got[0], pod.Name) {
-				t.Errorf("events = %q, want one Normal WaitingForMover naming %s", got, pod.Name)
-			}
+			assertHeld(t, c, recorder, res, err, pod.Name)
 
-			if err := c.Delete(context.Background(), pod); err != nil {
-				t.Fatalf("delete pod: %v", err)
+			pod.Status.Phase = corev1.PodSucceeded
+			if err := c.Status().Update(context.Background(), pod); err != nil {
+				t.Fatal(err)
 			}
 			if _, err := reconcileClaim(t, r); err != nil {
-				t.Fatalf("reconcile after the pod went: %v", err)
+				t.Fatalf("reconcile after the pod ended: %v", err)
 			}
 			assertLeftovers(t, c, false)
-			if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
-				t.Errorf("claim finalizers = %v, want %s removed", got, ClaimFinalizer)
-			}
 		})
 	}
 }
 
-// X2: a mover Job that is still there holds the cleanup even with no pod,
-// since it may not have started its first pod yet or be between two of its
-// retries. The Secret copy, the prime and the finalizer stay, and the claim
-// is requeued with a WaitingForMover event naming the Job. Once the Job is
-// gone the cleanup finishes. Before, only the Job's pods were looked for.
-func TestAMoverJobWithoutAPodIsWaitedFor(t *testing.T) {
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: internalvolsync.MoverJobName(DestinationName(orphanClaimUID)), Namespace: orphanControllerNS}}
-	c := newOrphanClient(t, append(leftovers(), stuckClaim(), job)...)
-	r, recorder := newOrphanReconciler(c, c)
-
-	deleteDestinationPass(t, r, recorder)
-	res, err := reconcileClaim(t, r)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("result = %+v, want a requeue", res)
-	}
-	for _, obj := range leftovers()[1:] {
-		if !present(t, c, obj) {
-			t.Errorf("%T %s deleted while the mover Job is there", obj, obj.GetName())
-		}
-	}
-	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
-		t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
-	}
-	got := drain(recorder)
-	if len(got) != 1 || !strings.HasPrefix(got[0], "Normal WaitingForMover") || !strings.Contains(got[0], "mover Job "+orphanControllerNS+"/"+job.Name) {
-		t.Errorf("events = %q, want one Normal WaitingForMover naming Job %s", got, job.Name)
-	}
-
-	if err := c.Delete(context.Background(), job); err != nil {
-		t.Fatalf("delete Job: %v", err)
-	}
-	if _, err := reconcileClaim(t, r); err != nil {
-		t.Fatalf("reconcile after the Job went: %v", err)
-	}
-	assertLeftovers(t, c, false)
-	if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
-		t.Errorf("claim finalizers = %v, want %s removed", got, ClaimFinalizer)
-	}
-}
-
-// X2: the pass that deletes the destination finishes nothing, even when it
-// sees no mover pod and no mover Job. VolSync may be in the middle of a
-// reconcile of that destination and create the Job after the look, so only
-// the next pass looks. The Secret copy, the prime and the finalizer stay, the
-// claim is requeued, and a WaitingForMover event names the destination.
-// Before, that pass went straight on to the rest of the cleanup.
-func TestThePassThatDeletesTheDestinationFinishesNothing(t *testing.T) {
-	c := newOrphanClient(t, append(leftovers(), stuckClaim())...)
-	r, recorder := newOrphanReconciler(c, c)
-
-	res, err := reconcileClaim(t, r)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("result = %+v, want a requeue", res)
-	}
-	objs := leftovers()
-	if present(t, c, objs[0]) {
-		t.Error("the ReplicationDestination is still there")
-	}
-	for _, obj := range objs[1:] {
-		if !present(t, c, obj) {
-			t.Errorf("%T %s deleted in the pass that deleted the destination", obj, obj.GetName())
-		}
-	}
-	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
-		t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
-	}
-	got := drain(recorder)
-	if len(got) != 1 || !strings.HasPrefix(got[0], "Normal WaitingForMover") || !strings.Contains(got[0], "deleted ReplicationDestination "+DestinationName(orphanClaimUID)) {
-		t.Errorf("events = %q, want one Normal WaitingForMover naming the deleted destination", got)
-	}
-
-	advancePoll(r)
-	if _, err := reconcileClaim(t, r); err != nil {
-		t.Fatalf("second reconcile: %v", err)
-	}
-	assertLeftovers(t, c, false)
-	if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
-		t.Errorf("claim finalizers = %v, want %s removed", got, ClaimFinalizer)
-	}
-}
-
-// A pod of another claim's mover does not hold this claim.
-func TestAnotherClaimsMoverDoesNotBlock(t *testing.T) {
-	other := moverPod(corev1.PodRunning)
-	other.Name = "volsync-dst-restore-other-abcde"
-	other.Labels = map[string]string{"job-name": "volsync-dst-restore-other"}
-	c := newOrphanClient(t, append(leftovers(), stuckClaim(), other)...)
-	r, recorder := newOrphanReconciler(c, c)
-	deleteDestinationPass(t, r, recorder)
+// A pod of another claim's restore does not hold this claim.
+func TestAnotherClaimsRestorePodDoesNotBlock(t *testing.T) {
+	other := restorePod(t, "other-job-uid", "restore-other-abcde", "node-a", corev1.PodRunning)
+	other.Labels[restorejob.LabelRestoreClaim] = "another-claim-uid"
+	other.OwnerReferences = nil
+	c := newOrphanClient(t, append(leftovers(t), stuckClaim(), other)...)
+	r, _ := newOrphanReconciler(c, c)
 	if _, err := reconcileClaim(t, r); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -447,7 +382,7 @@ func TestClaimsOutsideTheOrphanCaseAreLeftAlone(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			claim := stuckClaim()
 			mutate(claim)
-			c := newOrphanClient(t, append(leftovers(), claim)...)
+			c := newOrphanClient(t, append(leftovers(t), claim)...)
 			r, recorder := newOrphanReconciler(c, c)
 			if r.orphaned(claim) {
 				t.Error("the predicate passes the claim")
@@ -476,7 +411,7 @@ func TestClaimsOutsideTheOrphanCaseAreLeftAlone(t *testing.T) {
 // finds the claim without the finalizer and does nothing.
 func TestTheFinalizerPatchConverges(t *testing.T) {
 	t.Run("conflict", func(t *testing.T) {
-		inner := newOrphanClient(t, append(leftovers(), stuckClaim())...)
+		inner := newOrphanClient(t, append(leftovers(t), stuckClaim())...)
 		failed := false
 		c := interceptor.NewClient(inner, interceptor.Funcs{
 			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
@@ -487,8 +422,7 @@ func TestTheFinalizerPatchConverges(t *testing.T) {
 				return cl.Patch(ctx, obj, patch, opts...)
 			},
 		})
-		r, recorder := newOrphanReconciler(c, inner)
-		deleteDestinationPass(t, r, recorder)
+		r, _ := newOrphanReconciler(c, inner)
 		if _, err := reconcileClaim(t, r); !apierrors.IsConflict(err) {
 			t.Fatalf("reconcile = %v, want the conflict", err)
 		}
@@ -503,7 +437,7 @@ func TestTheFinalizerPatchConverges(t *testing.T) {
 		}
 	})
 	t.Run("lost response", func(t *testing.T) {
-		inner := newOrphanClient(t, append(leftovers(), stuckClaim())...)
+		inner := newOrphanClient(t, append(leftovers(t), stuckClaim())...)
 		lost := false
 		c := interceptor.NewClient(inner, interceptor.Funcs{
 			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
@@ -518,7 +452,6 @@ func TestTheFinalizerPatchConverges(t *testing.T) {
 			},
 		})
 		r, recorder := newOrphanReconciler(c, inner)
-		deleteDestinationPass(t, r, recorder)
 		if _, err := reconcileClaim(t, r); err == nil {
 			t.Fatal("reconcile returned no error for the lost response")
 		}
@@ -565,45 +498,5 @@ func TestADeletedVolumeRestoreEnqueuesTheClaimsNamingIt(t *testing.T) {
 	want := []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: orphanNamespace, Name: "data"}}}
 	if !slices.Equal(got, want) {
 		t.Errorf("requests = %v, want %v", got, want)
-	}
-}
-
-// X2: the pass right after the one that deleted the destination, which the
-// WaitingForMover event or another watch event can start at once, finishes
-// nothing either, even when it sees no mover pod and no mover Job. VolSync may
-// still be in the middle of a reconcile of that destination and create the
-// Job after that look. The cleanup goes on only once MoverPoll has passed
-// since the delete.
-func TestThePassRightAfterTheDeleteFinishesNothing(t *testing.T) {
-	c := newOrphanClient(t, append(leftovers(), stuckClaim())...)
-	r, recorder := newOrphanReconciler(c, c)
-
-	if _, err := reconcileClaim(t, r); err != nil {
-		t.Fatalf("reconcile that deletes the destination: %v", err)
-	}
-	drain(recorder)
-	res, err := reconcileClaim(t, r)
-	if err != nil {
-		t.Fatalf("reconcile right after the delete: %v", err)
-	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("result = %+v, want a requeue", res)
-	}
-	for _, obj := range leftovers()[1:] {
-		if !present(t, c, obj) {
-			t.Errorf("%T %s deleted on the pass right after the destination's delete", obj, obj.GetName())
-		}
-	}
-	if got := claimFinalizers(t, c); !slices.Contains(got, ClaimFinalizer) {
-		t.Errorf("claim finalizers = %v, want %s kept", got, ClaimFinalizer)
-	}
-
-	advancePoll(r)
-	if _, err := reconcileClaim(t, r); err != nil {
-		t.Fatalf("reconcile a mover poll after the delete: %v", err)
-	}
-	assertLeftovers(t, c, false)
-	if got := claimFinalizers(t, c); slices.Contains(got, ClaimFinalizer) {
-		t.Errorf("claim finalizers = %v, want %s removed a mover poll after the delete", got, ClaimFinalizer)
 	}
 }

@@ -2,11 +2,12 @@
 //
 // It fills PersistentVolumeClaims from restic repositories. It hands the
 // callbacks in internal/populator to lib-volume-populator's provider-function
-// mode, so a VolSync mover fills a claim whose dataSourceRef names a
-// VolumeRestore, and this binary builds no populator pod of its own. It also
-// runs a controller-runtime manager that reconciles BackupRun and RestoreRun,
-// runs the namespace backup scheduler, and serves the bootstrap webhook for
-// CloudNativePG Clusters when a certificate directory is given.
+// mode, so the controller's own restic restore Job fills a claim whose
+// dataSourceRef names a VolumeRestore, and this binary builds no populator pod
+// of its own. It also runs a controller-runtime manager that reconciles
+// BackupRun and RestoreRun, runs the namespace backup scheduler, and serves
+// the bootstrap webhook for CloudNativePG Clusters when a certificate
+// directory is given.
 package main
 
 import (
@@ -15,12 +16,12 @@ import (
 	"fmt"
 	"os"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/served"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -69,7 +70,7 @@ func main() {
 		klog.Errorf("failed to build the Kubernetes client: %v", err)
 		os.Exit(1)
 	}
-	callbacks := populator.New(operations, options.Namespace, restic.S3Lister{})
+	callbacks := populator.New(operations, options.Namespace, options.RestoreImage, restic.S3Lister{})
 
 	// The populator library drives only the one kind it is given, so
 	// BackupRun and RestoreRun are reconciled by a controller-runtime manager
@@ -124,7 +125,7 @@ func exitOnFailure(err error) {
 }
 
 // newClientOperations builds the cluster operations the populator callbacks
-// run through. They use a client whose scheme knows the core, VolSync and
+// run through. They use a client whose scheme knows the core, batch and
 // backup.wlz.li types. The kubeconfig argument is the path from the
 // --kubeconfig flag, and an empty path means the in-cluster configuration.
 //
@@ -139,7 +140,7 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 	scheme := runtime.NewScheme()
 	for name, add := range map[string]func(*runtime.Scheme) error{
 		"core":          corev1.AddToScheme,
-		"volsync":       volsyncv1alpha1.AddToScheme,
+		"batch":         batchv1.AddToScheme,
 		"backup.wlz.li": backupv1alpha1.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {
@@ -160,11 +161,11 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 // Parameters:
 //   - kubeClient is the populator's client, built with clientOptions.
 //
-// served.Client wraps it, so a 404 for a VolSync version the API server no
-// longer serves is an error the populator retries, never a missing
-// ReplicationDestination.
+// served.Client wraps it, so a 404 for a version the API server no longer
+// serves is an error the populator retries, never a restore Job that is
+// gone.
 func operationsFor(kubeClient client.Client) *clientOperations {
-	return &clientOperations{client: served.Client(kubeClient)}
+	return newOperations(served.Client(kubeClient))
 }
 
 // clientOptions returns the options of every client the controller writes

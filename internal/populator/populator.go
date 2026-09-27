@@ -1,36 +1,50 @@
 // Package populator holds the callbacks that the volume populator library
-// calls to fill a claim whose data source is a VolumeRestore.
+// calls to fill a claim whose data source is a VolumeRestore, and the
+// reconciler that finishes the cleanup for a claim whose VolumeRestore is
+// gone.
+//
+// A claim is filled by the controller's own restic restore Job
+// (internal/restorejob), which restores one snapshot, named by its full ID,
+// into the prime claim the library created. Populate creates, records,
+// resumes and replaces the Job, Complete reads its Complete condition, and
+// Cleanup stops it before the library hands the volume to the app claim.
 package populator
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
-	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	"github.com/walzen-group/backup-controller/internal/restic"
-	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
+	"github.com/walzen-group/backup-controller/internal/restorejob"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // Operations are the Kubernetes API calls the callbacks make. The binary
 // implements them with a client (clientOperations in cmd/backup-controller),
-// and the tests use an in-memory fake.
+// and the tests with a strict fake client. Every read goes to the API server
+// directly.
 type Operations interface {
-	GetReplicationDestination(ctx context.Context, namespace, name string) (*volsyncv1alpha1.ReplicationDestination, error)
-	CreateReplicationDestination(ctx context.Context, rd *volsyncv1alpha1.ReplicationDestination) error
-	DeleteReplicationDestination(ctx context.Context, namespace, name string) error
+	Jobs
+	// GetNamespace reads a namespace, for its privileged-movers annotation.
+	GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error)
+	// GetClaim reads a claim.
+	GetClaim(ctx context.Context, namespace, name string) (*corev1.PersistentVolumeClaim, error)
+	// PatchClaim sends a patch to a claim; Populate records the restore
+	// Job's UID on the prime claim with it.
+	PatchClaim(ctx context.Context, claim *corev1.PersistentVolumeClaim, patch client.Patch) error
+	// GetSecret reads a Secret.
 	GetSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error)
+	// CreateSecret creates a Secret.
 	CreateSecret(ctx context.Context, secret *corev1.Secret) error
+	// DeleteSecret deletes a Secret.
 	DeleteSecret(ctx context.Context, namespace, name string) error
+	// SetStatus writes the VolumeRestore's status subresource.
 	SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error
 	// UpdateVolumeRestore writes the VolumeRestore's metadata, which is how
 	// the callbacks add and remove Finalizer. The write carries the
@@ -43,8 +57,8 @@ type Operations interface {
 // claim has an entry in its status.claims. The library looks the VolumeRestore
 // up before it handles a deleted claim, and when the VolumeRestore is gone it
 // returns without calling Cleanup and leaves its own finalizer on the claim.
-// This finalizer keeps the VolumeRestore in place until Cleanup has deleted
-// the claim's ReplicationDestination and Secret copy. Populate adds it only
+// This finalizer keeps the VolumeRestore in place until Cleanup has stopped
+// the claim's restore Job and deleted its Secret copy. Populate adds it only
 // once the prime claim is bound, so a VolumeRestore deleted before that goes
 // at once; OrphanReconciler then finishes the cleanup for its claims.
 const Finalizer = "backup.wlz.li/volume-populator"
@@ -52,95 +66,59 @@ const Finalizer = "backup.wlz.li/volume-populator"
 // Callbacks holds the three functions that the volume populator library calls
 // for a claim whose data source is a VolumeRestore: Populate, Complete and
 // Cleanup. One Callbacks serves one controller namespace, where the prime
-// claims and the ReplicationDestinations live.
+// claims, the Secret copies and the restore Jobs live.
 type Callbacks struct {
 	operations Operations
 	namespace  string
-	snapshots  restic.Lister
+	image      string
+	snapshots  SnapshotLister
 }
 
 // New returns the callbacks for one controller namespace.
 //
 // Parameters:
 //   - operations makes the Kubernetes API calls.
-//   - namespace is the controller namespace, where the ReplicationDestinations
-//     and the repository Secret copies are created.
-//   - snapshots lists a repository's snapshots. Populate uses it to check a
-//     restore pinned to a moment, by the claim's backup.wlz.li/restore-as-of
-//     annotation or by the VolumeRestore's spec.restoreAsOf. When it's nil,
-//     Populate skips that check.
-func New(operations Operations, namespace string, snapshots restic.Lister) *Callbacks {
-	return &Callbacks{operations: operations, namespace: namespace, snapshots: snapshots}
+//   - namespace is the controller namespace, where the restore Jobs and the
+//     repository Secret copies are created.
+//   - image is the restic image the restore Jobs run, the controller's
+//     --restore-image.
+//   - snapshots lists a repository's snapshots, to pick the one a claim is
+//     filled from and to tell a first deploy's empty repository apart.
+func New(operations Operations, namespace, image string, snapshots SnapshotLister) *Callbacks {
+	return &Callbacks{operations: operations, namespace: namespace, image: image, snapshots: snapshots}
 }
 
-// pinnedOutOfReach checks a restore pinned to a moment. When no snapshot is at
-// or before that moment, VolSync prints "No eligible snapshots found",
-// restores nothing and reports success, and the claim would bind an empty
-// volume. This check catches that before the restore starts.
+// Populate moves one claim's restore on.
 //
 // Parameters:
-//   - vr and claim give the moment, which RestoreAsOf resolves the same way
-//     it does for the destination: the claim's backup.wlz.li/restore-as-of
-//     annotation first, then the VolumeRestore's spec.restoreAsOf.
-//   - repo is the app's repository Secret, which the lister opens.
+//   - ctx bounds the API calls.
+//   - params are what the library passes for the claim: the claim, its
+//     bound prime claim from the library's cache, and the VolumeRestore the
+//     claim names, as an unstructured object from that cache.
 //
-// It returns a reason when the moment isn't an RFC 3339 time, or when no
-// snapshot in the repository reaches it. The reason names where the moment
-// came from. It returns "" when neither the claim nor the VolumeRestore pins a
-// moment, when the moment is in reach, or when the Callbacks have no lister.
-// It returns an error when the snapshots can't be listed.
-func (c *Callbacks) pinnedOutOfReach(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim, repo *corev1.Secret) (string, error) {
-	pin := internalvolsync.RestoreAsOf(vr, claim)
-	if pin == nil || c.snapshots == nil {
-		return "", nil
-	}
-	value := *pin
-	source := "spec.restoreAsOf"
-	if _, ok := claim.Annotations[backupv1alpha1.AnnotationRestoreAsOf]; ok {
-		source = backupv1alpha1.AnnotationRestoreAsOf
-	}
-	at, err := time.Parse(time.RFC3339, value)
-	if err != nil {
-		return fmt.Sprintf("%s is %q, which is not an RFC 3339 time", source, value), nil //nolint:nilerr // the parse error is the refusal, returned as its reason; restic-jobs step 9 types it
-	}
-	snapshots, err := c.snapshots.Snapshots(ctx, repo)
-	if err != nil {
-		return "", fmt.Errorf("list the snapshots in %s: %w", repo.Name, err)
-	}
-	if _, ok := restic.AtOrBefore(snapshots, at); ok {
-		return "", nil
-	}
-	if len(snapshots) == 0 {
-		return fmt.Sprintf("%s asks for %s and the repository holds no snapshot", source, value), nil
-	}
-	return fmt.Sprintf("%s asks for %s; the oldest snapshot, %s, is from %s",
-		source, value, snapshots[0].ShortID(), snapshots[0].Time.UTC().Format(time.RFC3339)), nil
-}
-
-// Populate starts filling one claim from its VolumeRestore. The params the
-// library passes carry the claim, the prime claim and the VolumeRestore.
+// It returns nil when the library may go on to Complete in this sync, and an
+// error otherwise, which makes the library requeue the claim and leaves it
+// Pending.
 //
-// It first puts Finalizer on the VolumeRestore with holdVolumeRestore, and
-// returns an error when it can't. Then it copies the repository Secret that
-// the VolumeRestore names from the claim's namespace into the controller
-// namespace, and creates the ReplicationDestination that restores into the
-// prime claim. Both steps leave an object that already exists alone, so a
-// repeated call creates nothing twice.
+// It first puts Finalizer on the VolumeRestore and copies the repository
+// Secret into the controller namespace (see copySecret). It then reads the
+// claim's restore Job, JobName(claim UID), fresh from the API server:
+//   - No Job: once no pod of an earlier Job of the claim may still write, it
+//     picks the snapshot (see choose), creates the Job suspended for it,
+//     records the Job's UID on the prime claim and marks the claim
+//     Restoring. A repository with no snapshot at all and no pin creates no
+//     Job, and Complete binds the claim empty. No snapshot that can fill the
+//     claim marks it Failed with reason NoBackupInReach and returns an
+//     error.
+//   - A Job being deleted: it returns an error and creates nothing, until
+//     the Job is gone.
+//   - A failed Job: it marks the claim Failed with reason RestoreFailed and
+//     the Job's failure, then stops the Job, and returns an error (see
+//     failJob).
+//   - Any other Job: it records the Job on the prime claim, or resumes it
+//     once recorded (see resume), and marks the claim Restoring.
 //
-// Before it creates the destination, it checks a pinned restore with
-// pinnedOutOfReach. When no snapshot reaches the pinned moment, it marks the
-// claim Failed and sets Ready to False with reason NoBackupInReach and a
-// message that starts with "claim <name>: ", and writes the status when that
-// changed something. Then it returns an error and creates no destination.
-//
-// When the destination already exists and its latest mover run failed, it
-// leaves the status alone and returns nil. Complete, which the library calls
-// next, reports that failure, and the status stays Failed with the mover's
-// logs until a later sync succeeds.
-//
-// Otherwise it marks the claim Restoring and sets Ready with summarize, which
-// leaves Ready alone while another claim's entry is Failed. It writes the
-// status only when that changed something, and returns nil.
+// Every status write happens only when it changes something.
 func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.PopulatorParams) error {
 	if err := validateParams(params); err != nil {
 		return err
@@ -149,126 +127,99 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 	if err != nil {
 		return err
 	}
-	claim := params.Pvc
-	prime := params.PvcPrime
 	if err := c.holdVolumeRestore(ctx, vr); err != nil {
 		return err
 	}
-
-	repo, err := c.operations.GetSecret(ctx, claim.Namespace, vr.Spec.Repository)
+	repo, err := c.copySecret(ctx, vr, params.Pvc)
 	if err != nil {
-		return fmt.Errorf("get repository Secret %s/%s: %w", claim.Namespace, vr.Spec.Repository, err)
+		return err
 	}
-	secretName := internalvolsync.SecretCopyName(claim.UID)
-	if _, err := c.operations.GetSecret(ctx, c.namespace, secretName); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("check copied repository Secret %s/%s: %w", c.namespace, secretName, err)
-		}
-		if err := c.operations.CreateSecret(ctx, internalvolsync.SecretCopy(repo, claim.UID, c.namespace)); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create copied repository Secret %s/%s: %w", c.namespace, secretName, err)
-		}
-	}
-
-	destinationName := DestinationName(claim.UID)
-	existing, err := c.operations.GetReplicationDestination(ctx, c.namespace, destinationName)
-	if err == nil {
-		// The library calls Complete right after this, with the same cached
-		// VolumeRestore. While the mover keeps failing, Complete reports
-		// RestoreFailed with the logs. Writing Restoring here would change the
-		// status and bump its resource version, Complete's write would then
-		// conflict, and the reason would flip on every pass.
-		if _, failed := internalvolsync.Failure(existing); failed {
-			return nil
-		}
-	} else {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("get ReplicationDestination %s/%s: %w", c.namespace, destinationName, err)
-		}
-		reason, err := c.pinnedOutOfReach(ctx, vr, claim, repo)
-		if err != nil {
-			return err
-		}
-		if reason != "" {
-			// The error leaves the claim Pending, and the library calls
-			// Populate again. Once someone fixes the annotation or the
-			// VolumeRestore's spec.restoreAsOf, or recreates the claim without
-			// the pin, a later call creates the destination and the claim
-			// fills.
-			before := vr.Status.DeepCopy()
-			setClaimStatus(vr, claim, backupv1alpha1.RestorePhaseFailed)
-			backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonNoBackupInReach, claimMessage(claim, reason))
-			if !equality.Semantic.DeepEqual(before, &vr.Status) {
-				if err := c.operations.SetStatus(ctx, vr); err != nil {
-					return fmt.Errorf("set VolumeRestore status: %w", err)
-				}
-			}
-			return fmt.Errorf("claim %s/%s: %s", claim.Namespace, claim.Name, reason)
-		}
-		destination := internalvolsync.New(vr, claim, prime.Name, c.namespace)
-		if err := c.operations.CreateReplicationDestination(ctx, destination); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create ReplicationDestination %s/%s: %w", c.namespace, destinationName, err)
-		}
-	}
-
-	before := vr.Status.DeepCopy()
-	setClaimStatus(vr, claim, backupv1alpha1.RestorePhaseRestoring)
-	c.summarize(vr)
-	if equality.Semantic.DeepEqual(before, &vr.Status) {
-		return nil
-	}
-	if err := c.operations.SetStatus(ctx, vr); err != nil {
-		return fmt.Errorf("set VolumeRestore status: %w", err)
-	}
-	return nil
+	return c.populate(ctx, restore{vr: vr, claim: params.Pvc, prime: params.PvcPrime, repo: repo})
 }
 
-// Complete reports whether the restore of one claim has finished, which is
-// when VolSync has recorded the claim's manual trigger in the destination's
-// status.lastManualSync. It returns an error when it can't read the
-// destination.
+// Complete reports whether one claim's restore has finished, so the library
+// may hand the prime claim's volume to the claim.
 //
-// When the destination's latest mover run failed, Complete marks the claim
-// Failed and sets Ready to False with reason RestoreFailed and a message of
-// "claim <name>: " followed by the mover's logs. It writes that status when
-// it changed something, and returns false.
+// Parameters:
+//   - ctx bounds the API calls.
+//   - params are what the library passes for the claim, as for Populate.
+//     The library calls Complete only in a sync whose Populate returned nil.
+//
+// It returns true when the claim's restore Job has Complete=True, the one
+// sign that restic restored the Job's snapshot. With no Job, it returns true
+// only when the repository holds no snapshot at all and nothing pins the
+// claim, which is how a first deploy binds its empty volume (see choose). It
+// returns false for any other Job and in any other case, and an error when
+// the Job, the repository Secret or the snapshots can't be read. It writes
+// nothing: a Job that failed after Populate read it is Populate's in the
+// next sync.
 func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.PopulatorParams) (bool, error) {
 	if err := validateParams(params); err != nil {
 		return false, err
 	}
-	rdName := DestinationName(params.Pvc.UID)
-	rd, err := c.operations.GetReplicationDestination(ctx, c.namespace, rdName)
-	if err != nil {
-		return false, fmt.Errorf("get ReplicationDestination %s/%s: %w", c.namespace, rdName, err)
+	key := c.jobKey(params.Pvc.UID)
+	job, err := c.operations.GetJob(ctx, key)
+	switch {
+	case apierrors.IsNotFound(err):
+		return c.bindsEmpty(ctx, params)
+	case err != nil:
+		return false, fmt.Errorf("read restore Job %s: %w", key, err)
+	default:
+		return restorejob.Read(job, nil).State == restorejob.Succeeded, nil
 	}
-	if reason, failed := internalvolsync.Failure(rd); failed {
-		vr, err := decodeVolumeRestore(params)
-		if err != nil {
-			return false, err
-		}
-		before := vr.Status.DeepCopy()
-		setClaimStatus(vr, params.Pvc, backupv1alpha1.RestorePhaseFailed)
-		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoreFailed, claimMessage(params.Pvc, reason))
-		if equality.Semantic.DeepEqual(before, &vr.Status) {
-			return false, nil
-		}
-		if err := c.operations.SetStatus(ctx, vr); err != nil {
-			return false, fmt.Errorf("set failed VolumeRestore status: %w", err)
-		}
-		return false, nil
-	}
-	return internalvolsync.Complete(rd, internalvolsync.Trigger(params.Pvc)), nil
 }
 
-// Cleanup runs after a claim's restore has finished. It deletes the
-// ReplicationDestination and the repository Secret copy that Populate created,
-// and skips any that are already gone.
+// bindsEmpty reports whether a claim with no restore Job may bind its empty
+// volume.
+//
+// Parameters:
+//   - params are the library's params for the claim.
+//
+// It returns true only when choose selects nothing to restore, false when
+// no snapshot can fill the claim, and an error when the VolumeRestore can't
+// be decoded or the Secret or the snapshots can't be read.
+func (c *Callbacks) bindsEmpty(ctx context.Context, params populatormachinery.PopulatorParams) (bool, error) {
+	vr, err := decodeVolumeRestore(params)
+	if err != nil {
+		return false, err
+	}
+	repo, err := c.operations.GetSecret(ctx, params.Pvc.Namespace, vr.Spec.Repository)
+	if err != nil {
+		return false, fmt.Errorf("get repository Secret %s/%s: %w", params.Pvc.Namespace, vr.Spec.Repository, err)
+	}
+	chosen, err := c.selectSnapshot(ctx, vr, params.Pvc, repo)
+	var none *noBackupError
+	switch {
+	case errors.As(err, &none):
+		return false, nil
+	case err != nil:
+		return false, err
+	default:
+		return chosen.empty, nil
+	}
+}
+
+// Cleanup runs after a claim's restore has finished, and when the claim is
+// deleted before that. The library deletes the prime claim only once Cleanup
+// returns nil.
+//
+// Parameters:
+//   - ctx bounds the API calls.
+//   - params are what the library passes for the claim. The prime claim is
+//     absent on every sync after the one that deleted it, and Cleanup needs
+//     none.
+//
+// It first stops every restore Job of the claim (see stopRestore), and
+// returns an error while one of them may still write, so the prime claim and
+// its volume stay out of the app's hands until then. It then deletes the
+// repository Secret copy, skipping one that is already gone.
 //
 // It then removes the claim's entry from the VolumeRestore's status.claims.
 // It sets Ready from the entries that remain with summarize: Restored when no
 // claim is left, Restoring while other claims are being filled, and
 // unchanged while another claim's entry is Failed. It writes the status only
-// when that changed something. When the VolumeRestore
-// is gone by then, it returns nil, because nothing is left to report on.
+// when that changed something. When the VolumeRestore is gone by then, it
+// returns nil, because nothing is left to report on.
 //
 // Once no claim is left in status.claims, it removes Finalizer from the
 // VolumeRestore. A VolumeRestore deleted while a claim was being filled goes
@@ -278,43 +229,25 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 		return err
 	}
 	claim := params.Pvc
-	if err := c.operations.DeleteReplicationDestination(ctx, c.namespace, DestinationName(claim.UID)); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete ReplicationDestination: %w", err)
+	state, err := stopRestore(ctx, c.operations, c.namespace, claim.UID)
+	if err != nil {
+		return claimError(claim, err)
 	}
-	if err := c.operations.DeleteSecret(ctx, c.namespace, internalvolsync.SecretCopyName(claim.UID)); err != nil && !apierrors.IsNotFound(err) {
+	if !state.Stopped {
+		return claimError(claim, &stoppingError{state: state})
+	}
+	if err := c.operations.DeleteSecret(ctx, c.namespace, SecretCopyName(claim.UID)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete copied repository Secret: %w", err)
 	}
-
-	// The restore has ended, so the claim's entry goes. A VolumeRestore stays
-	// in place after its restores end. Its status holds an entry only for a
-	// claim being filled right now, and it reads Ready once no claim is.
 	vr, err := decodeVolumeRestore(params)
 	if err != nil {
 		return err
 	}
-	before := vr.Status.DeepCopy()
-
-	retireClaimStatus(vr, claim)
-	c.summarize(vr)
-
-	// The library has no early return for a claim it has already populated. It
-	// walks the whole path on every resync, reaches the completion branch and
-	// calls Cleanup again, for the life of the claim. Writing every time would
-	// send one status update per volume every resync interval, for as long as
-	// the claim exists, and none of them would change anything.
-	if !equality.Semantic.DeepEqual(before, &vr.Status) {
-		if err := c.operations.SetStatus(ctx, vr); err != nil {
-			if apierrors.IsNotFound(err) {
-				// The VolumeRestore is gone, and so is the status that
-				// reported this claim. The Secret copy and the destination
-				// are already deleted, which is all this claim needed.
-				return nil
-			}
-			return fmt.Errorf("set VolumeRestore status: %w", err)
-		}
+	if err := c.retire(ctx, vr, claim); err != nil {
+		return err
 	}
 
-	// The status write above bumped the resource version in vr, so this
+	// The status write in retire bumped the resource version in vr, so this
 	// update doesn't conflict with it. It does conflict when another claim's
 	// Populate has added an entry since the object was read, and then the
 	// finalizer stays for that claim.
@@ -327,43 +260,31 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 	return nil
 }
 
-// summarize sets the VolumeRestore's Ready condition from every entry in its
-// status.claims. Populate and Cleanup call it, so every claim that shares the
-// VolumeRestore computes the same condition. It changes the status in memory
-// only, and the caller writes it.
+// retire removes a claim's entry from the VolumeRestore's status, sets Ready
+// with summarize and writes the status when that changed something.
 //
-// With no entry, Ready is True with reason Restored. While any entry is
-// Failed, it leaves Ready as it is: the failed claim's own pass writes its
-// failure, RestoreFailed with the mover's logs from Complete or
-// NoBackupInReach from Populate, and another claim's pass must not overwrite
-// it. Otherwise Ready is False with reason Restoring, and the message lists
-// the ReplicationDestination of every entry, in status.claims order, and the
-// controller namespace they live in, since a reader who looks in the app's
-// namespace won't find them.
-func (c *Callbacks) summarize(vr *backupv1alpha1.VolumeRestore) {
-	if len(vr.Status.Claims) == 0 {
-		backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionTrue, backupv1alpha1.ReasonRestored, "no claim is being restored")
-		return
+// Parameters:
+//   - vr is the VolumeRestore, changed in place and written.
+//   - claim is the claim whose restore has ended.
+//
+// It returns an error from summarize or from the write, and nil when the
+// write finds the VolumeRestore gone, since nothing is left to report on.
+//
+// The library has no early return for a claim it has already populated. It
+// walks the whole path on every resync, reaches the completion branch and
+// calls Cleanup again, for the life of the claim. Writing every time would
+// send one status update per volume every resync interval, and none of them
+// would change anything.
+func (c *Callbacks) retire(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim) error {
+	before := vr.Status.DeepCopy()
+	retireClaimStatus(vr, claim)
+	if err := c.summarize(ctx, vr); err != nil {
+		return err
 	}
-	destinations := make([]string, 0, len(vr.Status.Claims))
-	for _, status := range vr.Status.Claims {
-		if status.Phase == backupv1alpha1.RestorePhaseFailed {
-			return
-		}
-		destinations = append(destinations, DestinationName(status.UID))
+	if err := c.writeChanged(ctx, vr, before); err != nil && !apierrors.IsNotFound(err) {
+		return err
 	}
-	noun := "ReplicationDestination"
-	if len(destinations) > 1 {
-		noun = "ReplicationDestinations"
-	}
-	waiting := fmt.Sprintf("waiting for %s %s in %s", noun, strings.Join(destinations, ", "), c.namespace)
-	backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRestoring, waiting)
-}
-
-// claimMessage prefixes a failure message with "claim <name>: ", so a
-// VolumeRestore that fills several claims says which claim failed.
-func claimMessage(claim *corev1.PersistentVolumeClaim, message string) string {
-	return fmt.Sprintf("claim %s: %s", claim.Name, message)
+	return nil
 }
 
 // holdVolumeRestore adds Finalizer to the VolumeRestore that vr holds, and
@@ -434,49 +355,4 @@ func decodeVolumeRestore(params populatormachinery.PopulatorParams) (*backupv1al
 		return nil, fmt.Errorf("decode VolumeRestore: %w", err)
 	}
 	return vr, nil
-}
-
-// setClaimStatus sets the phase of the claim's entry in the VolumeRestore's
-// status.claims, and adds the entry when there isn't one. It also updates the
-// entry's name, and sets startedAt to now when the entry has no start time
-// yet. It changes the status in memory only, and the caller writes it.
-func setClaimStatus(vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim, phase backupv1alpha1.RestorePhase) {
-	for i := range vr.Status.Claims {
-		status := &vr.Status.Claims[i]
-		if status.UID != claim.UID {
-			continue
-		}
-		status.Name = claim.Name
-		status.Phase = phase
-		if status.StartedAt == nil {
-			now := metav1.Now()
-			status.StartedAt = &now
-		}
-		return
-	}
-	now := metav1.Now()
-	vr.Status.Claims = append(vr.Status.Claims, backupv1alpha1.ClaimRestoreStatus{
-		Name:      claim.Name,
-		UID:       claim.UID,
-		Phase:     phase,
-		StartedAt: &now,
-	})
-}
-
-// retireClaimStatus removes the claim's entry from the VolumeRestore's
-// status.claims, which ends the VolumeRestore's report of that restore. When
-// no entry remains, it sets claims to nil. It changes the status in memory
-// only, and the caller writes it.
-func retireClaimStatus(vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim) {
-	remaining := vr.Status.Claims[:0]
-	for _, status := range vr.Status.Claims {
-		if status.UID != claim.UID {
-			remaining = append(remaining, status)
-		}
-	}
-	if len(remaining) == 0 {
-		vr.Status.Claims = nil
-		return
-	}
-	vr.Status.Claims = remaining
 }

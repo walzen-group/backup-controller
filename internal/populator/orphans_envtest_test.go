@@ -16,10 +16,9 @@ import (
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
+	"github.com/walzen-group/backup-controller/internal/restorejob"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -30,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
@@ -57,7 +57,7 @@ func TestEnvtestAClaimWhoseVolumeRestoreIsGoneIsReleased(t *testing.T) {
 	libraryDone := make(chan struct{})
 	go func() {
 		defer close(libraryDone)
-		callbacks := New(newFakeOperations(), orphanControllerNS, nil)
+		callbacks := New(newFakeOperations(t), orphanControllerNS, testImage, fixedSnapshots{monday})
 		populatormachinery.RunControllerWithConfig(populatormachinery.VolumePopulatorConfig{
 			Kubeconfig: kubeconfig,
 			Namespace:  orphanControllerNS,
@@ -157,8 +157,7 @@ func TestEnvtestAClaimWhoseVolumeRestoreIsGoneIsReleased(t *testing.T) {
 		Reader:    manager.GetAPIReader(),
 		Recorder:  manager.GetEventRecorder("backup-controller"),
 		Namespace: orphanControllerNS,
-		// The destination is looked for only a MoverPoll after its delete;
-		// a short one keeps the test inside its budget.
+		// A short poll keeps the test inside its budget.
 		MoverPoll: 500 * time.Millisecond,
 	}
 	if err := orphans.SetupWithManager(manager); err != nil {
@@ -202,19 +201,21 @@ func TestEnvtestAClaimWhoseVolumeRestoreIsGoneIsReleased(t *testing.T) {
 	})
 }
 
-// TestEnvtestARunningMoverHoldsTheOrphanCleanup builds a claim whose
-// VolumeRestore is gone, with its prime, Secret copy and ReplicationDestination
-// in the controller namespace and a Running pod of the destination's mover
-// Job. It shows that OrphanReconciler deletes only the ReplicationDestination
-// and records a Normal WaitingForMover event while the pod is there, and that
-// the cleanup completes once the pod is deleted.
+// TestEnvtestARunningRestoreJobHoldsTheOrphanCleanup builds a claim whose
+// VolumeRestore is gone, with its prime, Secret copy and a resumed restore
+// Job in the controller namespace, and a Running pod of that Job. It shows
+// that OrphanReconciler suspends the Job and records a Normal
+// WaitingForMover event, leaves the prime, the Secret copy and the claim's
+// finalizer in place while the pod runs, and completes the cleanup once the
+// pod has ended.
 //
-// OrphanReconciler counts every pod its label selector lists as a mover still
-// there, whatever the phase, so only the pod's deletion releases the cleanup.
-// The claim is created with ClaimFinalizer directly; the library plays no
-// part in this path, and TestEnvtestAClaimWhoseVolumeRestoreIsGoneIsReleased
-// pins the library's names.
-func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
+// envtest runs no Job controller and no garbage collector, so the test plays
+// both where the reconciler waits on them: it creates the pod, marks the Job
+// Suspended=True after the suspend, and ends the pod. The claim is created
+// with ClaimFinalizer directly; the library plays no part in this path, and
+// TestEnvtestAClaimWhoseVolumeRestoreIsGoneIsReleased pins the library's
+// names.
+func TestEnvtestARunningRestoreJobHoldsTheOrphanCleanup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -236,11 +237,9 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 		t.Fatalf("create claim: %v", err)
 	}
 	claimKey := client.ObjectKeyFromObject(claim)
-	destination := DestinationName(claim.UID)
-	rdKey := types.NamespacedName{Namespace: orphanControllerNS, Name: destination}
 	primeKey := types.NamespacedName{Namespace: orphanControllerNS, Name: PrimeClaimName(claim.UID)}
-	secretKey := types.NamespacedName{Namespace: orphanControllerNS, Name: internalvolsync.SecretCopyName(claim.UID)}
-	podKey := types.NamespacedName{Namespace: orphanControllerNS, Name: internalvolsync.MoverJobName(destination) + "-abcde"}
+	secretKey := types.NamespacedName{Namespace: orphanControllerNS, Name: SecretCopyName(claim.UID)}
+	jobKey := types.NamespacedName{Namespace: orphanControllerNS, Name: JobName(claim.UID)}
 
 	prime := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: primeKey.Name, Namespace: primeKey.Namespace},
@@ -254,26 +253,45 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: secretKey.Name, Namespace: secretKey.Namespace},
 		StringData: map[string]string{"RESTIC_REPOSITORY": "s3:http://example.invalid/bucket"},
 	}
-	rd := &volsyncv1alpha1.ReplicationDestination{ObjectMeta: metav1.ObjectMeta{Name: rdKey.Name, Namespace: rdKey.Namespace}}
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      podKey.Name,
-			Namespace: podKey.Namespace,
-			Labels:    map[string]string{"job-name": internalvolsync.MoverJobName(destination)},
-		},
-		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
-			Containers:    []corev1.Container{{Name: "restic", Image: "quay.io/backube/volsync:0.13.0"}},
-		},
-	}
-	for _, obj := range []client.Object{prime, secret, rd, pod} {
+	for _, obj := range []client.Object{prime, secret} {
 		if err := c.Create(ctx, obj); err != nil {
 			t.Fatalf("create %T %s: %v", obj, obj.GetName(), err)
 		}
 	}
+	job, err := restorejob.Build(restorejob.Spec{
+		Name: jobKey.Name, Namespace: jobKey.Namespace,
+		Origin:     restorejob.Origin{Kind: restorejob.OriginClaim, UID: claim.UID},
+		Owner:      metav1.OwnerReference{APIVersion: "v1", Kind: "PersistentVolumeClaim", Name: prime.Name, UID: prime.UID},
+		SnapshotID: monday.ID, Claim: prime.Name, Repository: secret.Name, Image: testImage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, job); err != nil {
+		t.Fatalf("create the restore Job: %v", err)
+	}
+	job.Spec.Suspend = ptr.To(false)
+	if err := c.Update(ctx, job); err != nil {
+		t.Fatalf("resume the restore Job: %v", err)
+	}
+	labels := map[string]string{batchv1.ControllerUidLabel: string(job.UID)}
+	for key, value := range job.Spec.Template.Labels {
+		labels[key] = value
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: job.Name + "-x7k2p", Namespace: job.Namespace, Labels: labels},
+		Spec: corev1.PodSpec{
+			NodeName:      "node-a",
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers:    []corev1.Container{{Name: "restore", Image: testImage}},
+		},
+	}
+	if err := c.Create(ctx, pod); err != nil {
+		t.Fatalf("create the restore pod: %v", err)
+	}
 	pod.Status.Phase = corev1.PodRunning
 	if err := c.Status().Update(ctx, pod); err != nil {
-		t.Fatalf("set the mover pod Running: %v", err)
+		t.Fatalf("set the restore pod Running: %v", err)
 	}
 	if err := c.Delete(ctx, claim); err != nil {
 		t.Fatalf("delete claim: %v", err)
@@ -307,10 +325,26 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 		<-managerDone
 	})
 
-	eventually(t, 30*time.Second, "the ReplicationDestination is gone and a Normal WaitingForMover event is on the claim", func() bool {
-		if err := c.Get(ctx, rdKey, &volsyncv1alpha1.ReplicationDestination{}); !apierrors.IsNotFound(err) {
+	// The Job controller would mark the suspended Job Suspended=True; the
+	// test does it once the reconciler has suspended the Job.
+	eventually(t, 30*time.Second, "the restore Job is suspended and marked so", func() bool {
+		got := &batchv1.Job{}
+		if err := c.Get(ctx, jobKey, got); err != nil {
+			t.Fatalf("get the restore Job: %v", err)
+		}
+		if !ptr.Deref(got.Spec.Suspend, false) {
 			return false
 		}
+		got.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobSuspended, Status: corev1.ConditionTrue, Reason: "JobSuspended", LastTransitionTime: metav1.Now(), LastProbeTime: metav1.Now()}}
+		err := c.Status().Update(ctx, got)
+		if err != nil && !apierrors.IsConflict(err) {
+			t.Fatalf("mark the restore Job suspended: %v", err)
+		}
+		return err == nil
+	})
+	// The events recorder folds events of one reason on one object into a
+	// series that keeps the first note, so the test looks for the reason.
+	eventually(t, 30*time.Second, "a Normal WaitingForMover event is on the claim", func() bool {
 		events := &corev1.EventList{}
 		if err := c.List(ctx, events, client.InNamespace(orphanNamespace)); err != nil {
 			t.Fatalf("list events: %v", err)
@@ -323,7 +357,7 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 		return false
 	})
 
-	// Several passes run while the pod is there; none goes past the pod.
+	// Several passes run while the pod runs; none goes past it.
 	time.Sleep(2 * time.Second)
 	for _, key := range []types.NamespacedName{primeKey, secretKey} {
 		var obj client.Object = &corev1.PersistentVolumeClaim{}
@@ -331,7 +365,7 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 			obj = &corev1.Secret{}
 		}
 		if err := c.Get(ctx, key, obj); err != nil || obj.GetDeletionTimestamp() != nil {
-			t.Fatalf("while the mover runs: %T %s get %v, deletion %v; want it in place", obj, key, err, obj.GetDeletionTimestamp())
+			t.Fatalf("while the restore pod runs: %T %s get %v, deletion %v; want it in place", obj, key, err, obj.GetDeletionTimestamp())
 		}
 	}
 	held := &corev1.PersistentVolumeClaim{}
@@ -339,17 +373,14 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 		t.Fatalf("get claim: %v", err)
 	}
 	if !controllerutil.ContainsFinalizer(held, ClaimFinalizer) {
-		t.Fatalf("while the mover runs: claim finalizers %v; want %s", held.Finalizers, ClaimFinalizer)
-	}
-	if err := c.Get(ctx, podKey, &corev1.Pod{}); err != nil {
-		t.Fatalf("while the mover runs: get mover pod: %v", err)
+		t.Fatalf("while the restore pod runs: claim finalizers %v; want %s", held.Finalizers, ClaimFinalizer)
 	}
 
-	// The pod is unscheduled, so the apiserver removes it at once.
-	if err := c.Delete(ctx, pod, client.GracePeriodSeconds(0)); err != nil {
-		t.Fatalf("delete the mover pod: %v", err)
+	pod.Status.Phase = corev1.PodFailed
+	if err := c.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("end the restore pod: %v", err)
 	}
-	eventually(t, 30*time.Second, "the Secret copy and the prime are deleted and the claim loses "+ClaimFinalizer, func() bool {
+	eventually(t, 30*time.Second, "the Job is deleted, the Secret copy and the prime are deleted and the claim loses "+ClaimFinalizer, func() bool {
 		got := &corev1.PersistentVolumeClaim{}
 		if err := c.Get(ctx, claimKey, got); err != nil && !apierrors.IsNotFound(err) {
 			t.Fatalf("get claim: %v", err)
@@ -359,26 +390,28 @@ func TestEnvtestARunningMoverHoldsTheOrphanCleanup(t *testing.T) {
 		if err := c.Get(ctx, secretKey, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 			return false
 		}
+		j := &batchv1.Job{}
+		if err := c.Get(ctx, jobKey, j); err == nil && j.DeletionTimestamp == nil {
+			return false
+		}
 		p := &corev1.PersistentVolumeClaim{}
 		err := c.Get(ctx, primeKey, p)
 		return apierrors.IsNotFound(err) || (err == nil && p.DeletionTimestamp != nil)
 	})
 }
 
-// startOrphanEnvtest starts envtest's kube-apiserver with the repo's CRDs and
-// the recorded VolSync ReplicationDestination CRD, and creates the claim
-// namespace, the controller namespace and a StorageClass nothing serves. The
-// apiserver stops when the test ends.
+// startOrphanEnvtest starts envtest's kube-apiserver with the repo's CRDs,
+// and creates the claim namespace, the controller namespace and a
+// StorageClass nothing serves. The apiserver stops when the test ends.
 //
 // It returns the environment, its rest config, a scheme with the core,
-// batch, storage, VolSync and backup types, a direct client, and the
+// batch, storage and backup types, a direct client, and the
 // StorageClass's name. It fails the test when a step fails.
 func startOrphanEnvtest(ctx context.Context, t *testing.T) (*envtest.Environment, *rest.Config, *runtime.Scheme, client.Client, string) {
 	t.Helper()
 	env := &envtest.Environment{
 		CRDDirectoryPaths: []string{
 			filepath.Join("..", "..", "config", "crd"),
-			filepath.Join("..", "testinfra", "crds", "volsync", "volsync.backube_replicationdestinations.yaml"),
 		},
 		ErrorIfCRDPathMissing: true,
 	}
@@ -389,7 +422,7 @@ func startOrphanEnvtest(ctx context.Context, t *testing.T) (*envtest.Environment
 	t.Cleanup(func() { _ = env.Stop() })
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, batchv1.AddToScheme, storagev1.AddToScheme, volsyncv1alpha1.AddToScheme, backupv1alpha1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, batchv1.AddToScheme, storagev1.AddToScheme, backupv1alpha1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatal(err)
 		}

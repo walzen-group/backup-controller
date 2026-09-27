@@ -71,7 +71,7 @@ func restoreImageFlag(fs *flag.FlagSet) func() (string, error) {
 func runFlags(fs *flag.FlagSet) func() (RunOptions, error) {
 	kubeconfig := kubeconfigFlag(fs)
 	restoreImage := restoreImageFlag(fs)
-	namespace := fs.String("namespace", "backup-system", "namespace the prime claim and the ReplicationDestination live in")
+	namespace := fs.String("namespace", "backup-system", "namespace the populator's prime claims, Secret copies and restore Jobs live in")
 	metricsAddr := fs.String("runs-metrics-addr", ":8081", "address the scheduler's metrics listener binds, at /metrics")
 	healthAddr := fs.String("health-probe-addr", ":8082", "address serving /healthz and /readyz for the run controllers; 0 serves none")
 	webhookCert := fs.String("webhook-cert-dir", "", "directory holding tls.crt and tls.key; empty serves no webhook")

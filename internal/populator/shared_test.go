@@ -2,36 +2,33 @@ package populator
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 // strictOperations is a fakeOperations whose VolumeRestore writes go to the
-// strict fake client, as clientOperations in cmd/backup-controller sends
-// them: SetStatus updates the status subresource and UpdateVolumeRestore the
-// object. The client keeps the stored VolumeRestore, bumps its
-// resourceVersion on every write, refuses a write whose resourceVersion is
-// stale with a Conflict, and prunes against the pinned CRD. Every
-// successful status write is also recorded in statuses.
+// strict fake client that holds its Jobs and claims, as clientOperations in
+// cmd/backup-controller sends them: SetStatus updates the status subresource
+// and UpdateVolumeRestore the object. The client keeps the stored
+// VolumeRestore, bumps its resourceVersion on every write, refuses a write
+// whose resourceVersion is stale with a Conflict, and prunes against the
+// pinned CRD. Every successful status write is also recorded in statuses.
 type strictOperations struct {
 	*fakeOperations
-	client client.Client
 }
 
 func (s *strictOperations) SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	if err := s.client.Status().Update(ctx, vr); err != nil {
+	if err := s.cluster.Status().Update(ctx, vr); err != nil {
 		return err
 	}
 	s.statuses = append(s.statuses, vr.DeepCopy())
@@ -39,7 +36,7 @@ func (s *strictOperations) SetStatus(ctx context.Context, vr *backupv1alpha1.Vol
 }
 
 func (s *strictOperations) UpdateVolumeRestore(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	if err := s.client.Update(ctx, vr); err != nil {
+	if err := s.cluster.Update(ctx, vr); err != nil {
 		return err
 	}
 	s.updates = append(s.updates, vr.DeepCopy())
@@ -50,15 +47,15 @@ func (s *strictOperations) UpdateVolumeRestore(ctx context.Context, vr *backupv1
 func (s *strictOperations) stored(t *testing.T) *backupv1alpha1.VolumeRestore {
 	t.Helper()
 	vr := new(backupv1alpha1.VolumeRestore)
-	if err := s.client.Get(context.Background(), client.ObjectKey{Namespace: "apps", Name: "notes-data"}, vr); err != nil {
+	if err := s.cluster.Get(context.Background(), client.ObjectKey{Namespace: appNS, Name: "notes-data"}, vr); err != nil {
 		t.Fatalf("get VolumeRestore: %v", err)
 	}
 	return vr
 }
 
 // paramsFor returns the library's params for one claim in apps, with the
-// VolumeRestore as the strict client holds it now, which is what the
-// library's informer cache hands the callbacks.
+// VolumeRestore and the prime claim as the strict client holds them now,
+// which is what the library's informer cache hands the callbacks.
 func (s *strictOperations) paramsFor(t *testing.T, name string, uid types.UID) populatormachinery.PopulatorParams {
 	t.Helper()
 	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(s.stored(t))
@@ -66,41 +63,35 @@ func (s *strictOperations) paramsFor(t *testing.T, name string, uid types.UID) p
 		t.Fatal(err)
 	}
 	return populatormachinery.PopulatorParams{
-		Pvc:          &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "apps", UID: uid}},
-		PvcPrime:     &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "prime-" + string(uid), Namespace: "backup-system"}},
+		Pvc:          &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: appNS, UID: uid}},
+		PvcPrime:     s.prime(t, uid),
 		Unstructured: &unstructured.Unstructured{Object: object},
 	}
 }
 
 // newStrictOperations returns a fake cluster that holds the repository
-// Secret, the Secret copies and healthy destinations of the claims notes
-// (claim-123) and photos (claim-456), and the VolumeRestore notes-data with
-// the populator's finalizer and the status given.
+// Secret, the Secret copies of the claims notes (claim-123) and photos
+// (claim-456), a running restore Job for photos, and the VolumeRestore
+// notes-data with the populator's finalizer and the status given.
 func newStrictOperations(t *testing.T, status backupv1alpha1.VolumeRestoreStatus) *strictOperations {
 	t.Helper()
-	s := runtime.NewScheme()
-	if err := backupv1alpha1.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
 	vr := &backupv1alpha1.VolumeRestore{
-		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 1, ResourceVersion: "7", Finalizers: []string{Finalizer}},
+		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: appNS, Generation: 1, ResourceVersion: "7", Finalizers: []string{Finalizer}},
 		Spec:       backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"},
 		Status:     status,
 	}
-	c := strictclient.Build(fake.NewClientBuilder().WithObjects(vr), s, strictclient.Options{
-		Clock: func() time.Time { return time.Date(2026, 9, 26, 7, 0, 0, 0, time.UTC) },
-		CRDs:  []string{"../testinfra/crds/backup-controller/v0.8.1/backup.wlz.li_volumerestores.yaml"},
-	})
-	ops := restoringOperations()
-	ops.secrets[namespacedName("backup-system", "claim-456")] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "claim-456", Namespace: "backup-system"}}
-	ops.destinations[namespacedName("backup-system", "restore-claim-456")] = &volsyncv1alpha1.ReplicationDestination{
-		ObjectMeta: metav1.ObjectMeta{Name: "restore-claim-456", Namespace: "backup-system"},
+	ops := fakeOperationsOn(newCluster(t, vr))
+	addRepository(ops)
+	for _, uid := range []string{"claim-123", "claim-456"} {
+		ops.secrets[namespacedName(controllerNS, uid)] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: uid, Namespace: controllerNS}}
 	}
-	return &strictOperations{fakeOperations: ops, client: c}
+	ops.createJobFor(t, 1)
+	ops.runJob(t, "claim-456")
+	return &strictOperations{fakeOperations: ops}
 }
 
-// failedNotes is a status in which the claim notes failed with the mover's
-// logs and the claim photos is being filled.
+// failedNotes is a status in which the claim notes failed with its restore
+// Job's failure and the claim photos is being filled.
 func failedNotes() backupv1alpha1.VolumeRestoreStatus {
 	started := metav1.NewTime(time.Date(2026, 9, 26, 6, 0, 0, 0, time.UTC))
 	return backupv1alpha1.VolumeRestoreStatus{
@@ -110,18 +101,32 @@ func failedNotes() backupv1alpha1.VolumeRestoreStatus {
 		},
 		Conditions: []metav1.Condition{{
 			Type: backupv1alpha1.ConditionReady, Status: metav1.ConditionFalse, Reason: backupv1alpha1.ReasonRestoreFailed,
-			Message: "claim notes: mover logs", ObservedGeneration: 1, LastTransitionTime: started,
+			Message: "claim notes: restic exited 1", ObservedGeneration: 1, LastTransitionTime: started,
 		}},
 	}
 }
 
 // assertReadyFailed checks that the stored VolumeRestore still reports the
-// failure of the claim notes with its mover logs.
+// failure of the claim notes.
 func assertReadyFailed(t *testing.T, ops *strictOperations) {
 	t.Helper()
 	ready := findCondition(ops.stored(t).Status.Conditions, backupv1alpha1.ConditionReady)
-	if ready == nil || ready.Reason != backupv1alpha1.ReasonRestoreFailed || ready.Message != "claim notes: mover logs" {
-		t.Fatalf("Ready = %#v, want RestoreFailed with the logs of claim notes", ready)
+	if ready == nil || ready.Reason != backupv1alpha1.ReasonRestoreFailed || ready.Message != "claim notes: restic exited 1" {
+		t.Fatalf("Ready = %#v, want RestoreFailed with the failure of claim notes", ready)
+	}
+}
+
+// assertEntry checks the stored entry of claim notes and the Ready
+// condition: the phase, the reason and a part of the message.
+func assertEntry(t *testing.T, ops *strictOperations, phase backupv1alpha1.RestorePhase, reason, message string) {
+	t.Helper()
+	stored := ops.stored(t)
+	if len(stored.Status.Claims) == 0 || stored.Status.Claims[0].Phase != phase {
+		t.Fatalf("claims = %+v, want notes %s", stored.Status.Claims, phase)
+	}
+	ready := findCondition(stored.Status.Conditions, backupv1alpha1.ConditionReady)
+	if ready == nil || ready.Reason != reason || !strings.Contains(ready.Message, message) {
+		t.Fatalf("Ready = %#v, want %s with %q", ready, reason, message)
 	}
 }
 
@@ -129,14 +134,14 @@ func assertReadyFailed(t *testing.T, ops *strictOperations) {
 // a filled claim leaves Ready alone while another claim's entry is Failed.
 // The library calls Cleanup on every resync for the life of a filled claim,
 // and it used to write Restoring "1 claim(s) still restoring" over the other
-// claim's RestoreFailed and its mover logs.
+// claim's RestoreFailed.
 func TestCleanupOfARestoredClaimKeepsAnotherClaimsFailure(t *testing.T) {
 	status := failedNotes()
 	status.Claims = status.Claims[:1]
 	ops := newStrictOperations(t, status)
-	callbacks := New(ops, "backup-system", nil)
+	ops.setJob(t, "claim-456", complete)
 
-	if err := callbacks.Cleanup(context.Background(), ops.paramsFor(t, "photos", "claim-456")); err != nil {
+	if err := newCallbacks(ops, monday).Cleanup(context.Background(), ops.paramsFor(t, "photos", "claim-456")); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
 	if len(ops.statuses) != 0 {
@@ -146,13 +151,11 @@ func TestCleanupOfARestoredClaimKeepsAnotherClaimsFailure(t *testing.T) {
 }
 
 // TestPopulateOfAHealthyClaimKeepsAnotherClaimsFailure checks that Populate
-// of a claim whose destination is healthy leaves Ready alone while another
-// claim's entry is Failed.
+// of a claim whose restore Job runs leaves Ready alone while another claim's
+// entry is Failed.
 func TestPopulateOfAHealthyClaimKeepsAnotherClaimsFailure(t *testing.T) {
 	ops := newStrictOperations(t, failedNotes())
-	callbacks := New(ops, "backup-system", nil)
-
-	if err := callbacks.Populate(context.Background(), ops.paramsFor(t, "photos", "claim-456")); err != nil {
+	if err := newCallbacks(ops, monday).Populate(context.Background(), ops.paramsFor(t, "photos", "claim-456")); err != nil {
 		t.Fatalf("Populate() error = %v", err)
 	}
 	assertReadyFailed(t, ops)
@@ -160,15 +163,16 @@ func TestPopulateOfAHealthyClaimKeepsAnotherClaimsFailure(t *testing.T) {
 
 // TestTwoRestoringClaimsWriteTheStatusOnce checks that two claims filled from
 // one VolumeRestore compute the same Ready message, so their passes write the
-// status once between them. Each used to write its own destination's name,
-// and every pass of either claim changed the status.
+// status once between them.
 func TestTwoRestoringClaimsWriteTheStatusOnce(t *testing.T) {
 	status := failedNotes()
 	status.Claims[0].Phase = backupv1alpha1.RestorePhaseRestoring
 	status.Conditions[0].Reason = backupv1alpha1.ReasonRestoring
-	status.Conditions[0].Message = "waiting for ReplicationDestination restore-claim-123 in backup-system"
+	status.Conditions[0].Message = "waiting for restore Job restore-claim-123 (snapshot 6e473100) in backup-system"
 	ops := newStrictOperations(t, status)
-	callbacks := New(ops, "backup-system", nil)
+	ops.createJob(t)
+	ops.runJob(t, "claim-123")
+	callbacks := newCallbacks(ops, monday)
 
 	for _, claim := range []struct {
 		name string
@@ -182,7 +186,7 @@ func TestTwoRestoringClaimsWriteTheStatusOnce(t *testing.T) {
 		t.Errorf("status writes = %d, want 1", len(ops.statuses))
 	}
 	ready := findCondition(ops.stored(t).Status.Conditions, backupv1alpha1.ConditionReady)
-	want := "waiting for ReplicationDestinations restore-claim-123, restore-claim-456 in backup-system"
+	want := "waiting for restore Jobs restore-claim-123 (snapshot 6e473100), restore-claim-456 (snapshot 6e473100) in backup-system"
 	if ready == nil || ready.Reason != backupv1alpha1.ReasonRestoring || ready.Message != want {
 		t.Fatalf("Ready = %#v, want Restoring %q", ready, want)
 	}
@@ -195,9 +199,8 @@ func TestCleanupOfTheOnlyFailedClaimReportsRestored(t *testing.T) {
 	status := failedNotes()
 	status.Claims = status.Claims[:1]
 	ops := newStrictOperations(t, status)
-	callbacks := New(ops, "backup-system", nil)
 
-	if err := callbacks.Cleanup(context.Background(), ops.paramsFor(t, "notes", "claim-123")); err != nil {
+	if err := newCallbacks(ops, monday).Cleanup(context.Background(), ops.paramsFor(t, "notes", "claim-123")); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
 	stored := ops.stored(t)
@@ -207,17 +210,15 @@ func TestCleanupOfTheOnlyFailedClaimReportsRestored(t *testing.T) {
 	}
 }
 
-// TestARecoveredClaimReportsEveryDestination checks that once a failed
-// claim's mover succeeds, its Populate marks it Restoring and Ready names the
-// destinations of both claims being filled.
-func TestARecoveredClaimReportsEveryDestination(t *testing.T) {
+// TestAReplacedJobReportsEveryJob checks that once a failed claim's Job has
+// been replaced by a new one, its Populate marks it Restoring and Ready names
+// the Jobs of both claims being filled.
+func TestAReplacedJobReportsEveryJob(t *testing.T) {
 	ops := newStrictOperations(t, failedNotes())
-	ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultSuccessful},
-	}
-	callbacks := New(ops, "backup-system", nil)
+	ops.createJob(t)
+	ops.runJob(t, "claim-123")
 
-	if err := callbacks.Populate(context.Background(), ops.paramsFor(t, "notes", "claim-123")); err != nil {
+	if err := newCallbacks(ops, monday).Populate(context.Background(), ops.paramsFor(t, "notes", "claim-123")); err != nil {
 		t.Fatalf("Populate() error = %v", err)
 	}
 	stored := ops.stored(t)
@@ -225,31 +226,26 @@ func TestARecoveredClaimReportsEveryDestination(t *testing.T) {
 		t.Errorf("notes phase = %s, want Restoring", stored.Status.Claims[0].Phase)
 	}
 	ready := findCondition(stored.Status.Conditions, backupv1alpha1.ConditionReady)
-	want := "waiting for ReplicationDestinations restore-claim-123, restore-claim-456 in backup-system"
+	want := "waiting for restore Jobs restore-claim-123 (snapshot 6e473100), restore-claim-456 (snapshot 6e473100) in backup-system"
 	if ready == nil || ready.Reason != backupv1alpha1.ReasonRestoring || ready.Message != want {
 		t.Fatalf("Ready = %#v, want Restoring %q", ready, want)
 	}
 }
 
-// TestACompleteThatChangesNothingWritesNothing checks that Complete prefixes
-// the mover's logs with the claim's name, and skips the write on a later
-// pass when the status already says so.
-func TestACompleteThatChangesNothingWritesNothing(t *testing.T) {
-	status := failedNotes()
-	status.Conditions[0].Message = "mover logs"
-	ops := newStrictOperations(t, status)
-	ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "mover logs"},
-	}
-	callbacks := New(ops, "backup-system", nil)
+// TestCompleteWritesNothing checks that Complete writes no status, even for
+// a failed Job: the failure is Populate's to record, in the next sync.
+func TestCompleteWritesNothing(t *testing.T) {
+	ops := newStrictOperations(t, failedNotes())
+	ops.createJob(t)
+	ops.setJob(t, "claim-123", failed)
 
 	for range 2 {
-		if _, err := callbacks.Complete(context.Background(), ops.paramsFor(t, "notes", "claim-123")); err != nil {
-			t.Fatalf("Complete() error = %v", err)
+		if done, err := newCallbacks(ops, monday).Complete(context.Background(), ops.paramsFor(t, "notes", "claim-123")); err != nil || done {
+			t.Fatalf("Complete() = %t, %v; want false", done, err)
 		}
 	}
-	if len(ops.statuses) != 1 {
-		t.Errorf("status writes = %d, want 1", len(ops.statuses))
+	if len(ops.statuses) != 0 {
+		t.Errorf("status writes = %d, want none", len(ops.statuses))
 	}
 	assertReadyFailed(t, ops)
 }

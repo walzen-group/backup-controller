@@ -15,6 +15,12 @@ const Prefix = "backup.wlz.li"
 // populator-machinery/controller.go:69 and :318).
 const ClaimFinalizer = Prefix + "/populate-target-protection"
 
+// AnnotationJobUID is the annotation on a prime claim that records the UID of
+// the restore Job Populate created for it or took over. Populate resumes a
+// Job, which restorejob.Build creates suspended, only once a later pass reads
+// this record back and finds the Job's own UID in it.
+const AnnotationJobUID = Prefix + "/restore-job-uid"
+
 // PrimeClaimName returns the name of the prime claim the populator library
 // creates in the controller namespace for the claim with the given UID. The
 // library names it "prime-" followed by the claim's UID
@@ -23,9 +29,15 @@ func PrimeClaimName(claimUID types.UID) string {
 	return "prime-" + string(claimUID)
 }
 
-// DestinationName returns the name of the ReplicationDestination that
-// Populate creates in the controller namespace for the claim with the given
-// UID.
-func DestinationName(claimUID types.UID) string {
+// JobName returns the name of the restore Job that Populate creates in the
+// controller namespace to fill the claim with the given UID.
+//
+// Parameters:
+//   - claimUID is the UID of the app claim being filled. Every callback gets
+//     the claim, so each finds the claim's Job again by this name.
+//
+// The name is "restore-" followed by the UID, 44 characters for a UID of 36,
+// so it needs no shortening.
+func JobName(claimUID types.UID) string {
 	return "restore-" + string(claimUID)
 }

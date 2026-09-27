@@ -5,10 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	internalvolsync "github.com/walzen-group/backup-controller/internal/volsync"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,7 +22,7 @@ import (
 )
 
 // defaultMoverPoll is how long OrphanReconciler waits before it looks again
-// for a mover pod that is still there.
+// at a restore Job that is still stopping.
 const defaultMoverPoll = 30 * time.Second
 
 // OrphanReconciler finishes the cleanup the populator library cannot do for a
@@ -36,32 +33,24 @@ const defaultMoverPoll = 30 * time.Second
 // that cleans up after a deleted claim (lib-volume-populator v3.3.0
 // populator-machinery/controller.go:661-671). A claim deleted after its
 // VolumeRestore therefore keeps ClaimFinalizer, stays Terminating for good,
-// and its prime claim, Secret copy and ReplicationDestination stay in the
-// controller namespace. The reconciler does for such a claim what Cleanup and
-// the library would have done.
+// and its prime claim, Secret copy and restore Job stay in the controller
+// namespace. The reconciler does for such a claim what Cleanup and the
+// library would have done.
 type OrphanReconciler struct {
 	// Client makes the writes, and lists claims from the manager's cache
 	// when a VolumeRestore is deleted.
 	Client client.Client
-	// Reader is the uncached API reader. Every read that decides a delete
-	// goes through it, so a stale cache cannot cause one.
+	// Reader is the uncached API reader. Every read that decides a stop or
+	// a delete goes through it, so a stale cache cannot cause one.
 	Reader client.Reader
 	// Recorder writes the events on the claim.
 	Recorder events.EventRecorder
 	// Namespace is the controller namespace, where the prime claims, the
-	// Secret copies and the ReplicationDestinations live.
+	// Secret copies and the restore Jobs live.
 	Namespace string
-	// MoverPoll is how long to wait before looking again for a mover pod
-	// that is still there. Zero means 30 seconds.
+	// MoverPoll is how long to wait before looking again at a restore Job
+	// that is still stopping. Zero means 30 seconds.
 	MoverPoll time.Duration
-	// Now returns the current time. Nil means time.Now. Tests replace it so
-	// they can move time forward without sleeping.
-	Now func() time.Time
-
-	// stops records when the reconciler deleted each claim's
-	// ReplicationDestination, so the mover counts gone only once MoverPoll
-	// has passed since the delete.
-	stops internalvolsync.Stops
 }
 
 // SetupWithManager registers the reconciler with the manager mgr, and
@@ -142,30 +131,19 @@ func (r *OrphanReconciler) orphaned(claim *corev1.PersistentVolumeClaim) bool {
 // VolumeRestore and cleans up itself. Only an authoritative NotFound for the
 // VolumeRestore lets it go on. It then, in the controller namespace:
 //
-//  1. deletes the ReplicationDestination DestinationName(uid). When the
-//     delete finds it there, the pass records a Normal WaitingForMover event
-//     naming the destination and requeues after MoverPoll, and goes no
-//     further: VolSync may be in the middle of a reconcile of that
-//     destination and create its mover Job after any look this pass could
-//     take. Only a pass whose delete finds the destination gone goes on,
-//     and only once MoverPoll has passed since the delete, because that
-//     event or a watch event can start the next pass at once. The time of
-//     the delete is kept in memory (see internalvolsync.Stops); a
-//     destination found gone with no record, after a restart, counts from
-//     that pass. Until then the pass requeues after MoverPoll;
-//  2. lists the pods of that destination's mover Job, and reads the Job
-//     itself once no pod is left, and while a pod or the Job is still there
-//     records a Normal WaitingForMover event and requeues after MoverPoll,
-//     because a restic restore killed mid-way leaves its repository lock
-//     and a Job with no pod can still start one (rule X2);
-//  3. deletes the Secret copy and the prime claim PrimeClaimName(uid);
-//  4. removes ClaimFinalizer from the claim with a merge patch that carries
+//  1. stops every restore Job of the claim, the way Cleanup does (see
+//     stopRestore). While one of them may still write, the pass records a
+//     Normal WaitingForMover event that says what the stop waits for, and
+//     requeues after MoverPoll, because a restic restore stopped mid-way
+//     leaves its repository lock and its pod may still write the prime;
+//  2. deletes the Secret copy and the prime claim PrimeClaimName(uid);
+//  3. removes ClaimFinalizer from the claim with a merge patch that carries
 //     the resourceVersion it read, and records a Warning DataSourceGone event.
 //
 // Every delete ignores NotFound and the finalizer goes last, so a pass that
 // fails anywhere is repeated from the start and converges. It returns an
-// error when a read, a delete, the pod list, the Job read or the patch fails;
-// a conflict on the patch is returned the same way.
+// error when a read, the stop, a delete or the patch fails; a conflict on
+// the patch is returned the same way.
 func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, req.NamespacedName, claim); err != nil {
@@ -174,92 +152,68 @@ func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if !r.orphaned(claim) {
 		return ctrl.Result{}, nil
 	}
-
 	vrKey := types.NamespacedName{Namespace: claim.Namespace, Name: claim.Spec.DataSourceRef.Name}
 	err := r.Reader.Get(ctx, vrKey, &backupv1alpha1.VolumeRestore{})
-	if err == nil {
+	switch {
+	case err == nil:
 		return ctrl.Result{}, nil
-	}
-	if !apierrors.IsNotFound(err) {
+	case !apierrors.IsNotFound(err):
 		return ctrl.Result{}, fmt.Errorf("get VolumeRestore %s: %w", vrKey, err)
 	}
 
-	destination := DestinationName(claim.UID)
-	poll := r.MoverPoll
-	if poll <= 0 {
-		poll = defaultMoverPoll
+	state, err := stopRestore(ctx, NewJobs(r.Reader, r.Client), r.Namespace, claim.UID)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	now := time.Now
-	if r.Now != nil {
-		now = r.Now
-	}
-	// A destination this pass deletes may be in the middle of a VolSync
-	// reconcile that creates its mover Job after any look this pass could
-	// take, and an event can start the next pass at once. So the mover is
-	// looked for only once poll has passed since the delete.
-	stopKey := r.Namespace + "/" + destination
-	rd := &volsyncv1alpha1.ReplicationDestination{ObjectMeta: metav1.ObjectMeta{Name: destination, Namespace: r.Namespace}}
-	err = r.Client.Delete(ctx, rd)
-	switch {
-	case err == nil:
-		r.stops.Deleted(stopKey, now())
+	if !state.Stopped {
 		r.Recorder.Eventf(claim, nil, corev1.EventTypeNormal, "WaitingForMover", "Cleanup",
-			"VolumeRestore %s is gone; deleted ReplicationDestination %s, and looks for its mover once %s have passed before the cleanup goes on",
-			vrKey.Name, destination, poll)
-		return ctrl.Result{RequeueAfter: poll}, nil
-	case !apierrors.IsNotFound(err):
-		return ctrl.Result{}, fmt.Errorf("delete ReplicationDestination %s/%s: %w", r.Namespace, destination, err)
+			"VolumeRestore %s is gone; %s before the cleanup goes on", vrKey.Name, state)
+		return ctrl.Result{RequeueAfter: r.poll()}, nil
 	}
-	if !r.stops.Gone(stopKey, now(), poll) {
-		return ctrl.Result{RequeueAfter: poll}, nil
-	}
+	return ctrl.Result{}, r.release(ctx, claim, vrKey.Name)
+}
 
-	pods := &corev1.PodList{}
-	if err := r.Reader.List(ctx, pods, client.InNamespace(r.Namespace), client.MatchingLabels{"job-name": internalvolsync.MoverJobName(destination)}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("list the mover pods of ReplicationDestination %s/%s: %w", r.Namespace, destination, err)
+// poll returns MoverPoll, or defaultMoverPoll when it is not set.
+func (r *OrphanReconciler) poll() time.Duration {
+	if r.MoverPoll <= 0 {
+		return defaultMoverPoll
 	}
-	left := ""
-	if len(pods.Items) > 0 {
-		pod := pods.Items[0]
-		left = fmt.Sprintf("mover pod %s/%s (phase %s)", r.Namespace, pod.Name, pod.Status.Phase)
-	} else {
-		job := internalvolsync.MoverJobName(destination)
-		err := r.Reader.Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: job}, &batchv1.Job{})
-		switch {
-		case err == nil:
-			left = fmt.Sprintf("mover Job %s/%s", r.Namespace, job)
-		case !apierrors.IsNotFound(err):
-			return ctrl.Result{}, fmt.Errorf("get the mover Job %s/%s of ReplicationDestination %s: %w", r.Namespace, job, destination, err)
-		}
-	}
-	if left != "" {
-		r.Recorder.Eventf(claim, nil, corev1.EventTypeNormal, "WaitingForMover", "Cleanup",
-			"VolumeRestore %s is gone; waiting for %s of ReplicationDestination %s to go before the cleanup finishes",
-			vrKey.Name, left, destination)
-		return ctrl.Result{RequeueAfter: poll}, nil
-	}
+	return r.MoverPoll
+}
 
-	secretName := internalvolsync.SecretCopyName(claim.UID)
+// release deletes what the library and Populate left in the controller
+// namespace for a claim whose restore Jobs are stopped, then removes
+// ClaimFinalizer from the claim.
+//
+// Parameters:
+//   - claim is the orphaned claim, as Reconcile read it.
+//   - volumeRestore is the name of the VolumeRestore that is gone, for the
+//     event.
+//
+// It returns an error when a delete or the patch fails, and nil when the
+// claim is already gone at the patch.
+func (r *OrphanReconciler) release(ctx context.Context, claim *corev1.PersistentVolumeClaim, volumeRestore string) error {
+	secretName := SecretCopyName(claim.UID)
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: r.Namespace}}
 	if err := r.Client.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("delete Secret copy %s/%s: %w", r.Namespace, secretName, err)
+		return fmt.Errorf("delete Secret copy %s/%s: %w", r.Namespace, secretName, err)
 	}
 	primeName := PrimeClaimName(claim.UID)
 	prime := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: primeName, Namespace: r.Namespace}}
 	if err := r.Client.Delete(ctx, prime); err != nil && !apierrors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("delete prime claim %s/%s: %w", r.Namespace, primeName, err)
+		return fmt.Errorf("delete prime claim %s/%s: %w", r.Namespace, primeName, err)
 	}
 
 	base := claim.DeepCopy()
 	controllerutil.RemoveFinalizer(claim, ClaimFinalizer)
 	if err := r.Client.Patch(ctx, claim, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
+			return nil
 		}
-		return ctrl.Result{}, fmt.Errorf("remove finalizer %s from claim %s: %w", ClaimFinalizer, req.NamespacedName, err)
+		return fmt.Errorf("remove finalizer %s from claim %s/%s: %w", ClaimFinalizer, claim.Namespace, claim.Name, err)
 	}
 	r.Recorder.Eventf(base, nil, corev1.EventTypeWarning, "DataSourceGone", "Cleanup",
-		"VolumeRestore %s was deleted before the populator finished with this claim; deleted ReplicationDestination %s, Secret copy %s and prime claim %s in %s, and removed finalizer %s",
-		vrKey.Name, destination, secretName, primeName, r.Namespace, ClaimFinalizer)
-	return ctrl.Result{}, nil
+		"VolumeRestore %s was deleted before the populator finished with this claim; stopped restore Job %s, deleted Secret copy %s and prime claim %s in %s, and removed finalizer %s",
+		volumeRestore, JobName(claim.UID), secretName, primeName, r.Namespace, ClaimFinalizer)
+	return nil
 }

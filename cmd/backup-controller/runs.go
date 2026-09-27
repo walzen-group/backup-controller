@@ -107,8 +107,8 @@ type RunOptions struct {
 	// in-cluster configuration.
 	Kubeconfig string
 	// Namespace is the controller namespace from the --namespace flag,
-	// where the populator keeps its prime claims, Secret copies and
-	// ReplicationDestinations. populator.OrphanReconciler cleans up there
+	// where the populator keeps its prime claims, Secret copies and restore
+	// Jobs. populator.OrphanReconciler cleans up there
 	// after a claim whose VolumeRestore is gone.
 	Namespace string
 	// MetricsAddr is the address where the manager serves the scheduler's
@@ -323,10 +323,10 @@ func checkServedVersions(mapper meta.RESTMapper) {
 //   - recorder writes the reconciler's events.
 //   - namespace is the controller namespace, where the reconciler cleans up.
 //
-// The reconciler reads ReplicationDestinations and takes a NotFound for one
-// that is gone. served.Client and served.Reader wrap both, so a 404 for a
-// VolSync version the API server no longer serves is an error it retries,
-// never a destination that is gone.
+// The reconciler reads restore Jobs and takes a NotFound for one that is
+// gone. served.Client and served.Reader wrap both, so a 404 for a version the
+// API server no longer serves is an error it retries, never a Job that is
+// gone.
 func orphanReconciler(c client.Client, reader client.Reader, recorder events.EventRecorder, namespace string) *populator.OrphanReconciler {
 	wrapped := served.Client(c)
 	return &populator.OrphanReconciler{Client: wrapped, Reader: served.Reader(reader, wrapped), Recorder: recorder, Namespace: namespace}

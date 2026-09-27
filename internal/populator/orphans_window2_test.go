@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -20,19 +19,27 @@ import (
 
 // clientOperations sends the callbacks' API calls to one client, as
 // cmd/backup-controller's clientOperations sends them to the API server.
-type clientOperations struct{ client client.Client }
-
-func (o clientOperations) GetReplicationDestination(ctx context.Context, namespace, name string) (*volsyncv1alpha1.ReplicationDestination, error) {
-	rd := &volsyncv1alpha1.ReplicationDestination{}
-	return rd, o.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, rd)
+type clientOperations struct {
+	Jobs
+	client client.Client
 }
 
-func (o clientOperations) CreateReplicationDestination(ctx context.Context, rd *volsyncv1alpha1.ReplicationDestination) error {
-	return o.client.Create(ctx, rd)
+func newClientOperations(c client.Client) clientOperations {
+	return clientOperations{Jobs: NewJobs(c, c), client: c}
 }
 
-func (o clientOperations) DeleteReplicationDestination(ctx context.Context, namespace, name string) error {
-	return o.client.Delete(ctx, &volsyncv1alpha1.ReplicationDestination{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
+func (o clientOperations) GetNamespace(ctx context.Context, name string) (*corev1.Namespace, error) {
+	ns := &corev1.Namespace{}
+	return ns, o.client.Get(ctx, client.ObjectKey{Name: name}, ns)
+}
+
+func (o clientOperations) GetClaim(ctx context.Context, namespace, name string) (*corev1.PersistentVolumeClaim, error) {
+	claim := &corev1.PersistentVolumeClaim{}
+	return claim, o.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, claim)
+}
+
+func (o clientOperations) PatchClaim(ctx context.Context, claim *corev1.PersistentVolumeClaim, patch client.Patch) error {
+	return o.client.Patch(ctx, claim, patch)
 }
 
 func (o clientOperations) GetSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
@@ -74,7 +81,7 @@ func TestAFailedPrimeDeleteAfterCleanupIsCompletedByTheOrphanReconciler(t *testi
 			{Name: "data", UID: orphanClaimUID, Phase: backupv1alpha1.RestorePhaseRestoring},
 		}},
 	}
-	c := newOrphanClient(t, append(leftovers(), stuckClaim(), vr)...)
+	c := newOrphanClient(t, append(leftovers(t), stuckClaim(), vr)...)
 	ctx := context.Background()
 
 	// The library hands Cleanup the VolumeRestore from its cache.
@@ -87,7 +94,7 @@ func TestAFailedPrimeDeleteAfterCleanupIsCompletedByTheOrphanReconciler(t *testi
 		t.Fatal(err)
 	}
 	params := populatormachinery.PopulatorParams{Pvc: stuckClaim(), Unstructured: &unstructured.Unstructured{Object: object}}
-	if err := New(clientOperations{client: c}, orphanControllerNS, nil).Cleanup(ctx, params); err != nil {
+	if err := New(newClientOperations(c), orphanControllerNS, testImage, fixedSnapshots{monday}).Cleanup(ctx, params); err != nil {
 		t.Fatalf("Cleanup: %v", err)
 	}
 	if present(t, c, &backupv1alpha1.VolumeRestore{ObjectMeta: metav1.ObjectMeta{Name: orphanVolumeRestore, Namespace: orphanNamespace}}) {
@@ -114,12 +121,6 @@ func TestAFailedPrimeDeleteAfterCleanupIsCompletedByTheOrphanReconciler(t *testi
 	}
 
 	r, recorder := newOrphanReconciler(c, c)
-	// Cleanup deleted the destination at a time the reconciler does not
-	// know, so its first pass waits a mover poll before it looks.
-	if res, err := reconcileClaim(t, r); err != nil || res.RequeueAfter <= 0 {
-		t.Fatalf("first Reconcile = %v, %v; want a requeue", res, err)
-	}
-	advancePoll(r)
 	if _, err := reconcileClaim(t, r); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}

@@ -115,15 +115,6 @@ linters:
       - path: '^internal/bootstrap/webhook\.go$'
         linters: [revive]
         text: '^file-length-limit:'
-      - path: '^internal/populator/orphans\.go$'
-        linters: [funlen, gocognit]
-        source: '^func \(r \*OrphanReconciler\) Reconcile\('
-      - path: '^internal/populator/populator\.go$'
-        linters: [funlen, gocognit]
-        source: '^func \(c \*Callbacks\) (Populate|Cleanup)\('
-      - path: '^internal/populator/populator\.go$'
-        linters: [nestif]
-        source: '^\s*if err == nil \{$'
       - path: '^internal/restic/retime\.go$'
         linters: [funlen, gocognit]
         source: '^func \(r \*Repository\) (retime|checkLocks)\('

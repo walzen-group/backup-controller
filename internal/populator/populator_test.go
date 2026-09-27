@@ -2,187 +2,210 @@ package populator
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	"github.com/walzen-group/backup-controller/internal/restorejob"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
-
-// fakeOperations is an in-memory Operations. It keeps objects by
-// namespace/name, and records every create, delete, status write and
-// VolumeRestore update so the tests can check them. When volumeRestoreGone is
-// true, writes to the VolumeRestore fail with NotFound, as they do once it
-// has been deleted.
-type fakeOperations struct {
-	destinations      map[string]*volsyncv1alpha1.ReplicationDestination
-	secrets           map[string]*corev1.Secret
-	createdRD         []*volsyncv1alpha1.ReplicationDestination
-	createdSec        []*corev1.Secret
-	deletedRD         []string
-	deletedSec        []string
-	statuses          []*backupv1alpha1.VolumeRestore
-	updates           []*backupv1alpha1.VolumeRestore
-	volumeRestoreGone bool
-}
-
-// newFakeOperations returns a fakeOperations that holds no objects.
-func newFakeOperations() *fakeOperations {
-	return &fakeOperations{
-		destinations: make(map[string]*volsyncv1alpha1.ReplicationDestination),
-		secrets:      make(map[string]*corev1.Secret),
-	}
-}
-
-func (f *fakeOperations) GetReplicationDestination(_ context.Context, namespace, name string) (*volsyncv1alpha1.ReplicationDestination, error) {
-	if rd, ok := f.destinations[namespacedName(namespace, name)]; ok {
-		return rd.DeepCopy(), nil
-	}
-	return nil, apierrors.NewNotFound(schema.GroupResource{Group: "volsync.backube", Resource: "replicationdestinations"}, name)
-}
-
-func (f *fakeOperations) CreateReplicationDestination(_ context.Context, rd *volsyncv1alpha1.ReplicationDestination) error {
-	key := namespacedName(rd.Namespace, rd.Name)
-	if _, ok := f.destinations[key]; ok {
-		return apierrors.NewAlreadyExists(schema.GroupResource{Group: "volsync.backube", Resource: "replicationdestinations"}, rd.Name)
-	}
-	f.destinations[key] = rd.DeepCopy()
-	f.createdRD = append(f.createdRD, rd.DeepCopy())
-	return nil
-}
-
-func (f *fakeOperations) DeleteReplicationDestination(_ context.Context, namespace, name string) error {
-	key := namespacedName(namespace, name)
-	if _, ok := f.destinations[key]; !ok {
-		return apierrors.NewNotFound(schema.GroupResource{Group: "volsync.backube", Resource: "replicationdestinations"}, name)
-	}
-	delete(f.destinations, key)
-	f.deletedRD = append(f.deletedRD, key)
-	return nil
-}
-
-func (f *fakeOperations) GetSecret(_ context.Context, namespace, name string) (*corev1.Secret, error) {
-	if secret, ok := f.secrets[namespacedName(namespace, name)]; ok {
-		return secret.DeepCopy(), nil
-	}
-	return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, name)
-}
-
-func (f *fakeOperations) CreateSecret(_ context.Context, secret *corev1.Secret) error {
-	key := namespacedName(secret.Namespace, secret.Name)
-	if _, ok := f.secrets[key]; ok {
-		return apierrors.NewAlreadyExists(schema.GroupResource{Resource: "secrets"}, secret.Name)
-	}
-	f.secrets[key] = secret.DeepCopy()
-	f.createdSec = append(f.createdSec, secret.DeepCopy())
-	return nil
-}
-
-func (f *fakeOperations) DeleteSecret(_ context.Context, namespace, name string) error {
-	key := namespacedName(namespace, name)
-	if _, ok := f.secrets[key]; !ok {
-		return apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, name)
-	}
-	delete(f.secrets, key)
-	f.deletedSec = append(f.deletedSec, key)
-	return nil
-}
-
-func (f *fakeOperations) SetStatus(_ context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	if f.volumeRestoreGone {
-		return apierrors.NewNotFound(schema.GroupResource{Group: "backup.wlz.li", Resource: "volumerestores"}, vr.Name)
-	}
-	f.statuses = append(f.statuses, vr.DeepCopy())
-	return nil
-}
-
-func (f *fakeOperations) UpdateVolumeRestore(_ context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	if f.volumeRestoreGone {
-		return apierrors.NewNotFound(schema.GroupResource{Group: "backup.wlz.li", Resource: "volumerestores"}, vr.Name)
-	}
-	f.updates = append(f.updates, vr.DeepCopy())
-	return nil
-}
 
 // TestPopulateCopiesRepositorySecret checks that Populate copies the repository
 // Secret from the app's namespace into the controller namespace with the same
 // data.
 func TestPopulateCopiesRepositorySecret(t *testing.T) {
-	ops := newFakeOperations()
-	ops.secrets[namespacedName("apps", "repo-secret")] = &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "repo-secret", Namespace: "apps"},
-		Type:       corev1.SecretTypeOpaque,
-		Data:       map[string][]byte{"repository": []byte("s3://bucket"), "password": []byte("secret")},
-	}
-	callbacks := New(ops, "backup-system", nil)
+	ops := populatedOperations(t)
+	ops.secrets[namespacedName(appNS, "repo-secret")].Data["password"] = []byte("secret")
+	callbacks := newCallbacks(ops, monday)
 
 	if err := callbacks.Populate(context.Background(), params()); err != nil {
 		t.Fatalf("Populate() error = %v", err)
 	}
 
-	copied, ok := ops.secrets[namespacedName("backup-system", "claim-123")]
-	if !ok || !reflect.DeepEqual(copied.Data, ops.secrets[namespacedName("apps", "repo-secret")].Data) {
+	copied, ok := ops.secrets[namespacedName(controllerNS, "claim-123")]
+	if !ok || !reflect.DeepEqual(copied.Data, ops.secrets[namespacedName(appNS, "repo-secret")].Data) {
 		t.Fatalf("copied repository secret = %#v, want same data in backup-system", copied)
 	}
 }
 
-// TestPopulateNamesFromClaimUID checks that Populate names the destination
-// restore-<claim UID> and names the Secret copy after the claim UID.
-func TestPopulateNamesFromClaimUID(t *testing.T) {
-	ops := populatedOperations()
-	callbacks := New(ops, "backup-system", nil)
+// TestPopulateCreatesTheJobForTheNewestSnapshot checks that Populate names
+// the restore Job restore-<claim UID> and the Secret copy after the claim UID,
+// and creates the Job suspended, for the full ID of the newest snapshot, into
+// the prime claim, owned by the prime claim, from the Secret copy.
+func TestPopulateCreatesTheJobForTheNewestSnapshot(t *testing.T) {
+	ops := populatedOperations(t)
+	callbacks := newCallbacks(ops, monday, tuesday)
 	if err := callbacks.Populate(context.Background(), params()); err != nil {
 		t.Fatalf("Populate() error = %v", err)
 	}
-	if _, ok := ops.destinations[namespacedName("backup-system", "restore-claim-123")]; !ok {
-		t.Fatalf("destination names = %v, want restore-claim-123", mapKeys(ops.destinations))
+	job := ops.job(t, "claim-123")
+	if job == nil {
+		t.Fatal("no Job restore-claim-123")
 	}
-	if _, ok := ops.secrets[namespacedName("backup-system", "claim-123")]; !ok {
+	if _, ok := ops.secrets[namespacedName(controllerNS, "claim-123")]; !ok {
 		t.Fatalf("secret names = %v, want claim-123", mapKeys(ops.secrets))
+	}
+	if !ptr.Deref(job.Spec.Suspend, false) {
+		t.Error("the Job was created running, want suspended")
+	}
+	if got := job.Annotations[restorejob.AnnotationSnapshotID]; got != tuesday.ID {
+		t.Errorf("snapshot = %s, want the newest, %s", got, tuesday.ID)
+	}
+	if got := job.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName; got != PrimeClaimName("claim-123") {
+		t.Errorf("claim = %s, want the prime claim", got)
+	}
+	if got := job.Spec.Template.Spec.Containers[0].EnvFrom[0].SecretRef.Name; got != "claim-123" {
+		t.Errorf("Secret = %s, want the copy", got)
+	}
+	if len(job.OwnerReferences) != 1 || job.OwnerReferences[0].UID != "prime-uid-123" {
+		t.Errorf("owner references = %+v, want the prime claim", job.OwnerReferences)
+	}
+	if got := job.Labels[restorejob.LabelRestoreClaim]; got != "claim-123" {
+		t.Errorf("claim label = %q, want claim-123", got)
 	}
 }
 
-// TestPopulateReusesExistingDestination checks that Populate leaves an existing
-// ReplicationDestination exactly as it is and creates no second one.
-func TestPopulateReusesExistingDestination(t *testing.T) {
-	ops := populatedOperations()
-	existing := &volsyncv1alpha1.ReplicationDestination{
-		ObjectMeta: metav1.ObjectMeta{Name: "restore-claim-123", Namespace: "backup-system", Labels: map[string]string{"keep": "exactly"}},
-		Spec:       volsyncv1alpha1.ReplicationDestinationSpec{Paused: true},
+// TestAPopulatorJobRunsOnlyOnceItsUIDIsRecorded checks the order of a
+// restore: the Job is created suspended and its UID recorded on the prime
+// claim in the first sync; only a later sync, which reads that record back,
+// resumes it; and once the Job controller runs it to Complete, Complete
+// reports the claim filled. restorejob.Build creates every Job suspended, so
+// a populator that never resumed would leave every claim Pending for good.
+func TestAPopulatorJobRunsOnlyOnceItsUIDIsRecorded(t *testing.T) {
+	ctx := context.Background()
+	ops := populatedOperations(t)
+	callbacks := newCallbacks(ops, monday)
+
+	if done, err := librarySync(ctx, callbacks, params()); err != nil || done {
+		t.Fatalf("first sync = %t, %v; want not done", done, err)
 	}
-	ops.destinations[namespacedName(existing.Namespace, existing.Name)] = existing.DeepCopy()
-	callbacks := New(ops, "backup-system", nil)
+	job := ops.job(t, "claim-123")
+	if job == nil || !ptr.Deref(job.Spec.Suspend, false) {
+		t.Fatalf("after the first sync the Job is %+v, want it created and still suspended", job)
+	}
+	if got := ops.prime(t, "claim-123").Annotations[AnnotationJobUID]; got != string(job.UID) {
+		t.Fatalf("prime claim records %q, want the Job's UID %s", got, job.UID)
+	}
+	ops.setJob(t, "claim-123", func(j *batchv1.Job) { withCondition(j, batchv1.JobSuspended) })
+
+	if done, err := librarySync(ctx, callbacks, params()); err != nil || done {
+		t.Fatalf("second sync = %t, %v; want not done", done, err)
+	}
+	if ptr.Deref(ops.job(t, "claim-123").Spec.Suspend, true) {
+		t.Fatal("the recorded Job is still suspended after the second sync, so it never runs")
+	}
+
+	pod := ops.createPod(t, job, "restore-claim-123-x7k2p", "node-a", corev1.PodRunning)
+	if done, err := librarySync(ctx, callbacks, params()); err != nil || done {
+		t.Fatalf("sync while the pod runs = %t, %v; want not done", done, err)
+	}
+	ops.setPod(t, pod, func(p *corev1.Pod) { p.Status.Phase = corev1.PodSucceeded })
+	ops.setJob(t, "claim-123", complete)
+	if done, err := librarySync(ctx, callbacks, params()); err != nil || !done {
+		t.Fatalf("sync after the Job completed = %t, %v; want done", done, err)
+	}
+	if n := len(ops.cluster.Cascades()); n != 0 {
+		t.Errorf("deletes = %d, want none before Cleanup", n)
+	}
+}
+
+// TestAJobFoundByNameIsRecordedBeforeItRuns checks that a Job of the claim
+// the prime claim does not record, such as one whose create answered with an
+// error and was stored anyway, is recorded in one sync and resumed only in
+// the next.
+func TestAJobFoundByNameIsRecordedBeforeItRuns(t *testing.T) {
+	ctx := context.Background()
+	ops := populatedOperations(t)
+	job := ops.createJob(t)
+	callbacks := newCallbacks(ops, monday)
+
+	if err := callbacks.Populate(ctx, params()); err != nil {
+		t.Fatalf("Populate() error = %v", err)
+	}
+	if !ptr.Deref(ops.job(t, "claim-123").Spec.Suspend, false) {
+		t.Fatal("a Job the prime claim did not record was resumed in the sync that recorded it")
+	}
+	if got := ops.prime(t, "claim-123").Annotations[AnnotationJobUID]; got != string(job.UID) {
+		t.Fatalf("prime claim records %q, want %s", got, job.UID)
+	}
+	if err := callbacks.Populate(ctx, params()); err != nil {
+		t.Fatalf("second Populate() error = %v", err)
+	}
+	if ptr.Deref(ops.job(t, "claim-123").Spec.Suspend, true) {
+		t.Error("the recorded Job was not resumed")
+	}
+}
+
+// TestAJobOfADeletedClaimIsNeverResumed checks that Populate resumes no Job
+// while the app claim, read fresh, is being deleted. Cleanup or the orphan
+// reconciler stops that claim's Job, and a Job their stop suspended looks
+// the same as one never resumed.
+func TestAJobOfADeletedClaimIsNeverResumed(t *testing.T) {
+	ctx := context.Background()
+	c := newCluster(t)
+	ops := fakeOperationsOn(c)
+	addRepository(ops)
+	job := ops.createJob(t)
+	prime := ops.prime(t, "claim-123")
+	prime.Annotations = map[string]string{AnnotationJobUID: string(job.UID)}
+	if err := c.Update(ctx, prime); err != nil {
+		t.Fatal(err)
+	}
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: appNS, Name: "notes"}, claim); err != nil {
+		t.Fatal(err)
+	}
+	claim.Finalizers = []string{ClaimFinalizer}
+	if err := c.Update(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := newCallbacks(ops, monday).Populate(ctx, params()); err != nil {
+		t.Fatalf("Populate() error = %v", err)
+	}
+	if !ptr.Deref(ops.job(t, "claim-123").Spec.Suspend, false) {
+		t.Error("Populate resumed the Job of a claim being deleted")
+	}
+}
+
+// TestPopulateReusesAnExistingJob checks that Populate leaves an existing
+// restore Job's spec as it is and creates no second one.
+func TestPopulateReusesAnExistingJob(t *testing.T) {
+	ops := populatedOperations(t)
+	existing := ops.createJob(t)
+	callbacks := newCallbacks(ops, monday, tuesday)
 
 	if err := callbacks.Populate(context.Background(), params()); err != nil {
 		t.Fatalf("Populate() error = %v", err)
 	}
-	if len(ops.createdRD) != 0 {
-		t.Fatalf("created destinations = %d, want 0", len(ops.createdRD))
-	}
-	if got := ops.destinations[namespacedName(existing.Namespace, existing.Name)]; !reflect.DeepEqual(got, existing) {
-		t.Fatalf("existing destination changed: got %#v, want %#v", got, existing)
+	got := ops.job(t, "claim-123")
+	if got.UID != existing.UID || !reflect.DeepEqual(got.Spec.Template, existing.Spec.Template) || got.Annotations[restorejob.AnnotationSnapshotID] != monday.ID {
+		t.Fatalf("the existing Job changed: got %+v, want %+v", got, existing)
 	}
 }
 
 // TestPopulateReportsRestoring checks that Populate writes the status once,
-// with Ready False and reason Restoring, and a Restoring entry for the claim
-// that has a start time.
+// with Ready False and reason Restoring naming the restore Job and its
+// namespace, and a Restoring entry for the claim that has a start time.
 func TestPopulateReportsRestoring(t *testing.T) {
-	ops := populatedOperations()
-	callbacks := New(ops, "backup-system", nil)
+	ops := populatedOperations(t)
+	callbacks := newCallbacks(ops, monday)
 	if err := callbacks.Populate(context.Background(), params()); err != nil {
 		t.Fatalf("Populate() error = %v", err)
 	}
@@ -194,32 +217,52 @@ func TestPopulateReportsRestoring(t *testing.T) {
 	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != backupv1alpha1.ReasonRestoring {
 		t.Fatalf("Ready condition = %#v, want False/Restoring", condition)
 	}
-	// The destination lives in the controller's namespace, so the message says
-	// which namespace to look in as well as what to look for.
-	if condition.Message != "waiting for ReplicationDestination restore-claim-123 in backup-system" {
-		t.Errorf("Ready message = %q, want the destination and its namespace", condition.Message)
+	// The Job lives in the controller's namespace, so the message says which
+	// namespace to look in as well as what to look for.
+	if condition.Message != "waiting for restore Job restore-claim-123 (snapshot 6e473100) in backup-system" {
+		t.Errorf("Ready message = %q, want the Job and its namespace", condition.Message)
 	}
 	if len(status.Status.Claims) != 1 || status.Status.Claims[0].Name != "notes" || status.Status.Claims[0].UID != types.UID("claim-123") || status.Status.Claims[0].Phase != backupv1alpha1.RestorePhaseRestoring || status.Status.Claims[0].StartedAt == nil {
 		t.Fatalf("claim status = %#v, want restoring claim with start time", status.Status.Claims)
 	}
 }
 
-// TestCompleteTriggerMatching checks that Complete reports the restore finished
-// only when status.lastManualSync equals the claim's trigger.
-func TestCompleteTriggerMatching(t *testing.T) {
+// TestTheReadyMessageShowsWhyThePodWaits checks that while the restore
+// Job's pod waits, such as for its image, the Ready message says so.
+func TestTheReadyMessageShowsWhyThePodWaits(t *testing.T) {
+	ops := populatedOperations(t)
+	job := ops.createJob(t)
+	pod := ops.createPod(t, job, "restore-claim-123-x7k2p", "node-a", corev1.PodPending)
+	ops.setPod(t, pod, func(p *corev1.Pod) {
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "restore", State: corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "Back-off pulling image"},
+		}}}
+	})
+	if err := newCallbacks(ops, monday).Populate(context.Background(), params()); err != nil {
+		t.Fatalf("Populate() error = %v", err)
+	}
+	ready := findCondition(ops.statuses[len(ops.statuses)-1].Status.Conditions, backupv1alpha1.ConditionReady)
+	if ready == nil || !strings.Contains(ready.Message, "restore-claim-123 (snapshot 6e473100; waiting: restore: ImagePullBackOff") {
+		t.Fatalf("Ready = %#v, want the pod's waiting reason", ready)
+	}
+}
+
+// TestCompleteTrustsOnlyTheJob checks that Complete reports the restore
+// finished only for a Job with Complete=True.
+func TestCompleteTrustsOnlyTheJob(t *testing.T) {
 	for name, test := range map[string]struct {
-		last string
-		want bool
+		change func(*batchv1.Job)
+		want   bool
 	}{
-		"equal":     {last: "claim-123", want: true},
-		"different": {last: "other", want: false},
-		"empty":     {last: "", want: false},
+		"complete":  {change: complete, want: true},
+		"running":   {change: func(*batchv1.Job) {}},
+		"failed":    {change: failed},
+		"suspended": {change: func(j *batchv1.Job) { withCondition(j, batchv1.JobSuspended) }},
 	} {
 		t.Run(name, func(t *testing.T) {
-			ops := restoringOperations()
-			ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{LastManualSync: test.last}
-			callbacks := New(ops, "backup-system", nil)
-			got, err := callbacks.Complete(context.Background(), params())
+			ops := restoringOperations(t)
+			ops.setJob(t, "claim-123", func(j *batchv1.Job) { j.Status.Conditions = nil; test.change(j) })
+			got, err := newCallbacks(ops, monday).Complete(context.Background(), params())
 			if err != nil || got != test.want {
 				t.Fatalf("Complete() = %t, %v, want %t, nil", got, err, test.want)
 			}
@@ -227,135 +270,232 @@ func TestCompleteTriggerMatching(t *testing.T) {
 	}
 }
 
-// TestCompleteReportsFailedMover checks that after a failed mover run, Complete
-// returns false and writes a Failed entry for the claim and a Ready condition
-// with reason RestoreFailed and the mover's logs as the message.
-func TestCompleteReportsFailedMover(t *testing.T) {
-	ops := restoringOperations()
-	ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "mover logs"},
+// TestAnEmptyRepositoryBindsAnEmptyClaim checks that a claim whose
+// repository holds no snapshot at all, and that nothing pins, gets no Job and
+// binds its empty volume, as a first deploy does.
+func TestAnEmptyRepositoryBindsAnEmptyClaim(t *testing.T) {
+	ops := populatedOperations(t)
+	done, err := librarySync(context.Background(), newCallbacks(ops), params())
+	if err != nil || !done {
+		t.Fatalf("sync = %t, %v; want done", done, err)
 	}
-	callbacks := New(ops, "backup-system", nil)
-	complete, err := callbacks.Complete(context.Background(), params())
-	if err != nil || complete {
-		t.Fatalf("Complete() = %t, %v, want false, nil", complete, err)
-	}
-	if len(ops.statuses) != 1 {
-		t.Fatalf("status writes = %d, want 1", len(ops.statuses))
-	}
-	status := ops.statuses[0]
-	condition := findCondition(status.Status.Conditions, backupv1alpha1.ConditionReady)
-	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != backupv1alpha1.ReasonRestoreFailed || condition.Message != "claim notes: mover logs" {
-		t.Fatalf("Ready condition = %#v, want False/RestoreFailed with mover logs", condition)
-	}
-	if len(status.Status.Claims) != 1 || status.Status.Claims[0].Phase != backupv1alpha1.RestorePhaseFailed {
-		t.Fatalf("claim status = %#v, want Failed", status.Status.Claims)
+	if job := ops.job(t, "claim-123"); job != nil {
+		t.Errorf("Job %s created for an empty repository", job.Name)
 	}
 }
 
-// versionedStatus is a fakeOperations whose status writes behave like the API
-// server's: a write whose resourceVersion is older than the stored one fails
-// with a conflict, and a write that changes the status bumps the version.
-type versionedStatus struct {
-	*fakeOperations
-	stored  *backupv1alpha1.VolumeRestore
-	version int
+// failingLister is a SnapshotLister whose listing fails.
+type failingLister struct{}
+
+func (failingLister) Snapshots(context.Context, *corev1.Secret) ([]restic.Snapshot, error) {
+	return nil, errors.New("S3 is away")
 }
 
-func (v *versionedStatus) SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
-	if vr.ResourceVersion != v.stored.ResourceVersion {
-		return apierrors.NewConflict(schema.GroupResource{Group: "backup.wlz.li", Resource: "volumerestores"}, vr.Name, nil)
+// TestAListingErrorNeverBindsEmpty checks that a repository that can't be
+// listed never counts as empty: Populate and Complete return the error and
+// the claim stays Pending.
+func TestAListingErrorNeverBindsEmpty(t *testing.T) {
+	ops := populatedOperations(t)
+	callbacks := New(ops, controllerNS, testImage, failingLister{})
+	if done, err := librarySync(context.Background(), callbacks, params()); err == nil || done {
+		t.Fatalf("sync = %t, %v; want an error", done, err)
 	}
-	// The API server keeps times to the second, so the comparison and the
-	// stored copy go through the same serialisation.
-	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vr)
-	if err != nil {
-		return err
-	}
-	written := new(backupv1alpha1.VolumeRestore)
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object, written); err != nil {
-		return err
-	}
-	if !reflect.DeepEqual(written.Status, v.stored.Status) {
-		v.version++
-		v.stored = written
-		v.stored.ResourceVersion = fmt.Sprint(v.version)
-	}
-	vr.ResourceVersion = v.stored.ResourceVersion
-	return v.fakeOperations.SetStatus(ctx, vr)
-}
-
-// TestAFailingMoverKeepsTheStatusFailed checks that while the mover keeps
-// failing, the VolumeRestore reports RestoreFailed with the mover's logs on
-// every pass. The library calls Populate and then Complete on each pass with
-// the same cached object. When Populate wrote Restoring over the Failed entry,
-// Complete's write of Failed conflicted, and the reason flipped between
-// Restoring and RestoreFailed from one pass to the next.
-func TestAFailingMoverKeepsTheStatusFailed(t *testing.T) {
-	ops := &versionedStatus{fakeOperations: restoringOperations(), version: 1}
-	ops.destinations[namespacedName("backup-system", "restore-claim-123")].Status = &volsyncv1alpha1.ReplicationDestinationStatus{
-		LatestMoverStatus: &volsyncv1alpha1.MoverStatus{Result: volsyncv1alpha1.MoverResultFailed, Logs: "mover logs"},
-	}
-	ops.stored = &backupv1alpha1.VolumeRestore{
-		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3, ResourceVersion: "1"},
-		Spec:       backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"},
-	}
-	callbacks := New(ops, "backup-system", nil)
-
-	var reasons []string
-	for range 4 {
-		object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ops.stored)
-		if err != nil {
-			t.Fatal(err)
-		}
-		p := params()
-		p.Unstructured = &unstructured.Unstructured{Object: object}
-		// Errors are the library's cue to requeue, so the pass goes on to the
-		// next one the way the library's would.
-		_ = callbacks.Populate(context.Background(), p)
-		_, _ = callbacks.Complete(context.Background(), p)
-		reasons = append(reasons, findCondition(ops.stored.Status.Conditions, backupv1alpha1.ConditionReady).Reason)
-	}
-	for i, reason := range reasons[1:] {
-		if reason != backupv1alpha1.ReasonRestoreFailed {
-			t.Fatalf("Ready reason after each pass = %v, want %s from pass %d on", reasons, backupv1alpha1.ReasonRestoreFailed, i+2)
-		}
+	if done, err := callbacks.Complete(context.Background(), params()); err == nil || done {
+		t.Fatalf("Complete() = %t, %v; want an error", done, err)
 	}
 }
 
-// TestCleanupDeletesDestinationAndSecret checks that Cleanup deletes the
-// destination and the Secret copy.
-func TestCleanupDeletesDestinationAndSecret(t *testing.T) {
-	ops := restoringOperations()
-	callbacks := New(ops, "backup-system", nil)
-	if err := callbacks.Cleanup(context.Background(), params()); err != nil {
+// TestSnapshotsOfAnotherLayoutNeverBindEmpty checks that a repository whose
+// snapshots all have another layout than a VolSync mover's gives no Job and
+// never binds the claim empty: the claim stays Pending with NoBackupInReach,
+// and the message names the snapshots passed over.
+func TestSnapshotsOfAnotherLayoutNeverBindEmpty(t *testing.T) {
+	ops := populatedOperations(t)
+	other := monday
+	other.Hostname = "laptop"
+	callbacks := newCallbacks(ops, other)
+
+	done, err := librarySync(context.Background(), callbacks, params())
+	if err == nil || done {
+		t.Fatalf("sync = %t, %v; want an error and not done", done, err)
+	}
+	if job := ops.job(t, "claim-123"); job != nil {
+		t.Errorf("Job %s created from a snapshot of another layout", job.Name)
+	}
+	last := ops.statuses[len(ops.statuses)-1]
+	ready := findCondition(last.Status.Conditions, backupv1alpha1.ConditionReady)
+	if ready == nil || ready.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(ready.Message, "6e473100 (host laptop") {
+		t.Fatalf("Ready = %#v, want NoBackupInReach naming the snapshot passed over", ready)
+	}
+	if got, err := callbacks.Complete(context.Background(), params()); err != nil || got {
+		t.Errorf("Complete() = %t, %v; want false", got, err)
+	}
+}
+
+// jobFailedWithExit1 marks the claim's Job Failed after its pod ended with
+// restic's exit code 1, as the Job controller and the kubelet leave it.
+func jobFailedWithExit1(t *testing.T, ops *fakeOperations, job *batchv1.Job) *corev1.Pod {
+	t.Helper()
+	pod := ops.createPod(t, job, "restore-claim-123-x7k2p", "node-a", corev1.PodRunning)
+	ops.setPod(t, pod, func(p *corev1.Pod) {
+		p.Status.Phase = corev1.PodFailed
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "restore", State: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: "Fatal: failed to find snapshot"},
+		}}}
+	})
+	ops.setJob(t, "claim-123", failed)
+	return pod
+}
+
+// TestAFailedJobKeepsRestoreFailedUntilReplaced checks F3: a failed Job is
+// recorded on the status as RestoreFailed with restic's exit code before it
+// is stopped, the entry keeps that reason while the Job is being deleted,
+// no Job is created until the old one is gone, and the entry reads
+// Restoring once the new Job exists. The syncs run in the library's order,
+// so Complete never sees a Job Populate is taking down.
+func TestAFailedJobKeepsRestoreFailedUntilReplaced(t *testing.T) {
+	ctx := context.Background()
+	ops := newStrictOperations(t, backupv1alpha1.VolumeRestoreStatus{})
+	callbacks := newCallbacks(ops, monday)
+	if _, err := librarySync(ctx, callbacks, ops.paramsFor(t, "notes", "claim-123")); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	job := ops.job(t, "claim-123")
+	ops.setJob(t, "claim-123", func(j *batchv1.Job) { withCondition(j, batchv1.JobSuspended) })
+	if _, err := librarySync(ctx, callbacks, ops.paramsFor(t, "notes", "claim-123")); err != nil {
+		t.Fatalf("resume sync: %v", err)
+	}
+	pod := jobFailedWithExit1(t, ops.fakeOperations, job)
+	// The pod keeps the Job controller's tracking finalizer until the Job
+	// controller has counted it, so the foreground delete waits for it.
+	ops.addTracking(t, pod)
+
+	done, err := librarySync(ctx, callbacks, ops.paramsFor(t, "notes", "claim-123"))
+	if err == nil || done {
+		t.Fatalf("sync of the failed Job = %t, %v; want an error", done, err)
+	}
+	assertEntry(t, ops, backupv1alpha1.RestorePhaseFailed, backupv1alpha1.ReasonRestoreFailed, "restic exited 1")
+	stopped := ops.job(t, "claim-123")
+	if stopped == nil || stopped.DeletionTimestamp == nil || stopped.UID != job.UID {
+		t.Fatalf("the failed Job is %+v, want it being deleted", stopped)
+	}
+
+	creates := ops.jobCreates
+	if _, err := librarySync(ctx, callbacks, ops.paramsFor(t, "notes", "claim-123")); err == nil {
+		t.Fatal("sync while the failed Job is being deleted returned no error")
+	}
+	if ops.jobCreates != creates {
+		t.Errorf("Job creates while the old Job is being deleted = %d, want none", ops.jobCreates-creates)
+	}
+	assertEntry(t, ops, backupv1alpha1.RestorePhaseFailed, backupv1alpha1.ReasonRestoreFailed, "restic exited 1")
+	if got := ops.job(t, "claim-123"); got == nil || got.UID != job.UID {
+		t.Fatalf("Job = %+v while the old one is being deleted, want the old one and no create", got)
+	}
+
+	ops.removeTracking(t, pod, "claim-123")
+	if ops.job(t, "claim-123") != nil {
+		t.Fatal("the old Job is still there once its pod is gone")
+	}
+	if _, err := librarySync(ctx, callbacks, ops.paramsFor(t, "notes", "claim-123")); err != nil {
+		t.Fatalf("sync once the old Job is gone: %v", err)
+	}
+	replaced := ops.job(t, "claim-123")
+	if replaced == nil || replaced.UID == job.UID {
+		t.Fatalf("Job = %+v, want a new one", replaced)
+	}
+	assertEntry(t, ops, backupv1alpha1.RestorePhaseRestoring, backupv1alpha1.ReasonRestoring, "restore-claim-123")
+}
+
+// TestAJobDeletedByAPersonWaitsForItsPods checks that a restore Job a person
+// deleted while its pod runs, with the pods orphaned, is not replaced while
+// that pod may still write the prime claim, and is replaced once the pod has
+// ended.
+func TestAJobDeletedByAPersonWaitsForItsPods(t *testing.T) {
+	ctx := context.Background()
+	ops := populatedOperations(t)
+	ops.createJob(t)
+	job := ops.runJob(t, "claim-123")
+	pod := ops.createPod(t, job, "restore-claim-123-x7k2p", "node-a", corev1.PodRunning)
+	if err := ops.cluster.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationOrphan)); err != nil {
+		t.Fatal(err)
+	}
+	callbacks := newCallbacks(ops, monday)
+
+	err := callbacks.Populate(ctx, params())
+	var stopping *stoppingError
+	if !errors.As(err, &stopping) || !strings.Contains(err.Error(), pod.Name) {
+		t.Fatalf("Populate() = %v, want it waiting for pod %s", err, pod.Name)
+	}
+	if got := ops.job(t, "claim-123"); got != nil {
+		t.Fatalf("Job %s created while a pod of the deleted one runs", got.Name)
+	}
+
+	ops.setPod(t, pod, func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed })
+	if err := callbacks.Populate(ctx, params()); err != nil {
+		t.Fatalf("Populate() once the pod ended: %v", err)
+	}
+	if got := ops.job(t, "claim-123"); got == nil || got.UID == job.UID {
+		t.Fatalf("Job = %+v, want a new one", got)
+	}
+}
+
+// TestCleanupWaitsForTheGate checks that Cleanup of a claim whose restore
+// Job runs suspends the Job and returns an error while its pod may still
+// write, so the library keeps the prime claim, and deletes the Job and the
+// Secret copy once the pod has ended. Before, Cleanup deleted the
+// destination and returned nil while its mover pod still ran.
+func TestCleanupWaitsForTheGate(t *testing.T) {
+	ctx := context.Background()
+	ops := restoringOperations(t)
+	job := ops.runJob(t, "claim-123")
+	pod := ops.createPod(t, job, "restore-claim-123-x7k2p", "node-a", corev1.PodRunning)
+	callbacks := newCallbacks(ops, monday)
+
+	if err := callbacks.Cleanup(ctx, params()); err == nil {
+		t.Fatal("Cleanup() returned nil while the Job runs")
+	}
+	if !ptr.Deref(ops.job(t, "claim-123").Spec.Suspend, false) {
+		t.Fatal("Cleanup did not suspend the running Job")
+	}
+	ops.setJob(t, "claim-123", func(j *batchv1.Job) { withCondition(j, batchv1.JobSuspended) })
+	if err := callbacks.Cleanup(ctx, params()); err == nil || !strings.Contains(err.Error(), pod.Name) {
+		t.Fatalf("Cleanup() = %v while the pod runs, want an error naming it", err)
+	}
+	if len(ops.deletedSec) != 0 {
+		t.Fatalf("Secret copy deleted while the pod runs: %v", ops.deletedSec)
+	}
+
+	ops.setPod(t, pod, func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed })
+	if err := callbacks.Cleanup(ctx, params()); err != nil {
+		t.Fatalf("Cleanup() once the pod ended: %v", err)
+	}
+	if ops.job(t, "claim-123") != nil {
+		t.Error("the Job is still there after Cleanup")
+	}
+	if len(ops.deletedSec) != 1 {
+		t.Errorf("deleted Secrets = %v, want the copy", ops.deletedSec)
+	}
+}
+
+// TestCleanupDeletesTheJobAndTheSecret checks that Cleanup of a completed
+// restore deletes the Job and the Secret copy.
+func TestCleanupDeletesTheJobAndTheSecret(t *testing.T) {
+	ops := restoringOperations(t)
+	if err := newCallbacks(ops, monday).Cleanup(context.Background(), params()); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
-	if len(ops.deletedRD) != 1 || len(ops.deletedSec) != 1 {
-		t.Fatalf("deleted destinations/secrets = %v/%v, want one each", ops.deletedRD, ops.deletedSec)
+	if ops.job(t, "claim-123") != nil || len(ops.deletedSec) != 1 {
+		t.Fatalf("Job %v, deleted Secrets %v; want the Job gone and the copy deleted", ops.job(t, "claim-123"), ops.deletedSec)
 	}
 }
 
 // TestCleanupToleratesMissingObjects checks that Cleanup succeeds when the
-// destination and the Secret copy are already gone.
+// Job and the Secret copy are already gone.
 func TestCleanupToleratesMissingObjects(t *testing.T) {
-	callbacks := New(newFakeOperations(), "backup-system", nil)
-	if err := callbacks.Cleanup(context.Background(), params()); err != nil {
+	if err := newCallbacks(newFakeOperations(t), monday).Cleanup(context.Background(), params()); err != nil {
 		t.Fatalf("Cleanup() error = %v, want nil for missing objects", err)
 	}
 }
-
-// fixedSnapshots is a restic.Lister that returns the same snapshots for every
-// Secret.
-type fixedSnapshots []restic.Snapshot
-
-func (f fixedSnapshots) Snapshots(context.Context, *corev1.Secret) ([]restic.Snapshot, error) {
-	return f, nil
-}
-
-// monday is the one snapshot in the repository of the pinned-claim tests,
-// taken at 05:00 UTC on Monday 21 September 2026.
-var monday = restic.Snapshot{ID: "6e473100aaaa", Time: time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)}
 
 // pinned returns the default params with the claim pinned by the
 // backup.wlz.li/restore-as-of annotation to the time given in at.
@@ -365,83 +505,72 @@ func pinned(at string) populatormachinery.PopulatorParams {
 	return p
 }
 
-// TestAPinnedClaimRestoresItsMoment checks that a claim pinned to a moment gets
-// a destination whose restoreAsOf is that moment. The VolumeRestore alone
+// TestAPinnedClaimRestoresItsMoment checks that a claim pinned to a moment
+// gets a Job for the newest snapshot at or before it. The VolumeRestore alone
 // would restore the newest snapshot.
 func TestAPinnedClaimRestoresItsMoment(t *testing.T) {
-	ops := populatedOperations()
-	callbacks := New(ops, "backup-system", fixedSnapshots{monday})
-
-	if err := callbacks.Populate(context.Background(), pinned("2026-09-22T00:00:00Z")); err != nil {
+	ops := populatedOperations(t)
+	if err := newCallbacks(ops, monday, tuesday).Populate(context.Background(), pinned("2026-09-21T12:00:00Z")); err != nil {
 		t.Fatalf("Populate() error = %v", err)
 	}
-	rd := ops.destinations[namespacedName("backup-system", "restore-claim-123")]
-	if rd == nil || rd.Spec.Restic.RestoreAsOf == nil || *rd.Spec.Restic.RestoreAsOf != "2026-09-22T00:00:00Z" {
-		t.Fatalf("restoreAsOf = %v, want the claim's annotation", rd)
+	job := ops.job(t, "claim-123")
+	if job == nil || job.Annotations[restorejob.AnnotationSnapshotID] != monday.ID {
+		t.Fatalf("Job = %+v, want one for %s", job, monday.ID)
 	}
 }
 
-// TestAPinnedClaimNoSnapshotReachesStaysPending checks that Populate returns an
-// error and creates no destination for a claim pinned before every snapshot,
-// and that it reports NoBackupInReach with the oldest snapshot's ID. VolSync
-// would restore nothing and report success, and the claim would bind an empty
-// volume.
+// TestAPinnedClaimNoSnapshotReachesStaysPending checks that Populate returns
+// an error and creates no Job for a claim pinned before every snapshot, and
+// that it reports NoBackupInReach with the oldest snapshot's ID.
 func TestAPinnedClaimNoSnapshotReachesStaysPending(t *testing.T) {
-	ops := populatedOperations()
-	callbacks := New(ops, "backup-system", fixedSnapshots{monday})
-
-	err := callbacks.Populate(context.Background(), pinned("2026-09-01T00:00:00Z"))
-	if err == nil {
-		t.Fatal("Populate() filled a claim pinned before every snapshot")
-	}
-	if len(ops.createdRD) != 0 {
-		t.Fatalf("a destination was created: %v", ops.createdRD)
-	}
-	last := ops.statuses[len(ops.statuses)-1]
-	if cond := last.Status.Conditions[0]; cond.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(cond.Message, "6e473100") {
-		t.Fatalf("condition = %+v, want NoBackupInReach naming the oldest snapshot", cond)
+	for name, snapshots := range map[string][]restic.Snapshot{"older snapshots": {monday}, "no snapshot": nil} {
+		t.Run(name, func(t *testing.T) {
+			ops := populatedOperations(t)
+			err := newCallbacks(ops, snapshots...).Populate(context.Background(), pinned("2026-09-01T00:00:00Z"))
+			if err == nil {
+				t.Fatal("Populate() filled a claim pinned before every snapshot")
+			}
+			if job := ops.job(t, "claim-123"); job != nil {
+				t.Fatalf("a Job was created: %s", job.Name)
+			}
+			last := ops.statuses[len(ops.statuses)-1]
+			if cond := last.Status.Conditions[0]; cond.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(cond.Message, backupv1alpha1.AnnotationRestoreAsOf) {
+				t.Fatalf("condition = %+v, want NoBackupInReach naming the annotation", cond)
+			}
+		})
 	}
 }
 
 // TestAVolumeRestorePinnedBeforeEverySnapshotStaysPending checks that
 // Populate checks the VolumeRestore's own spec.restoreAsOf when the claim has
-// no annotation. The destination takes that time as its restoreAsOf, and when
-// it is before every snapshot VolSync prints "No eligible snapshots found",
-// exits 0, and the claim binds an empty volume. Populate returns an error,
-// creates no destination, and reports NoBackupInReach.
+// no annotation: it returns an error, creates no Job, and reports
+// NoBackupInReach naming spec.restoreAsOf and the oldest snapshot.
 func TestAVolumeRestorePinnedBeforeEverySnapshotStaysPending(t *testing.T) {
-	ops := populatedOperations()
-	callbacks := New(ops, "backup-system", fixedSnapshots{monday})
-	p := params()
-	vr := &backupv1alpha1.VolumeRestore{
-		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3},
-		Spec:       backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret", RestoreAsOf: new("2026-09-01T00:00:00Z")},
-	}
-	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p.Unstructured = &unstructured.Unstructured{Object: object}
+	ops := populatedOperations(t)
+	p := paramsWith(func(vr *backupv1alpha1.VolumeRestore) { vr.Spec.RestoreAsOf = new("2026-09-01T00:00:00Z") })
 
-	if err := callbacks.Populate(context.Background(), p); err == nil {
+	if err := newCallbacks(ops, monday).Populate(context.Background(), p); err == nil {
 		t.Fatal("Populate() filled a claim whose VolumeRestore is pinned before every snapshot")
 	}
-	if len(ops.createdRD) != 0 {
-		t.Fatalf("a destination was created: %v", ops.createdRD)
+	if job := ops.job(t, "claim-123"); job != nil {
+		t.Fatalf("a Job was created: %s", job.Name)
 	}
 	last := ops.statuses[len(ops.statuses)-1]
-	if cond := last.Status.Conditions[0]; cond.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(cond.Message, "spec.restoreAsOf") {
-		t.Fatalf("condition = %+v, want NoBackupInReach naming spec.restoreAsOf", cond)
+	if cond := last.Status.Conditions[0]; cond.Reason != backupv1alpha1.ReasonNoBackupInReach || !strings.Contains(cond.Message, "spec.restoreAsOf") || !strings.Contains(cond.Message, "6e473100") {
+		t.Fatalf("condition = %+v, want NoBackupInReach naming spec.restoreAsOf and the oldest snapshot", cond)
 	}
 }
 
 // params returns the library's parameters for the claim notes (UID claim-123)
-// in apps, its prime claim in backup-system, and a VolumeRestore that names
-// the Secret repo-secret.
+// in apps, its bound prime claim in backup-system, and a VolumeRestore that
+// names the Secret repo-secret.
 func params() populatormachinery.PopulatorParams {
 	return populatormachinery.PopulatorParams{
-		Pvc:          &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "notes", Namespace: "apps", UID: types.UID("claim-123"), Generation: 3}},
-		PvcPrime:     &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "prime-claim-123", Namespace: "backup-system"}},
+		Pvc: &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "notes", Namespace: appNS, UID: types.UID("claim-123"), Generation: 3}},
+		PvcPrime: &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: PrimeClaimName("claim-123"), Namespace: controllerNS, UID: "prime-uid-123"},
+			Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pv-123"},
+		},
 		Unstructured: volumeRestoreUnstructured(),
 	}
 }
@@ -449,7 +578,7 @@ func params() populatormachinery.PopulatorParams {
 // volumeRestoreUnstructured returns the VolumeRestore notes-data as an
 // unstructured object, the form in which the library passes it.
 func volumeRestoreUnstructured() *unstructured.Unstructured {
-	vr := &backupv1alpha1.VolumeRestore{ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3}, Spec: backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"}}
+	vr := &backupv1alpha1.VolumeRestore{ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: appNS, Generation: 3}, Spec: backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"}}
 	object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vr)
 	if err != nil {
 		panic(err)
@@ -457,31 +586,38 @@ func volumeRestoreUnstructured() *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: object}
 }
 
-// populatedOperations returns a fake cluster that holds only the repository
-// Secret repo-secret in apps.
-func populatedOperations() *fakeOperations {
-	ops := newFakeOperations()
-	ops.secrets[namespacedName("apps", "repo-secret")] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "repo-secret", Namespace: "apps"}, Data: map[string][]byte{"repository": []byte("s3://bucket")}}
+// addRepository puts the repository Secret repo-secret into apps.
+func addRepository(ops *fakeOperations) {
+	ops.secrets[namespacedName(appNS, "repo-secret")] = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "repo-secret", Namespace: appNS}, Data: map[string][]byte{"repository": []byte("s3://bucket")}}
+}
+
+// populatedOperations returns a fake cluster that holds the repository
+// Secret repo-secret in apps and no restore Job.
+func populatedOperations(t *testing.T) *fakeOperations {
+	t.Helper()
+	ops := newFakeOperations(t)
+	addRepository(ops)
 	return ops
 }
 
-// restoringOperations returns a fake cluster in the state a finished Populate
-// leaves: the repository Secret copied into the controller namespace and the
-// destination for claim-123. Complete and Cleanup read those objects, so their
-// tests start from this state.
-func restoringOperations() *fakeOperations {
-	ops := populatedOperations()
-	ops.secrets[namespacedName("backup-system", "claim-123")] = &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "claim-123", Namespace: "backup-system"},
+// restoringOperations returns a fake cluster with the repository Secret
+// copied into the controller namespace and a completed restore Job for
+// claim-123. Complete and Cleanup read those objects, so their tests start
+// from this state.
+func restoringOperations(t *testing.T) *fakeOperations {
+	t.Helper()
+	ops := populatedOperations(t)
+	ops.secrets[namespacedName(controllerNS, "claim-123")] = &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-123", Namespace: controllerNS},
 		Data:       map[string][]byte{"repository": []byte("s3://bucket")},
 	}
-	ops.destinations[namespacedName("backup-system", "restore-claim-123")] = &volsyncv1alpha1.ReplicationDestination{
-		ObjectMeta: metav1.ObjectMeta{Name: "restore-claim-123", Namespace: "backup-system"},
-	}
+	ops.createJob(t)
+	ops.setJob(t, "claim-123", complete)
 	return ops
 }
 
-// namespacedName returns the namespace/name key the fake stores objects under.
+// namespacedName returns the namespace/name key the fake stores Secrets
+// under.
 func namespacedName(namespace, name string) string { return namespace + "/" + name }
 
 // findCondition returns the condition of the given type, or nil when there is
@@ -504,8 +640,6 @@ func mapKeys[T any](values map[string]T) []string {
 	return keys
 }
 
-var _ Operations = (*fakeOperations)(nil)
-
 // TestCleanupToleratesTheAlreadyDeletedPrimeClaim checks that Cleanup succeeds
 // without a prime claim and still writes the status that ends the restore.
 //
@@ -525,14 +659,13 @@ var _ Operations = (*fakeOperations)(nil)
 // Cleanup exists to remove things, and the prime claim being gone is the state
 // it works towards.
 func TestCleanupToleratesTheAlreadyDeletedPrimeClaim(t *testing.T) {
-	ops := restoringOperations()
-	callbacks := New(ops, "backup-system", nil)
+	ops := restoringOperations(t)
 	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
 		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
 	})
 	params.PvcPrime = nil
 
-	if err := callbacks.Cleanup(context.Background(), params); err != nil {
+	if err := newCallbacks(ops, monday).Cleanup(context.Background(), params); err != nil {
 		t.Fatalf("Cleanup() without a prime claim = %v, want it tolerated", err)
 	}
 	if len(ops.statuses) != 1 {
@@ -547,12 +680,10 @@ func TestCleanupToleratesTheAlreadyDeletedPrimeClaim(t *testing.T) {
 // resync walks the whole path, reaches the completion branch and calls Cleanup
 // again, for the life of the claim. Writing status each time would send one
 // update per volume every resync interval, forever, and none of them would
-// change anything. It was seen as a PopulatorFinished event that repeated on a
-// claim bound long before. The event is the library's own and harmless. The
-// status writes behind it were the problem.
+// change anything.
 func TestCleanupWritesNothingWhenThereIsNothingToChange(t *testing.T) {
-	ops := restoringOperations()
-	callbacks := New(ops, "backup-system", nil)
+	ops := restoringOperations(t)
+	callbacks := newCallbacks(ops, monday)
 	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
 		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
 	})
@@ -585,13 +716,12 @@ func TestCleanupWritesNothingWhenThereIsNothingToChange(t *testing.T) {
 // entry of the last claim being filled and sets Ready to True with reason
 // Restored.
 func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
-	ops := restoringOperations()
-	callbacks := New(ops, "backup-system", nil)
+	ops := restoringOperations(t)
 	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
 		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
 	})
 
-	if err := callbacks.Cleanup(context.Background(), params); err != nil {
+	if err := newCallbacks(ops, monday).Cleanup(context.Background(), params); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
 	if len(ops.statuses) != 1 {
@@ -612,14 +742,13 @@ func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
 // a time, so the other claims stay reported, and Ready stays False with reason
 // Restoring.
 func TestCleanupLeavesOtherClaimsRestoring(t *testing.T) {
-	ops := restoringOperations()
-	callbacks := New(ops, "backup-system", nil)
+	ops := restoringOperations(t)
 	params := paramsWithClaims(
 		backupv1alpha1.ClaimRestoreStatus{Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring},
 		backupv1alpha1.ClaimRestoreStatus{Name: "photos", UID: types.UID("claim-456"), Phase: backupv1alpha1.RestorePhaseRestoring},
 	)
 
-	if err := callbacks.Cleanup(context.Background(), params); err != nil {
+	if err := newCallbacks(ops, monday).Cleanup(context.Background(), params); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
 	status := ops.statuses[0]
@@ -643,7 +772,7 @@ func paramsWithClaims(claims ...backupv1alpha1.ClaimRestoreStatus) populatormach
 func paramsWith(change func(*backupv1alpha1.VolumeRestore)) populatormachinery.PopulatorParams {
 	p := params()
 	vr := &backupv1alpha1.VolumeRestore{
-		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: "apps", Generation: 3},
+		ObjectMeta: metav1.ObjectMeta{Name: "notes-data", Namespace: appNS, Generation: 3},
 		Spec:       backupv1alpha1.VolumeRestoreSpec{Repository: "repo-secret"},
 	}
 	change(vr)
@@ -658,14 +787,10 @@ func paramsWith(change func(*backupv1alpha1.VolumeRestore)) populatormachinery.P
 // TestPopulateHoldsTheVolumeRestoreWhileItRestores checks that Populate puts
 // the populator's finalizer on the VolumeRestore before it copies the
 // repository Secret. The library looks the VolumeRestore up before it handles
-// a deleted claim, and does nothing when it's gone. A RestoreRun's scratch
-// claim and its VolumeRestore are deleted together when the run times out or
-// is deleted, and without the finalizer the claim stayed Terminating with the
-// library's finalizer, and the Secret copy with the S3 keys was never
-// deleted.
+// a deleted claim, and does nothing when it's gone.
 func TestPopulateHoldsTheVolumeRestoreWhileItRestores(t *testing.T) {
-	ops := populatedOperations()
-	callbacks := New(ops, "backup-system", nil)
+	ops := populatedOperations(t)
+	callbacks := newCallbacks(ops, monday)
 
 	if err := callbacks.Populate(context.Background(), params()); err != nil {
 		t.Fatalf("Populate() error = %v", err)
@@ -685,22 +810,21 @@ func TestPopulateHoldsTheVolumeRestoreWhileItRestores(t *testing.T) {
 }
 
 // TestPopulateStartsNothingForADeletedVolumeRestore checks that Populate
-// copies no Secret and creates no destination for a VolumeRestore that is
-// being deleted without the populator's finalizer. The API server refuses a
-// new finalizer on it, so nothing would keep it in place until Cleanup ran.
+// copies no Secret and creates no Job for a VolumeRestore that is being
+// deleted without the populator's finalizer. The API server refuses a new
+// finalizer on it, so nothing would keep it in place until Cleanup ran.
 func TestPopulateStartsNothingForADeletedVolumeRestore(t *testing.T) {
-	ops := populatedOperations()
-	callbacks := New(ops, "backup-system", nil)
+	ops := populatedOperations(t)
 	deleted := paramsWith(func(vr *backupv1alpha1.VolumeRestore) {
 		vr.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 		vr.Finalizers = []string{"someone.else/keeps-it"}
 	})
 
-	if err := callbacks.Populate(context.Background(), deleted); err == nil {
+	if err := newCallbacks(ops, monday).Populate(context.Background(), deleted); err == nil {
 		t.Fatal("Populate() started a restore from a VolumeRestore being deleted")
 	}
-	if len(ops.createdSec) != 0 || len(ops.createdRD) != 0 {
-		t.Fatalf("created Secrets %v and destinations %v, want none", ops.createdSec, ops.createdRD)
+	if len(ops.createdSec) != 0 || ops.job(t, "claim-123") != nil {
+		t.Fatalf("created Secrets %v and Job %v, want none", ops.createdSec, ops.job(t, "claim-123"))
 	}
 }
 
@@ -709,15 +833,14 @@ func TestPopulateStartsNothingForADeletedVolumeRestore(t *testing.T) {
 // the populator's finalizer, so a VolumeRestore deleted mid-restore goes once
 // its claim is cleaned up.
 func TestCleanupReleasesTheVolumeRestoreOnceNoClaimIsLeft(t *testing.T) {
-	ops := restoringOperations()
-	callbacks := New(ops, "backup-system", nil)
+	ops := restoringOperations(t)
 	deleted := paramsWith(func(vr *backupv1alpha1.VolumeRestore) {
 		vr.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 		vr.Finalizers = []string{Finalizer}
 		vr.Status.Claims = []backupv1alpha1.ClaimRestoreStatus{{Name: "notes", UID: "claim-123", Phase: backupv1alpha1.RestorePhaseRestoring}}
 	})
 
-	if err := callbacks.Cleanup(context.Background(), deleted); err != nil {
+	if err := newCallbacks(ops, monday).Cleanup(context.Background(), deleted); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
 	if len(ops.deletedSec) != 1 {
@@ -732,8 +855,7 @@ func TestCleanupReleasesTheVolumeRestoreOnceNoClaimIsLeft(t *testing.T) {
 // Cleanup leaves the finalizer in place while another claim still has an
 // entry in status.claims. That claim's Cleanup needs the VolumeRestore too.
 func TestCleanupKeepsTheVolumeRestoreWhileAnotherClaimRestores(t *testing.T) {
-	ops := restoringOperations()
-	callbacks := New(ops, "backup-system", nil)
+	ops := restoringOperations(t)
 	two := paramsWith(func(vr *backupv1alpha1.VolumeRestore) {
 		vr.Finalizers = []string{Finalizer}
 		vr.Status.Claims = []backupv1alpha1.ClaimRestoreStatus{
@@ -742,7 +864,7 @@ func TestCleanupKeepsTheVolumeRestoreWhileAnotherClaimRestores(t *testing.T) {
 		}
 	})
 
-	if err := callbacks.Cleanup(context.Background(), two); err != nil {
+	if err := newCallbacks(ops, monday).Cleanup(context.Background(), two); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
 	if len(ops.updates) != 0 {
@@ -751,18 +873,17 @@ func TestCleanupKeepsTheVolumeRestoreWhileAnotherClaimRestores(t *testing.T) {
 }
 
 // TestCleanupOfAGoneVolumeRestoreSucceeds checks that Cleanup succeeds when the
-// VolumeRestore is gone by the time it writes the status. The destination
-// and the Secret copy are deleted, and there is no status left to write.
+// VolumeRestore is gone by the time it writes the status. The Job and the
+// Secret copy are deleted, and there is no status left to write.
 func TestCleanupOfAGoneVolumeRestoreSucceeds(t *testing.T) {
-	ops := restoringOperations()
+	ops := restoringOperations(t)
 	ops.volumeRestoreGone = true
-	callbacks := New(ops, "backup-system", nil)
 	p := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{Name: "notes", UID: "claim-123", Phase: backupv1alpha1.RestorePhaseRestoring})
 
-	if err := callbacks.Cleanup(context.Background(), p); err != nil {
+	if err := newCallbacks(ops, monday).Cleanup(context.Background(), p); err != nil {
 		t.Fatalf("Cleanup() error = %v, want NotFound from the status write ignored", err)
 	}
-	if len(ops.deletedSec) != 1 || len(ops.deletedRD) != 1 {
-		t.Errorf("deleted destinations/secrets = %v/%v, want one each", ops.deletedRD, ops.deletedSec)
+	if len(ops.deletedSec) != 1 || ops.job(t, "claim-123") != nil {
+		t.Errorf("deleted Secrets %v, Job %v; want the copy deleted and the Job gone", ops.deletedSec, ops.job(t, "claim-123"))
 	}
 }
