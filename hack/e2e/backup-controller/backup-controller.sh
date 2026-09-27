@@ -10,19 +10,23 @@
 #              base image by digest, runs apk add ca-certificates and go mod
 #              download; nothing else is downloaded.
 #   install    waits for cert-manager and Kueue (installed by their own
-#              scripts), applies config/crd and deploy/ through overlay/ with
+#              scripts), applies config/crd and deploy/ (the release render,
+#              with the restore Job admission policy) through overlay/ with
 #              the image replaced by the local build and --restore-image set
 #              to hack/e2e/volsync's mover image, and creates the
 #              LocalQueue the kueue-managed namespace needs. The Deployment
 #              names the image as backup-controller:e2e-<image id>, so every
 #              build is a tag the kubelet has not seen and pulls through
 #              Docker Desktop's registry mirror from the local engine.
-#   check      the Deployment is Ready, /healthz and /readyz answer, the
-#              metrics listener on 8081 serves backup_controller_* series, and
-#              the Cluster MutatingWebhookConfiguration has its caBundle.
-#              Creates nothing, so there is nothing to clean up.
-#   rebuild    fetch, then points the Deployment at the new image and waits
-#              for the rollout. For iterating on fixes.
+#   check      the Deployment is Ready and runs with --restore-image set to
+#              VolSync's mover image, the restore Job ValidatingAdmissionPolicy
+#              and its binding exist, /healthz and /readyz answer, the metrics
+#              listener on 8081 serves backup_controller_* series, and the
+#              Cluster MutatingWebhookConfiguration has its caBundle. Creates
+#              only a probe namespace, which it deletes again.
+#   rebuild    fetch, then applies the render again with the new image (so a
+#              change under deploy/ lands too), restarts the Deployment and
+#              waits for the rollout. For iterating on fixes.
 #   uninstall  deletes what install applied, the LocalQueue and the CRDs.
 #
 # The controller keeps no storage of its own. Every kubectl call passes
@@ -50,6 +54,8 @@ cluster_queue=$(pin kueue.clusterQueue)
 restore_image=$(jq -r '.volsync.image | "\(.repository):\(.tag)@\(.digest)"' "$volsync_pins")
 deploy=backup-controller
 webhook_config=backup-controller-bootstrap
+# The ValidatingAdmissionPolicy and its binding share this name.
+restore_jobs_policy=backup-controller-restore-jobs
 probe_ns=e2e-backup-controller-check
 
 # wait_for polls a command every 5 seconds for up to 10 minutes. It prints
@@ -146,11 +152,9 @@ EOF
 
 rebuild() {
   fetch
-  local tag
-  tag=$(image_tag)
-  kc -n "$ns" set image "deploy/$deploy" "controller=$tag"
-  # set image is a no-op when the build changed nothing; restart anyway so
-  # the pod is fresh.
+  apply_controller
+  # The apply changes nothing in the pod template when the build changed
+  # nothing; restart anyway so the pod is fresh.
   kc -n "$ns" rollout restart "deploy/$deploy"
   kc -n "$ns" rollout status "deploy/$deploy" --timeout=300s
 }
@@ -174,6 +178,13 @@ check() {
   # The controller runs its restore Jobs in VolSync's pinned mover image.
   got=$(kc -n "$ns" get pod "$pod" -o jsonpath='{.spec.containers[?(@.name=="controller")].args}')
   [[ "$got" == *"\"--restore-image=$restore_image\""* ]] || fail "the controller's args $got do not set --restore-image=$restore_image"
+
+  # The restore Job admission policy from deploy/admissionpolicy.yaml and its
+  # binding exist.
+  kc get validatingadmissionpolicy "$restore_jobs_policy" >/dev/null ||
+    fail "ValidatingAdmissionPolicy $restore_jobs_policy is missing"
+  kc get validatingadmissionpolicybinding "$restore_jobs_policy" >/dev/null ||
+    fail "ValidatingAdmissionPolicyBinding $restore_jobs_policy is missing"
 
   # The scratch image has no shell, so the endpoints are read through the
   # API server's pod proxy.
@@ -209,7 +220,7 @@ EOF
   [[ -n "$ca" ]] && ! grep -qx '' <<<"$ca" || fail "$webhook_config has a webhook without a caBundle"
 
   kc -n "$ns" get localqueue "$local_queue" >/dev/null || fail "LocalQueue $local_queue is missing"
-  echo "backup-controller: $pod Ready on $got, /healthz and /readyz answer, $series backup_controller_* series on 8081, caBundle set on $webhook_config"
+  echo "backup-controller: $pod Ready with --restore-image=$restore_image, $restore_jobs_policy policy and binding present, /healthz and /readyz answer, $series backup_controller_* series on 8081, caBundle set on $webhook_config"
 }
 
 uninstall() {
