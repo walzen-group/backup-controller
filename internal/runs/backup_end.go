@@ -241,13 +241,16 @@ func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.B
 	return nil
 }
 
-// backupItemDone reports whether the run's volume item for the claim name
-// has finished: it is neither Pending nor Running, or the run has no such
-// item.
+// backupItemDone reports whether the run's items with the given name, a
+// volume and a Cluster item, have finished: each is neither Pending nor Running, or the run
+// has no such item. A Lease names its items by name alone. Thus a claim Lease
+// stays while a Cluster item with the claim's name runs, until the run
+// finishes at the latest. Another run can still take that Lease over (see
+// holderLive).
 func backupItemDone(run *backupv1alpha1.BackupRun, name string) bool {
 	for _, item := range run.Status.Items {
-		if item.Kind == backupv1alpha1.ItemKindSource && item.Name == name {
-			return item.Phase != backupv1alpha1.ItemPending && item.Phase != backupv1alpha1.ItemRunning
+		if item.Name == name && (item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
+			return false
 		}
 	}
 	return true

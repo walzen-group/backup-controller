@@ -655,6 +655,14 @@ longer exists. A Lease counts as held while the item of the holder, of the kind
 that gets the Lease, is Pending or Running. Thus a Cluster item with the same
 name as a claim does not keep the Lease of that claim.
 
+Two BackupRuns of the same Cluster also never run at the same time. Immediately
+before a Cluster item creates its CloudNativePG Backup, it gets the Cluster
+Lease, with the name `backup-controller-cluster-<cluster uid>` and the label
+`backup.wlz.li/lease-scope: cluster`. The Cluster item holds it while it is
+Pending or Running, and the run releases it when the item ends. The other run's
+Cluster item stays Pending with reason SourceBusy and creates no Backup until
+then.
+
 If a run finds another run that holds one of the Leases, it waits with reason
 SourceBusy:
 

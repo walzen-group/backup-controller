@@ -26,10 +26,12 @@ import (
 // Pending or Running. A RestoreRun's item also keeps it live once it has
 // finished, for as long as it records the UID of its restore Job: the run
 // has stopped that Job and not yet seen that no pod of it can write (rule
-// X2, see stopJobs). Only an item of the kind that takes Leases counts, a
+// X2, see stopJobs). Only an item of the kind that takes the Lease counts: a
 // BackupRun's ReplicationSource item or a RestoreRun's PersistentVolumeClaim
-// item: a Lease names its items by name alone, and a Cluster item with the
-// claim's name does not keep the claim's Lease. A quiesce Lease is live
+// item for a claim or repository Lease, and a BackupRun's Cluster item for a
+// Cluster Lease (see clusterLeaseName). A Lease names its items by name
+// alone, so a Cluster item with the claim's name does not keep the claim's
+// Lease, and a volume item does not keep a Cluster Lease. A quiesce Lease is live
 // while the holder's stored status does not show the workloads given back
 // (see durablyRestarted): the holder exists with the UID the Lease names, has
 // not finished, and has no plan yet or has not recorded its restart as done.
@@ -71,9 +73,13 @@ func backupHolderLive(ctx context.Context, reader client.Reader, key types.Names
 	if lease.Labels[labelLeaseScope] == scopeQuiesce {
 		return !durablyRestarted(run), nil
 	}
+	kind := backupv1alpha1.ItemKindSource
+	if lease.Labels[labelLeaseScope] == scopeCluster {
+		kind = backupv1alpha1.ItemKindCluster
+	}
 	items := leaseItems(lease)
 	for _, item := range run.Status.Items {
-		if item.Kind == backupv1alpha1.ItemKindSource && slices.Contains(items, item.Name) &&
+		if item.Kind == kind && slices.Contains(items, item.Name) &&
 			(item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning) {
 			return true, nil
 		}

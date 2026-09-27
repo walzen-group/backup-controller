@@ -438,6 +438,7 @@ The controller adds a guard only where no other part prevents the case.
 | More backups at once than the cluster can run | Kueue: the ClusterQueue quota admits a Workload only when quota is free | none more |
 | Two syncs of one ReplicationSource | VolSync: one sync at a time per source | none more |
 | A backup and a restore of one claim at the same time | nothing: a RestoreRun does not go through Kueue, the Kueue quota counts pods and not claims, and restic takes a non-exclusive lock for both `backup` and `restore` | the claim and repository Leases below |
+| Two BackupRuns of one Cluster at the same time | nothing: the Scheduler holds back only runs with `spec.all`, and two manual runs with `spec.database` each create a CloudNativePG Backup | the Cluster Lease below |
 | Two runs that stop and restart one namespace | nothing: the other parts do not know about quiesce | the quiesce Lease below |
 | A status write that fails after a create | nothing: the API server keeps the created Job, Workload or claim | the next pass finds the object by name and label and records it |
 
@@ -464,6 +465,12 @@ The Lease closes that window and does not otherwise hold either run back. It
 names its holder by UID, so a run created again under the same name does not
 inherit it. When the holder of a Lease is finished or gone, the next run that
 wants the Lease takes it over.
+
+A BackupRun's Cluster item takes a third Lease the same way,
+`backup-controller-cluster-<cluster uid>`, immediately before it creates its
+CloudNativePG Backup (`startDatabase`, internal/runs/backup_database.go). The run
+releases it when the item ends. A second BackupRun of the same Cluster waits
+with reason SourceBusy and creates no Backup until then.
 
 ## Take one quiesce Lease per namespace
 

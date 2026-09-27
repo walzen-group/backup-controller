@@ -29,10 +29,14 @@ const (
 	// holder run's items the Lease is held for.
 	annotationLeaseItems = "backup.wlz.li/lease-items"
 	// labelLeaseScope marks a Lease that guards a namespace's quiesce (see
-	// scopeQuiesce). Claim and repository Leases carry no scope label.
+	// scopeQuiesce) or a Cluster's backup (see scopeCluster). Claim and
+	// repository Leases carry no scope label.
 	labelLeaseScope = "backup.wlz.li/lease-scope"
 	// scopeQuiesce is the value of labelLeaseScope on a quiesce Lease.
 	scopeQuiesce = "quiesce"
+	// scopeCluster is the value of labelLeaseScope on a Cluster Lease (see
+	// clusterLeaseName).
+	scopeCluster = "cluster"
 	// quiesceLeaseName is the Lease one run at a time takes in a namespace
 	// before it stops that namespace's workloads.
 	quiesceLeaseName = "backup-controller-quiesce"
@@ -49,7 +53,9 @@ type leaseHolder struct {
 	// for.
 	item string
 	// scope is scopeQuiesce for the Lease that guards a namespace's quiesce
-	// (see acquireQuiesceLease), and "" for a claim or repository Lease.
+	// (see acquireQuiesceLease), scopeCluster for the Lease that guards a
+	// Cluster's backup (see clusterLeaseName), and "" for a claim or
+	// repository Lease.
 	scope string
 }
 
@@ -60,6 +66,12 @@ func claimLeaseName(uid types.UID) string { return "backup-controller-claim-" + 
 // repositoryLeaseName returns the name of the Lease that guards the restic
 // repository whose Secret has the given UID.
 func repositoryLeaseName(uid types.UID) string { return "backup-controller-repo-" + string(uid) }
+
+// clusterLeaseName returns the name of the Lease that guards the backup of
+// the CloudNativePG Cluster with the given UID. A BackupRun's Cluster item
+// takes it right before it creates its Backup (see startDatabase), so two
+// BackupRuns never back up one Cluster at once.
+func clusterLeaseName(uid types.UID) string { return "backup-controller-cluster-" + string(uid) }
 
 // leaseRequest names the run and the objects that acquireLeases takes the
 // Leases for.
@@ -307,8 +319,8 @@ func leaseItems(lease *coordinationv1.Lease) []string {
 	return strings.Split(value, ",")
 }
 
-// releaseLeases deletes the claim and repository Leases a run holds in its
-// namespace once every item each Lease names is done.
+// releaseLeases deletes the claim, repository and Cluster Leases a run holds
+// in its namespace once every item each Lease names is done.
 //
 // Parameters:
 //   - run is the BackupRun or RestoreRun whose Leases go, found by the UID
@@ -336,7 +348,7 @@ func releaseLeases(ctx context.Context, c client.Client, reader client.Reader, r
 	}
 	for i := range leases.Items {
 		lease := &leases.Items[i]
-		if lease.Labels[labelLeaseScope] != "" {
+		if lease.Labels[labelLeaseScope] == scopeQuiesce {
 			continue
 		}
 		if holderUID(lease) != string(run.GetUID()) || !allDoneItems(leaseItems(lease), done) {

@@ -16,38 +16,49 @@ import (
 //   - item is the Pending database item to start. It is changed in place,
 //     and the caller writes the status.
 //
-// It returns an error for any failed read or write a later pass may not
-// get, with the item left Pending. The caller, startPending, records that
-// error in status.items[].lastStartError and tries the item again on its
-// next pass.
+// It returns a hold of kind holdSourceBusy that names the other run while
+// another BackupRun's item for the same Cluster holds the Cluster Lease (see
+// clusterLeaseName). The item then stays Pending, and a later pass tries it
+// again. It returns an error for any failed read or write a later pass may
+// not get, with the item left Pending. The caller, startPending, records
+// that error in status.items[].lastStartError and tries the item again on
+// its next pass.
 //
-// It creates a CloudNativePG Backup and moves the item to Running, or skips
-// the item when the Cluster is hibernated, with reason ClusterHibernated.
-// When the Cluster is gone, it fails the item with reason ClusterMissing.
-// A Backup the API server rejects as invalid fails the item with reason
-// BackupRefused.
-func (r *BackupRunReconciler) startDatabase(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) error {
+// It takes the Cluster Lease, creates a CloudNativePG Backup and moves the
+// item to Running. The Lease stays until the item is done (see
+// releaseFinished), so two BackupRuns never back up one Cluster at once. It
+// skips the item when the Cluster is hibernated, with reason
+// ClusterHibernated. When the Cluster is gone, it fails the item with
+// reason ClusterMissing. A Backup the API server rejects as invalid fails
+// the item with reason BackupRefused.
+func (r *BackupRunReconciler) startDatabase(ctx context.Context, run *backupv1alpha1.BackupRun, item *backupv1alpha1.BackupItem) (hold, error) {
 	cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
 	switch {
 	case err != nil:
-		return err
+		return hold{}, err
 	case !found:
 		failBackupItem(item, refuse(backupv1alpha1.ItemReasonClusterMissing, "the Cluster %s no longer exists", item.Name))
+		return hold{}, nil
 	case cnpg.Hibernated(cluster):
 		item.Phase, item.Reason = backupv1alpha1.ItemSkipped, backupv1alpha1.ItemReasonClusterHibernated
 		item.Message = "the Cluster is hibernated; CloudNativePG fails a Backup of a hibernated Cluster"
-	default:
-		name, err := cnpg.EnsureBackup(ctx, r.Client, run.Namespace, item.Name, run.UID)
-		if apierrors.IsInvalid(err) {
-			failBackupItem(item, refuse(backupv1alpha1.ItemReasonBackupRefused, "%v", err))
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		item.Phase, item.Backup = backupv1alpha1.ItemRunning, name
+		return hold{}, nil
 	}
-	return nil
+	holder := leaseHolder{kind: backupv1alpha1.KindBackupRun, run: run, item: item.Name, scope: scopeCluster}
+	busy, err := acquireLease(ctx, r.Client, r.Reader, holder, run.Namespace, clusterLeaseName(cluster.GetUID()))
+	if err != nil || busy.held() {
+		return busy, err
+	}
+	name, err := cnpg.EnsureBackup(ctx, r.Client, run.Namespace, item.Name, run.UID)
+	if apierrors.IsInvalid(err) {
+		failBackupItem(item, refuse(backupv1alpha1.ItemReasonBackupRefused, "%v", err))
+		return hold{}, nil
+	}
+	if err != nil {
+		return hold{}, err
+	}
+	item.Phase, item.Backup = backupv1alpha1.ItemRunning, name
+	return hold{}, nil
 }
 
 // collectDatabase records the result of a Running database item once its

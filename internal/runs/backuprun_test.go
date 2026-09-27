@@ -832,6 +832,62 @@ func TestAHibernatedDatabaseIsSkipped(t *testing.T) {
 	}
 }
 
+// Two BackupRuns of one Cluster never back it up at once. The second run's
+// item waits with reason SourceBusy and creates no Backup while the first
+// run's Backup runs. It starts once the first run has finished.
+func TestTwoRunsOfOneClusterBackItUpOneAfterTheOther(t *testing.T) {
+	// The first eight characters of a run's UID name its Backup (see
+	// cnpg.BackupName), so this UID differs from runUID there.
+	const secondUID = types.UID("7c1d9e4b-0000-4000-8000-000000000003")
+	second := backupRun(func(b *backupv1alpha1.BackupRun) {
+		b.Name, b.UID, b.Spec.Database = "manual-notes", secondUID, pgN
+	})
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), second, cluster())
+	stepSecond := func() {
+		t.Helper()
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(second)}); err != nil {
+			t.Fatalf("reconcile %s: %v", second.Name, err)
+		}
+	}
+	for range 3 {
+		step(t, r) // plan, admit with no queue, start
+	}
+	first, ok := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, runUID))
+	if !ok {
+		t.Fatal("the first run created no Backup")
+	}
+
+	for range 3 {
+		stepSecond()
+	}
+	if _, ok := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, secondUID)); ok {
+		t.Fatal("the second run created a Backup while the first run's Backup runs")
+	}
+	waiting := &backupv1alpha1.BackupRun{}
+	get(t, c, ns, second.Name, waiting)
+	if readyReason(waiting.Status.Conditions) != backupv1alpha1.ReasonSourceBusy || waiting.Status.Items[0].Phase != backupv1alpha1.ItemPending {
+		t.Fatalf("second run = %+v, want its item Pending and the run waiting with reason SourceBusy", waiting.Status)
+	}
+
+	_ = unstructured.SetNestedField(first.Object, "completed", "status", "phase")
+	if err := c.Status().Update(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	step(t, r)
+	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+		t.Fatalf("first run phase = %q, want Succeeded", run.Status.Phase)
+	}
+
+	stepSecond()
+	if _, ok := getUnstructured(t, c, cnpg.BackupGVK, ns, cnpg.BackupName(pgN, secondUID)); !ok {
+		t.Fatal("the second run created no Backup after the first run finished")
+	}
+	get(t, c, ns, second.Name, waiting)
+	if item := waiting.Status.Items[0]; item.Phase != backupv1alpha1.ItemRunning {
+		t.Errorf("second run's item = %+v, want it Running", item)
+	}
+}
+
 // admitAll stands in for Kueue admitting the run: it sets the Admitted
 // condition on the run's Workload.
 func admitAll(t *testing.T, c client.Client) {

@@ -406,9 +406,9 @@ func (r *BackupRunReconciler) finishOrWait(ctx context.Context, run *backupv1alp
 //     caller writes the status.
 //
 // It returns the waits, one sentence for each item that waits for another
-// run (see startVolume), and the retries, one line for each item whose start
-// failed with an error a later pass may not get, naming the item and the
-// error.
+// run (see startVolume and startDatabase), and the retries, one line for each
+// item whose start failed with an error a later pass may not get, naming the
+// item and the error.
 //
 // An item whose start fails that way records the error in
 // status.items[].lastStartError, and its message says it has not started
@@ -429,7 +429,7 @@ func (r *BackupRunReconciler) startPending(ctx context.Context, run *backupv1alp
 		case backupv1alpha1.ItemKindSource:
 			wait, err = r.startVolume(ctx, run, item)
 		case backupv1alpha1.ItemKindCluster:
-			err = r.startDatabase(ctx, run, item)
+			wait, err = r.startDatabase(ctx, run, item)
 		}
 		if err != nil {
 			item.LastStartError = err.Error()
