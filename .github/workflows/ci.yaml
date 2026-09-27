@@ -97,6 +97,26 @@ jobs:
       - name: Run the tagged envtest suite
         run: make envtest
 
+  conformance:
+    name: Conformance against real restic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      # The suite carries the conformance build tag, so the plain check job
+      # never compiles it. It runs restic of the mover image's version, from
+      # the flake's restic-mover package, with the restore Job's arguments
+      # against a copy of a recorded repository, all offline.
+      - name: Run the tagged conformance suite
+        run: make conformance
+
   chart:
     name: Chart and install manifests render
     runs-on: ubuntu-latest

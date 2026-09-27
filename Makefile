@@ -7,6 +7,9 @@ CONTROLLER_GEN := $(NIX) controller-gen
 # The envtest shell adds a kube-apiserver and an etcd from the store, at the
 # Kubernetes version versions.json pins, and points KUBEBUILDER_ASSETS at them.
 ENVTEST := nix develop .\#envtest -c
+# The conformance tests run real restic of the mover image's version, which
+# the flake's restic-mover package puts on PATH ahead of the devShell.
+CONFORMANCE := nix shell .\#restic-mover -c $(NIX)
 # The fixtures shell adds every real program a recorded fixture comes from.
 FIXTURES := nix develop .\#fixtures -c
 
@@ -14,7 +17,7 @@ FIXTURES := nix develop .\#fixtures -c
 # copy, because kustomize and helm both read a directory of their own. Every
 # generated file is copied, so a new kind needs no edit here.
 
-.PHONY: build test vet lint check envtest generate manifests verify fixtures fixtures-restic fixtures-barman fixtures-transcripts fixtures-crds e2e e2e-fetch e2e-up e2e-check e2e-down demo
+.PHONY: build test vet lint check envtest conformance generate manifests verify fixtures fixtures-restic fixtures-barman fixtures-transcripts fixtures-crds e2e e2e-fetch e2e-up e2e-check e2e-down demo
 
 ## build: compile every package.
 build:
@@ -38,6 +41,10 @@ check: vet test lint build
 ## envtest: run the suites tagged envtest against a real kube-apiserver and etcd, as CI's envtest job does.
 envtest:
 	$(ENVTEST) go test -tags envtest ./...
+
+## conformance: run the tests tagged conformance, which run real restic 0.18.1 with the restore Job's arguments, as CI's conformance job does.
+conformance:
+	$(CONFORMANCE) go test -tags conformance ./internal/restic/
 
 ## fixtures: re-record every checked-in fixture that real programs produce. Run it after a pin in versions.json moves; check fails until it has.
 fixtures: fixtures-restic fixtures-barman fixtures-crds
