@@ -171,7 +171,7 @@ func restoreImageArgs(args []string) []string {
 //
 // Without GOMEMLIMIT the Go runtime collects only when the heap doubles
 // since the last collection. A repository Open holds 32 MiB for scrypt, and
-// the garbage it leaves let the heap grow past the container's 128Mi limit
+// the garbage it leaves let the heap grow past the container's former 128Mi limit
 // until the kubelet OOMKilled the controller during the e2e suite. With the
 // limit known, the runtime collects before the heap reaches it.
 func TestTheGoMemoryLimitIsTheContainersLimit(t *testing.T) {
@@ -219,4 +219,33 @@ func goMemLimit(env []corev1.EnvVar) *corev1.EnvVar {
 		}
 	}
 	return nil
+}
+
+// controllerMemoryLimit is the memory limit of the controller container in
+// deploy/ and in the chart's default values.
+//
+// The process rests at about 50Mi, and each restic key derivation holds 32
+// MiB more while it runs. 128Mi left too little room: the e2e suite saw the
+// controller OOMKilled.
+const controllerMemoryLimit = "256Mi"
+
+// TestTheControllersMemoryLimit checks that the controller container in
+// deploy/deployment.yaml and in the chart's default render has the memory
+// limit controllerMemoryLimit, so both install the same controller.
+func TestTheControllersMemoryLimit(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deployment.yaml"))
+	if err != nil {
+		t.Fatalf("read deploy/deployment.yaml: %v", err)
+	}
+	render, err := renderChart(t, "restoreImage="+pinnedRestoreImage)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, render)
+	}
+	want := resource.MustParse(controllerMemoryLimit)
+	for source, manifest := range map[string]string{"deploy/deployment.yaml": string(content), "the chart": render} {
+		got, ok := controllerContainer(t, manifest).Resources.Limits[corev1.ResourceMemory]
+		if !ok || got.Cmp(want) != 0 {
+			t.Errorf("%s limits the controller's memory to %s, want %s", source, got.String(), controllerMemoryLimit)
+		}
+	}
 }

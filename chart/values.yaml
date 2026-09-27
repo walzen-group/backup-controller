@@ -66,10 +66,12 @@ serviceAccount:
 
 # Compute resources for the controller container. There is deliberately no CPU
 # limit: throttling a controller during a restore delays the copy without
-# protecting the node it runs on.
+# protecting the node it runs on. The process rests at about 50Mi, and a restic
+# key derivation holds 32Mi more while it runs; 128Mi left too little room, and
+# the controller was OOMKilled. GOMEMLIMIT follows the memory limit.
 resources:
   requests:
     cpu: 10m
     memory: 64Mi
   limits:
-    memory: 128Mi
+    memory: 256Mi
