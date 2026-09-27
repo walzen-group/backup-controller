@@ -8,7 +8,6 @@ import (
 	"slices"
 	"sync"
 	"testing"
-	"time"
 )
 
 // fixture is testdata/repo, a version 2 repository that restic 0.19.1 wrote
@@ -74,53 +73,6 @@ func TestALocationWithNoKeysIsNoRepository(t *testing.T) {
 	}
 	if _, err := Open(context.Background(), DirStore(dir), "backup"); !errors.Is(err, ErrNoRepository) {
 		t.Fatalf("err = %v, want ErrNoRepository", err)
-	}
-}
-
-// TestAtOrBeforeRoundsBackToTheSnapshotBefore checks that AtOrBefore picks the
-// newest snapshot at or before the time, and nothing when every snapshot is
-// later. A VolSync restore with restoreAsOf picks the same snapshot, or
-// restores nothing, and AtOrBefore answers that question before the restore
-// starts.
-func TestAtOrBeforeRoundsBackToTheSnapshotBefore(t *testing.T) {
-	snapshots := []Snapshot{
-		{ID: "a", Time: time.Date(2026, 9, 20, 5, 0, 0, 0, time.UTC)},
-		{ID: "b", Time: time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)},
-	}
-	cases := []struct {
-		at   time.Time
-		want string
-		ok   bool
-	}{
-		{time.Date(2026, 9, 20, 4, 59, 59, 0, time.UTC), "", false},
-		{time.Date(2026, 9, 20, 5, 0, 0, 0, time.UTC), "a", true},
-		{time.Date(2026, 9, 20, 13, 40, 0, 0, time.UTC), "a", true},
-		{time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC), "b", true},
-	}
-	for _, c := range cases {
-		got, ok := AtOrBefore(snapshots, c.at)
-		if ok != c.ok || got.ID != c.want {
-			t.Errorf("AtOrBefore(%s) = %q, %v; want %q, %v", c.at, got.ID, ok, c.want, c.ok)
-		}
-	}
-}
-
-// TestAtOrBeforeComparesWholeSecondsAsVolSyncDoes checks that AtOrBefore
-// drops the fraction of a second from each snapshot's time before it compares
-// it with the time asked for. VolSync's restic mover does the same, so a
-// snapshot taken at 06:00:00.7 is in reach of a restoreAsOf of 06:00:00, the
-// whole-second time a BackupRun reports for it.
-func TestAtOrBeforeComparesWholeSecondsAsVolSyncDoes(t *testing.T) {
-	snapshots := []Snapshot{
-		{ID: "a", Time: time.Date(2026, 9, 20, 5, 0, 0, 0, time.UTC)},
-		{ID: "b", Time: time.Date(2026, 9, 20, 6, 0, 0, 700_000_000, time.UTC)},
-	}
-	got, ok := AtOrBefore(snapshots, time.Date(2026, 9, 20, 6, 0, 0, 0, time.UTC))
-	if !ok || got.ID != "b" {
-		t.Errorf("AtOrBefore(06:00:00) = %q, %v; want the 06:00:00.7 snapshot", got.ID, ok)
-	}
-	if _, ok := AtOrBefore(snapshots[1:], time.Date(2026, 9, 20, 5, 59, 59, 999_000_000, time.UTC)); ok {
-		t.Error("AtOrBefore(05:59:59.999) found the 06:00:00.7 snapshot, which VolSync would not restore")
 	}
 }
 

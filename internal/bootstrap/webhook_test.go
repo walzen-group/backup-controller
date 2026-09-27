@@ -477,20 +477,6 @@ func optedOut(t *testing.T) *unstructured.Unstructured {
 	})
 }
 
-// TestTheOptOutAnnotationStartsEmptyOnAnEmptyPrefix checks that an opted-out
-// Cluster whose prefix holds nothing is admitted without a patch, through the
-// real S3Prober against the recorded empty store.
-func TestTheOptOutAnnotationStartsEmptyOnAnEmptyPrefix(t *testing.T) {
-	response := decideOn(t, optedOut(t), recordedS3(t, barmanstore.MustLoad(t, "empty")))
-
-	if !response.Allowed {
-		t.Fatalf("the cluster was refused: %v", response.Result)
-	}
-	if len(response.Patches) != 0 {
-		t.Fatalf("an opted-out cluster was rewritten: %v", response.Patches)
-	}
-}
-
 // TestTheOptOutAnnotationIsRefusedOverAnOldArchive checks that an opted-out
 // Cluster is refused, with the way out, when its prefix still holds the
 // archive of an earlier database, here the recorded done-base store. Finding

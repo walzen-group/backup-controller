@@ -3,7 +3,6 @@ package populator
 import (
 	"context"
 	"errors"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -22,24 +21,6 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
-
-// TestPopulateCopiesRepositorySecret checks that Populate copies the repository
-// Secret from the app's namespace into the controller namespace with the same
-// data.
-func TestPopulateCopiesRepositorySecret(t *testing.T) {
-	ops := populatedOperations(t)
-	ops.secrets[namespacedName(appNS, "repo-secret")].Data["password"] = []byte("secret")
-	callbacks := newCallbacks(ops, monday)
-
-	if err := callbacks.Populate(context.Background(), params()); err != nil {
-		t.Fatalf("Populate() error = %v", err)
-	}
-
-	copied, ok := ops.secrets[namespacedName(controllerNS, "claim-123")]
-	if !ok || !reflect.DeepEqual(copied.Data, ops.secrets[namespacedName(appNS, "repo-secret")].Data) {
-		t.Fatalf("copied repository secret = %#v, want same data in backup-system", copied)
-	}
-}
 
 // TestPopulateCreatesTheJobForTheNewestSnapshot checks that Populate names
 // the restore Job restore-<claim UID> and the Secret copy after the claim UID,

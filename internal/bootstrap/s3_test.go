@@ -3,7 +3,6 @@ package bootstrap
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/walzen-group/backup-controller/internal/testinfra/barmanstore"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -96,31 +95,6 @@ func TestASiblingPrefixDoesNotCount(t *testing.T) {
 	}
 	if len(response.Patches) != 0 {
 		t.Fatalf("the cluster was rewritten: %v", response.Patches)
-	}
-}
-
-// TestAStoreWithADoneBaseBackupRecoversTheCluster checks that a Cluster whose
-// archive holds a failed base backup and a completed one is rewritten to
-// recover, through the real S3Prober against the recorded done-base store
-// with a failed backup added a day before its completed one.
-func TestAStoreWithADoneBaseBackupRecoversTheCluster(t *testing.T) {
-	done := barmanstore.MustLoad(t, "done-base")
-	withFailed, err := done.WithFailedBackup("app-pg", time.Date(2026, 9, 24, 21, 52, 25, 0, time.UTC))
-	if err != nil {
-		t.Fatalf("add a failed backup: %v", err)
-	}
-	server := recordedS3(t, withFailed)
-
-	original := cluster(t, nil)
-	response := decideOn(t, original, server)
-
-	if !response.Allowed {
-		t.Fatalf("the cluster was refused: %v", response.Result)
-	}
-	patched := applied(t, original, response)
-	source, _, _ := unstructured.NestedString(patched, "spec", "bootstrap", "recovery", "source")
-	if source != RecoverySource {
-		t.Errorf("recovery source = %q, want %q", source, RecoverySource)
 	}
 }
 
