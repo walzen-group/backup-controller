@@ -100,18 +100,20 @@ func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1al
 // waitForBackup); the caller creates nothing in that pass. It returns a
 // *refusalError, which the caller fails the item with (see settled), for a
 // source claim, VolumeRestore or repository Secret that is gone, each
-// saying nothing was written to the claim spec.into names, for a spec
-// edited since the checks that names neither a claim nor a repository, with
-// reason SpecInvalid (see specRefusal), and for a claim of that name the
-// run did not create, with reason IntoClaimTaken (see intoTaken). A failed
-// read or write comes back as a plain error for a retry.
+// saying nothing was written to the claim spec.into names, and for a claim
+// of that name the run did not create, with reason IntoClaimTaken (see
+// intoTaken). A failed read or write comes back as a plain error for a
+// retry.
 //
 // The Leases and the wait cover the source claim when there is one, as the
-// checks did, and the new claim otherwise.
+// checks did, and the new claim otherwise. repositoryFor never refuses the
+// spec here: the CRD's CEL rule "into needs claim or repository" keeps a
+// spec that names neither out of the API server, on create and on every
+// update.
 func (r *RestoreRunReconciler) intoChecks(ctx context.Context, run *backupv1alpha1.RestoreRun) (restoreSettings, bool, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if err != nil {
-		return settings, false, nothingWrittenTo(run.Spec.Into, specRefusal(err))
+		return settings, false, nothingWrittenTo(run.Spec.Into, err)
 	}
 	// A claim that appeared since the checks ends the run before it waits
 	// for anything: it is not the run's to write into.

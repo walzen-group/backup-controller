@@ -119,9 +119,4 @@ const (
 	// create its own. The run writes only into a claim it created, so
 	// nothing was written to that claim.
 	ItemReasonIntoClaimTaken ItemReason = "IntoClaimTaken"
-
-	// ItemReasonSpecInvalid is an into restore whose spec, edited after the
-	// run's checks, names neither a claim nor a repository when the run
-	// would create its claim. Nothing was written to the claim.
-	ItemReasonSpecInvalid ItemReason = "SpecInvalid"
 )

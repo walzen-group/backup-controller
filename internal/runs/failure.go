@@ -170,28 +170,6 @@ func invalidSpec(format string, args ...any) error {
 	return &invalidSpecError{text: fmt.Sprintf(format, args...)}
 }
 
-// specRefusal turns a refusal of a run's spec into a refusal of the item a
-// check runs for, so a check that runs after the plan fails that item.
-//
-// Parameters:
-//   - err is the error the check returned. It may be nil.
-//
-// It returns a *refusalError with reason SpecInvalid and err's text when err
-// holds an *invalidSpecError, and err unchanged otherwise.
-//
-// A check that runs while the run plans ends the run with reason Invalid on
-// an *invalidSpecError. Once the run has items, a spec edited since the plan
-// can still give one, and asItemFailure does not take it, so the pass would
-// retry it without end. The item records it instead, and the run ends as
-// its items say.
-func specRefusal(err error) error {
-	var spec *invalidSpecError
-	if !errors.As(err, &spec) {
-		return err
-	}
-	return refuse(backupv1alpha1.ItemReasonSpecInvalid, "%s", err.Error())
-}
-
 // itemFailure is how an item ends when an error fails it: the reason it
 // records and the message a person reads.
 type itemFailure struct {
@@ -217,8 +195,7 @@ type itemFailure struct {
 // err.Error(). Any other error, and nil, gives false: the pass returns the
 // error and retries. An *invalidSpecError is not on the list, because only
 // run-level sites meet one, and an item that recorded it would carry a
-// reason no item has. A check that runs for an item turns it into a
-// refusal first (see specRefusal).
+// reason no item has.
 func asItemFailure(err error) (itemFailure, bool) {
 	var refused *refusalError
 	if errors.As(err, &refused) {
