@@ -48,6 +48,15 @@ webhook:
 rbac:
   # Create the ClusterRole and ClusterRoleBinding for the controller.
   create: true
+admissionPolicy:
+  # Create the ValidatingAdmissionPolicy and its binding that let the
+  # controller's ServiceAccount create, change and delete only restore Jobs
+  # of the controller's own shape: no host access, no ServiceAccount token,
+  # only claims and scratch volumes, and at most the capabilities CHOWN,
+  # DAC_OVERRIDE and FOWNER. The ClusterRole grants create and delete on
+  # every Job in the cluster, and this policy is what narrows it. Needs
+  # Kubernetes 1.30 or later.
+  create: true
 serviceAccount:
   # Create the ServiceAccount the Deployment runs with.
   create: true
