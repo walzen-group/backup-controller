@@ -116,9 +116,6 @@ linters:
       - path: '^cmd/backup-controller/runs\.go$'
         linters: [funlen, gocognit]
         source: '^func startRunControllers\('
-      - path: '^internal/bootstrap/survey\.go$'
-        linters: [funlen, gocognit]
-        source: '^func (\(p S3Prober\) Survey|readInfos)\('
       - path: '^internal/quiesce/plan\.go$'
         linters: [funlen, gocognit]
         source: '^func Plan\('
