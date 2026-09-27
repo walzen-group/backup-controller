@@ -120,4 +120,4 @@ kubectl delete -f chart/crds/
 | rbac.create | true | Create the ClusterRole and ClusterRoleBinding for the controller |
 | serviceAccount.create | true | Create the ServiceAccount |
 | serviceAccount.name | "" (the fullname) | Use this ServiceAccount name, created or pre-existing |
-| resources | 10m/64Mi requests, 256Mi memory limit | CPU limit is deliberately absent; see values.yaml. The container gets GOMEMLIMIT set to its memory limit, so the Go runtime collects garbage before the heap reaches the limit |
+| resources | 10m/256Mi requests, 512Mi memory limit | CPU limit is deliberately absent; see values.yaml. The container gets GOMEMLIMIT set to its memory limit, so the Go runtime collects garbage before the heap reaches the limit |

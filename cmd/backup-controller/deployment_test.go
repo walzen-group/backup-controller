@@ -221,17 +221,23 @@ func goMemLimit(env []corev1.EnvVar) *corev1.EnvVar {
 	return nil
 }
 
-// controllerMemoryLimit is the memory limit of the controller container in
-// deploy/ and in the chart's default values.
+// controllerMemoryRequest and controllerMemoryLimit are the memory request
+// and the memory limit of the controller container in deploy/ and in the
+// chart's default values.
 //
 // The process rests at about 50Mi, and each restic key derivation holds 32
 // MiB more while it runs. 128Mi left too little room: the e2e suite saw the
-// controller OOMKilled.
-const controllerMemoryLimit = "256Mi"
+// controller OOMKilled. The request is the same as the old limit, so that the
+// scheduler keeps that memory for the controller.
+const (
+	controllerMemoryRequest = "256Mi"
+	controllerMemoryLimit   = "512Mi"
+)
 
 // TestTheControllersMemoryLimit checks that the controller container in
 // deploy/deployment.yaml and in the chart's default render has the memory
-// limit controllerMemoryLimit, so both install the same controller.
+// request controllerMemoryRequest and the memory limit controllerMemoryLimit,
+// so both install the same controller.
 func TestTheControllersMemoryLimit(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deployment.yaml"))
 	if err != nil {
@@ -241,10 +247,16 @@ func TestTheControllersMemoryLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, render)
 	}
-	want := resource.MustParse(controllerMemoryLimit)
+	wantRequest := resource.MustParse(controllerMemoryRequest)
+	wantLimit := resource.MustParse(controllerMemoryLimit)
 	for source, manifest := range map[string]string{"deploy/deployment.yaml": string(content), "the chart": render} {
-		got, ok := controllerContainer(t, manifest).Resources.Limits[corev1.ResourceMemory]
-		if !ok || got.Cmp(want) != 0 {
+		resources := controllerContainer(t, manifest).Resources
+		got, ok := resources.Requests[corev1.ResourceMemory]
+		if !ok || got.Cmp(wantRequest) != 0 {
+			t.Errorf("%s requests %s of memory for the controller, want %s", source, got.String(), controllerMemoryRequest)
+		}
+		got, ok = resources.Limits[corev1.ResourceMemory]
+		if !ok || got.Cmp(wantLimit) != 0 {
 			t.Errorf("%s limits the controller's memory to %s, want %s", source, got.String(), controllerMemoryLimit)
 		}
 	}
