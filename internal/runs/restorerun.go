@@ -1531,15 +1531,15 @@ func (r *RestoreRunReconciler) deleteCluster(ctx context.Context, cluster *unstr
 // selectSnapshot refuses, ends with reason NoBackupInReach.
 func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	run.Status.Target = run.Spec.Into
-	refusal, err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim")
-	if err == nil && refusal == "" && run.Spec.Claim != "" {
-		refusal, err = r.intoTaken(ctx, run, &backupv1alpha1.VolumeRestore{}, "VolumeRestore")
+	err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim")
+	if err == nil && run.Spec.Claim != "" {
+		err = r.intoTaken(ctx, run, &backupv1alpha1.VolumeRestore{}, "VolumeRestore")
+	}
+	if asRunRefusal(err) {
+		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
 	if err != nil {
 		return ctrl.Result{}, err
-	}
-	if refusal != "" {
-		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, refusal)
 	}
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
 	if asRunRefusal(err) {
@@ -1600,29 +1600,31 @@ func intoTimedOut(into string, deadline time.Time) string {
 	return fmt.Sprintf("claim %s had not been restored by %s", into, deadline.Format(time.RFC3339))
 }
 
-// intoTaken reads the object named spec.into into object, and returns the
-// refusal from notCreatedByRun when it exists and the run did not create it.
-// It returns "" when the object does not exist or the run controls it.
+// intoTaken reads the object named spec.into into object, and refuses it
+// when it exists and the run did not create it.
 //
 // Parameters:
 //   - object is an empty claim or VolumeRestore, of the kind to read.
 //   - kind is "claim" or "VolumeRestore", for the message.
 //
-// The read goes through the uncached Reader, so an object created a moment
-// ago is seen. A failed read comes back as an error, and the caller retries.
-func (r *RestoreRunReconciler) intoTaken(ctx context.Context, run *backupv1alpha1.RestoreRun, object client.Object, kind string) (string, error) {
+// It returns nil when the object does not exist or the run controls it, and
+// the *refusalError from notCreatedByRun, with reason IntoClaimTaken,
+// otherwise. The read goes through the uncached Reader, so an object
+// created a moment ago is seen. A failed read comes back as a plain error,
+// and the caller retries.
+func (r *RestoreRunReconciler) intoTaken(ctx context.Context, run *backupv1alpha1.RestoreRun, object client.Object, kind string) error {
 	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
 	if err := r.Reader.Get(ctx, key, object); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", nil
+			return nil
 		}
-		return "", fmt.Errorf("get %s %s: %w", kind, key, err)
+		return fmt.Errorf("get %s %s: %w", kind, key, err)
 	}
-	return notCreatedByRun(run, kind, object), nil
+	return notCreatedByRun(run, kind, object)
 }
 
 // createOwned creates object, which carries the run's controller reference,
-// and returns "" once an object of that name exists that the run controls.
+// and makes sure the object of that name is one the run controls.
 //
 // Parameters:
 //   - object is the claim to create.
@@ -1630,23 +1632,26 @@ func (r *RestoreRunReconciler) intoTaken(ctx context.Context, run *backupv1alpha
 //     is read into when the create finds one.
 //   - kind is "claim", for the message.
 //
+// It returns nil once an object of that name exists that the run controls,
+// and the *refusalError from notCreatedByRun, with reason IntoClaimTaken,
+// for any other; nothing is written to that one. A failed create or read
+// comes back as a plain error, and the caller retries.
+//
 // A create that finds the name taken reads the stored object. The run's own,
 // left by a pass whose create went through but whose answer was lost, is
-// fine; any other gives the refusal from notCreatedByRun, and nothing is
-// written to it. A failed create or read comes back as an error, and the
-// caller retries.
-func (r *RestoreRunReconciler) createOwned(ctx context.Context, run *backupv1alpha1.RestoreRun, object, existing client.Object, kind string) (string, error) {
+// fine.
+func (r *RestoreRunReconciler) createOwned(ctx context.Context, run *backupv1alpha1.RestoreRun, object, existing client.Object, kind string) error {
 	err := r.Create(ctx, object)
 	if err == nil {
-		return "", nil
+		return nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
-		return "", fmt.Errorf("create %s %s/%s: %w", kind, object.GetNamespace(), object.GetName(), err)
+		return fmt.Errorf("create %s %s/%s: %w", kind, object.GetNamespace(), object.GetName(), err)
 	}
 	if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(object), existing); err != nil {
-		return "", fmt.Errorf("get %s %s/%s: %w", kind, object.GetNamespace(), object.GetName(), err)
+		return fmt.Errorf("get %s %s/%s: %w", kind, object.GetNamespace(), object.GetName(), err)
 	}
-	return notCreatedByRun(run, kind, existing), nil
+	return notCreatedByRun(run, kind, existing)
 }
 
 // createDestination creates the run's ReplicationDestination, and makes sure

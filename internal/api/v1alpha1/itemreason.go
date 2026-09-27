@@ -113,4 +113,10 @@ const (
 	// ItemReasonClusterRestoredElsewhere is a database restore whose Cluster
 	// another unfinished RestoreRun is restoring. The run deleted nothing.
 	ItemReasonClusterRestoredElsewhere ItemReason = "ClusterRestoredElsewhere"
+
+	// ItemReasonIntoClaimTaken is an into restore whose claim name, from
+	// spec.into, holds a claim the run did not create when the run would
+	// create its own. The run writes only into a claim it created, so
+	// nothing was written to that claim.
+	ItemReasonIntoClaimTaken ItemReason = "IntoClaimTaken"
 )

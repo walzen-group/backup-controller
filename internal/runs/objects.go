@@ -211,8 +211,8 @@ func ownsDestination(run *backupv1alpha1.RestoreRun, destination *volsyncv1alpha
 	return destination.Spec.Trigger != nil && destination.Spec.Trigger.Manual == string(run.UID)
 }
 
-// notCreatedByRun returns the refusal for an object named spec.into that the
-// run does not control, and "" when the run controls it.
+// notCreatedByRun refuses an object named spec.into that the run does not
+// control.
 //
 // Parameters:
 //   - run is the RestoreRun. It controls an object whose controller
@@ -221,14 +221,18 @@ func ownsDestination(run *backupv1alpha1.RestoreRun, destination *volsyncv1alpha
 //   - kind is "claim" or "VolumeRestore", for the message.
 //   - object is the object as read from the API server.
 //
+// It returns nil when the run controls the object, and otherwise a
+// *refusalError with reason IntoClaimTaken whose message names the object
+// and says how to choose another name.
+//
 // When another RestoreRun controls the object, the message names that run:
 // the garbage collector deletes the object when that run is deleted, so a
 // run that took the object over would lose it under its own success. A
 // VolumeRestore describes the backups of the claim of its name, so its name
 // is taken by a claim too, even while that claim does not exist.
-func notCreatedByRun(run *backupv1alpha1.RestoreRun, kind string, object metav1.Object) string {
+func notCreatedByRun(run *backupv1alpha1.RestoreRun, kind string, object metav1.Object) error {
 	if metav1.IsControlledBy(object, run) {
-		return ""
+		return nil
 	}
 	owner := ""
 	if ref := metav1.GetControllerOf(object); ref != nil && ref.Kind == "RestoreRun" &&
@@ -236,12 +240,12 @@ func notCreatedByRun(run *backupv1alpha1.RestoreRun, kind string, object metav1.
 		owner = fmt.Sprintf("; it belongs to RestoreRun %s, which deletes it when it is deleted", ref.Name)
 	}
 	if kind == "claim" {
-		return fmt.Sprintf("claim %s already exists and this run did not create it%s. "+
+		return refuse(backupv1alpha1.ItemReasonIntoClaimTaken, "claim %s already exists and this run did not create it%s. "+
 			"spec.into names a new claim for the run to create, and a restore never writes into a claim it did not create. "+
 			"Choose a name no claim in this namespace has. To overwrite an existing claim, restore it in place with spec.claim.",
 			object.GetName(), owner)
 	}
-	return fmt.Sprintf("%[1]s %[2]s already exists and this run did not create it%[3]s. "+
+	return refuse(backupv1alpha1.ItemReasonIntoClaimTaken, "%[1]s %[2]s already exists and this run did not create it%[3]s. "+
 		"A %[1]s describes the backups of the claim of its name, so that name belongs to another claim, and "+
 		"spec.into names a new claim for the run to create. Choose a name no claim or %[1]s in this namespace has.",
 		kind, object.GetName(), owner)

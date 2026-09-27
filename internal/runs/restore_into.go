@@ -64,7 +64,9 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 // UID together. A Job with another ID, or one the run did not create,
 // fails the item, and the run ends Failed. A run past its deadline before
 // it has a Job ends with reason TimedOut. Otherwise the checks right before
-// the create run, and the claim and the Job are created (see createInto).
+// the create run (see intoChecks): a refusal fails the item with its
+// reason and ends the run Failed, and a backup in progress makes the pass
+// requeue. Then the claim and the Job are created (see createInto).
 func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (ctrl.Result, error) {
 	taken, err := r.takeOverJob(ctx, run, 0, item)
 	if done, err := settled(item, err); done {
@@ -76,11 +78,14 @@ func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1al
 	if deadline, over := r.overdue(run); over {
 		return r.timeOut(ctx, run, intoTimedOut(run.Spec.Into, deadline))
 	}
-	settings, result, err := r.intoChecks(ctx, run)
-	if settings == nil {
-		return result, err
+	settings, waiting, err := r.intoChecks(ctx, run)
+	if done, err := settled(item, err); done {
+		return r.endInto(ctx, run, err)
 	}
-	return r.createInto(ctx, run, item, *settings)
+	if waiting {
+		return after(pollInterval, nil)
+	}
+	return r.createInto(ctx, run, item, settings)
 }
 
 // intoChecks runs the checks an into restore makes right before it creates
@@ -89,46 +94,35 @@ func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1al
 // Parameters:
 //   - run is the RestoreRun, with no restore Job yet.
 //
-// It returns the repository and mover settings when the restore may go on.
-// It returns nil settings, with the result and error the pass returns, when
-// it may not: a source claim, VolumeRestore or repository Secret that is
-// gone, or a claim named spec.into the run did not create, aborts the run
-// with reason Failed; a backup of the source claim or the repository in
-// progress makes the run wait with reason SourceBusy (see waitForBackup); a
-// failed read comes back as an error for a retry.
+// It returns the repository and mover settings, and whether the run waits.
+// It returns true, with the run moved to Waiting with reason SourceBusy,
+// while a backup of the source claim or the repository is in progress (see
+// waitForBackup); the caller creates nothing in that pass. It returns a
+// *refusalError, which the caller fails the item with (see settled), for a
+// source claim, VolumeRestore or repository Secret that is gone, each
+// saying nothing was written to the claim spec.into names, and for a claim
+// of that name the run did not create, with reason IntoClaimTaken (see
+// intoTaken). A failed read or write comes back as a plain error for a
+// retry.
 //
 // The Leases and the wait cover the source claim when there is one, as the
 // checks did, and the new claim otherwise.
-func (r *RestoreRunReconciler) intoChecks(ctx context.Context, run *backupv1alpha1.RestoreRun) (*restoreSettings, ctrl.Result, error) {
+func (r *RestoreRunReconciler) intoChecks(ctx context.Context, run *backupv1alpha1.RestoreRun) (restoreSettings, bool, error) {
 	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, run.Spec.Claim, run.Spec.Repository, run.Spec.MoverSecurityContext)
-	if asRunRefusal(err) {
-		result, err := r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error())
-		return nil, result, err
-	}
 	if err != nil {
-		return nil, ctrl.Result{}, err
+		return settings, false, nothingWrittenTo(run.Spec.Into, err)
 	}
 	// A claim that appeared since the checks ends the run before it waits
 	// for anything: it is not the run's to write into.
-	refusal, err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim")
-	if err != nil || refusal != "" {
-		result, err := r.abortOn(ctx, run, refusal, err)
-		return nil, result, err
+	if err := r.intoTaken(ctx, run, &corev1.PersistentVolumeClaim{}, "claim"); err != nil {
+		return settings, false, err
 	}
 	leased := run.Spec.Claim
 	if leased == "" {
 		leased = run.Spec.Into
 	}
 	waiting, err := r.waitForBackup(ctx, run, leased, settings.Secret)
-	if asRunRefusal(err) {
-		result, err := r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error()+nothingWritten(run.Spec.Into))
-		return nil, result, err
-	}
-	if waiting || err != nil {
-		result, err := after(pollInterval, err)
-		return nil, result, err
-	}
-	return &settings, ctrl.Result{}, nil
+	return settings, waiting, nothingWrittenTo(run.Spec.Into, err)
 }
 
 // createInto lists the repository again, then creates an into restore's
@@ -147,21 +141,20 @@ func (r *RestoreRunReconciler) intoChecks(ctx context.Context, run *backupv1alph
 // a plain one with no data source, so no populator takes part: it carries
 // the run's controller reference, the source claim's size and class, or
 // spec.intoSize, and the node the source claim's volume is on (see
-// scratchClaim). A claim of that name the run did not create aborts the run
-// with reason Failed (see createOwned). The Job, created only once the
-// claim is known to be the run's since it restores with --delete, mounts
-// the claim by name and is its first consumer, so on a
-// WaitForFirstConsumer class the scheduler places the volume where the
-// Job's pod runs when no node was copied (see createJob). The status write
-// that follows records the Job's name and UID together.
+// scratchClaim). A claim of that name the run did not create fails the
+// item with reason IntoClaimTaken and ends the run Failed (see createOwned).
+// The Job, created only once the claim is known to be the run's since it
+// restores with --delete, mounts the claim by name and is its first
+// consumer, so on a WaitForFirstConsumer class the scheduler places the
+// volume where the Job's pod runs when no node was copied (see createJob).
+// The status write that follows records the Job's name and UID together.
 func (r *RestoreRunReconciler) createInto(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem, settings restoreSettings) (ctrl.Result, error) {
 	err := nothingWrittenTo(run.Spec.Into, r.recheckJobSnapshot(ctx, run, *item, settings.Secret))
 	if done, err := settled(item, err); done {
 		return r.endInto(ctx, run, err)
 	}
-	refusal, err := r.createOwned(ctx, run, scratchClaim(run, settings), &corev1.PersistentVolumeClaim{}, "claim")
-	if err != nil || refusal != "" {
-		return r.abortOn(ctx, run, refusal, err)
+	if done, err := settled(item, r.createOwned(ctx, run, scratchClaim(run, settings), &corev1.PersistentVolumeClaim{}, "claim")); done {
+		return r.endInto(ctx, run, err)
 	}
 	if done, err := settled(item, r.createJob(ctx, run, 0, item, settings)); done {
 		return r.endInto(ctx, run, err)
@@ -235,24 +228,6 @@ func (r *RestoreRunReconciler) finishInto(ctx context.Context, run *backupv1alph
 		return r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, fmt.Sprintf("claim %s holds the restored data", run.Spec.Into))
 	}
 	return r.finish(ctx, run, backupv1alpha1.ReasonFailed, restoreFailures(run.Status.Items))
-}
-
-// abortOn aborts an into restore on a refusal, or returns a failed read for
-// a retry.
-//
-// Parameters:
-//   - run is the RestoreRun.
-//   - refusal is the message of a refusal from intoTaken or createOwned, or
-//     empty.
-//   - err is the error of the same call, or nil.
-//
-// It returns err when it is not nil, and otherwise what abort returns with
-// reason Failed and the refusal as the message.
-func (r *RestoreRunReconciler) abortOn(ctx context.Context, run *backupv1alpha1.RestoreRun, refusal string, err error) (ctrl.Result, error) {
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	return r.abort(ctx, run, backupv1alpha1.ReasonFailed, refusal)
 }
 
 // resume writes the status of an into restore once its item names its

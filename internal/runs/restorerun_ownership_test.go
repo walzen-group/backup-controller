@@ -188,6 +188,7 @@ func TestAnIntoRestoreRefusesAClaimCreatedAfterItsChecks(t *testing.T) {
 				t.Fatalf("phase = %q, reason = %q, message = %q; want Failed saying the claim exists",
 					run.Status.Phase, readyReason(run.Status.Conditions), readyMessage(run.Status.Conditions))
 			}
+			expectItemReason(t, c, backupv1alpha1.ItemReasonIntoClaimTaken)
 			if names := movers(t, c); len(names) > 0 {
 				t.Errorf("movers = %v, want none", names)
 			}
@@ -377,6 +378,7 @@ func TestAnIntoRestoreRefusesAClaimCreatedAtItsCreate(t *testing.T) {
 		!strings.Contains(readyMessage(run.Status.Conditions), "claim scratch already exists and this run did not create it") {
 		t.Fatalf("phase = %q, message = %q; want Failed naming the claim", run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
+	expectItemReason(t, c, backupv1alpha1.ItemReasonIntoClaimTaken)
 	after := &corev1.PersistentVolumeClaim{}
 	get(t, c, ns, foreign.Name, after)
 	if after.ResourceVersion != foreign.ResourceVersion || len(after.OwnerReferences) != 0 || after.DeletionTimestamp != nil {

@@ -23,6 +23,16 @@ type endedItem struct {
 // message ends with, written out so a change to it fails the test.
 const nothingWrittenEnd = ". Nothing was written to claim " + claimN + ". Create a new RestoreRun to select again"
 
+// intoNothingWrittenEnd is the sentence a refused into restore item's
+// message ends with: nothing was written to the new claim scratch.
+const intoNothingWrittenEnd = ". Nothing was written to claim scratch. Create a new RestoreRun to select again"
+
+// intoScratch returns a RestoreRun that restores the backups of the claim
+// notes-data into a new claim named scratch.
+func intoScratch() *backupv1alpha1.RestoreRun {
+	return restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" })
+}
+
 // deleteClaim deletes the claim notes-data, which the case seeded.
 func deleteClaim(t *testing.T, c client.Client) {
 	t.Helper()
@@ -112,9 +122,11 @@ func restoreItemAfter(t *testing.T, run *backupv1alpha1.RestoreRun, between func
 // sourceSettingsFor, volumeAffinity, the quiesce pre-check's foreign
 // source, startItem's hibernated and missing Cluster, checkVolume's
 // repositoryFor, the in-place quiesce pre-check's Lease of a repository
-// Secret that is gone, and restoreDatabase's clustersRestoredElsewhere. An
-// item that fails for a reason not yet typed records no reason, even when
-// another item failed with one in the same pass.
+// Secret that is gone, the into start checks (repositoryFor and the Lease
+// of a repository Secret that is gone), and restoreDatabase's
+// clustersRestoredElsewhere. An item that fails for a reason not yet typed
+// records no reason, even when another item failed with one in the same
+// pass.
 func TestARefusedItemRecordsItsReason(t *testing.T) {
 	quiescing := backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true })
 	unbound := claim()
@@ -210,6 +222,20 @@ func TestARefusedItemRecordsItsReason(t *testing.T) {
 			}, claim(), volumeRestore(), repository(), deployment(), kustomization(false))
 		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonClaimDeleting,
 			"claim " + claimN + " is being deleted" + nothingWrittenEnd}},
+
+		{"into RestoreRun from a claim, source claim deleted after plan", func(t *testing.T) endedItem {
+			return restoreItemAfter(t, intoScratch(), deleteClaim, claim(), volumeRestore(), repository())
+		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonClaimMissing,
+			"no PersistentVolumeClaim " + claimN + " in this namespace" + intoNothingWrittenEnd}},
+
+		{"into RestoreRun from a claim, VolumeRestore deleted after plan", func(t *testing.T) endedItem {
+			return restoreItemAfter(t, intoScratch(), deleteVolumeRestore, claim(), volumeRestore(), repository())
+		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonVolumeRestoreMissing, noVolumeRestore + intoNothingWrittenEnd}},
+
+		{"into RestoreRun from a repository, repository Secret deleted after plan", func(t *testing.T) endedItem {
+			return restoreItemAfter(t, restoreRun(fromRepository), deleteRepositorySecret, repository())
+		}, endedItem{backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonRepositorySecretMissing,
+			"repository Secret " + repoN + " does not exist in this namespace, so the run can't take the Lease that keeps other runs' movers off the repository" + intoNothingWrittenEnd}},
 
 		{"RestoreRun of a Cluster another RestoreRun holds, found at restoreDatabase", func(t *testing.T) endedItem {
 			started := metav1.NewTime(frozen)
