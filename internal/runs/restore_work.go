@@ -165,10 +165,7 @@ func (r *RestoreRunReconciler) releaseFinished(ctx context.Context, run *backupv
 		return err
 	}
 	if durablyRestarted(run) {
-		if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
-			log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
-				"namespace", run.Namespace, "name", run.Name)
-		}
+		r.releaseQuiesce(ctx, run)
 	}
 	return nil
 }
@@ -185,7 +182,7 @@ func (r *RestoreRunReconciler) releaseFinished(ctx context.Context, run *backupv
 // workloads can not be read: a refusal (see asRunRefusal) aborts the run
 // with reason Failed, and any other error comes back for a retry.
 func (r *RestoreRunReconciler) waitForStoppedPods(ctx context.Context, run *backupv1alpha1.RestoreRun) (done bool, result ctrl.Result, err error) {
-	if !stopped(run) || !anyRestorePending(run.Status.Items) {
+	if !stopped(run) || !anyItemIn(run.Status.Items, backupv1alpha1.ItemPending) {
 		return false, ctrl.Result{}, nil
 	}
 	targets, err := quiesce.NamedAndMarked(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
@@ -356,7 +353,7 @@ func (r *RestoreRunReconciler) restoreDatabaseItem(ctx context.Context, run *bac
 // done starts nothing again, so it never scales up a workload another run
 // has stopped since.
 func (r *RestoreRunReconciler) giveBackWhenDone(ctx context.Context, run *backupv1alpha1.RestoreRun, volumes volumePass, databases databasePass) error {
-	if !volumes.done || anyRestorePending(run.Status.Items) || len(databases.shuttingDown) > 0 || !stopped(run) {
+	if !volumes.done || anyItemIn(run.Status.Items, backupv1alpha1.ItemPending) || len(databases.shuttingDown) > 0 || !stopped(run) {
 		return nil
 	}
 	return r.restart(ctx, run)
@@ -370,7 +367,7 @@ func (r *RestoreRunReconciler) giveBackWhenDone(ctx context.Context, run *backup
 //   - volumes and databases are what this pass found.
 //
 // It returns what finish returns for a run that ends: Failed when an item
-// failed (see anyRestoreFailed and endReason), Failed with reason
+// failed (see endReason), Failed with reason
 // NoBackupInReach when no item succeeded (see nothingRestored), and
 // Succeeded otherwise. A run that goes on waits, in this order, with reason
 // WaitingForShutdown for a deleted Cluster that is not gone yet, with
@@ -380,9 +377,9 @@ func (r *RestoreRunReconciler) giveBackWhenDone(ctx context.Context, run *backup
 func (r *RestoreRunReconciler) finishOrWait(ctx context.Context, run *backupv1alpha1.RestoreRun, volumes volumePass, databases databasePass) (ctrl.Result, error) {
 	items := run.Status.Items
 	switch {
-	case restoreDone(items) && anyRestoreFailed(items):
+	case restoreDone(items) && anyItemIn(items, backupv1alpha1.ItemFailed):
 		return r.finish(ctx, run, endReason(items), restoreFailures(items))
-	case restoreDone(items) && !anyRestoreSucceeded(items):
+	case restoreDone(items) && !anyItemIn(items, backupv1alpha1.ItemSucceeded):
 		return r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, nothingRestored(items))
 	case restoreDone(items):
 		return r.finish(ctx, run, backupv1alpha1.ReasonSucceeded, "every item holds the restored data")

@@ -165,7 +165,7 @@ func (r *RestoreRunReconciler) planStop(ctx context.Context, run *backupv1alpha1
 	// rest, or every item Skipped at the plan, there is nothing to stop.
 	// The run records the stop and the restart at the same moment, and
 	// work then finishes it.
-	if !anyRestorePending(run.Status.Items) {
+	if !anyItemIn(run.Status.Items, backupv1alpha1.ItemPending) {
 		now := metav1.NewTime(r.Now())
 		run.Status.QuiescedAt, run.Status.RestartedAt = &now, &now
 		result, err = after(time.Second, r.writeStatus(ctx, run))

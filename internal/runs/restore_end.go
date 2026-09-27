@@ -164,18 +164,13 @@ func leftDeleted(item backupv1alpha1.RestoreItem) bool {
 // The steps run in this order, and each one runs only once the one before it
 // went through:
 //
-//  1. It stops the run's movers (see stopJobs): it suspends each restore
-//     Job and waits until no pod of it can still write (rule X2), so no
-//     mover writes into a claim or the repository once the app is back or
-//     another run takes over.
-//  2. It gives back the workloads the run stopped and resumes the
-//     Kustomizations it suspended, and records status.restartedAt.
-//  3. It releases the run's claim and repository Leases (see releaseLeases).
-//  4. It writes the end: the phase, the Ready condition and
+//  1. It stops the run's movers, gives the app back and releases the run's
+//     claim and repository Leases (see giveBack).
+//  2. It writes the end: the phase, the Ready condition and
 //     status.completedAt.
-//  5. It releases the namespace's quiesce Lease, which the stored status now
+//  3. It releases the namespace's quiesce Lease, which the stored status now
 //     shows is no longer needed.
-//  6. It removes the run's finalizer.
+//  4. It removes the run's finalizer.
 //
 // A run never reaches finish with a Cluster item still in phase Deleted:
 // such an item is not finished, so work ends the run only through abort or
@@ -191,23 +186,8 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 			return ctrl.Result{}, err
 		}
 	}
-	left, err := r.stopJobs(ctx, run, anyItem)
-	if err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, err)
-	}
-	if len(left) > 0 {
-		return r.waitForStopped(ctx, run, left.message())
-	}
-	// The app is given back before the Leases go: a run that could not start
-	// the workloads keeps the claim and the repository to itself until it
-	// can, so no other run's mover starts on them meanwhile.
-	if stopped(run) {
-		if err := r.restart(ctx, run); err != nil {
-			return ctrl.Result{}, r.releaseFailed(ctx, run, err)
-		}
-	}
-	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err))
+	if done, result, err := r.giveBack(ctx, run); !done {
+		return result, err
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
@@ -221,11 +201,8 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 	}
 	// The stored status now shows the workloads back, so the quiesce Leases
 	// may go, before the finalizer: another run then takes the namespace over
-	// at once. Best effort, as in work.
-	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
-		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
-			"namespace", run.Namespace, "name", run.Name)
-	}
+	// at once.
+	r.releaseQuiesce(ctx, run)
 	return ctrl.Result{}, dropFinalizer(ctx, r.Client, run)
 }
 
@@ -240,12 +217,8 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 // from waitForStopped. A step that fails is reported through releaseFailed,
 // whose error it returns for a retry.
 //
-// The steps run in this order, and each one runs only once the one before it
-// went through: it stops the run's movers and waits until none can still
-// write (rule X2, see stopJobs), gives the stopped workloads back and
-// resumes the suspended Kustomizations, releases the claim and repository
-// Leases, drops the finalizer, and last releases the namespace's quiesce
-// Lease. Without
+// It first gives back what the run holds (see giveBack), then drops the
+// finalizer, and last releases the namespace's quiesce Lease. Without
 // finalize, a run deleted while its mover writes would leave a restore
 // running against a claim with nothing tracking it. The run keeps its
 // finalizer and its Leases while it waits or retries: a Lease released
@@ -259,21 +232,8 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
 	}
-	left, err := r.stopJobs(ctx, run, anyItem)
-	if err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, err)
-	}
-	if len(left) > 0 {
-		return r.waitForStopped(ctx, run, left.message())
-	}
-	// The app is given back before the Leases go, as in finish.
-	if stopped(run) {
-		if err := r.restart(ctx, run); err != nil {
-			return ctrl.Result{}, r.releaseFailed(ctx, run, err)
-		}
-	}
-	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
-		return ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err))
+	if done, result, err := r.giveBack(ctx, run); !done {
+		return result, err
 	}
 	r.announceLeftDeleted(ctx, run)
 	if err := dropFinalizer(ctx, r.Client, run); err != nil {
@@ -283,13 +243,62 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	// restart in the run's status, so when the drop fails, the next pass
 	// restarts the app again. Released before that, the Lease would let
 	// another run stop the app in between, and the repeated restart would
-	// undo that stop. The release is best effort: a Lease left behind is
-	// stale under holderLive's rule.
+	// undo that stop.
+	r.releaseQuiesce(ctx, run)
+	return ctrl.Result{}, nil
+}
+
+// giveBack stops the run's movers, gives the app back and releases the
+// run's claim and repository Leases, for finish and finalize.
+//
+// Parameters:
+//   - run is the RestoreRun that ends or is being deleted.
+//
+// It returns done true once all three steps went through. It returns done
+// false with the wait from waitForStopped while a stopped mover is not gone
+// yet, and with the error of releaseFailed when a step failed.
+//
+// Each step runs only once the one before it went through:
+//
+//  1. It stops the run's movers (see stopJobs): it suspends each restore
+//     Job and waits until no pod of it can still write (rule X2), so no
+//     mover writes into a claim or the repository once the app is back or
+//     another run takes over.
+//  2. It gives back the workloads the run stopped and resumes the
+//     Kustomizations it suspended, and records status.restartedAt. A run
+//     that could not start the workloads keeps the claim and the
+//     repository to itself until it can, so no other run's mover starts on
+//     them meanwhile.
+//  3. It releases the run's claim and repository Leases (see releaseLeases).
+func (r *RestoreRunReconciler) giveBack(ctx context.Context, run *backupv1alpha1.RestoreRun) (done bool, result ctrl.Result, err error) {
+	left, err := r.stopJobs(ctx, run, anyItem)
+	if err != nil {
+		return false, ctrl.Result{}, r.releaseFailed(ctx, run, err)
+	}
+	if len(left) > 0 {
+		result, err = r.waitForStopped(ctx, run, left.message())
+		return false, result, err
+	}
+	if stopped(run) {
+		if err := r.restart(ctx, run); err != nil {
+			return false, ctrl.Result{}, r.releaseFailed(ctx, run, err)
+		}
+	}
+	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
+		return false, ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err))
+	}
+	return true, ctrl.Result{}, nil
+}
+
+// releaseQuiesce releases the namespace's quiesce Lease the run holds, once
+// the stored status shows the workloads back. The release is best effort: a
+// failed one is logged, and a Lease left behind is stale under holderLive's
+// rule, so the next run takes it over.
+func (r *RestoreRunReconciler) releaseQuiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) {
 	if err := releaseQuiesceLeases(ctx, r.Client, r.Reader, run); err != nil {
-		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the deletion goes on",
+		log.FromContext(ctx).Error(err, "could not release the run's quiesce Leases; the run goes on",
 			"namespace", run.Namespace, "name", run.Name)
 	}
-	return ctrl.Result{}, nil
 }
 
 // announceLeftDeleted records a Warning event with reason

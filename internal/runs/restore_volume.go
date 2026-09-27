@@ -231,9 +231,12 @@ func (r *RestoreRunReconciler) followJob(ctx context.Context, run *backupv1alpha
 // (see storedRunGoesOn) or can't be read, and when the patch fails for a
 // reason a retry may fix, such as a 500 from an admission webhook that
 // can't be reached, a 503 or a 504. When the API server refuses the resume
-// it returns a *refusalError: reason RestoreJobRefused, saying that nothing
-// was written to the claim, for Forbidden, and for an Invalid refusal that
-// did not come from a replaced Job (see invalidResume).
+// as Forbidden or Invalid, it returns a *refusalError with reason
+// RestoreJobRefused that says nothing was written to the claim. The resume
+// is a merge patch that carries the Job's UID, and the API server answers
+// such a patch on a Job created again under the same name with 422 Invalid,
+// so a Job replaced since the read is refused the same way and the run
+// stops the recorded one.
 //
 // The pass's copy of the run can lag the stored run, and a resume is a
 // write that no later status conflict undoes. So the stored run is read
@@ -257,10 +260,8 @@ func (r *RestoreRunReconciler) resumeJob(ctx context.Context, run *backupv1alpha
 	}
 	err = r.jobs().ResumeJob(ctx, job)
 	switch {
-	case apierrors.IsForbidden(err):
+	case apierrors.IsForbidden(err) || apierrors.IsInvalid(err):
 		return refusedResume(item, job, err)
-	case apierrors.IsInvalid(err):
-		return r.invalidResume(ctx, item, job, err)
 	case err != nil:
 		return fmt.Errorf("resume restore Job %s: %w", job.Name, err)
 	}
@@ -294,37 +295,6 @@ func (r *RestoreRunReconciler) storedRunGoesOn(ctx context.Context, run *backupv
 	}
 	s := stored.Status.Items[index]
 	return s.Name == item.Name && s.Phase == backupv1alpha1.ItemRunning && s.Job == item.Job && s.JobUID == item.JobUID, nil
-}
-
-// invalidResume tells a resume the API server refused as Invalid because
-// the Job was replaced from one it refused for its own reasons.
-//
-// Parameters:
-//   - item is the Running volume item, which names its Job.
-//   - job is the item's Job as the pass read it before the resume.
-//   - err is the Invalid error of the resume.
-//
-// It returns the RestoreJobDeleted refusal of followJob when the Job is
-// gone or a Job with another UID now holds its name, the RestoreJobRefused
-// refusal of refusedResume when the name still holds the item's Job, and a
-// plain error, for a retry, when the Job can't be read again.
-//
-// The resume is a merge patch that carries the Job's UID. The API server
-// answers such a patch on a Job created again under the same name with
-// 422 Invalid ("metadata.uid: field is immutable"), which a kind check on
-// Kubernetes 1.36 confirmed, so an Invalid alone does not say whether the
-// server refused the resume or the Job the item records is gone.
-func (r *RestoreRunReconciler) invalidResume(ctx context.Context, item backupv1alpha1.RestoreItem, job *batchv1.Job, err error) error {
-	current, getErr := r.jobs().GetJob(ctx, client.ObjectKeyFromObject(job))
-	switch {
-	case apierrors.IsNotFound(getErr):
-		return jobDeleted(job.Name, false)
-	case getErr != nil:
-		return fmt.Errorf("resume restore Job %s: %w; read it again: %w", job.Name, err, getErr)
-	case current.UID != job.UID:
-		return jobDeleted(job.Name, true)
-	}
-	return refusedResume(item, job, err)
 }
 
 // refusedResume returns the refusal for a resume the API server refused.

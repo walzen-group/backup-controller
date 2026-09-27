@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -116,8 +115,8 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 		return r.waitAtChecks(ctx, run, busy)
 	}
 	run.Status.Items = items
-	if unreachable := unreachableItems(items); len(unreachable) > 0 {
-		return r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, strings.Join(unreachable, "; "))
+	if unreachable := unreachableItems(items); unreachable != "" {
+		return r.finish(ctx, run, backupv1alpha1.ReasonNoBackupInReach, unreachable)
 	}
 	if run.Spec.SyncDatabaseToVolume {
 		if synced == nil {
@@ -271,17 +270,12 @@ func (r *RestoreRunReconciler) checkClusterItem(ctx context.Context, run *backup
 //     reason OtherItemFailed. The run deleted and overwrote nothing yet.
 //
 // It returns one line for each Failed item, with its kind, name and
-// message, for the run's message. It returns none, and changes no item,
-// when no item failed.
-func unreachableItems(items []backupv1alpha1.RestoreItem) []string {
-	var unreachable []string
-	for _, item := range items {
-		if item.Phase == backupv1alpha1.ItemFailed {
-			unreachable = append(unreachable, fmt.Sprintf("%s %s: %s", item.Kind, item.Name, item.Message))
-		}
-	}
-	if len(unreachable) == 0 {
-		return nil
+// message, for the run's message (see restoreFailures). It returns "", and
+// changes no item, when no item failed.
+func unreachableItems(items []backupv1alpha1.RestoreItem) string {
+	unreachable := restoreFailures(items)
+	if unreachable == "" {
+		return ""
 	}
 	for i := range items {
 		if items[i].Phase == backupv1alpha1.ItemPending {
