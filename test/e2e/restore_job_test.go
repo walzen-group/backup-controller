@@ -557,7 +557,7 @@ spec:
       defaultRequest: {cpu: 10m}
 `, f.ns.Name, stopTestCPU))
 
-	pods := watchObjects[corev1.Pod](t, f.ns.Name, "pods", "app.kubernetes.io/component=restore")
+	pods := watchObjects[corev1.Pod](t, f.ns.Name, "pods", "-l", "app.kubernetes.io/component=restore")
 	f.applyRestore(t, "stopped", "")
 
 	var restorePod string
@@ -644,11 +644,13 @@ spec:
 	}
 }
 
-// objectWatch keeps the latest state of each object a kubectl watch reports,
-// including an object's last state before it was deleted.
+// objectWatch keeps every state of each object a kubectl watch reports, in
+// the order the watch reported them, including an object's last state before
+// it was deleted.
 type objectWatch[T any] struct {
 	mu    sync.Mutex
 	state map[string]T
+	seen  map[string][]T
 }
 
 // latest returns a copy of the latest state of every object seen, by name.
@@ -662,18 +664,26 @@ func (w *objectWatch[T]) latest() map[string]T {
 	return out
 }
 
+// history returns every state of the object name seen so far, oldest first.
+func (w *objectWatch[T]) history(name string) []T {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.seen[name])
+}
+
 // watchObjects starts kubectl get --watch for objects of a kind in namespace
-// that match selector, and records every state it reports until the test
-// ends.
+// that the selector arguments pick, and records every state it reports until
+// the test ends.
 //
 // Parameters:
 //   - kind: the resource, such as pods or jobs
-//   - selector: a label selector
-func watchObjects[T any](t *testing.T, namespace, kind, selector string) *objectWatch[T] {
+//   - selectArgs: kubectl's selector flags, such as -l with a label selector
+//     or --field-selector with metadata.name=<name>
+func watchObjects[T any](t *testing.T, namespace, kind string, selectArgs ...string) *objectWatch[T] {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "-n", namespace, "get", kind,
-		"-l", selector, "--watch", "--output-watch-events", "-o", "json")
+	args := append([]string{"--context", kubeContext, "-n", namespace, "get", kind}, selectArgs...)
+	cmd := exec.CommandContext(ctx, "kubectl", append(args, "--watch", "--output-watch-events", "-o", "json")...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -683,7 +693,7 @@ func watchObjects[T any](t *testing.T, namespace, kind, selector string) *object
 		cancel()
 		t.Fatalf("start the watch of %s: %v", kind, err)
 	}
-	w := &objectWatch[T]{state: map[string]T{}}
+	w := &objectWatch[T]{state: map[string]T{}, seen: map[string][]T{}}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -706,6 +716,7 @@ func watchObjects[T any](t *testing.T, namespace, kind, selector string) *object
 			}
 			w.mu.Lock()
 			w.state[meta.Metadata.Name] = obj
+			w.seen[meta.Metadata.Name] = append(w.seen[meta.Metadata.Name], obj)
 			w.mu.Unlock()
 		}
 	}()
