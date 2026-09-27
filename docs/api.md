@@ -243,9 +243,13 @@ that ended by a path that records no reason leaves it empty
 | SourceNotManaged | BackupRun | the claim has a ReplicationSource the controller did not write |
 | SourceRefused | BackupRun | the API server refused the ReplicationSource as invalid |
 | SourceAbandoned | BackupRun | the ReplicationSource still retries a backup that no run waits for |
-| ClusterMissing | BackupRun | the Cluster does not exist when the run starts the item |
+| ClusterMissing | both | the Cluster does not exist when the run starts or checks the item |
 | ClusterHibernated | BackupRun | the run skipped a hibernated Cluster |
 | BackupRefused | BackupRun | the API server refused the CloudNativePG Backup as invalid |
+| BackupFailed | BackupRun | the CloudNativePG Backup ended in the phase `failed` or `invalid backup definition`. The message carries the error from CloudNativePG |
+| RunEnded | BackupRun | the run ended before the item finished, for a cause other than the timeout. The run's `status.ending` says why the run ended |
+| NotStarted | BackupRun | the run did not start the item before the `backup.wlz.li/max-quiesce` limit ran out. The run then gave the workloads back |
+| CloneNotCut | BackupRun | VolSync did not cut the clone before the `backup.wlz.li/max-quiesce` limit ran out. The run then gave the workloads back |
 | RestoreJobFailed | RestoreRun | the restore Job ended with `Failed=True`, and the message carries restic's exit code and its meaning. The reason also applies in two other cases. The run's own Job restores a snapshot other than the one the run selected, or the run no longer controls the Job |
 | RestoreJobDeleted | RestoreRun | someone deleted the restore Job before it finished, or its name now holds a Job with another UID. The run records no result from it. The run gives nothing back until no pod of the Job can still write |
 | RestoreJobRefused | RestoreRun | the run created no restore Job, or the Job never ran. The API server refused the create or the resume as Forbidden or Invalid. Or the controller could not build the Job's spec. Or a Job that the run did not create holds its name. The run wrote nothing to the claim |
@@ -254,6 +258,11 @@ that ended by a path that records no reason leaves it empty
 | ClaimDeleting | RestoreRun | the claim was in deletion when the run was about to start the restore |
 | IntoClaimTaken | RestoreRun | the claim `spec.into` names holds a claim the run did not create |
 | ClusterRestoredElsewhere | RestoreRun | another unfinished RestoreRun restores the Cluster |
+| NoBackupInReach | RestoreRun | no backup is in reach of the run's moment. No snapshot or base backup is at or before the moment, or `spec.previous` reaches past the oldest one. For a synced restore, the items can also have no quiesced moment in common. The run wrote and deleted nothing |
+| ClusterArchivesNowhere | RestoreRun | the Cluster archives its WAL nowhere, so it has no backup to restore. The run skips the item |
+| OtherItemFailed | RestoreRun | the run left the item alone because another item failed. Before the restore starts, the cause is another item with no backup in reach. Later, the cause is a failed volume restore, and the run leaves the Cluster running |
+| ClusterLeftAlone | RestoreRun | the Cluster opts out of the bootstrap webhook or declares its own bootstrap method. The run cannot make the next creation of the Cluster its recovery, so it does not delete the Cluster |
+| ClusterNotRecovered | RestoreRun | the Cluster came back without the run's recovery, or someone deleted or replaced the recovered Cluster. The run leaves that Cluster alone |
 
 ### Ready reasons
 

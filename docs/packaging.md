@@ -32,11 +32,20 @@ backup-controller/
 ├── cmd/backup-controller/      the binary's main package
 ├── internal/
 │   ├── api/v1alpha1/           VolumeRestore, BackupRun, RestoreRun and the annotations
-│   ├── populator/              the three provider callbacks
-│   ├── restorejob/             building, reading and stopping the restore Job
-│   ├── runs/                   the BackupRun and RestoreRun reconcilers and the scheduler
 │   ├── bootstrap/              the Cluster webhook and the object store reads
-│   └── restic/                 reading a repository's snapshots over S3
+│   ├── cnpg/                   reads Clusters, and creates and reads their Backups
+│   ├── kueue/                  makes, reads and deletes the Kueue Workload of a run
+│   ├── populator/              the three provider callbacks and the cleanup reconciler
+│   ├── quiesce/                stops and starts workloads, suspends and resumes Kustomizations
+│   ├── restic/                 reads a repository's snapshots over S3, and rewrites a snapshot's time
+│   ├── restorejob/             builds, reads and stops the restic restore Job
+│   ├── runs/                   the BackupRun and RestoreRun reconcilers and the scheduler
+│   ├── served/                 finds the version at which the API server serves a kind
+│   └── testinfra/              test support: fakes, recorded stores, CRD copies and pins
+├── hack/
+│   ├── e2e/                    installs the controller and its dependencies into the e2e cluster
+│   ├── fixtures/               records the restic and barman fixtures, copies the CRDs
+│   └── movecheck/              shows that a step that only moves code changed none
 ├── config/
 │   ├── crd/                    generated CRD YAML, one file per kind
 │   └── samples/                a VolumeRestore and a claim that names it
