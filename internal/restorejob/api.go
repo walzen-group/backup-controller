@@ -26,9 +26,10 @@ type API interface {
 	// DeleteJob deletes the Job with Foreground propagation, and only the
 	// Job with the given one's UID.
 	DeleteJob(ctx context.Context, job *batchv1.Job) error
-	// ListJobPods lists the pods whose batch.kubernetes.io/controller-uid
-	// label is the Job's UID.
-	ListJobPods(ctx context.Context, job *batchv1.Job) ([]corev1.Pod, error)
+	// ListJobPods lists the pods of the given namespace whose
+	// batch.kubernetes.io/controller-uid label is the given Job UID. It finds
+	// them also after the Job is gone.
+	ListJobPods(ctx context.Context, namespace string, uid types.UID) ([]corev1.Pod, error)
 }
 
 // clientAPI is the API over controller-runtime clients.
@@ -90,12 +91,12 @@ func (a *clientAPI) DeleteJob(ctx context.Context, job *batchv1.Job) error {
 		client.Preconditions{UID: &uid})
 }
 
-// ListJobPods lists the Job's pods through the reader, by the label the Job
+// ListJobPods lists a Job's pods through the reader, by the label the Job
 // controller puts on every pod it creates.
-func (a *clientAPI) ListJobPods(ctx context.Context, job *batchv1.Job) ([]corev1.Pod, error) {
+func (a *clientAPI) ListJobPods(ctx context.Context, namespace string, uid types.UID) ([]corev1.Pod, error) {
 	pods := &corev1.PodList{}
-	if err := a.reader.List(ctx, pods, client.InNamespace(job.Namespace),
-		client.MatchingLabels{batchv1.ControllerUidLabel: string(job.UID)}); err != nil {
+	if err := a.reader.List(ctx, pods, client.InNamespace(namespace),
+		client.MatchingLabels{batchv1.ControllerUidLabel: string(uid)}); err != nil {
 		return nil, err
 	}
 	return pods.Items, nil

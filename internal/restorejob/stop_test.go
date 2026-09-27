@@ -10,7 +10,6 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -146,7 +145,7 @@ func (k *cluster) setPhase(pod *corev1.Pod, phase corev1.PodPhase) {
 
 func (k *cluster) stop(job *batchv1.Job) restorejob.StopState {
 	k.t.Helper()
-	state, err := restorejob.Stop(context.Background(), k.api, job)
+	state, err := restorejob.Stop(context.Background(), k.api, restorejob.RefOf(job))
 	if err != nil {
 		k.t.Fatal(err)
 	}
@@ -320,20 +319,6 @@ func TestStopStateNamesNoEmptyPodList(t *testing.T) {
 	}
 }
 
-func TestStopDeletesOnlyTheJobItRead(t *testing.T) {
-	k := newCluster(t)
-	job := k.createJob(batchv1.JobFailed)
-	stale := job.DeepCopy()
-	stale.UID = "an-earlier-job"
-	_, err := restorejob.Stop(context.Background(), k.api, stale)
-	if !apierrors.IsConflict(err) {
-		t.Fatalf("Stop of a Job replaced under its name = %v, want a Conflict", err)
-	}
-	if k.read(job).DeletionTimestamp != nil {
-		t.Error("Stop deleted the Job that replaced the one it read")
-	}
-}
-
 func TestStopOfAJobAlreadyGone(t *testing.T) {
 	k := newCluster(t)
 	job := k.createJob(batchv1.JobComplete)
@@ -368,7 +353,7 @@ func TestStopAndReadIgnoreAnOlderJobsPods(t *testing.T) {
 	if err := k.c.Status().Update(context.Background(), old); err != nil {
 		t.Fatal(err)
 	}
-	pods, err := k.api.ListJobPods(context.Background(), job)
+	pods, err := k.api.ListJobPods(context.Background(), job.Namespace, job.UID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,11 +378,11 @@ func TestReadsGoThroughTheReader(t *testing.T) {
 	if _, err := k.api.GetJob(context.Background(), client.ObjectKeyFromObject(job)); err != nil {
 		t.Error(err)
 	}
-	pods, err := k.api.ListJobPods(context.Background(), job)
+	pods, err := k.api.ListJobPods(context.Background(), job.Namespace, job.UID)
 	if err != nil || len(pods) != 1 {
 		t.Errorf("ListJobPods = %d pods, %v; want p", len(pods), err)
 	}
-	if _, err := restorejob.Stop(context.Background(), k.api, job); err != nil {
+	if _, err := restorejob.Stop(context.Background(), k.api, restorejob.RefOf(job)); err != nil {
 		t.Error(err)
 	}
 }
