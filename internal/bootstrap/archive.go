@@ -172,14 +172,21 @@ func ResolveLocation(
 // The webhook reads the status of that ObjectStore (see recordedBackup).
 //
 // The arguments, the Location and the errors are those of ResolveLocation.
-// The ObjectStore is nil when the error is not nil.
+// The ObjectStore is nil when the error is not nil. A destinationPath that is
+// missing or isn't an s3:// URL with a bucket gives a *destinationError (see
+// storeLocation).
 func resolveStore(
 	ctx context.Context,
 	c client.Reader,
 	mapper meta.RESTMapper,
 	namespace, objectStore, serverName string,
 ) (Location, *unstructured.Unstructured, error) {
-	at, store, err := archiveAt(ctx, c, mapper, namespace, objectStore, serverName)
+	key := types.NamespacedName{Namespace: namespace, Name: objectStore}
+	store, err := served.Get(ctx, c, mapper, objectStoreKind, key)
+	if err != nil {
+		return Location{}, nil, fmt.Errorf("read ObjectStore %s/%s: %w", namespace, objectStore, err)
+	}
+	at, err := storeLocation(store, serverName)
 	if err != nil {
 		return Location{}, nil, err
 	}
@@ -204,36 +211,8 @@ func resolveStore(
 	return at, store, nil
 }
 
-// archiveAt works out where one database archives from its ObjectStore alone,
-// reading no Secret. ResolveLocation builds on it.
-//
-// The arguments are those of ResolveLocation. It returns a Location with only
-// Endpoint, Bucket and Prefix set, and the ObjectStore it read so the caller
-// can follow its Secret references. It returns an error when the ObjectStore
-// can't be read, or when its spec.configuration.destinationPath is missing or
-// isn't an s3:// URL with a bucket. The second kind is a *destinationError,
-// and the first wraps the error the read returned.
-func archiveAt(
-	ctx context.Context,
-	c client.Reader,
-	mapper meta.RESTMapper,
-	namespace, objectStore, serverName string,
-) (Location, *unstructured.Unstructured, error) {
-	key := types.NamespacedName{Namespace: namespace, Name: objectStore}
-	store, err := served.Get(ctx, c, mapper, objectStoreKind, key)
-	if err != nil {
-		return Location{}, nil, fmt.Errorf("read ObjectStore %s/%s: %w", namespace, objectStore, err)
-	}
-
-	at, err := storeLocation(store, serverName)
-	if err != nil {
-		return Location{}, nil, err
-	}
-	return at, store, nil
-}
-
 // storeLocation works out where one database archives from an ObjectStore
-// already read. archiveAt calls it on the store it fetched, and the webhook's
+// already read. resolveStore calls it on the store it fetched, and the webhook's
 // collision check calls it on each store of one cluster-wide list.
 //
 // Parameters:
@@ -325,16 +304,7 @@ func endpointCA(
 	if err != nil || !found || key == "" {
 		return nil, fmt.Errorf("ObjectStore %s/%s names an endpointCA Secret with no key", namespace, store.GetName())
 	}
-
-	secret := &corev1.Secret{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, secret); err != nil {
-		return nil, fmt.Errorf("read endpointCA Secret %s/%s: %w", namespace, name, err)
-	}
-	bundle, ok := secret.Data[key]
-	if !ok {
-		return nil, fmt.Errorf("endpointCA Secret %s/%s has no key %q", namespace, name, key)
-	}
-	return bundle, nil
+	return secretValue(ctx, c, "endpointCA Secret", namespace, name, key)
 }
 
 // splitDestination splits a destinationPath such as s3://bucket/some/prefix/
@@ -382,14 +352,25 @@ func credential(
 	if err != nil || key == "" {
 		return "", fmt.Errorf("ObjectStore %s/%s has no s3Credentials.%s.key", namespace, store.GetName(), field)
 	}
+	value, err := secretValue(ctx, c, "Secret", namespace, name, key)
+	return string(value), err
+}
 
+// secretValue reads the entry under key of the Secret namespace/name.
+//
+// Parameters:
+//   - what names the Secret in the errors, such as "endpointCA Secret".
+//
+// It returns an error when the Secret can't be read or has no entry under
+// key.
+func secretValue(ctx context.Context, c client.Reader, what, namespace, name, key string) ([]byte, error) {
 	secret := &corev1.Secret{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, secret); err != nil {
-		return "", fmt.Errorf("read Secret %s/%s: %w", namespace, name, err)
+		return nil, fmt.Errorf("read %s %s/%s: %w", what, namespace, name, err)
 	}
 	value, ok := secret.Data[key]
 	if !ok {
-		return "", fmt.Errorf("secret %s/%s has no key %q", namespace, name, key)
+		return nil, fmt.Errorf("%s %s/%s has no key %q", what, namespace, name, key)
 	}
-	return string(value), nil
+	return value, nil
 }
