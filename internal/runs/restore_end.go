@@ -32,7 +32,8 @@ import (
 // volume item, a lost create's included (see settleJobs), so an item whose
 // Job has ended records how, and an item whose Job still waits for its pod
 // adds why to its message. A failed read comes back as an error for a
-// retry. The items it fails record no reason; the run's ending says why.
+// retry. The items it fails record reason RunEnded, and the run's ending
+// says why.
 // The Ready message also carries the note of each Cluster the run left
 // deleted (see leftDeletedNotes). A run past its deadline ends through
 // timeOut instead.
@@ -41,7 +42,7 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	failRemainingItems(run, message, "")
+	failRemainingItems(run, message, backupv1alpha1.ItemReasonRunEnded)
 	addWaits(run, waits)
 	return r.finish(ctx, run, reason, leftDeletedNotes(run.Status.Items, message))
 }
@@ -85,7 +86,8 @@ func (r *RestoreRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.
 //     the caller writes the status.
 //   - message is the run's Ready message.
 //   - reason is the reason each failed item records: ItemReasonTimedOut
-//     from timeOut, and none from abort, whose run's ending says why.
+//     from timeOut, and ItemReasonRunEnded from abort, whose run's ending
+//     says why.
 //
 // A Pending, Running or Recovering item gets the message as it is. A
 // Cluster item in phase Deleted records status.items[].clusterLeftDeleted,
@@ -131,7 +133,7 @@ func leftDeletedNotes(items []backupv1alpha1.RestoreItem, message string) string
 // Parameters:
 //   - item is one of the run's items, as its status records it.
 func leftDeleted(item backupv1alpha1.RestoreItem) bool {
-	return item.Kind == "Cluster" && (item.Phase == backupv1alpha1.ItemDeleted || item.ClusterLeftDeleted)
+	return item.Kind == backupv1alpha1.ItemKindCluster && (item.Phase == backupv1alpha1.ItemDeleted || item.ClusterLeftDeleted)
 }
 
 // finish ends the run and gives back what it holds.
@@ -250,16 +252,10 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 // before the finalizer is dropped would let another run take the claim over
 // while this run repeats its restart.
 //
-// Right before it drops the finalizer, finalize records a Warning event with
-// reason ClusterLeftDeleted, with the note from clusterLeftDeleted, for
-// each Cluster item still in phase Deleted and each one that records
-// status.items[].clusterLeftDeleted, which a run that timed out or aborted
-// set when it failed the item (see leftDeleted). The run is about to go,
-// so the event is the only place that note can appear. It reads the
-// Cluster first: one its owner has created again, with a UID other than the
-// item's clusterUID, gets no event, since the note speaks of a creation
-// still to come. A failed read comes back as an error, and the finalizer
-// stays until a retry gets past it.
+// Right before it drops the finalizer, finalize records the
+// ClusterLeftDeleted events (see announceLeftDeleted). A failed read of a
+// Cluster comes back as an error, and the finalizer stays until a retry
+// gets past it.
 func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return ctrl.Result{}, nil
@@ -280,21 +276,8 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return ctrl.Result{}, r.releaseFailed(ctx, run, leaseReleaseError(run, err))
 	}
-	if r.Recorder != nil {
-		for _, item := range run.Status.Items {
-			if !leftDeleted(item) {
-				continue
-			}
-			// A Cluster its owner has created again is back, and the note
-			// about its next creation would be wrong.
-			cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			if !found || cluster.GetUID() == item.ClusterUID {
-				r.Recorder.Eventf(run, nil, corev1.EventTypeWarning, "ClusterLeftDeleted", "Restore", "%s", fitNote(clusterLeftDeleted(item.Name)))
-			}
-		}
+	if err := r.announceLeftDeleted(ctx, run); err != nil {
+		return ctrl.Result{}, err
 	}
 	if err := dropFinalizer(ctx, r.Client, run); err != nil {
 		return ctrl.Result{}, err
@@ -310,6 +293,44 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 			"namespace", run.Namespace, "name", run.Name)
 	}
 	return ctrl.Result{}, nil
+}
+
+// announceLeftDeleted records a Warning event with reason
+// ClusterLeftDeleted, with the note from clusterLeftDeleted, for each
+// Cluster the run deleted and left deleted.
+//
+// Parameters:
+//   - run is the RestoreRun being deleted. Its items say which Clusters it
+//     left deleted: each Cluster item still in phase Deleted and each one
+//     that records status.items[].clusterLeftDeleted, which a run that timed
+//     out or aborted set when it failed the item (see leftDeleted).
+//
+// It returns the error of a failed read of a Cluster, and nil otherwise. It
+// records nothing when the reconciler has no event recorder.
+//
+// The run is about to go, so the event is the only place that note can
+// appear. It reads the Cluster first: one its owner has created again, with
+// a UID other than the item's clusterUID, gets no event, since the note
+// speaks of a creation still to come.
+func (r *RestoreRunReconciler) announceLeftDeleted(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+	if r.Recorder == nil {
+		return nil
+	}
+	for _, item := range run.Status.Items {
+		if !leftDeleted(item) {
+			continue
+		}
+		// A Cluster its owner has created again is back, and the note
+		// about its next creation would be wrong.
+		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
+		if err != nil {
+			return err
+		}
+		if !found || cluster.GetUID() == item.ClusterUID {
+			r.Recorder.Eventf(run, nil, corev1.EventTypeWarning, "ClusterLeftDeleted", "Restore", "%s", fitNote(clusterLeftDeleted(item.Name)))
+		}
+	}
+	return nil
 }
 
 // releaseFailed reports on the run that it could not stop one of its movers,
@@ -340,7 +361,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 func (r *RestoreRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.RestoreRun, err error) error {
 	reason, message := releaseFailure(err, releasePlan{
 		stopped: run.Status.Quiesced, suspended: run.Status.SuspendedKustomizations,
-		kind: "RestoreRun", deleting: !run.DeletionTimestamp.IsZero(), appDown: stopped(run),
+		kind: backupv1alpha1.KindRestoreRun, deleting: !run.DeletionTimestamp.IsZero(), appDown: stopped(run),
 	})
 	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
 	_ = r.writeStatus(ctx, run)

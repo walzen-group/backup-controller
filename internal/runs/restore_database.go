@@ -27,14 +27,45 @@ import (
 // RestoreRuns, the status write or the delete fails, and the caller retries.
 // It returns nil otherwise, with the item's new phase and message set.
 //
+// Each phase has its own step: startDatabase for a Pending item,
+// followDeleted for a Deleted item and followRecovering for a Recovering
+// item. An item in any other phase has finished, so there is nothing left
+// to restore.
+func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
+	switch item.Phase {
+	case backupv1alpha1.ItemPending:
+		return r.startDatabase(ctx, run, item)
+	case backupv1alpha1.ItemDeleted:
+		return r.followDeleted(ctx, run, item)
+	case backupv1alpha1.ItemRecovering:
+		return r.followRecovering(ctx, run, item)
+	case backupv1alpha1.ItemRunning, backupv1alpha1.ItemSucceeded, backupv1alpha1.ItemFailed, backupv1alpha1.ItemSkipped:
+		// An item in any other phase has finished, so there is nothing
+		// left to restore.
+	}
+	return nil
+}
+
+// startDatabase deletes the Cluster of a Pending database item.
+//
+// Parameters:
+//   - run is the RestoreRun the item belongs to. Its status is written
+//     before the delete.
+//   - item is the Pending Cluster item, which startDatabase updates in
+//     place.
+//
+// It returns an error when a read of the Cluster, the list of the
+// RestoreRuns, the status write or the delete fails, and the caller retries.
+//
 // A Pending item whose Cluster opts out of the bootstrap webhook, or whose
-// owner declares its own bootstrap method (see leftAlone), moves to Skipped,
-// and the run never deletes that Cluster. Right before it marks any other
-// Pending item Deleted, restoreDatabase checks again that no other unfinished
-// run is restoring the Cluster (see clustersRestoredElsewhere), because two
-// runs that planned in the same instant both passed the check at their plan.
-// When another run holds the Cluster, the item fails with the refusal,
-// naming that run, and the run deletes nothing.
+// owner declares its own bootstrap method (see leftAlone), moves to Skipped
+// with reason ClusterLeftAlone, and the run never deletes that Cluster.
+// Right before it marks any other Pending item Deleted, startDatabase checks
+// again that no other unfinished run is restoring the Cluster (see
+// clustersRestoredElsewhere), because two runs that planned in the same
+// instant both passed the check at their plan. When another run holds the
+// Cluster, the item fails with the refusal, naming that run, and the run
+// deletes nothing.
 //
 // The item is marked Deleted, and the status written, before the Cluster is
 // deleted. The bootstrap webhook recovers a Cluster only for a run whose item
@@ -42,107 +73,142 @@ import (
 // Cluster again. The same write records the old Cluster's UID in
 // status.items[].clusterUID. A run that found no Cluster to delete leaves its
 // item Deleted without a UID.
+func (r *RestoreRunReconciler) startDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
+	cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
+	if err != nil {
+		return err
+	}
+	if found && skipLeftAlone(item, cluster) {
+		return nil
+	}
+	// Two runs that planned in the same instant both passed this check
+	// at their plan. Checked again right before the mark, the second
+	// run finds the first one's item Pending or Deleted and deletes
+	// nothing; of two runs that get here together, each finds the other
+	// Pending and neither deletes.
+	err = r.clustersRestoredElsewhere(ctx, run, []backupv1alpha1.RestoreItem{*item})
+	if failRestoreItem(item, nothingDeleted(err)) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if found {
+		item.ClusterUID = cluster.GetUID()
+	}
+	item.Phase = backupv1alpha1.ItemDeleted
+	if err := r.writeStatus(ctx, run); err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	return r.deleteCluster(ctx, cluster)
+}
+
+// followDeleted follows a Deleted database item until the Cluster comes
+// back.
+//
+// Parameters:
+//   - run is the RestoreRun the item belongs to. Its name is the mark the
+//     bootstrap webhook sets on a Cluster it recovers for the run.
+//   - item is the Deleted Cluster item, which followDeleted updates in
+//     place.
+//
+// It returns an error when the read of the Cluster or the delete fails, and
+// the caller retries.
 //
 // A Deleted item waits while no Cluster of its name exists, or while one is
 // being deleted, and otherwise sorts the live Cluster into one of three kinds:
 //
 //   - The old Cluster, whose UID is the recorded one: the delete failed, or
 //     the controller stopped after the mark was written. The run deletes it
-//     again, or Skips the item when the Cluster opted out or declared its own
-//     bootstrap since. The webhook's backup.wlz.li/restore-run annotation
-//     stays on a recovered Cluster for good, so it says nothing on the old
-//     Cluster.
+//     again, or Skips the item with reason ClusterLeftAlone when the Cluster
+//     opted out or declared its own bootstrap since. The webhook's
+//     backup.wlz.li/restore-run annotation stays on a recovered Cluster for
+//     good, so it says nothing on the old Cluster.
 //   - This run's recovery: another UID and the annotation naming this run.
 //     The item moves to Recovering.
 //   - Any other Cluster: one created again empty by the owner's choice, with
 //     its own bootstrap, archiving nowhere, recovered for another run, or not
-//     seen by the webhook. The item fails with a message saying so (see
-//     notRecovered), and the run leaves the Cluster alone. It did not create
-//     that Cluster, and deleting it would only loop as Flux creates it again.
-//     An item without a recorded UID has no old Cluster, so any live Cluster
-//     that is not the run's recovery lands here.
-//
-// A Recovering item succeeds once the Cluster reports the healthy phase and
-// still carries the run's mark, and fails when the recovered Cluster is
-// deleted or replaced by one without the mark.
-func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
-	switch item.Phase {
-	case backupv1alpha1.ItemPending:
-		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
-		if err != nil {
-			return err
-		}
-		if found {
-			if why := leftAlone(cluster); why != "" {
-				item.Phase, item.Message = backupv1alpha1.ItemSkipped, why
-				return nil
-			}
-		}
-		// Two runs that planned in the same instant both passed this check
-		// at their plan. Checked again right before the mark, the second
-		// run finds the first one's item Pending or Deleted and deletes
-		// nothing; of two runs that get here together, each finds the other
-		// Pending and neither deletes.
-		err = r.clustersRestoredElsewhere(ctx, run, []backupv1alpha1.RestoreItem{*item})
-		if failRestoreItem(item, nothingDeleted(err)) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if found {
-			item.ClusterUID = cluster.GetUID()
-		}
-		item.Phase = backupv1alpha1.ItemDeleted
-		if err := r.writeStatus(ctx, run); err != nil {
-			return err
-		}
-		if !found {
+//     seen by the webhook. The item fails with reason ClusterNotRecovered and
+//     a message saying so (see notRecovered), and the run leaves the Cluster
+//     alone. It did not create that Cluster, and deleting it would only loop
+//     as Flux creates it again. An item without a recorded UID has no old
+//     Cluster, so any live Cluster that is not the run's recovery lands here.
+func (r *RestoreRunReconciler) followDeleted(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
+	cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
+	switch {
+	case err != nil:
+		return err
+	case !found || cluster.GetDeletionTimestamp() != nil:
+		return nil
+	case item.ClusterUID != "" && cluster.GetUID() == item.ClusterUID:
+		// The old Cluster, which the earlier delete did not reach. Its
+		// annotations say nothing about this run.
+		if skipLeftAlone(item, cluster) {
+			// Marked to be left alone before the delete reached it.
 			return nil
 		}
 		return r.deleteCluster(ctx, cluster)
-
-	case backupv1alpha1.ItemDeleted:
-		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
-		switch {
-		case err != nil:
-			return err
-		case !found || cluster.GetDeletionTimestamp() != nil:
-			return nil
-		case item.ClusterUID != "" && cluster.GetUID() == item.ClusterUID:
-			// The old Cluster, which the earlier delete did not reach. Its
-			// annotations say nothing about this run.
-			if why := leftAlone(cluster); why != "" {
-				// Marked to be left alone before the delete reached it.
-				item.Phase, item.Message = backupv1alpha1.ItemSkipped, why
-				return nil
-			}
-			return r.deleteCluster(ctx, cluster)
-		case cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun] == run.Name:
-			item.Phase = backupv1alpha1.ItemRecovering
-		default:
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, notRecovered(item, cluster)
-		}
-
-	case backupv1alpha1.ItemRecovering:
-		cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
-		switch {
-		case err != nil:
-			return err
-		case !found || cluster.GetDeletionTimestamp() != nil:
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, "the recovered Cluster was deleted"
-		case cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun] != run.Name:
-			// The webhook recovers a Cluster only for a run whose item says
-			// Deleted, so one created again now carries no mark of this run.
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, "the recovered Cluster was replaced by one this run did not recover"
-		case cnpg.Phase(cluster) == cnpg.HealthyPhase:
-			item.Phase = backupv1alpha1.ItemSucceeded
-		}
+	case cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun] == run.Name:
+		item.Phase = backupv1alpha1.ItemRecovering
 	default:
-		// An item in any other phase has finished, so there is nothing
-		// left to restore.
+		failRestoreItem(item, notRecovered(item, cluster))
 	}
 	return nil
+}
+
+// followRecovering follows a Recovering database item until the recovered
+// Cluster is healthy.
+//
+// Parameters:
+//   - run is the RestoreRun the item belongs to. Its name is the mark the
+//     bootstrap webhook sets on a Cluster it recovers for the run.
+//   - item is the Recovering Cluster item, which followRecovering updates
+//     in place.
+//
+// It returns an error when the read of the Cluster fails, and the caller
+// retries.
+//
+// A Recovering item succeeds once the Cluster reports the healthy phase and
+// still carries the run's mark. It fails with reason ClusterNotRecovered when
+// the recovered Cluster is deleted or replaced by one without the mark.
+func (r *RestoreRunReconciler) followRecovering(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) error {
+	cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, item.Name)
+	switch {
+	case err != nil:
+		return err
+	case !found || cluster.GetDeletionTimestamp() != nil:
+		failRestoreItem(item, refuse(backupv1alpha1.ItemReasonClusterNotRecovered, "the recovered Cluster was deleted"))
+	case cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreRun] != run.Name:
+		// The webhook recovers a Cluster only for a run whose item says
+		// Deleted, so one created again now carries no mark of this run.
+		failRestoreItem(item, refuse(backupv1alpha1.ItemReasonClusterNotRecovered, "the recovered Cluster was replaced by one this run did not recover"))
+	case cnpg.Phase(cluster) == cnpg.HealthyPhase:
+		item.Phase = backupv1alpha1.ItemSucceeded
+	}
+	return nil
+}
+
+// skipLeftAlone skips a database item whose Cluster the run must leave
+// alone (see leftAlone).
+//
+// Parameters:
+//   - item is the Cluster item, which skipLeftAlone updates in place.
+//   - cluster is the Cluster the run has not deleted: the live one of a
+//     Pending item, or the old one a Deleted item finds still there.
+//
+// It returns true when it moved the item to Skipped, with reason
+// ClusterLeftAlone and the refusal's text as the message. It returns false,
+// and leaves the item as it was, when the run may delete the Cluster.
+func skipLeftAlone(item *backupv1alpha1.RestoreItem, cluster *unstructured.Unstructured) bool {
+	err := leftAlone(cluster)
+	if err == nil {
+		return false
+	}
+	item.Phase, item.Reason, item.Message = backupv1alpha1.ItemSkipped, backupv1alpha1.ItemReasonClusterLeftAlone, err.Error()
+	return true
 }
 
 // notRecovered explains why a live Cluster that a Deleted item finds is not
@@ -163,7 +229,10 @@ func (r *RestoreRunReconciler) restoreDatabase(ctx context.Context, run *backupv
 // Without a recorded UID the message gives the same reason and says the run
 // can't tell whether this is the Cluster it meant to delete. Every message
 // says the run leaves the Cluster alone.
-func notRecovered(item *backupv1alpha1.RestoreItem, cluster *unstructured.Unstructured) string {
+//
+// It returns a *refusalError with reason ClusterNotRecovered, which fails
+// the item. Its text is the item's message.
+func notRecovered(item *backupv1alpha1.RestoreItem, cluster *unstructured.Unstructured) error {
 	name, uid := cluster.GetName(), cluster.GetUID()
 	optedOut := cluster.GetAnnotations()[bootstrap.OptOutAnnotation] == bootstrap.OptOutValue
 	method := bootstrap.OwnerBootstrap(cluster)
@@ -183,21 +252,21 @@ func notRecovered(item *backupv1alpha1.RestoreItem, cluster *unstructured.Unstru
 	}
 
 	if item.ClusterUID == "" {
-		return fmt.Sprintf("Cluster %s (UID %s) is not this run's recovery: %s. The item holds no clusterUID, "+
+		return refuse(backupv1alpha1.ItemReasonClusterNotRecovered, "Cluster %s (UID %s) is not this run's recovery: %s. The item holds no clusterUID, "+
 			"because the run found no Cluster at its start, so it can't tell the old Cluster from a new one, "+
 			"and it leaves this one alone. Create a new RestoreRun to restore it", name, uid, why)
 	}
 	switch {
 	case optedOut:
-		return fmt.Sprintf("Cluster %s came back carrying %s: %s after this run deleted it, so it started empty and nothing was restored. "+
+		return refuse(backupv1alpha1.ItemReasonClusterNotRecovered, "Cluster %s came back carrying %s: %s after this run deleted it, so it started empty and nothing was restored. "+
 			"Remove the annotation from its manifest and create a new RestoreRun to recover it. The run leaves the Cluster alone",
 			name, bootstrap.OptOutAnnotation, bootstrap.OptOutValue)
 	case method != "":
-		return fmt.Sprintf("Cluster %s came back declaring spec.bootstrap.%s after this run deleted it, so it started from that bootstrap and nothing was restored. "+
+		return refuse(backupv1alpha1.ItemReasonClusterNotRecovered, "Cluster %s came back declaring spec.bootstrap.%s after this run deleted it, so it started from that bootstrap and nothing was restored. "+
 			"Remove spec.bootstrap.%s from its manifest and create a new RestoreRun to recover it. The run leaves the Cluster alone",
 			name, method, method)
 	}
-	return fmt.Sprintf("Cluster %s (UID %s) came back without this run's recovery: %s. The run does not delete a Cluster it did not recover",
+	return refuse(backupv1alpha1.ItemReasonClusterNotRecovered, "Cluster %s (UID %s) came back without this run's recovery: %s. The run does not delete a Cluster it did not recover",
 		name, uid, why)
 }
 
@@ -240,9 +309,9 @@ func clusterLeftDeleted(cluster string) string {
 		"the moment this run chose no longer applies", cluster, backupv1alpha1.AnnotationRestoreAsOf)
 }
 
-// leftAlone says why a run must not restore a Cluster, and returns an empty
-// string when it may. The run never deletes a Cluster whose next creation it
-// can't turn into its recovery:
+// leftAlone refuses a Cluster that a run must not restore, and returns nil
+// when the run may restore it. The run never deletes a Cluster whose next
+// creation it can't turn into its recovery:
 //
 //   - A Cluster carrying backup.wlz.li/bootstrap: initdb opts out of the
 //     bootstrap webhook. The webhook lets it through empty and never marks it
@@ -258,14 +327,15 @@ func clusterLeftDeleted(cluster string) string {
 // Pending item, and of the old Cluster (the recorded UID) that a Deleted item
 // finds still there. A Cluster created again after the delete is never
 // Skipped, since it came back without the restore; restoreDatabase fails
-// that item (see notRecovered). The returned text is the item's message.
-func leftAlone(cluster *unstructured.Unstructured) string {
+// that item (see notRecovered). The refusal is a *refusalError with reason
+// ClusterLeftAlone, and its text is the item's message.
+func leftAlone(cluster *unstructured.Unstructured) error {
 	if cluster.GetAnnotations()[bootstrap.OptOutAnnotation] == bootstrap.OptOutValue {
-		return fmt.Sprintf("the Cluster carries %s: %s, which asks for an empty database, so the run leaves it alone",
+		return refuse(backupv1alpha1.ItemReasonClusterLeftAlone, "the Cluster carries %s: %s, which asks for an empty database, so the run leaves it alone",
 			bootstrap.OptOutAnnotation, bootstrap.OptOutValue)
 	}
 	if method := bootstrap.OwnerBootstrap(cluster); method != "" {
-		return fmt.Sprintf("the Cluster declares its own spec.bootstrap.%s, so the run leaves it alone", method)
+		return refuse(backupv1alpha1.ItemReasonClusterLeftAlone, "the Cluster declares its own spec.bootstrap.%s, so the run leaves it alone", method)
 	}
-	return ""
+	return nil
 }

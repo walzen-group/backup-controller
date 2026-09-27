@@ -158,4 +158,15 @@ const (
 	// ItemReasonOtherItemFailed is an item the run left alone because
 	// another item of the run failed.
 	ItemReasonOtherItemFailed ItemReason = "OtherItemFailed"
+
+	// ItemReasonClusterLeftAlone is a database restore whose Cluster opts
+	// out of the bootstrap webhook or declares its own bootstrap method.
+	// The run cannot turn the next creation of that Cluster into its
+	// recovery, so it does not delete the Cluster.
+	ItemReasonClusterLeftAlone ItemReason = "ClusterLeftAlone"
+
+	// ItemReasonClusterNotRecovered is a database restore whose Cluster
+	// came back without the run's recovery, or whose recovered Cluster was
+	// deleted or replaced. The run leaves that Cluster alone.
+	ItemReasonClusterNotRecovered ItemReason = "ClusterNotRecovered"
 )

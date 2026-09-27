@@ -305,18 +305,22 @@ func unreachableItems(items []backupv1alpha1.RestoreItem) []string {
 // spec.database names one Cluster. A run with neither takes every claim and
 // every Cluster in the namespace marked backup.wlz.li/enabled: "true" (see
 // enabledItems). A Cluster that archives nowhere has no backup to restore, so
-// its item starts out Skipped with reason ClusterArchivesNowhere. So does a Cluster that opts out of the bootstrap webhook, or
-// whose owner declares its own bootstrap method (see leftAlone).
+// its item starts out Skipped with reason ClusterArchivesNowhere. A Cluster
+// that opts out of the bootstrap webhook, or whose owner declares its own
+// bootstrap method, starts out Skipped with reason ClusterLeftAlone (see
+// leftAlone).
 //
 // It returns an *invalidSpecError, which plan turns into reason Invalid: when
 // spec.repository is set and spec.claim is not, since a restore in place
 // needs a claim to write into, and the refusal sends the user to spec.into
 // with a name no claim has, or to spec.claim to overwrite an existing claim
-// in place; when nothing in the namespace is marked; and when spec.database
-// names a Cluster that opts out of the bootstrap webhook or declares its own
-// bootstrap. It returns the *refusalError of clustersRestoredElsewhere, which
-// plan turns into reason Invalid as well, when another unfinished RestoreRun
-// is restoring a Cluster the run would restore.
+// in place; and when nothing in the namespace is marked. It returns the
+// *refusalError of leftAlone, which plan turns into reason Invalid as well,
+// when spec.database names a Cluster that opts out of the bootstrap webhook
+// or declares its own bootstrap. It returns the *refusalError of
+// clustersRestoredElsewhere, which plan turns into reason Invalid as well,
+// when another unfinished RestoreRun is restoring a Cluster the run would
+// restore.
 // A failed read comes back as a plain error, and the caller retries.
 func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	var items []backupv1alpha1.RestoreItem
@@ -352,18 +356,20 @@ func pendingRestore(kind, name string) backupv1alpha1.RestoreItem {
 // Parameters:
 //   - run is the RestoreRun being planned, with spec.database set.
 //
-// It returns one Pending Cluster item. It returns an *invalidSpecError when
-// the Cluster exists and the run must leave it alone (see leftAlone), and a
-// plain error when the read of the Cluster fails. A missing Cluster gives an
-// item too, and checkDatabase fails it.
+// It returns one Pending Cluster item. It returns the refusal of leftAlone,
+// wrapped with the Cluster's name, when the Cluster exists and the run must
+// leave it alone. plan ends the run with reason Invalid (see asRunRefusal),
+// and no item records it. It returns a plain error when the read of the
+// Cluster fails. A missing Cluster gives an item too, and checkDatabase
+// fails it.
 func (r *RestoreRunReconciler) databaseItems(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	cluster, found, err := cnpg.GetCluster(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Spec.Database)
 	if err != nil {
 		return nil, err
 	}
 	if found {
-		if why := leftAlone(cluster); why != "" {
-			return nil, invalidSpec("Cluster %s: %s", run.Spec.Database, why)
+		if err := leftAlone(cluster); err != nil {
+			return nil, fmt.Errorf("%s %s: %w", backupv1alpha1.ItemKindCluster, run.Spec.Database, err)
 		}
 	}
 	return []backupv1alpha1.RestoreItem{pendingRestore(backupv1alpha1.ItemKindCluster, run.Spec.Database)}, nil
@@ -378,10 +384,11 @@ func (r *RestoreRunReconciler) databaseItems(ctx context.Context, run *backupv1a
 //     and Clusters are listed.
 //
 // It returns the items, claims first. A Cluster the run must leave alone
-// (see leftAlone) starts out Skipped. A Cluster that archives nowhere has no
-// backup to restore, so its item starts out Skipped with reason
-// ClusterArchivesNowhere. It returns an *invalidSpecError when nothing in
-// the namespace is marked, and a plain error when a list fails.
+// (see leftAlone) starts out Skipped with reason ClusterLeftAlone. A
+// Cluster that archives nowhere has no backup to restore, so its item
+// starts out Skipped with reason ClusterArchivesNowhere. It returns an
+// *invalidSpecError when nothing in the namespace is marked, and a plain
+// error when a list fails.
 func (r *RestoreRunReconciler) enabledItems(ctx context.Context, run *backupv1alpha1.RestoreRun) ([]backupv1alpha1.RestoreItem, error) {
 	claims, err := enabledClaims(ctx, r.Reader, run.Namespace)
 	if err != nil {
@@ -397,9 +404,7 @@ func (r *RestoreRunReconciler) enabledItems(ctx context.Context, run *backupv1al
 	}
 	for i := range clusters {
 		item := pendingRestore(backupv1alpha1.ItemKindCluster, clusters[i].GetName())
-		if why := leftAlone(&clusters[i]); why != "" {
-			item.Phase, item.Message = backupv1alpha1.ItemSkipped, why
-		} else if _, _, archives := bootstrap.Archiver(&clusters[i]); !archives {
+		if _, _, archives := bootstrap.Archiver(&clusters[i]); !skipLeftAlone(&item, &clusters[i]) && !archives {
 			item.Phase, item.Reason = backupv1alpha1.ItemSkipped, backupv1alpha1.ItemReasonClusterArchivesNowhere
 			item.Message = "the Cluster archives nowhere, so it has no backup to restore"
 		}

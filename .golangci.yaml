@@ -121,7 +121,7 @@ linters:
       - path: '^internal/quiesce/restart\.go$'
         linters: [funlen, gocognit]
         source: '^func Restart\('
-      - path: '^internal/runs/(clusterwebhook|release_report|restore_end|restore_quiesce)\.go$'
+      - path: '^internal/runs/(clusterwebhook|release_report)\.go$'
         linters: [goconst]
       - path: '^internal/runs/crdcheck\.go$'
         linters: [funlen, gocognit]
@@ -130,18 +130,6 @@ linters:
         linters: [revive]
         text: '^confusing-results:'
         source: '^func releaseFailure\('
-      - path: '^internal/runs/restore_database\.go$'
-        linters: [funlen, gocognit]
-        source: '^func \(r \*RestoreRunReconciler\) restoreDatabase\('
-      - path: '^internal/runs/restore_quiesce\.go$'
-        linters: [funlen, gocognit]
-        source: '^func \(r \*RestoreRunReconciler\) quiesce\('
-      - path: '^internal/runs/restore_end\.go$'
-        linters: [funlen, gocognit]
-        source: '^func \(r \*RestoreRunReconciler\) finalize\('
-      - path: '^internal/runs/restore_quiesce\.go$'
-        linters: [nestif]
-        source: '^\s*if len\(run\.Status\.Quiesced\) == 0 \{$'
       - path: '^internal/runs/schedule\.go$'
         linters: [funlen, gocognit]
         source: '^func \(s \*Scheduler\) Reconcile\('

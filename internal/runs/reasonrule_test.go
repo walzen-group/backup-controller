@@ -46,9 +46,8 @@ type reasonRuleEntry struct {
 // chose: refuse stores the reason of a checked call, the item failures
 // copy a *refusalError's reason into the item, and failRemainingItems
 // passes its checked reason to refuse. The constant reasons these
-// declarations set of their own are checked. abort passes no reason until
-// RestoreRun step R5 adds RunEnded, and that step empties its entry. A new
-// entry needs a reviewer's eye like any rule exception.
+// declarations set of their own are checked. A new entry needs a
+// reviewer's eye like any rule exception.
 var reasonForwardingAllowlist = []reasonRuleEntry{
 	{file: "failure.go", decl: "refuse", forwarded: []string{"reason"},
 		what: "stores its reason parameter, which the rule checks at every call"},
@@ -60,8 +59,6 @@ var reasonForwardingAllowlist = []reasonRuleEntry{
 		what: "copies the reason asItemFailure returned"},
 	{file: "restore_end.go", decl: "failRemainingItems", forwarded: []string{"reason"},
 		what: "passes to refuse the reason its callers give, which the rule checks at every call"},
-	{file: "restore_end.go", decl: "RestoreRunReconciler.abort", forwarded: []string{`""`},
-		what: "the items abort fails record no reason until RestoreRun step R5 adds RunEnded"},
 }
 
 // reasonListUse is one value of an entry, as applyReasonList reports it
