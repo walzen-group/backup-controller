@@ -51,8 +51,8 @@ func jobRef(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem) res
 //   - index is the item's position in status.items.
 //
 // It returns the Job, or nil when there is none, and an error from any
-// other failed read. The Job may be one the run does not control; the
-// caller checks.
+// other failed read. The Job may be one the run did not create; the
+// caller checks (see jobOfRun).
 func (r *RestoreRunReconciler) lostJob(ctx context.Context, run *backupv1alpha1.RestoreRun, index int) (*batchv1.Job, error) {
 	name := jobName(run.UID, index)
 	job, err := r.jobs().GetJob(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name})
@@ -63,6 +63,23 @@ func (r *RestoreRunReconciler) lostJob(ctx context.Context, run *backupv1alpha1.
 		return nil, fmt.Errorf("get restore Job %s: %w", name, err)
 	}
 	return job, nil
+}
+
+// jobOfRun reports whether the Job that holds the name of one of a run's
+// restore Jobs is one the run created.
+//
+// Parameters:
+//   - job is the Job under the name, which jobName binds to the run.
+//   - run is the RestoreRun.
+//
+// It returns true when the Job's restore-run label
+// (restorejob.LabelRestoreRun), which Build sets, holds the run's UID. The
+// name and the label decide, and the controller reference does not: a
+// delete of the run with --cascade=orphan makes the garbage collector remove
+// that reference while the run's finalizer still holds the run, and the run
+// must still stop the Job then.
+func jobOfRun(job *batchv1.Job, run *backupv1alpha1.RestoreRun) bool {
+	return job.Labels[restorejob.LabelRestoreRun] == string(run.UID)
 }
 
 // recheckJobSnapshot lists the repository again right before the run
@@ -290,7 +307,7 @@ func (l jobList) message() string {
 // waiting on an error, and the next pass tries again.
 //
 // A chosen volume item that has not finished and names no Job gets the one
-// the run controls under the item's name, if there is one (see
+// the run created under the item's name, if there is one (see
 // nameLostJob): a pass that created it and lost the status write left it
 // unnamed. Each Job is stopped through restorejob.Stop by the recorded Ref:
 // suspended, then deleted once no pod of its UID can still write. An item
@@ -324,7 +341,7 @@ func (r *RestoreRunReconciler) stopJobs(ctx context.Context, run *backupv1alpha1
 }
 
 // nameLostJob records on an unfinished item that names no restore Job the
-// Job the run controls under the item's name, so the run stops it.
+// Job the run created under the item's name, so the run stops it.
 //
 // Parameters:
 //   - run is the RestoreRun.
@@ -344,7 +361,7 @@ func (r *RestoreRunReconciler) nameLostJob(ctx context.Context, run *backupv1alp
 		return nil
 	}
 	job, err := r.lostJob(ctx, run, index)
-	if job == nil || err != nil || !metav1.IsControlledBy(job, run) {
+	if job == nil || err != nil || !jobOfRun(job, run) {
 		return err
 	}
 	item.Job, item.JobUID = job.Name, job.UID

@@ -227,13 +227,15 @@ func TestTakeoverChecksTheSnapshotIDAnnotation(t *testing.T) {
 	}
 }
 
-// A Job the run does not control that holds the name of the item's restore
-// Job fails the item with reason RestoreJobRefused. The run leaves that Job
-// alone: it neither suspends nor deletes it.
+// A Job the run did not create, with neither a controller reference to the
+// run nor the run's UID in its restore-run label, that holds the name of
+// the item's restore Job fails the item with reason RestoreJobRefused. The
+// run leaves that Job alone: it neither suspends nor deletes it.
 func TestARestoreRefusesAJobItDidNotCreate(t *testing.T) {
 	run := checkedRestore(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN })
 	foreign := restoreJobFor(t, run, claimN, monday.ID)
 	foreign.OwnerReferences = nil
+	delete(foreign.Labels, restorejob.LabelRestoreRun)
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(), foreign)
 	restoreStep(t, r)
 	restoreStep(t, r)

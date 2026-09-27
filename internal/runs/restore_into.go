@@ -57,14 +57,14 @@ func (r *RestoreRunReconciler) restoreIntoEmptyClaim(ctx context.Context, run *b
 //
 // It returns what the pass returns (see restoreIntoEmptyClaim).
 //
-// A Job the run controls under the item's name was created by a pass that
-// ran every check and lost the status write that recorded it, and the item
-// takes it over when it restores the recorded full ID (see takeOverJob).
-// The status write that follows records the Job's name and UID together. A
-// Job with another ID, or one the run does not control, fails the item,
-// and the run ends Failed. A run past its deadline before it has a Job ends
-// with reason TimedOut. Otherwise the checks right before the create run,
-// and the claim and the Job are created (see createInto).
+// A Job the run created under the item's name (see jobOfRun) comes from a
+// pass that ran every check and lost the status write that recorded it,
+// and the item takes it over when it restores the recorded full ID (see
+// takeOverJob). The status write that follows records the Job's name and
+// UID together. A Job with another ID, or one the run did not create,
+// fails the item, and the run ends Failed. A run past its deadline before
+// it has a Job ends with reason TimedOut. Otherwise the checks right before
+// the create run, and the claim and the Job are created (see createInto).
 func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (ctrl.Result, error) {
 	taken, err := r.takeOverJob(ctx, run, 0, item)
 	if done, err := settled(item, err); done {

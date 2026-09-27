@@ -49,7 +49,7 @@ func settled(item *backupv1alpha1.RestoreItem, err error) (bool, error) {
 // waits. It returns an error, and leaves the item as it was, when an API
 // call or the listing fails for a reason a retry may fix.
 //
-// A Job the run controls under the item's name is taken over before
+// A Job the run created under the item's name is taken over before
 // anything else (see takeOverJob). Any other Pending item waits until no pod
 // mounts the claim, then passes the start checks (see startRefusal), takes
 // the Leases, and lists the repository again (see recheckJobSnapshot). A
@@ -119,16 +119,16 @@ func (r *RestoreRunReconciler) startJob(ctx context.Context, run *backupv1alpha1
 //
 // An item that records a Job UID already had its Job, so it moves to
 // Running and is never given a second one: Stop gates only on the pods of
-// the recorded UID. A Job the run controls under the item's name means an
-// earlier pass ran every start check, created the Job, and lost the status
-// write that recorded it. The item takes it over, records its name and UID
-// in the same status write, and moves to Running, but only when the Job's
-// snapshot-id annotation is the full ID the item recorded. A Job with
-// another ID is the controller's own bug: the refusal has reason
-// RestoreJobFailed, the item keeps the Job's name and UID, and the run stops
-// that Job like any other. A Job the run does not control under that name
-// gives a refusal with reason RestoreJobRefused, and the run leaves that Job
-// alone.
+// the recorded UID. A Job the run created under the item's name (see
+// jobOfRun) means an earlier pass ran every start check, created the Job,
+// and lost the status write that recorded it. The item takes it over,
+// records its name and UID in the same status write, and moves to Running,
+// but only when the Job's snapshot-id annotation is the full ID the item
+// recorded. A Job with another ID is the controller's own bug: the refusal
+// has reason RestoreJobFailed, the item keeps the Job's name and UID, and
+// the run stops that Job like any other. A Job the run did not create under
+// that name gives a refusal with reason RestoreJobRefused, and the run
+// leaves that Job alone.
 func (r *RestoreRunReconciler) takeOverJob(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (bool, error) {
 	if item.JobUID != "" {
 		item.Phase = backupv1alpha1.ItemRunning
@@ -138,7 +138,7 @@ func (r *RestoreRunReconciler) takeOverJob(ctx context.Context, run *backupv1alp
 	if job == nil || err != nil {
 		return false, err
 	}
-	if !metav1.IsControlledBy(job, run) {
+	if !jobOfRun(job, run) {
 		return true, refuse(backupv1alpha1.ItemReasonRestoreJobRefused,
 			"a Job named %s that the run did not create holds the name of the item's restore Job; the run started no restore and leaves that Job alone", job.Name)
 	}

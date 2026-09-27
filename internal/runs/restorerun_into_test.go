@@ -235,10 +235,10 @@ func plannedInto() *backupv1alpha1.RestoreRun {
 	})
 }
 
-// A restore Job the run controls under the into item's name whose
+// A restore Job the run created under the into item's name whose
 // snapshot-id annotation is not the recorded full ID fails the item with
 // reason RestoreJobFailed naming both IDs, and the run stops that Job. A
-// Job of that name the run does not control fails the item with reason
+// Job of that name the run did not create fails the item with reason
 // RestoreJobRefused and is left alone.
 func TestAnIntoTakeoverChecksTheJob(t *testing.T) {
 	t.Run("another ID", func(t *testing.T) {
@@ -264,6 +264,7 @@ func TestAnIntoTakeoverChecksTheJob(t *testing.T) {
 		run := plannedInto()
 		foreign := restoreJobFor(t, run, run.Spec.Into, monday.ID)
 		foreign.OwnerReferences = nil
+		delete(foreign.Labels, restorejob.LabelRestoreRun)
 		r, c := restoreReconciler(t, nil, run, sourceOnNode(), volumeRestore(), repository(), foreign)
 		done := stepUntilFinished(t, r, c, 3)
 

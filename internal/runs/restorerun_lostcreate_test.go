@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // The tests in this file cover an in-place restore whose pass created the
@@ -147,6 +148,72 @@ func TestATimeoutRecordsTheJobOfALostCreate(t *testing.T) {
 			}
 			if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
 				t.Errorf("phase = %q, reason = %q; want Failed, %s", done.Status.Phase, readyReason(done.Status.Conditions), backupv1alpha1.ReasonTimedOut)
+			}
+		})
+	}
+}
+
+// orphanedLostJob returns the restore Job a pass created for the run's
+// first item and lost the status write of, after someone deleted the run
+// with --cascade=orphan: the garbage collector has removed the Job's
+// controller reference while the run's finalizer holds the run. The Job
+// keeps its name and its restore-run label.
+func orphanedLostJob(t *testing.T, run *backupv1alpha1.RestoreRun, claimName string) *batchv1.Job {
+	t.Helper()
+	job := restoreJobFor(t, run, claimName, monday.ID)
+	job.OwnerReferences = nil
+	return job
+}
+
+// A run deleted with --cascade=orphan after a pass created a restore Job and
+// lost the status write that recorded it still stops that Job: the Job's
+// name and its restore-run label bind it to the run, although the garbage
+// collector removed its controller reference. The run suspends the Job and
+// keeps its finalizer, and a quiesced run keeps the app down, until the
+// Job's pod has ended. That holds for an in-place and an into restore.
+func TestARunDeletedWithOrphanStopsTheJobOfALostCreate(t *testing.T) {
+	quiesced := checkedRestore(quiescedInPlace, func(r *backupv1alpha1.RestoreRun) {
+		r.Finalizers = []string{Finalizer}
+		r.Status.QuiescedAt = atFrozen(0)
+		r.Status.Quiesced = []backupv1alpha1.QuiescedWorkload{{Kind: "Deployment", Name: appN, Replicas: 2}}
+		r.Status.SuspendedKustomizations = []string{"flux-system/" + appN}
+	})
+	into := plannedInto()
+	for name, tc := range map[string]struct {
+		run     *backupv1alpha1.RestoreRun
+		claim   string
+		objects []client.Object
+	}{
+		"in place": {quiesced, claimN, []client.Object{claim(), stoppedDeployment(), kustomization(true)}},
+		"into":     {into, into.Spec.Into, []client.Object{intoClaim(into), sourceOnNode()}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			job := orphanedLostJob(t, tc.run, tc.claim)
+			pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
+			r, c := restoreReconciler(t, nil, append(tc.objects, tc.run, volumeRestore(), repository(), job, pod)...)
+			if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
+				t.Fatal(err)
+			}
+			restoreStep(t, r)
+			markSuspended(t, c, job)
+			restoreStep(t, r)
+
+			waiting := readRestoreRun(t, c)
+			if !suspendedJob(t, c, job.Name) || len(waiting.Finalizers) == 0 || !strings.Contains(readyMessage(waiting.Status.Conditions), pod.Name) {
+				t.Fatalf("Job suspended = %t, finalizers = %v, message = %q; want the Job stopped and the run waiting for pod %s",
+					suspendedJob(t, c, job.Name), waiting.Finalizers, readyMessage(waiting.Status.Conditions), pod.Name)
+			}
+			if tc.run.Spec.Into == "" && replicasOf(t, c) != 0 {
+				t.Errorf("replicas = %d while pod %s runs, want the app still down", replicasOf(t, c), pod.Name)
+			}
+
+			setPodPhase(t, c, pod, corev1.PodFailed)
+			restoreStep(t, r)
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{}); !apierrors.IsNotFound(err) {
+				t.Errorf("RestoreRun = %v, want it gone once the pod had ended", err)
+			}
+			if jobs := restoreJobs(t, c); len(jobs) != 0 {
+				t.Errorf("restore Jobs = %v, want the stopped Job deleted", jobs)
 			}
 		})
 	}
