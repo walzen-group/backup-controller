@@ -22,6 +22,13 @@ fullnameOverride: ""
 # the README.
 namespace: backup-system
 
+# Image the controller's restore Jobs run restic in, passed to the container
+# as --restore-image. It has no default and the chart does not render without
+# it: set it to the image VolSync runs its restic mover in (VolSync's
+# restic.image), pinned by digest, so a restore runs the restic that wrote the
+# backup.
+restoreImage: ""
+
 # The admission webhook that chooses how a CloudNativePG Cluster starts. A
 # Cluster whose object store already holds a base backup is recovered from it;
 # one whose store is empty bootstraps an empty database.

@@ -126,13 +126,19 @@ jobs:
             grep -q "runAsNonRoot: true" .tmp/ci-deploy-render.yaml
           '
 
+      # The chart does not render without restoreImage, the restic image the
+      # controller's restore Jobs run. CI renders with VolSync's mover image
+      # as the e2e pins it, which is what an install passes.
       - name: helm lint
-        run: nix develop -c helm lint chart/
+        run: |
+          image=$(nix develop -c jq -r '.volsync.image | "\(.repository):\(.tag)@\(.digest)"' hack/e2e/volsync/pins.json)
+          nix develop -c helm lint chart/ --set "restoreImage=$image"
 
       - name: helm template
         run: |
           mkdir -p .tmp
-          nix develop -c helm template backup-controller chart/ > .tmp/ci-chart-render.yaml
+          image=$(nix develop -c jq -r '.volsync.image | "\(.repository):\(.tag)@\(.digest)"' hack/e2e/volsync/pins.json)
+          nix develop -c helm template backup-controller chart/ --set "restoreImage=$image" > .tmp/ci-chart-render.yaml
 
       # Schema validation of both renders with no cluster available.
       # `kubectl apply --dry-run=client` cannot run here at all: kubectl v1.37

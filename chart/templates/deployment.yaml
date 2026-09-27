@@ -30,8 +30,12 @@ spec:
         # The prime claim and the ReplicationDestination live in this
         # namespace, which is the library's namespace setting. The metrics
         # listen address and path keep their defaults, :8080 and /metrics.
+        # --restore-image is the image the restore Jobs run restic in. The
+        # controller has no default and refuses to start without it, so the
+        # render fails here first when the value is missing.
         args:
         - --namespace={{ .Values.namespace }}
+        - {{ printf "--restore-image=%s" (required "restoreImage is required: set it to the image VolSync runs its restic mover in, pinned by digest" .Values.restoreImage) | quote }}
         {{- if .Values.webhook.enabled }}
         - --webhook-cert-dir=/etc/webhook/tls
         - --webhook-port={{ .Values.webhook.port }}

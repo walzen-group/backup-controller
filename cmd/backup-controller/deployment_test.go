@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -37,4 +38,119 @@ func TestOneControllerRunsAtATime(t *testing.T) {
 	if !strings.Contains(string(chart), "type: Recreate") {
 		t.Error("the chart's Deployment does not use the Recreate strategy")
 	}
+}
+
+// pinnedRestoreImage is VolSync's mover image as hack/e2e/volsync/pins.json
+// pins it, used here only as a realistic value to render with.
+const pinnedRestoreImage = "quay.io/backube/volsync:0.16.0@sha256:0d03a6aad57569eba2c0eaa0848cf4a908d9744b372ff2224bb291a320f36d76"
+
+// renderChart runs helm template over the chart and returns what it printed
+// and the error it ended with.
+//
+// Parameters:
+//   - t fails the test when helm is not on the PATH. The tests run in the
+//     flake's shell, which carries helm, and a missing helm must not pass as
+//     a chart that renders.
+//   - set holds helm's --set assignments, one per entry.
+func renderChart(t *testing.T, set ...string) (string, error) {
+	t.Helper()
+	helm, err := exec.LookPath("helm")
+	if err != nil {
+		t.Fatalf("helm is not on the PATH; run the tests in the flake's shell: %v", err)
+	}
+	args := []string{"template", "backup-controller", filepath.Join("..", "..", "chart")}
+	for _, value := range set {
+		args = append(args, "--set", value)
+	}
+	output, err := exec.Command(helm, args...).CombinedOutput()
+	return string(output), err
+}
+
+// controllerArgs returns the args of the controller container of the
+// Deployment in a multi-document YAML render.
+//
+// Parameters:
+//   - t fails the test when the render holds no such Deployment or container.
+//   - render is the output of helm template or the content of a manifest.
+func controllerArgs(t *testing.T, render string) []string {
+	t.Helper()
+	for _, document := range strings.Split(render, "\n---") {
+		deployment := &appsv1.Deployment{}
+		if err := yaml.Unmarshal([]byte(document), deployment); err != nil || deployment.Kind != "Deployment" {
+			continue
+		}
+		for _, container := range deployment.Spec.Template.Spec.Containers {
+			if container.Name == "controller" {
+				return container.Args
+			}
+		}
+	}
+	t.Fatalf("no Deployment with a controller container in:\n%s", render)
+	return nil
+}
+
+// TestTheChartRefusesToRenderWithoutARestoreImage checks that helm template
+// fails when the restoreImage value is not set, and that its error names the
+// value.
+//
+// The controller refuses to start without --restore-image, and has no
+// default image of its own. A chart that rendered without the value would
+// install a pod that exits at once; failing the render says what is missing
+// before anything is installed.
+func TestTheChartRefusesToRenderWithoutARestoreImage(t *testing.T) {
+	output, err := renderChart(t)
+	if err == nil {
+		t.Fatalf("helm template rendered without restoreImage:\n%s", output)
+	}
+	if !strings.Contains(output, "restoreImage") {
+		t.Errorf("helm's error does not name restoreImage:\n%s", output)
+	}
+}
+
+// TestTheChartPassesTheRestoreImage checks that the chart passes the
+// restoreImage value to the controller container as --restore-image,
+// unchanged and exactly once.
+func TestTheChartPassesTheRestoreImage(t *testing.T) {
+	output, err := renderChart(t, "restoreImage="+pinnedRestoreImage)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, output)
+	}
+	if got := restoreImageArgs(controllerArgs(t, output)); len(got) != 1 || got[0] != "--restore-image="+pinnedRestoreImage {
+		t.Errorf("the controller's --restore-image args are %q, want one with %s", got, pinnedRestoreImage)
+	}
+}
+
+// TestTheReleaseManifestsLeaveTheRestoreImageToTheInstaller checks that the
+// controller container in deploy/deployment.yaml has an args list and no
+// --restore-image in it.
+//
+// deploy/ is the release's plain manifest, and it names no restic image,
+// because only the installer knows which image VolSync backs up with. The
+// installer appends the flag to the controller's args (the infra module
+// does, and so does the e2e setup), so a flag here would reach the
+// controller twice, and a missing args list would leave nothing to append
+// to.
+func TestTheReleaseManifestsLeaveTheRestoreImageToTheInstaller(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deployment.yaml"))
+	if err != nil {
+		t.Fatalf("read deploy/deployment.yaml: %v", err)
+	}
+	args := controllerArgs(t, string(content))
+	if len(args) == 0 {
+		t.Error("the controller container in deploy/deployment.yaml has no args to append --restore-image to")
+	}
+	if got := restoreImageArgs(args); len(got) != 0 {
+		t.Errorf("deploy/deployment.yaml passes %q; the installer appends --restore-image", got)
+	}
+}
+
+// restoreImageArgs returns the entries of args that set --restore-image.
+func restoreImageArgs(args []string) []string {
+	var found []string
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--restore-image") {
+			found = append(found, arg)
+		}
+	}
+	return found
 }
