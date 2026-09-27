@@ -1699,13 +1699,14 @@ func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha
 // It returns what finish returns: an empty result once the run has ended, or
 // the wait for a stopped mover, which finish reports (rule X2).
 //
-// Before it fails anything, abort reads the restore Job of each Running
-// volume item (see settleJobs), so an item whose Job has ended records
-// how, and an item whose Job still waits for its pod adds why to its
-// message. A failed read comes back as an error for a retry. The items it
-// fails record no reason; the run's ending says why. The Ready message also
-// carries the note of each Cluster the run left deleted (see
-// leftDeletedNotes). A run past its deadline ends through timeOut instead.
+// Before it fails anything, abort reads the restore Job of each unfinished
+// volume item, a lost create's included (see settleJobs), so an item whose
+// Job has ended records how, and an item whose Job still waits for its pod
+// adds why to its message. A failed read comes back as an error for a
+// retry. The items it fails record no reason; the run's ending says why.
+// The Ready message also carries the note of each Cluster the run left
+// deleted (see leftDeletedNotes). A run past its deadline ends through
+// timeOut instead.
 func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
 	waits, err := r.settleJobs(ctx, run)
 	if err != nil {
@@ -1728,11 +1729,12 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 // the wait for a stopped mover, or the error of a release that failed, for
 // a retry. A failed read of a restore Job comes back as an error too.
 //
-// First the restore Job of each Running volume item is read (see
-// settleJobs), so a restore that completed just as the deadline passed
-// records Succeeded. Every item still unfinished then fails with reason
-// TimedOut (see failRemainingItems), and finish records the Ready message, with the note
-// of each Cluster the run left deleted, in status.ending. Every status
+// First the restore Job of each unfinished volume item is read, a lost
+// create's included (see settleJobs), so a restore that completed just as
+// the deadline passed records Succeeded. Every item still unfinished then
+// fails with reason TimedOut (see failRemainingItems), and finish records
+// the Ready message, with the note of each Cluster the run left deleted, in
+// status.ending. Every status
 // write from then on carries the ending, and a later pass, such as one
 // after the wait for a stopped mover replaced the SourceBusy condition,
 // ends with it as recorded.

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -112,6 +113,40 @@ func TestALostDestinationCreateIsStoppedAtTheEnd(t *testing.T) {
 			}
 			if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{}); !apierrors.IsNotFound(err) {
 				t.Errorf("RestoreRun = %v, want it gone once its finalizer was dropped", err)
+			}
+		})
+	}
+}
+
+// A run that times out before any pass took over the restore Job of a lost
+// create records how that Job ended: the timeout takes the Job over under
+// the item's name before it fails what is left (P11). A Job that completed
+// records the item Succeeded, and one that failed records restic's exit
+// code; the run still ends TimedOut.
+func TestATimeoutRecordsTheJobOfALostCreate(t *testing.T) {
+	for name, tc := range map[string]struct {
+		condition batchv1.JobConditionType
+		phase     backupv1alpha1.ItemPhase
+		reason    backupv1alpha1.ItemReason
+	}{
+		"complete": {batchv1.JobComplete, backupv1alpha1.ItemSucceeded, ""},
+		"failed":   {batchv1.JobFailed, backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonRestoreJobFailed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			run := checkedRestore(inPlace)
+			lost := restoreJobFor(t, run, claimN, monday.ID)
+			lost.Status.Conditions = []batchv1.JobCondition{{Type: tc.condition, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"}}
+			r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(), lost, heldClaimLease(run, claimN))
+			r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+			restoreStep(t, r)
+			restoreStep(t, r)
+
+			done := readRestoreRun(t, c)
+			if item := done.Status.Items[0]; item.Phase != tc.phase || item.Reason != tc.reason {
+				t.Errorf("item = %+v, want %s with reason %q from the lost create's Job", item, tc.phase, tc.reason)
+			}
+			if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+				t.Errorf("phase = %q, reason = %q; want Failed, %s", done.Status.Phase, readyReason(done.Status.Conditions), backupv1alpha1.ReasonTimedOut)
 			}
 		})
 	}

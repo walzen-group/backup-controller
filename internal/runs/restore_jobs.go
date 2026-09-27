@@ -177,7 +177,7 @@ func (r *RestoreRunReconciler) createJob(ctx context.Context, run *backupv1alpha
 	return nil
 }
 
-// settleJobs reads the restore Job of each Running volume item of a run
+// settleJobs reads the restore Job of each unfinished volume item of a run
 // that ends early, so each item records how its Job really ended.
 //
 // Parameters:
@@ -191,16 +191,19 @@ func (r *RestoreRunReconciler) createJob(ctx context.Context, run *backupv1alpha
 //
 // A deadline that passes just as a Job completes then records the item
 // Succeeded, and one whose Job failed records restic's exit code; only an
-// item whose Job has not ended gets the run's message (P11).
+// item whose Job has not ended gets the run's message (P11). An item that
+// records no Job first takes over the one a pass created and lost the
+// status write of (see settleJob), so a lost create is recorded the same
+// way.
 func (r *RestoreRunReconciler) settleJobs(ctx context.Context, run *backupv1alpha1.RestoreRun) (map[int]*restorejob.Waiting, error) {
 	waits := map[int]*restorejob.Waiting{}
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
-		if item.Kind != backupv1alpha1.ItemKindClaim || item.Phase != backupv1alpha1.ItemRunning || item.JobUID == "" {
+		if item.Kind != backupv1alpha1.ItemKindClaim || finished(*item) {
 			continue
 		}
-		waiting, err := r.followJob(ctx, run, item)
-		if done, err := settled(item, err); done && err != nil {
+		waiting, err := r.settleJob(ctx, run, i, item)
+		if err != nil {
 			return nil, err
 		}
 		if waiting != nil {
@@ -208,6 +211,36 @@ func (r *RestoreRunReconciler) settleJobs(ctx context.Context, run *backupv1alph
 		}
 	}
 	return waits, nil
+}
+
+// settleJob reads how the restore Job of one unfinished volume item stands,
+// for settleJobs.
+//
+// Parameters:
+//   - run is the RestoreRun that ends early.
+//   - index is the item's position in status.items, which names its Job.
+//   - item is the volume item, updated in place.
+//
+// It returns the waiting reason of a Job that still runs and whose newest
+// pod waits, and nil otherwise. A failed read comes back as an error.
+//
+// An item that records no Job takes over the one the run created under its
+// name, as a pass would (see takeOverJob), and an item with no such Job
+// has nothing to read. A refused takeover fails the item with its reason.
+// The Job an item then records is read and its end recorded (see
+// followJob).
+func (r *RestoreRunReconciler) settleJob(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (*restorejob.Waiting, error) {
+	if item.JobUID == "" {
+		taken, err := r.takeOverJob(ctx, run, index, item)
+		if done, err := settled(item, err); done || !taken {
+			return nil, err
+		}
+	}
+	waiting, err := r.followJob(ctx, run, item)
+	if _, err := settled(item, err); err != nil {
+		return nil, err
+	}
+	return waiting, nil
 }
 
 // addWaits adds to the message of each item a run failed as it ended early
