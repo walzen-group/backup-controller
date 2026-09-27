@@ -119,24 +119,23 @@ linters:
       - path: '^internal/bootstrap/survey\.go$'
         linters: [funlen, gocognit]
         source: '^func (\(p S3Prober\) Survey|readInfos)\('
-      - path: '^internal/bootstrap/collision\.go$'
+      - path: '^internal/quiesce/plan\.go$'
         linters: [funlen, gocognit]
-        source: '^func archiveHolder\('
-      - path: '^internal/bootstrap/recovery\.go$'
+        source: '^func Plan\('
+      - path: '^internal/quiesce/(plan|quiesce|stop)\.go$'
+        linters: [goconst]
+      - path: '^internal/quiesce/restart\.go$'
         linters: [funlen, gocognit]
-        source: '^func setRecovery\('
-      - path: '^internal/bootstrap/webhook\.go$'
-        linters: [funlen, gocognit]
-        source: '^func \(d \*Decider\) Handle\('
+        source: '^func Restart\('
       - path: '^internal/runs/backuprun\.go$'
         linters: [funlen, gocognit]
         source: '^func \(r \*BackupRunReconciler\) (items|admit|work|quiesce|startItem)\('
       - path: '^internal/runs/backuprun\.go$'
         linters: [nestif]
         source: '^\s*if (queue != "" |run\.Spec\.All && run\.Status\.RestartedAt == nil && len\(run\.Status\.Quiesced\) > 0 |len\(run\.Status\.Quiesced\) == 0 )\{$'
-      - path: '^internal/runs/(backuprun|clusterwebhook|exclusive|lease|objects|quiesce|restorerun|sources)\.go$'
+      - path: '^internal/runs/(backuprun|clusterwebhook|exclusive|lease|objects|quiesce_run|release_report|restorerun|sources)\.go$'
         linters: [goconst]
-      - path: '^internal/runs/(backuprun|quiesce|restorerun|sources)\.go$'
+      - path: '^internal/runs/(backuprun|restorerun|sources)\.go$'
         linters: [revive]
         text: '^file-length-limit:'
       - path: '^internal/runs/crdcheck\.go$'
@@ -152,10 +151,7 @@ linters:
         linters: [revive]
         text: '^argument-limit:'
         source: '^func acquireLeases\('
-      - path: '^internal/runs/quiesce\.go$'
-        linters: [funlen, gocognit]
-        source: '^func (planStop|restartWorkloads)\('
-      - path: '^internal/runs/quiesce\.go$'
+      - path: '^internal/runs/release_report\.go$'
         linters: [revive]
         text: '^confusing-results:'
         source: '^func releaseFailure\('

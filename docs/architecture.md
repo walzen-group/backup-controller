@@ -51,7 +51,7 @@ On objects the controller does not own:
 
 | Object | Write | When |
 | --- | --- | --- |
-| Deployment or StatefulSet marked `backup.wlz.li/quiesce` | the replica count to 0, then back to the recorded value, through the `scale` subresource. The run reads the Scale, then sends an update without a resourceVersion. This update changes only `spec.replicas` (internal/runs/scale.go) | during a BackupRun with `all: true` |
+| Deployment or StatefulSet marked `backup.wlz.li/quiesce` | the replica count to 0, then back to the recorded value, through the `scale` subresource. The run reads the Scale, then sends an update without a resourceVersion. This update changes only `spec.replicas` (internal/quiesce/stop.go) | during a BackupRun with `all: true` |
 | Deployment or StatefulSet a RestoreRun's `quiesce` lists | the same | from the RestoreRun's start until the run restores its volumes and deletes its databases |
 | the workload's Flux Kustomization | `spec.suspend` on, then off, only when the run found it running and its `status.inventory` lists the workload | the same as its workload |
 | a snapshot in the volume's restic repository | a new snapshot file at the run's `restartedAt`, tagged `quiesced`, replacing the one the mover wrote, under a lock file in locks/ | after the mover of a BackupRun that stopped workloads |

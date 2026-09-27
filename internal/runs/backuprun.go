@@ -11,6 +11,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/kueue"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -472,11 +473,11 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	}
 
 	if run.Spec.All && run.Status.RestartedAt == nil && !limited && anyPending(run.Status.Items) {
-		targets, err := quiesceTargets(ctx, r.Reader, run.Namespace)
+		targets, err := quiesce.Targets(ctx, r.Reader, run.Namespace)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		gone, pod, err := podsGone(ctx, r.Reader, run.Namespace, targets)
+		gone, pod, err := quiesce.PodsGone(ctx, r.Reader, run.Namespace, targets)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -514,7 +515,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		}
 	}
 	if restart || run.Status.RestartPending {
-		if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
+		if err := quiesce.Restart(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 			// The run says why the app is still down at once, rather than
 			// only at its timeout, and the error makes the pass run again.
 			return ctrl.Result{}, r.releaseFailed(ctx, run, err, true)
@@ -575,16 +576,16 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 // backup.wlz.li/quiesce: "true", before the run does anything else. It stores
 // its now argument, the time of this pass, in status.quiescedAt.
 //
-// It first records the plan from planStop in status.quiesced and
+// It first records the plan from quiesce.Plan in status.quiesced and
 // status.suspendedKustomizations, with each workload's replica count, and
-// writes the status. Only then does applyStop suspend the Kustomizations and
+// writes the status. Only then does quiesce.Apply suspend the Kustomizations and
 // scale the workloads to zero. A pass that finds a plan in the status reuses
 // it, so a retry after a lost status write still gives back the counts the
 // workloads had before the run touched them. Before it stops from such a
 // plan, quiesce reads the run again through the uncached Reader (see
 // stopOwed), and stops nothing when the stored run has recorded the stop,
 // given the app back or ended. quiesce then writes status.quiescedAt. After
-// a failed stop, it narrows the plan with appliedPart to what is stopped
+// a failed stop, it narrows the plan with quiesce.Applied to what is stopped
 // now, and aborts the run, which puts that back. When no workload is marked, or no item is left Pending once the
 // checks below have failed the others, quiesce stops nothing and sets
 // status.restartedAt to the same moment, because there is nothing to start
@@ -660,7 +661,7 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			}
 		}
 
-		targets, err := quiesceTargets(ctx, r.Reader, run.Namespace)
+		targets, err := quiesce.Targets(ctx, r.Reader, run.Namespace)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -692,8 +693,8 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 			return after(pollInterval, r.waitFor(ctx, run, backupv1alpha1.ReasonSourceBusy, busy))
 		}
 		// A Kustomization that also applies workloads of another namespace
-		// is refused before anything is stopped (see planStop).
-		stop, suspend, err := planStop(ctx, r.Reader, r.RESTMapper(), run.Namespace, targets)
+		// is refused before anything is stopped (see quiesce.Plan).
+		stop, suspend, err := quiesce.Plan(ctx, r.Reader, r.RESTMapper(), run.Namespace, targets)
 		if asRunRefusal(err) {
 			return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 		}
@@ -718,9 +719,9 @@ func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.B
 		}
 	}
 
-	stopErr := applyStop(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+	stopErr := quiesce.Apply(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	if stopErr != nil {
-		run.Status.Quiesced, run.Status.SuspendedKustomizations = appliedPart(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+		run.Status.Quiesced, run.Status.SuspendedKustomizations = quiesce.Applied(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	}
 	run.Status.QuiescedAt = newTime(now)
 	if err := r.writeStatus(ctx, run); err != nil {
@@ -1620,7 +1621,7 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 // the app its replicas.
 //
 // It returns nil when everything is put back. A failed restart comes back as
-// a *restartError from restartWorkloads, which names the workload or
+// a *quiesce.RestartError from quiesce.Restart, which names the workload or
 // Kustomization; a failed Lease release or Workload delete as a
 // *releaseError that names what it could not delete. When both the restart
 // and the Lease release fail, it returns both, joined with errors.Join. A
@@ -1633,7 +1634,7 @@ func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.B
 	var restartErr error
 	holding := (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil
 	if holding || run.Status.RestartPending {
-		restartErr = restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+		restartErr = quiesce.Restart(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 		if restartErr == nil {
 			if run.Status.RestartedAt == nil {
 				run.Status.RestartedAt = newTime(metav1.NewTime(r.Now()).Rfc3339Copy())
@@ -1699,7 +1700,7 @@ func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.
 // controller-runtime's backoff.
 //
 // Parameters:
-//   - err is the error from release, or the *restartError of the restart
+//   - err is the error from release, or the *quiesce.RestartError of the restart
 //     after the clones are cut.
 //   - working is true when work calls it for that restart, while the run is
 //     still backing up, and false when finish or finalize call it because

@@ -9,6 +9,7 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/kueue"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	"github.com/walzen-group/backup-controller/internal/served"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	appsv1 "k8s.io/api/apps/v1"
@@ -226,7 +227,7 @@ func TestARestartThatKeepsFailingIsReportedAndRetried(t *testing.T) {
 	if replicas := replicasOf(t, c); replicas != 2 {
 		t.Fatalf("replicas = %d once the API server accepts the restart, want 2 back", replicas)
 	}
-	k, _ := getUnstructured(t, c, KustomizationGVK, "flux-system", appN)
+	k, _ := getUnstructured(t, c, quiesce.KustomizationGVK, "flux-system", appN)
 	if suspended, _, _ := unstructured.NestedBool(k.Object, "spec", "suspend"); suspended {
 		t.Error("the Kustomization the run suspended was not resumed")
 	}
@@ -236,7 +237,7 @@ func TestARestartThatKeepsFailingIsReportedAndRetried(t *testing.T) {
 	}
 }
 
-// restartWorkloads resumes a Kustomization at the version the API server
+// quiesce.Restart resumes a Kustomization at the version the API server
 // serves, here v2 only, and does not assume v1.
 func TestRestartResumesAKustomizationAtTheServedVersion(t *testing.T) {
 	v2 := schema.GroupVersionKind{Group: fluxGroup, Version: "v2", Kind: "Kustomization"}
@@ -254,7 +255,7 @@ func TestRestartResumesAKustomizationAtTheServedVersion(t *testing.T) {
 	inner := strictclient.Build(fake.NewClientBuilder().WithObjects(k).WithRESTMapper(mapper), s, strictclient.Options{Clock: func() time.Time { return frozen }})
 	c := servingOnly(inner)
 
-	if err := restartWorkloads(context.Background(), c, ns, nil, []string{"flux-system/" + appN}); err != nil {
+	if err := quiesce.Restart(context.Background(), c, ns, nil, []string{"flux-system/" + appN}); err != nil {
 		t.Fatalf("restartWorkloads: %v", err)
 	}
 	got, ok := getUnstructured(t, c, v2, "flux-system", appN)
@@ -283,7 +284,7 @@ func (m failingMapper) RESTMapping(schema.GroupKind, ...string) (*meta.RESTMappi
 // some versions of the group, is an error the caller retries, so nothing is
 // skipped on it.
 func TestOnlyAKindNoVersionOfWhichIsServedIsGone(t *testing.T) {
-	gk := KustomizationGVK.GroupKind()
+	gk := quiesce.KustomizationGVK.GroupKind()
 	partial := apiutil.ErrResourceDiscoveryFailed{
 		{Group: fluxGroup, Version: "v1"}: &meta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{Group: fluxGroup, Version: "v1"}},
 	}
@@ -506,7 +507,7 @@ func TestAQuiesceAfterFluxMovesVersionStillSuspends(t *testing.T) {
 	step(t, r) // plan
 	step(t, r) // admit, no queue; the lookup of LocalQueue reads discovery
 	// The mapper caches v1 now, and Flux then moves to v2.
-	if _, err := r.RESTMapper().RESTMapping(KustomizationGVK.GroupKind()); err != nil {
+	if _, err := r.RESTMapper().RESTMapping(quiesce.KustomizationGVK.GroupKind()); err != nil {
 		t.Fatal(err)
 	}
 	d.serve("v2")
@@ -625,7 +626,7 @@ func TestAnAppGivenBackByHandLetsTheRunGoOn(t *testing.T) {
 			if err := c.Patch(context.Background(), d, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"replicas":2}}`))); err != nil {
 				t.Fatal(err)
 			}
-			k, _ := getUnstructured(t, c, KustomizationGVK, "flux-system", appN)
+			k, _ := getUnstructured(t, c, quiesce.KustomizationGVK, "flux-system", appN)
 			if err := c.Patch(context.Background(), k, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"suspend":false}}`))); err != nil {
 				t.Fatal(err)
 			}

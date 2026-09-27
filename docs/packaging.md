@@ -237,7 +237,7 @@ controller:
 | `clusters.postgresql.cnpg.io` | get, list, delete | the shared-archive check of the webhook, a database run, and a database restore that deletes its Cluster |
 | `objectstores.barmancloud.cnpg.io` | get, list | the webhook and the restore checks read where a Cluster archives. The shared-archive check of the webhook lists every ObjectStore once per create. Without list, the webhook refuses every Cluster create with an HTTP 500 while any other Cluster archives |
 | `deployments`, `statefulsets` | get, list | quiesce reads the workloads that it stops. The controller has no write verb on them |
-| `deployments/scale`, `statefulsets/scale` | get, update | quiesce sets the replica count through the scale subresource, which can change nothing else (internal/runs/scale.go) |
+| `deployments/scale`, `statefulsets/scale` | get, update | quiesce sets the replica count through the scale subresource, which can change nothing else (internal/quiesce/stop.go) |
 | `kustomizations.kustomize.toolkit.fluxcd.io` | get, patch | suspend and resume the Kustomization of a quiesced workload |
 | `workloads.kueue.x-k8s.io` | get, create, delete | admit a run as one Workload |
 | `workloads/status` | update | the PodsReady condition that the run sets itself |

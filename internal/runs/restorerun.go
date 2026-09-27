@@ -11,6 +11,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/served"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -397,8 +398,8 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 	if err != nil {
 		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 	}
-	if _, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce); err != nil {
-		if !isQuiesceSpecError(err) {
+	if _, err := quiesce.Named(ctx, r.Reader, run.Namespace, run.Spec.Quiesce); err != nil {
+		if !asRunRefusal(err) {
 			return ctrl.Result{}, err
 		}
 		return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
@@ -996,14 +997,14 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 		return r.quiesce(ctx, run)
 	}
 	if stopped(run) && anyRestorePending(run.Status.Items) {
-		targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
+		targets, err := quiesce.Named(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
 		if err != nil {
-			if !isQuiesceSpecError(err) {
+			if !asRunRefusal(err) {
 				return ctrl.Result{}, err
 			}
 			return r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error())
 		}
-		gone, pod, err := podsGone(ctx, r.Reader, run.Namespace, targets)
+		gone, pod, err := quiesce.PodsGone(ctx, r.Reader, run.Namespace, targets)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1848,25 +1849,25 @@ func clusterLeftDeleted(cluster string) string {
 // the same moment, and work then finishes the run. A spec.quiesce entry the
 // namespace does not hold ends the run as Failed with reason Invalid before
 // anything is stopped, and a Kustomization that also applies workloads of
-// another namespace aborts it with reason Invalid (see planStop).
+// another namespace aborts it with reason Invalid (see quiesce.Plan).
 //
-// quiesce then records the plan from planStop in status.quiesced and
+// quiesce then records the plan from quiesce.Plan in status.quiesced and
 // status.suspendedKustomizations, with each workload's replica count, and
-// writes the status. Only then does applyStop suspend the Kustomizations and
+// writes the status. Only then does quiesce.Apply suspend the Kustomizations and
 // scale the workloads to zero. A pass that finds a plan in the status reuses
 // it, so a retry after a lost status write still gives back the counts the
 // workloads had before the run touched them. Before it stops from such a
 // plan, quiesce reads the run again through the uncached Reader (see
 // stopOwed), and stops nothing when the stored run has recorded the stop,
 // given the app back or ended. quiesce then writes status.quiescedAt. After
-// a failed stop, it narrows the plan with appliedPart to what is stopped
+// a failed stop, it narrows the plan with quiesce.Applied to what is stopped
 // now, and aborts the run with reason Failed, which starts those workloads
 // again and resumes the Kustomizations, the same as a BackupRun does.
 func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	if len(run.Status.Quiesced) == 0 {
-		targets, err := namedTargets(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
+		targets, err := quiesce.Named(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
 		if err != nil {
-			if !isQuiesceSpecError(err) {
+			if !asRunRefusal(err) {
 				return ctrl.Result{}, err
 			}
 			return r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
@@ -1935,8 +1936,8 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 		}
 
 		// A Kustomization that also applies workloads of another namespace
-		// is refused before anything is stopped (see planStop).
-		stop, suspend, err := planStop(ctx, r.Reader, r.RESTMapper(), run.Namespace, targets)
+		// is refused before anything is stopped (see quiesce.Plan).
+		stop, suspend, err := quiesce.Plan(ctx, r.Reader, r.RESTMapper(), run.Namespace, targets)
 		if asRunRefusal(err) {
 			return r.abort(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 		}
@@ -1960,9 +1961,9 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 	}
-	stopErr := applyStop(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+	stopErr := quiesce.Apply(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	if stopErr != nil {
-		run.Status.Quiesced, run.Status.SuspendedKustomizations = appliedPart(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
+		run.Status.Quiesced, run.Status.SuspendedKustomizations = quiesce.Applied(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
 	}
 	now := metav1.NewTime(r.Now())
 	run.Status.QuiescedAt = &now
@@ -2034,7 +2035,7 @@ func (r *RestoreRunReconciler) restart(ctx context.Context, run *backupv1alpha1.
 	if !stopped(run) {
 		return nil
 	}
-	if err := restartWorkloads(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
+	if err := quiesce.Restart(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations); err != nil {
 		return err
 	}
 	now := metav1.NewTime(r.Now())
@@ -2489,7 +2490,7 @@ func finishedWithMover(items []backupv1alpha1.RestoreItem) bool {
 //     status written.
 //   - err is the error from finish or finalize: the *releaseError of a mover
 //     the run could not stop or of a Lease it could not read or release, or
-//     the *restartError of a restart that failed.
+//     the *quiesce.RestartError of a restart that failed.
 //
 // It returns err, so the reconcile runs again with controller-runtime's
 // backoff.

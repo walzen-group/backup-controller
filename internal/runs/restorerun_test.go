@@ -11,6 +11,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	appsv1 "k8s.io/api/apps/v1"
@@ -316,7 +317,7 @@ func replicasOf(t *testing.T, c client.Client) int32 {
 // suspended reports whether the app's Flux Kustomization is suspended.
 func suspended(t *testing.T, c client.Client) bool {
 	t.Helper()
-	k, _ := getUnstructured(t, c, KustomizationGVK, "flux-system", appN)
+	k, _ := getUnstructured(t, c, quiesce.KustomizationGVK, "flux-system", appN)
 	s, _, _ := unstructured.NestedBool(k.Object, "spec", "suspend")
 	return s
 }

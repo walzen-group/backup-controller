@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -102,11 +103,11 @@ func TestScaleUsesTheScaleSubresource(t *testing.T) {
 		{Kind: backupv1alpha1.WorkloadKindStatefulSet, Name: dbN, Replicas: 3},
 	}
 
-	if err := applyStop(ctx, watched, ns, stop, nil); err != nil {
+	if err := quiesce.Apply(ctx, watched, ns, stop, nil); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
 	checkWorkloads(t, c, 0, 0, 2)
-	if err := restartWorkloads(ctx, watched, ns, stop, nil); err != nil {
+	if err := quiesce.Restart(ctx, watched, ns, stop, nil); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
 	checkWorkloads(t, c, 2, 3, 3)
@@ -200,7 +201,7 @@ func TestAChangeBetweenReadAndScaleDoesNotFailIt(t *testing.T) {
 
 	c := newClient(t, deployment())
 	racing, outcomes := changeBetweenReadAndWrite(t, c, 100)
-	if err := applyStop(ctx, racing, ns, stop, nil); err != nil {
+	if err := quiesce.Apply(ctx, racing, ns, stop, nil); err != nil {
 		t.Fatalf("stop against a Deployment that keeps changing: %v", err)
 	}
 	if got := replicasOf(t, c); got != 0 || fmt.Sprint(*outcomes) != "[ok]" {

@@ -15,6 +15,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/kueue"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
@@ -55,7 +56,7 @@ const (
 // scheme registers each one, and its list kind, so the fake client can store
 // them.
 var unstructuredKinds = []schema.GroupVersionKind{
-	cnpg.ClusterGVK, cnpg.BackupGVK, KustomizationGVK, kueue.WorkloadGVK,
+	cnpg.ClusterGVK, cnpg.BackupGVK, quiesce.KustomizationGVK, kueue.WorkloadGVK,
 	{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueue"},
 	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "LocalQueue"},
 	{Group: "kueue.x-k8s.io", Version: "v1beta1", Kind: "Workload"},
@@ -340,7 +341,7 @@ func deployment() *appsv1.Deployment {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: appN, Namespace: ns,
 			Annotations: map[string]string{backupv1alpha1.AnnotationQuiesce: "true"},
-			Labels:      map[string]string{fluxNameLabel: appN, fluxNamespaceLabel: "flux-system"},
+			Labels:      map[string]string{quiesce.FluxNameLabel: appN, quiesce.FluxNamespaceLabel: "flux-system"},
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
@@ -360,7 +361,7 @@ func kustomization(suspended bool) *unstructured.Unstructured {
 			map[string]any{"id": ns + "_" + appN + "_apps_Deployment", "v": "v1"},
 		}}},
 	}}
-	k.SetGroupVersionKind(KustomizationGVK)
+	k.SetGroupVersionKind(quiesce.KustomizationGVK)
 	k.SetNamespace("flux-system")
 	k.SetName(appN)
 	return k

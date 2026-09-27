@@ -13,6 +13,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
 	"github.com/walzen-group/backup-controller/internal/kueue"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -852,7 +853,7 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 	if *d.Spec.Replicas != 0 {
 		t.Fatalf("replicas = %d while the clones are cut, want 0", *d.Spec.Replicas)
 	}
-	k, _ := getUnstructured(t, c, KustomizationGVK, "flux-system", appN)
+	k, _ := getUnstructured(t, c, quiesce.KustomizationGVK, "flux-system", appN)
 	if suspended, _, _ := unstructured.NestedBool(k.Object, "spec", "suspend"); !suspended {
 		t.Error("the Kustomization was not suspended, and Flux would put the replicas back")
 	}
@@ -869,7 +870,7 @@ func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
 	if *d.Spec.Replicas != 2 {
 		t.Fatalf("replicas = %d once the clone is cut, want 2 back", *d.Spec.Replicas)
 	}
-	k, _ = getUnstructured(t, c, KustomizationGVK, "flux-system", appN)
+	k, _ = getUnstructured(t, c, quiesce.KustomizationGVK, "flux-system", appN)
 	if suspended, _, _ := unstructured.NestedBool(k.Object, "spec", "suspend"); suspended {
 		t.Error("the Kustomization the run suspended was not resumed")
 	}
@@ -1654,14 +1655,14 @@ func TestANamespaceRunWithoutCloudNativePGBacksUpTheVolumes(t *testing.T) {
 // them at another team's Kustomization.
 func TestAKustomizationThatDoesNotListTheWorkloadIsNotSuspended(t *testing.T) {
 	app := deployment()
-	app.Labels = map[string]string{fluxNameLabel: "billing", fluxNamespaceLabel: "billing"}
+	app.Labels = map[string]string{quiesce.FluxNameLabel: "billing", quiesce.FluxNamespaceLabel: "billing"}
 	billing := &unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{"suspend": false},
 		"status": map[string]any{"inventory": map[string]any{"entries": []any{
 			map[string]any{"id": "billing_api_apps_Deployment", "v": "v1"},
 		}}},
 	}}
-	billing.SetGroupVersionKind(KustomizationGVK)
+	billing.SetGroupVersionKind(quiesce.KustomizationGVK)
 	billing.SetNamespace("billing")
 	billing.SetName("billing")
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -1673,7 +1674,7 @@ func TestAKustomizationThatDoesNotListTheWorkloadIsNotSuspended(t *testing.T) {
 	if got := replicasOf(t, c); got != 0 {
 		t.Errorf("replicas = %d after the quiesce, want 0", got)
 	}
-	k, _ := getUnstructured(t, c, KustomizationGVK, "billing", "billing")
+	k, _ := getUnstructured(t, c, quiesce.KustomizationGVK, "billing", "billing")
 	if on, _, _ := unstructured.NestedBool(k.Object, "spec", "suspend"); on {
 		t.Error("the run suspended a Kustomization that does not apply the app")
 	}

@@ -16,11 +16,16 @@ import (
 // non-test Go files of each directory, or only the named files when a scope
 // lists them. It covers every non-test file of internal/runs and
 // internal/populator, and internal/restorejob, whose Read renders the
-// termination message restic leaves and must never decide on it.
+// termination message restic leaves and must never decide on it. It also
+// covers internal/quiesce, internal/cnpg and internal/kueue, which hold code
+// that moved out of internal/runs.
 var messageRuleScope = []messageRuleDir{
 	{dir: "."},
 	{dir: "../populator"},
 	{dir: "../restorejob"},
+	{dir: "../quiesce"},
+	{dir: "../cnpg"},
+	{dir: "../kueue"},
 }
 
 // messageRuleDir is one directory the rule reads.
@@ -54,15 +59,15 @@ var textMatcherAllowlist = []messageRuleEntry{
 		what: "strings.Cut on a Go struct field's json tag, to get the field name the CRD schema must declare"},
 	{pkg: "runs", decl: "leaseItems",
 		what: "strings.Split on the Lease's items annotation, the comma-separated item names acquireLeases wrote"},
-	{pkg: "runs", decl: "otherNamespaces",
+	{pkg: "quiesce", decl: "OtherNamespaces",
 		what: "strings.Split on a Kustomization inventory entry id, <namespace>_<name>_<group>_<kind> as kustomize-controller records it"},
-	{pkg: "runs", decl: "inventoryIDs",
+	{pkg: "quiesce", decl: "inventoryIDs",
 		what: "strings.Count on a Kustomization inventory entry id, to check its four-part format"},
-	{pkg: "runs", decl: "applyStop",
+	{pkg: "quiesce", decl: "Apply",
 		what: "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built"},
-	{pkg: "runs", decl: "appliedPart",
+	{pkg: "quiesce", decl: "Applied",
 		what: "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built"},
-	{pkg: "runs", decl: "restartWorkloads",
+	{pkg: "quiesce", decl: "Restart",
 		what: "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built"},
 	{pkg: "runs", decl: "resticSpan",
 		what: "the regexp of the span syntax restic's --keep-within takes"},

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -27,7 +28,7 @@ const wikiNS = "wiki"
 func deploymentApplying(namespace, name string) *appsv1.Deployment {
 	d := deployment()
 	d.Namespace, d.Name = namespace, name
-	d.Labels = map[string]string{fluxNameLabel: sharedKustomizationName, fluxNamespaceLabel: "flux-system"}
+	d.Labels = map[string]string{quiesce.FluxNameLabel: sharedKustomizationName, quiesce.FluxNamespaceLabel: "flux-system"}
 	return d
 }
 
@@ -47,7 +48,7 @@ func sharedKustomization(suspended bool) *unstructured.Unstructured {
 // sharedSuspended reports whether the shared Kustomization is suspended.
 func sharedSuspended(t *testing.T, c client.Client) bool {
 	t.Helper()
-	k, ok := getUnstructured(t, c, KustomizationGVK, "flux-system", sharedKustomizationName)
+	k, ok := getUnstructured(t, c, quiesce.KustomizationGVK, "flux-system", sharedKustomizationName)
 	if !ok {
 		t.Fatal("the shared Kustomization is gone")
 	}
@@ -129,7 +130,7 @@ func TestAQuiescedRestoreRefusesAKustomizationSharedAcrossNamespaces(t *testing.
 	}
 }
 
-// otherNamespaces counts the apps Deployments and StatefulSets a
+// quiesce.OtherNamespaces counts the apps Deployments and StatefulSets a
 // Kustomization's inventory lists in another namespace, and no other kind:
 // a StatefulSet there is a workload a run in that namespace stops too.
 func TestOtherNamespacesCountsDeploymentsAndStatefulSets(t *testing.T) {
@@ -149,7 +150,7 @@ func TestOtherNamespacesCountsDeploymentsAndStatefulSets(t *testing.T) {
 				map[string]any{"id": ns + "_" + appN + "_apps_Deployment", "v": "v1"},
 				map[string]any{"id": tc.id, "v": "v1"},
 			}, "status", "inventory", "entries")
-			if got := otherNamespaces(k, ns); !slices.Equal(got, tc.want) {
+			if got := quiesce.OtherNamespaces(k, ns); !slices.Equal(got, tc.want) {
 				t.Errorf("otherNamespaces = %v, want %v", got, tc.want)
 			}
 		})

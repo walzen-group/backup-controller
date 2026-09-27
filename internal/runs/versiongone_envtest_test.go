@@ -4,7 +4,7 @@
 // Kubernetes version versions.json pins), the answers served.VersionGone tells
 // apart: a request at a Kustomization version the API server no longer
 // serves, and a request for a Kustomization that doesn't exist at a version
-// it serves. It also drives setSuspend through controller-runtime's lazy
+// it serves. It also drives quiesce.SetSuspend through controller-runtime's lazy
 // RESTMapper across such a change.
 //
 //	nix develop .#envtest -c go test -tags envtest ./internal/runs/ -run Envtest
@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	"github.com/walzen-group/backup-controller/internal/served"
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
 	corev1 "k8s.io/api/core/v1"
@@ -63,7 +64,7 @@ func twoVersionKustomizationCRD(t *testing.T) string {
 // the given name in the test namespace, ready for a Get or a Patch.
 func kustomizationAt(version, name string) *unstructured.Unstructured {
 	k := &unstructured.Unstructured{}
-	k.SetGroupVersionKind(KustomizationGVK.GroupKind().WithVersion(version))
+	k.SetGroupVersionKind(quiesce.KustomizationGVK.GroupKind().WithVersion(version))
 	k.SetNamespace(ns)
 	k.SetName(name)
 	return k
@@ -74,7 +75,7 @@ func kustomizationAt(version, name string) *unstructured.Unstructured {
 // serving a Kustomization version, a get and a patch at that version fail
 // with a NotFound that apierrors.IsUnexpectedServerError reports, while a get
 // of a Kustomization that doesn't exist, at a version it serves, fails with
-// a NotFound that it does not report. setSuspend through the lazy RESTMapper
+// a NotFound that it does not report. quiesce.SetSuspend through the lazy RESTMapper
 // that cached the old version then fails once with a *served.VersionGoneError, for
 // which apierrors.IsNotFound is false, and the next call suspends the
 // Kustomization at the version the API server serves.
@@ -119,18 +120,18 @@ func TestEnvtestAVersionNoLongerServedIsNotAMissingObject(t *testing.T) {
 		t.Fatalf("create the Kustomization: %v", err)
 	}
 
-	gvk, err := served.Kind(c.RESTMapper(), KustomizationGVK.GroupKind())
+	gvk, err := served.Kind(c.RESTMapper(), quiesce.KustomizationGVK.GroupKind())
 	if err != nil || gvk.Version != "v2" {
 		t.Fatalf("served.Kind = %v, %v; want v2, the version the API server prefers", gvk, err)
 	}
-	if err := setSuspend(ctx, c, ns, appN, true); err != nil {
+	if err := quiesce.SetSuspend(ctx, c, ns, appN, true); err != nil {
 		t.Fatalf("suspend at v2 while it is served: %v", err)
 	}
 
 	// Flux stops serving v2.
 	crd := &unstructured.Unstructured{}
 	crd.SetGroupVersionKind(crdGVK)
-	if err := c.Get(ctx, types.NamespacedName{Name: "kustomizations." + KustomizationGVK.Group}, crd); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Name: "kustomizations." + quiesce.KustomizationGVK.Group}, crd); err != nil {
 		t.Fatal(err)
 	}
 	versions, _, _ := unstructured.NestedSlice(crd.Object, "spec", "versions")
@@ -170,12 +171,12 @@ func TestEnvtestAVersionNoLongerServedIsNotAMissingObject(t *testing.T) {
 			missingErr, apierrors.IsNotFound(missingErr), apierrors.IsUnexpectedServerError(missingErr))
 	}
 
-	err = setSuspend(ctx, c, ns, appN, false)
+	err = quiesce.SetSuspend(ctx, c, ns, appN, false)
 	var gone *served.VersionGoneError
 	if !errors.As(err, &gone) || apierrors.IsNotFound(err) {
 		t.Fatalf("resume at the cached v2 = %v; want a *served.VersionGoneError that is not NotFound", err)
 	}
-	if err := setSuspend(ctx, c, ns, appN, false); err != nil {
+	if err := quiesce.SetSuspend(ctx, c, ns, appN, false); err != nil {
 		t.Fatalf("resume on the next pass: %v; want it done at v1", err)
 	}
 	got := kustomizationAt("v1", appN)

@@ -19,9 +19,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// FieldOwner is the field manager name, backupv1alpha1.FieldManager, that
-// the run controllers send with their patches to workloads and
-// Kustomizations.
+// FieldOwner is the field manager name, backupv1alpha1.FieldManager, of
+// the run controllers. The quiesce package sends the same name with its
+// writes to workloads and Kustomizations.
 const FieldOwner = client.FieldOwner(backupv1alpha1.FieldManager)
 
 // Finalizer keeps a deleted run in place until the controller has put back

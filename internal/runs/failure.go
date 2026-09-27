@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 )
 
@@ -269,14 +270,19 @@ func failRestoreItem(item *backupv1alpha1.RestoreItem, err error) bool {
 //   - err is the error a plan, quiesce or run-level check returned. It may
 //     be nil.
 //
-// It returns true for an *invalidSpecError, a *refusalError and an
-// invalidSettingError, and false for any other error and for nil. A
-// *refusalError met here, such as a claim repositoryFor does not find while
-// planIntoNewClaim plans, records no item reason: the run's reason says why
-// it ended.
+// It returns true for an *invalidSpecError, a *refusalError, an
+// invalidSettingError, a *quiesce.SpecError, a *quiesce.CrossNamespaceError
+// and a *quiesce.InventoryError. It returns false for any other error and
+// for nil. A *refusalError met here, such as a claim repositoryFor does not
+// find while planIntoNewClaim plans, records no item reason: the run's
+// reason says why it ended.
 func asRunRefusal(err error) bool {
 	var spec *invalidSpecError
 	var refused *refusalError
 	var bad invalidSettingError
-	return errors.As(err, &spec) || errors.As(err, &refused) || errors.As(err, &bad)
+	var quiesceSpec *quiesce.SpecError
+	var crossNamespace *quiesce.CrossNamespaceError
+	var inventory *quiesce.InventoryError
+	return errors.As(err, &spec) || errors.As(err, &refused) || errors.As(err, &bad) ||
+		errors.As(err, &quiesceSpec) || errors.As(err, &crossNamespace) || errors.As(err, &inventory)
 }

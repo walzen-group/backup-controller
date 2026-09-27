@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/quiesce"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	apidiscoveryv2 "k8s.io/api/apidiscovery/v2"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -369,7 +370,7 @@ func (d *fluxDiscovery) handle(w http.ResponseWriter, req *http.Request) {
 func fluxServedAt(c client.Client, d *fluxDiscovery, mapper meta.RESTMapper) client.Client {
 	kustomization := func(obj runtime.Object) (*unstructured.Unstructured, bool) {
 		u, ok := obj.(*unstructured.Unstructured)
-		return u, ok && u.GroupVersionKind().GroupKind() == KustomizationGVK.GroupKind()
+		return u, ok && u.GroupVersionKind().GroupKind() == quiesce.KustomizationGVK.GroupKind()
 	}
 	// call runs do on obj stored at v1 and gives obj back its version. name
 	// is the object's name, which client-go puts in the error's details.
@@ -383,7 +384,7 @@ func fluxServedAt(c client.Client, d *fluxDiscovery, mapper meta.RESTMapper) cli
 			return apierrors.NewGenericServerResponse(http.StatusNotFound, verb,
 				schema.GroupResource{Group: fluxGroup, Resource: "kustomizations"}, name, "404 page not found", 0, true)
 		}
-		u.SetGroupVersionKind(KustomizationGVK)
+		u.SetGroupVersionKind(quiesce.KustomizationGVK)
 		err := do()
 		u.SetGroupVersionKind(gvk)
 		return err
