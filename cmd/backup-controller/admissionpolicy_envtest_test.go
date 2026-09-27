@@ -57,6 +57,8 @@ const (
 	msgServiceAcct   = "a restore Job's pod runs as its namespace's default ServiceAccount"
 	msgNoHost        = "a restore Job's pod uses no host namespace, names no node, and claims no device"
 	msgVolumes       = "a restore Job's pod mounts only claims, emptyDir and ephemeral claims without a data source"
+	msgClasses       = "a restore Job's pod names no runtime class or priority class"
+	msgAppArmor      = "a restore Job's pod template carries no AppArmor annotation"
 	msgOwnJob        = "backup-controller may change only a Job it created"
 	msgPodSecurity   = "a restore Job's pod security context sets no sysctls, SELinux options or unconfined profile"
 	msgUnprivileged  = "a restore Job's containers are unprivileged"
@@ -459,6 +461,11 @@ func TestEnvtestThePolicyRefusesJobsOutOfShape(t *testing.T) {
 		{"the controller's ServiceAccount in the deprecated field", func(j *batchv1.Job) {
 			j.Spec.Template.Spec.DeprecatedServiceAccount = "backup-controller"
 		}, msgServiceAcct},
+		{"a runtime class", func(j *batchv1.Job) { j.Spec.Template.Spec.RuntimeClassName = ptr.To("nvidia") }, msgClasses},
+		{"a priority class", func(j *batchv1.Job) { j.Spec.Template.Spec.PriorityClassName = "system-node-critical" }, msgClasses},
+		{"an unconfined AppArmor annotation", func(j *batchv1.Job) {
+			j.Spec.Template.Annotations = map[string]string{"container.apparmor.security.beta.kubernetes.io/restore": "unconfined"}
+		}, msgAppArmor},
 		{"pod SELinux options", func(j *batchv1.Job) {
 			j.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{SELinuxOptions: &corev1.SELinuxOptions{Type: "spc_t"}}
 		}, msgPodSecurity},

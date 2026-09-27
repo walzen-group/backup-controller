@@ -81,6 +81,18 @@ spec:
     reason: Forbidden
     message: "a restore Job's pod uses no host namespace, names no node, and claims no device"
   - expression: >-
+      request.operation == 'DELETE' ||
+      (!has(variables.pod.runtimeClassName) && !has(variables.pod.priorityClassName))
+    reason: Forbidden
+    message: "a restore Job's pod names no runtime class or priority class"
+  # The API server still turns this legacy annotation into the container's
+  # appArmorProfile when it creates the pod. Build sets no pod annotations.
+  - expression: >-
+      request.operation == 'DELETE' || !has(object.spec.template.metadata.annotations) ||
+      !object.spec.template.metadata.annotations.exists(k, k.startsWith('container.apparmor.security.beta.kubernetes.io/'))
+    reason: Forbidden
+    message: "a restore Job's pod template carries no AppArmor annotation"
+  - expression: >-
       request.operation == 'DELETE' || !has(variables.pod.volumes) ||
       variables.pod.volumes.all(v,
         has(v.persistentVolumeClaim) || has(v.emptyDir) ||
