@@ -79,7 +79,7 @@ func baseBackupAt(key string, raw []byte) (BaseBackup, bool, error) {
 // field has no effect. This is the rule of the plugin's catalog
 // (barman-cloud v0.6.0 pkg/catalog/catalog.go:372-374, isBackupDone), which
 // picks the base backup of a recovery. barman writes an unset field as None
-// (barman 3.20.0 infofile.py:335-336). When a time is missing or None, it
+// (barman 3.20.0 infofile.py:275 writes it, :336 reads it). When a time is missing or None, it
 // returns false with only the ID filled in (from backup_id, which can be
 // empty). It returns an error when a time is set but is not in barman's
 // timestamp format. Lines without an "=" are ignored.
@@ -110,7 +110,7 @@ func ParseBackupInfo(raw []byte) (BaseBackup, bool, error) {
 }
 
 // barmanTimeSet tells if a time field of backup.info has a value. barman
-// writes an unset field as None (barman 3.20.0 infofile.py:335-336), and an
+// writes an unset field as None (barman 3.20.0 infofile.py:275 writes it, :336 reads it), and an
 // older file can have no such line.
 func barmanTimeSet(value string) bool {
 	return value != "" && value != "None"

@@ -758,7 +758,7 @@ cites each rule.
   `end_time`, as in the catalog of the plugin. The `status` field does not
   count.
 - A prefix holds an archive only when WAL files are under `wals/`, as in
-  `barman-cloud-check-wal-archive`. A prefix with only failed base backups and
+  `barman-cloud-check-wal-archive`. A prefix with only base backups that lack `begin_time` or `end_time`, and
   no WAL now gets an empty database. v0.8.x refused such a Cluster.
 - The webhook refuses an empty database when the ObjectStore status records a
   completed backup for the serverName and the listing found no archive. The

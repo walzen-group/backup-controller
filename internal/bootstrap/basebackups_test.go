@@ -112,7 +112,7 @@ func TestParseBackupInfoCountsABackupWithBothTimes(t *testing.T) {
 
 // TestParseBackupInfoSkipsABackupWithoutBothTimes checks that a backup whose
 // backup.info writes begin_time or end_time as None is incomplete, whatever
-// its status. barman writes an unset field as None (infofile.py:335-336).
+// its status. barman writes an unset field as None (infofile.py:275).
 func TestParseBackupInfoSkipsABackupWithoutBothTimes(t *testing.T) {
 	for _, info := range []string{
 		"status=DONE\nbegin_time=None\nend_time=2026-09-15 07:32:19+00:00\n",
