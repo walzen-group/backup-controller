@@ -2,14 +2,18 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/kueue"
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // setWorkloadConditions replaces the conditions of the run's Workload, as
@@ -93,6 +97,24 @@ func TestAnEvictedRunGivesTheAppBackAndEnds(t *testing.T) {
 				t.Error("the Workload is still there, and Kueue keeps its quota reserved")
 			}
 		})
+	}
+}
+
+// A Running run whose Workload the controller cannot read goes on with its
+// pass, so the max-quiesce limit and the timeout still give the app back.
+func TestARunWhoseWorkloadReadFailsGoesOn(t *testing.T) {
+	r, c := runningQuiescedRun(t)
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == kueue.WorkloadGVK.Kind {
+				return apierrors.NewForbidden(schema.GroupResource{Group: kueue.WorkloadGVK.Group, Resource: "workloads"}, key.Name, errors.New("RBAC lost"))
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	step(t, r)
+	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseRunning {
+		t.Fatalf("phase = %q, want Running", run.Status.Phase)
 	}
 }
 

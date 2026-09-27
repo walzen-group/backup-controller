@@ -112,8 +112,10 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 //     through no LocalQueue, and endIfEvicted does nothing for it.
 //
 // It returns done true when the pass must stop here: Kueue evicted the
-// Workload and the run ended, or the read of the Workload failed. The error
-// is the error of that read or of finish.
+// Workload and the run ended. The error is the error of finish. A failed
+// read of the Workload does not stop the pass. The pass logs it and goes
+// on, so that the max-quiesce limit and the timeout still give the app back
+// when the controller cannot read Workloads.
 //
 // Kueue marks an evicted Workload with Evicted True, and expects the owner
 // to stop the work (see kueue.Evicted). Kueue would start the work again
@@ -129,7 +131,8 @@ func (r *BackupRunReconciler) endIfEvicted(ctx context.Context, run *backupv1alp
 	}
 	workload, err := kueue.ReadWorkload(ctx, r.Client, run.Namespace, run.UID)
 	if err != nil {
-		return true, err
+		log.FromContext(ctx).Error(err, "cannot read the run's Workload to check for an eviction; the pass goes on")
+		return false, nil
 	}
 	if workload == nil || !kueue.Evicted(workload) {
 		return false, nil
