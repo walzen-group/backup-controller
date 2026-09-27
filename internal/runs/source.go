@@ -210,8 +210,8 @@ func foreignSource(name string) error {
 //     has completed it. A lost status write after the first write gets here.
 //   - The source is in use (see inUse) with another tag, or with none. It
 //     then also returns what holder gives: a hold of kind holdSourceBusy
-//     while a live run waits for that tag, or a *sourceHeldError that
-//     matches errSourceAbandoned when no run does.
+//     while a live run waits for that tag, or a *refusalError with reason
+//     SourceAbandoned when no run does.
 //   - Another live run holds the Lease of the claim or its repository (see
 //     acquireLeases), or a live RestoreRun's mover works on either (see
 //     otherMover). It then also returns a hold of kind holdSourceBusy that
@@ -264,15 +264,12 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 		}
 		return write.fill(source)
 	})
-	if busy, found, bad := heldOf(err); found {
-		if bad != nil {
-			return nil, hold{}, fmt.Errorf("write ReplicationSource %s/%s: %w", claim.Namespace, claim.Name, bad)
-		}
+	if busy, found := heldOf(err); found {
 		return source, busy, nil
 	}
-	_, refused := asItemFailure(err)
+	reason, refused := asItemFailure(err)
 	switch {
-	case errors.Is(err, errSourceAbandoned):
+	case reason == backupv1alpha1.ItemReasonSourceAbandoned:
 		return source, hold{}, err
 	case refused:
 		return nil, hold{}, err

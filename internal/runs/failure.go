@@ -179,65 +179,45 @@ func invalidSpec(format string, args ...any) error {
 	return &invalidSpecError{text: fmt.Sprintf(format, args...)}
 }
 
-// itemFailure is how an item ends when an error fails it: the reason it
-// records and the message a person reads.
-type itemFailure struct {
-	// reason is the ItemReason the item records, always a constant of the
-	// API package.
-	reason backupv1alpha1.ItemReason
-	// message is the error's text, which the item records for a person.
-	// No decision reads it.
-	message string
-}
-
-// asItemFailure tells whether an error fails an item, and how.
+// asItemFailure tells whether an error fails an item, and with which
+// reason.
 //
 // Parameters:
 //   - err is the error a start check or a start returned. It may be nil.
 //
-// It returns the failure and true for an error on this list, checked in
+// It returns the reason and true for an error on this list, checked in
 // this order with errors.As: a *refusalError (its own reason), an
-// invalidSettingError (SettingsInvalid), a *sourceHeldError for a source no
-// run waits for (SourceAbandoned), a *restorejob.FailureError of a restore
-// Job that ended Failed (RestoreJobFailed), a *restorejob.SpecError of a
-// restore Job the run could not build (RestoreJobRefused), a
+// invalidSettingError (SettingsInvalid), a *restorejob.FailureError of a
+// restore Job that ended Failed (RestoreJobFailed), a *restorejob.SpecError
+// of a restore Job the run could not build (RestoreJobRefused), a
 // *claimLostError of a claim that is no longer the run's (ClaimLost), and an
 // *identifyError of a completed sync that left no record of when it ran
-// (NoMoverSnapshot). The message is
-// err.Error(). Any other error, and nil, gives false: the pass returns the
-// error and retries. An *invalidSpecError is not on the list, because only
-// run-level sites meet one, and an item that recorded it would carry a
-// reason no item has.
-func asItemFailure(err error) (itemFailure, bool) {
+// (NoMoverSnapshot). The item's message is err.Error(). Any other error,
+// and nil, gives false: the pass returns the error and retries. An
+// *invalidSpecError is not on the list, because only run-level sites meet
+// one, and an item that recorded it would carry a reason no item has.
+func asItemFailure(err error) (backupv1alpha1.ItemReason, bool) {
 	var refused *refusalError
-	if errors.As(err, &refused) {
-		return itemFailure{reason: refused.reason, message: err.Error()}, true
-	}
 	var bad invalidSettingError
-	if errors.As(err, &bad) {
-		return itemFailure{reason: backupv1alpha1.ItemReasonSettingsInvalid, message: err.Error()}, true
-	}
-	var held *sourceHeldError
-	if errors.As(err, &held) {
-		return itemFailure{reason: backupv1alpha1.ItemReasonSourceAbandoned, message: err.Error()}, true
-	}
 	var jobFailed *restorejob.FailureError
-	if errors.As(err, &jobFailed) {
-		return itemFailure{reason: backupv1alpha1.ItemReasonRestoreJobFailed, message: err.Error()}, true
-	}
 	var badSpec *restorejob.SpecError
-	if errors.As(err, &badSpec) {
-		return itemFailure{reason: backupv1alpha1.ItemReasonRestoreJobRefused, message: err.Error()}, true
-	}
 	var lost *claimLostError
-	if errors.As(err, &lost) {
-		return itemFailure{reason: backupv1alpha1.ItemReasonClaimLost, message: err.Error()}, true
-	}
 	var unidentified *identifyError
-	if errors.As(err, &unidentified) {
-		return itemFailure{reason: backupv1alpha1.ItemReasonNoMoverSnapshot, message: err.Error()}, true
+	switch {
+	case errors.As(err, &refused):
+		return refused.reason, true
+	case errors.As(err, &bad):
+		return backupv1alpha1.ItemReasonSettingsInvalid, true
+	case errors.As(err, &jobFailed):
+		return backupv1alpha1.ItemReasonRestoreJobFailed, true
+	case errors.As(err, &badSpec):
+		return backupv1alpha1.ItemReasonRestoreJobRefused, true
+	case errors.As(err, &lost):
+		return backupv1alpha1.ItemReasonClaimLost, true
+	case errors.As(err, &unidentified):
+		return backupv1alpha1.ItemReasonNoMoverSnapshot, true
 	}
-	return itemFailure{}, false
+	return "", false
 }
 
 // failBackupItem fails a BackupRun's item with an error, when the error is
@@ -251,9 +231,9 @@ func asItemFailure(err error) (itemFailure, bool) {
 // reason and the message. For any other error, and nil, it returns false
 // and leaves the item as it was.
 func failBackupItem(item *backupv1alpha1.BackupItem, err error) bool {
-	failure, ok := asItemFailure(err)
+	reason, ok := asItemFailure(err)
 	if ok {
-		item.Phase, item.Reason, item.Message = backupv1alpha1.ItemFailed, failure.reason, failure.message
+		item.Phase, item.Reason, item.Message = backupv1alpha1.ItemFailed, reason, err.Error()
 	}
 	return ok
 }
@@ -269,9 +249,9 @@ func failBackupItem(item *backupv1alpha1.BackupItem, err error) bool {
 // reason and the message. For any other error, and nil, it returns false
 // and leaves the item as it was.
 func failRestoreItem(item *backupv1alpha1.RestoreItem, err error) bool {
-	failure, ok := asItemFailure(err)
+	reason, ok := asItemFailure(err)
 	if ok {
-		item.Phase, item.Reason, item.Message = backupv1alpha1.ItemFailed, failure.reason, failure.message
+		item.Phase, item.Reason, item.Message = backupv1alpha1.ItemFailed, reason, err.Error()
 	}
 	return ok
 }

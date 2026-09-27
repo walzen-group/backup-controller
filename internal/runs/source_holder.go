@@ -27,31 +27,6 @@ func inUse(source *volsyncv1alpha1.ReplicationSource) bool {
 	return busy(source) || (source.Status != nil && source.Status.LastSyncStartTime != nil)
 }
 
-// errSourceAbandoned is the error that ensureSource returns, wrapped in a
-// sourceHeldError, when the ReplicationSource of the claim is busy with a
-// tag that no run waits for. The item fails at once. A wait would not end,
-// and VolSync would complete a new tag with the older sync.
-var errSourceAbandoned = errors.New("the ReplicationSource is still retrying a backup no run waits for")
-
-// sourceHeldError is the error that says why a run must not write the
-// ReplicationSource of the claim when no run waits for its tag. It matches
-// errSourceAbandoned, and asItemFailure fails the item with reason
-// SourceAbandoned. Its message is for the message of the item.
-type sourceHeldError struct {
-	// message names the source and the run or the tag that holds it, and
-	// says what a person can do.
-	message string
-}
-
-// Error returns the message, which names the source and the run or tag that
-// holds it.
-func (e *sourceHeldError) Error() string { return e.message }
-
-// Is makes errors.Is match errSourceAbandoned.
-func (*sourceHeldError) Is(target error) bool {
-	return target == errSourceAbandoned
-}
-
 // heldError carries a hold out of the mutate function of
 // controllerutil.CreateOrUpdate. An error is the only way to stop the write
 // from that function. ensureSource gets the hold back with errors.As, and no
@@ -69,22 +44,14 @@ func (e *heldError) Error() string { return e.hold.text }
 // Parameters:
 //   - err is the error of controllerutil.CreateOrUpdate.
 //
-// It returns found false when err carries no *heldError. It returns the hold
-// and found true when err carries a *heldError. It returns an error with
-// found true when that *heldError carries the zero hold.
-//
-// The zero hold does not hold the run. If ensureSource took it as a hold,
-// the item would go Running with a tag that the write did not put on the
-// source. The error stops the item, and the pass runs again.
-func heldOf(err error) (h hold, found bool, bad error) {
+// It returns the hold and true when err carries a *heldError, and false
+// otherwise. check puts only a hold that holds into a *heldError.
+func heldOf(err error) (hold, bool) {
 	var held *heldError
 	if !errors.As(err, &held) {
-		return hold{}, false, nil
+		return hold{}, false
 	}
-	if !held.hold.held() {
-		return hold{}, true, errors.New("a hold with no kind stopped the write, and the run writes nothing")
-	}
-	return held.hold, true, nil
+	return held.hold, true
 }
 
 // holder returns why the run with the trigger tag must not write the
@@ -105,7 +72,7 @@ func heldOf(err error) (h hold, found bool, bad error) {
 // mover would make VolSync replace the mover Job, which stops restic and
 // leaves its lock in the repository.
 //
-// It returns a *sourceHeldError that matches errSourceAbandoned for a source
+// It returns a *refusalError with reason SourceAbandoned for a source
 // whose open tag no live run holds, and the item fails. A tag is live
 // when the namespace holds a BackupRun whose UID is the tag without its
 // "backuprun-" prefix, which is not being deleted and not finished, and whose
@@ -129,7 +96,7 @@ func holder(ctx context.Context, reader client.Reader, source *volsyncv1alpha1.R
 	if run := taggedRun(runs, manualTag(source)); run != nil {
 		owner = run.Name
 	}
-	return hold{}, &sourceHeldError{message: abandonedMessage(source, owner)}
+	return hold{}, refuse(backupv1alpha1.ItemReasonSourceAbandoned, "%s", abandonedMessage(source, owner))
 }
 
 // abandonedMessage returns the item's message for a source busy with a tag
