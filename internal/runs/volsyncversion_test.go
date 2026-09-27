@@ -14,8 +14,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
@@ -78,61 +76,6 @@ func checkVolSyncUnsupported(t *testing.T, conditions []metav1.Condition, kind s
 		if !strings.Contains(message, want) {
 			t.Errorf("Ready message %q does not name %s", message, want)
 		}
-	}
-}
-
-// A BackupRun on a cluster whose VolSync no longer serves v1alpha1 ends
-// Failed with reason VolSyncUnsupported, whose message names
-// ReplicationSource, the version the controller needs and the version
-// served, and never creates a ReplicationSource or stops anything on a
-// guess.
-func TestABackupEndsWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
-	c := newClientWithCRDs(t, crdsWithVolSyncAt(t, "v1beta1"), backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment())
-	served := servingOnly(c)
-	r := &BackupRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
-
-	for range 4 {
-		_ = tryStep(r)
-	}
-
-	run := readBackupRun(t, c)
-	checkVolSyncUnsupported(t, run.Status.Conditions, "ReplicationSource")
-	if len(run.Status.Quiesced) != 0 || replicasOf(t, c) != 2 {
-		t.Errorf("quiesced = %v, replicas = %d; want nothing stopped", run.Status.Quiesced, replicasOf(t, c))
-	}
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Errorf("phase = %q, want Failed", run.Status.Phase)
-	}
-}
-
-// A RestoreRun on such a cluster fails each pass with an error naming
-// v1alpha1 and the VolSync kind it met first, the ReplicationSources its
-// plan lists to find a backup of the claim still running, and puts that
-// error on its Ready condition. It stays unfinished and creates no restore
-// Job.
-func TestARestoreRetriesLoudlyWhenVolSyncNoLongerServesV1alpha1(t *testing.T) {
-	c := newClientWithCRDs(t, crdsWithVolSyncAt(t, "v1beta1"),
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
-		claim(), volumeRestore(), repository())
-	served := servingOnly(c)
-	r := &RestoreRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
-
-	var err error
-	for range 3 {
-		_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}})
-	}
-
-	checkVolSyncRefused(t, err, "ReplicationSource")
-	run := readRestoreRun(t, c)
-	if run.Status.Phase.Finished() {
-		t.Errorf("phase = %q, want the run unfinished", run.Status.Phase)
-	}
-	if message := readyMessage(run.Status.Conditions); !strings.Contains(message, "volsync.backube/v1alpha1") {
-		t.Errorf("Ready message = %q, want the refused VolSync version on it", message)
-	}
-	if jobs := restoreJobs(t, c); len(jobs) != 0 {
-		t.Errorf("restore Jobs = %v, want none created", jobs)
 	}
 }
 

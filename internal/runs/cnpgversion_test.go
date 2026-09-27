@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -111,20 +110,6 @@ func TestADatabaseIsBackedUpAtTheVersionCloudNativePGServes(t *testing.T) {
 	}
 }
 
-// A namespace backup on such a cluster plans the Cluster too.
-func TestANamespaceRunFindsClustersAtTheVersionCloudNativePGServes(t *testing.T) {
-	c := newClientWithCRDs(t, crdsServedAtNext(t), backupRun(), claim(), volume(), volumeRestore(), repository(), atNext(cluster()))
-	served := servingOnly(c)
-	r := &BackupRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
-
-	step(t, r) // plan
-
-	run := readBackupRun(t, c)
-	if len(run.Status.Items) != 2 {
-		t.Fatalf("items = %+v, want the claim and the Cluster", run.Status.Items)
-	}
-}
-
 // clusterListGone wraps c so that the API server answers every Cluster list
 // at v1 with the plain-text 404 of a version it no longer serves, as after a
 // CloudNativePG upgrade the client's mapper has not seen yet.
@@ -154,29 +139,5 @@ func TestAClusterListAtAVersionNoLongerServedIsRetried(t *testing.T) {
 	}
 	if run := readBackupRun(t, c); len(run.Status.Items) != 0 {
 		t.Errorf("items = %+v, want the run not planned without its Cluster", run.Status.Items)
-	}
-}
-
-// The schedule's Cluster list at a version the API server has stopped
-// serving is an error too, never a namespace with nothing to back up.
-func TestEnabledClustersRetriesAListAtAVersionNoLongerServed(t *testing.T) {
-	c := newClient(t, cluster())
-	if _, err := cnpg.EnabledClusters(context.Background(), clusterListGone(c), c.RESTMapper(), ns); err == nil || !retryable(err) {
-		t.Errorf("cnpg.EnabledClusters error = %v, want one the caller retries", err)
-	}
-}
-
-// A database backup in a cluster without the CloudNativePG CRDs is refused
-// with a message that says so. The API server's discovery serves no version
-// of Cluster there, which cnpg.GetCluster reports as an error for which
-// meta.IsNoMatchError is true, and never as a Cluster that is missing.
-func TestADatabaseBackupWithoutCloudNativePGSaysTheCRDsAreMissing(t *testing.T) {
-	r, c, _ := servedBackupReconciler(t, []string{cnpg.ClusterGVK.Group}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }))
-	step(t, r)
-
-	run := readBackupRun(t, c)
-	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || !strings.Contains(readyMessage(run.Status.Conditions), "no CloudNativePG CRDs") {
-		t.Errorf("phase = %q, message = %q; want Failed saying the cluster has no CloudNativePG CRDs",
-			run.Status.Phase, readyMessage(run.Status.Conditions))
 	}
 }

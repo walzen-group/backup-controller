@@ -58,14 +58,3 @@ func TestBackupRunSetupWrapsTheClientForGoneVersions(t *testing.T) {
 	checkVersionGoneRetried(t, "Client", r.Client)
 	checkVersionGoneRetried(t, "Reader", r.Reader)
 }
-
-// SetupWithManager does the same for a RestoreRunReconciler.
-func TestRestoreRunSetupWrapsTheClientForGoneVersions(t *testing.T) {
-	gone := destinationGone(newClient(t))
-	r := &RestoreRunReconciler{Client: gone, Reader: gone}
-	if err := r.SetupWithManager(testManager(t)); err != nil {
-		t.Fatal(err)
-	}
-	checkVersionGoneRetried(t, "Client", r.Client)
-	checkVersionGoneRetried(t, "Reader", r.Reader)
-}

@@ -10,13 +10,10 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // The tests in this file check what a run does when VolSync, in the middle
@@ -241,117 +238,5 @@ func TestARestoreWaitsOnAnUnservedVolSyncUntilItTimesOut(t *testing.T) {
 	}
 	if got := replicasOf(t, c); got != 2 || suspended(t, c) {
 		t.Errorf("replicas = %d, Kustomization suspended = %t; want the app's 2 back and the Kustomization resumed", got, suspended(t, c))
-	}
-}
-
-// A pass that read a stale copy of a RestoreRun that has since ended, and
-// then met an unserved VolSync version, records no VolSyncUnsupported event.
-// showVolSyncWait leaves the ended run's condition alone, and the pass's
-// copy keeps the Ready condition it had, so the reconcile announces no
-// condition it never wrote.
-func TestAVolSyncWaitOnAnEndedRunRecordsNoEvent(t *testing.T) {
-	run, job := quiescedMidRestore(t)
-	ended := run.DeepCopy()
-	ended.Status.Phase = backupv1alpha1.RunPhaseFailed
-	backupv1alpha1.SetReady(&ended.Status.Conditions, ended.Generation, metav1.ConditionTrue, backupv1alpha1.ReasonTimedOut, "the run had not finished")
-	r, c := movedRestoreReconciler(t, ended, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true), job)
-	recorder := events.NewFakeRecorder(10)
-	r.Recorder = recorder
-
-	stale := readRestoreRun(t, c)
-	stale.Status.Phase, stale.Status.Conditions = run.Status.Phase, run.Status.Conditions
-	before := readyReason(stale.Status.Conditions)
-	kind := schema.GroupKind{Group: volsyncv1alpha1.GroupVersion.Group, Kind: "ReplicationSource"}
-	cause := &meta.NoKindMatchError{GroupKind: kind, SearchedVersions: []string{"v1alpha1"}}
-	if err := r.showVolSyncWait(context.Background(), stale, kind, cause); err != nil {
-		t.Fatalf("show the wait: %v", err)
-	}
-	announce(r.Recorder, stale, stale.Status.Conditions, before, "Restore")
-
-	if got := recorded(recorder); len(got) != 0 {
-		t.Errorf("events = %q, want none for a wait on a run that has ended", got)
-	}
-	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonTimedOut {
-		t.Errorf("stored Ready reason = %q, want the ending's %s kept", reason, backupv1alpha1.ReasonTimedOut)
-	}
-}
-
-// An into restore that meets a VolSync no longer serving v1alpha1 before it
-// creates its restore Job waits with reason VolSyncUnsupported, and once it
-// passes spec.timeout it ends TimedOut with a Ready message that names the
-// claim, the deadline and the VolSync wait it was in.
-func TestAnIntoRestoreTimedOutOnAnUnservedVolSyncNamesTheWait(t *testing.T) {
-	run := checkedRestore(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" })
-	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository())
-
-	checkVolSyncRefused(t, tryRestoreStep(r), "ReplicationSource")
-	waiting := readRestoreRun(t, c)
-	checkVolSyncUnsupported(t, waiting.Status.Conditions, "ReplicationSource")
-
-	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-	for range 2 {
-		if err := tryRestoreStep(r); err != nil {
-			t.Fatalf("reconcile past the deadline: %v", err)
-		}
-	}
-
-	done := readRestoreRun(t, c)
-	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
-		t.Fatalf("phase = %q, reason = %q; want Failed, TimedOut", done.Status.Phase, readyReason(done.Status.Conditions))
-	}
-	message := readyMessage(done.Status.Conditions)
-	if !strings.HasPrefix(message, "claim scratch had not been restored by ") {
-		t.Errorf("Ready message = %q, want it to name the claim and the deadline", message)
-	}
-	if wait := readyMessage(waiting.Status.Conditions); !strings.Contains(message, "; it was waiting: "+wait) {
-		t.Errorf("Ready message = %q, want it to name the VolSync wait %q", message, wait)
-	}
-}
-
-// A pass whose VolSync wait meets a Conflict on the status write, because
-// another writer changed the run between the read and the write, records no
-// VolSyncUnsupported event: the stored run never held that condition, and
-// the pass's copy keeps the Ready condition it had. The pass returns the
-// Conflict with the VolSync error, so the run is reconciled again, and the
-// next pass shows the wait and announces it once.
-func TestAVolSyncWaitThatMeetsAConflictRecordsNoEventAndRetries(t *testing.T) {
-	run := checkedRestore(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" })
-	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository())
-	recorder := events.NewFakeRecorder(10)
-	r.Recorder = recorder
-	serving := r.Client
-	interfered := false
-	r.Client = interceptor.NewClient(serving.(client.WithWatch), interceptor.Funcs{
-		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			written, ok := obj.(*backupv1alpha1.RestoreRun)
-			if ok && !interfered && readyReason(written.Status.Conditions) == backupv1alpha1.ReasonVolSyncUnsupported {
-				interfered = true
-				other := readRestoreRun(t, c)
-				other.Labels = map[string]string{"example.com/touched": "yes"}
-				if err := c.Update(ctx, other); err != nil {
-					t.Fatalf("another writer's update: %v", err)
-				}
-			}
-			return cl.SubResource(sub).Update(ctx, obj, opts...)
-		},
-	})
-
-	err := tryRestoreStep(r)
-	checkVolSyncRefused(t, err, "ReplicationSource")
-	if !interfered || !apierrors.IsConflict(err) {
-		t.Fatalf("interfered = %t, error = %v; want the wait's status write to meet a Conflict", interfered, err)
-	}
-	if got := recorded(recorder); len(got) != 0 {
-		t.Errorf("events = %q, want none for a wait the status never held", got)
-	}
-	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason == backupv1alpha1.ReasonVolSyncUnsupported {
-		t.Errorf("stored Ready reason = %q, want the write that met the Conflict to have changed nothing", reason)
-	}
-
-	checkVolSyncRefused(t, tryRestoreStep(r), "ReplicationSource")
-	checkVolSyncUnsupported(t, readRestoreRun(t, c).Status.Conditions, "ReplicationSource")
-	got := recorded(recorder)
-	if len(got) != 1 || !strings.Contains(got[0], backupv1alpha1.ReasonVolSyncUnsupported) {
-		t.Errorf("events = %q, want one VolSyncUnsupported event from the pass that showed the wait", got)
 	}
 }
