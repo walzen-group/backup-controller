@@ -127,6 +127,11 @@ type RunOptions struct {
 	// RestoreImage is the image from the required --restore-image flag,
 	// which the RestoreRun reconciler's restore Jobs run restic in.
 	RestoreImage string
+	// Paused is true when the command line sets --pause. New BackupRuns,
+	// RestoreRuns and restores of VolumeRestore claims then wait, and work
+	// in progress goes on to its end. The value changes only with a restart
+	// of the pod.
+	Paused bool
 }
 
 // startRunControllers starts the controller-runtime manager that reconciles
@@ -282,15 +287,15 @@ func addRunControllers(manager ctrl.Manager, options RunOptions) error {
 
 	reader := manager.GetAPIReader()
 	recorder := manager.GetEventRecorder("backup-controller")
-	backups := &runs.BackupRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Retimer: restic.S3Lister{}, Recorder: recorder}
+	backups := &runs.BackupRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Retimer: restic.S3Lister{}, Recorder: recorder, Paused: options.Paused}
 	if err := backups.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the BackupRun controller: %w", err)
 	}
-	restores := &runs.RestoreRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Prober: bootstrap.S3Prober{}, Recorder: recorder, RestoreImage: options.RestoreImage}
+	restores := &runs.RestoreRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Prober: bootstrap.S3Prober{}, Recorder: recorder, RestoreImage: options.RestoreImage, Paused: options.Paused}
 	if err := restores.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the RestoreRun controller: %w", err)
 	}
-	if err := (&runs.Scheduler{Client: manager.GetClient(), Reader: reader, Recorder: recorder}).SetupWithManager(manager); err != nil {
+	if err := (&runs.Scheduler{Client: manager.GetClient(), Reader: reader, Recorder: recorder, Paused: options.Paused}).SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the scheduler: %w", err)
 	}
 

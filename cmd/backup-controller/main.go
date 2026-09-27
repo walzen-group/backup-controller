@@ -105,6 +105,10 @@ func run(options RunOptions, listener metrics, exitOnFailure func(error)) int {
 		return 1
 	}
 	callbacks := populator.New(operations, options.Namespace, options.RestoreImage, restic.S3Lister{})
+	if options.Paused {
+		callbacks.Pause()
+		klog.Info("paused: new runs wait, runs in progress finish")
+	}
 
 	// The populator library drives only the one kind it is given, so
 	// BackupRun and RestoreRun are reconciled by a controller-runtime manager

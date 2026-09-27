@@ -118,6 +118,7 @@ kubectl delete -f chart/crds/
 | nameOverride / fullnameOverride | "" | Name parts used by the object names |
 | namespace | backup-system | Namespace the controller creates its prime claims, Secret copies and the populator's restore Jobs in, passed as --namespace |
 | restoreImage | "" (required) | Image the restore Jobs run restic in, pinned by digest, passed as --restore-image. The render fails without it |
+| pause | false | Passed as --pause when true. New BackupRuns, RestoreRuns and VolumeRestore claims then wait, and runs in progress finish. Set it before an upgrade (see docs/upgrading.md) |
 | webhook.enabled | true | Serve the bootstrap webhook and install its Service and MutatingWebhookConfiguration. With false, every Cluster bootstraps as written. Then a rebuilt cluster comes back with empty databases |
 | webhook.port | 9443 | Port the webhook listens on inside the pod, passed as --webhook-port |
 | webhook.certManager.create | true | Create the cert-manager Certificate that fills the Secret <fullname>-webhook-tls and injects the CA. With false, supply that Secret with tls.crt and tls.key, and set the caBundle yourself |

@@ -76,6 +76,7 @@ func runFlags(fs *flag.FlagSet) func() (RunOptions, error) {
 	healthAddr := fs.String("health-probe-addr", ":8082", "address serving /healthz and /readyz for the run controllers; 0 serves none")
 	webhookCert := fs.String("webhook-cert-dir", "", "directory holding tls.crt and tls.key; empty serves no webhook")
 	webhookPort := fs.Int("webhook-port", 9443, "port the admission webhook listens on")
+	pause := fs.Bool("pause", false, "new runs and restores wait, and runs in progress finish; set it before an upgrade")
 	return func() (RunOptions, error) {
 		image, err := restoreImage()
 		if err != nil {
@@ -88,6 +89,7 @@ func runFlags(fs *flag.FlagSet) func() (RunOptions, error) {
 			HealthAddr:   *healthAddr,
 			Hook:         BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort},
 			RestoreImage: image,
+			Paused:       *pause,
 		}, nil
 	}
 }

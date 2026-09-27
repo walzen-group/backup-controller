@@ -29,6 +29,11 @@ namespace: backup-system
 # backup.
 restoreImage: ""
 
+# Pause the controller for an upgrade, passed to the container as --pause.
+# While it is true, new BackupRuns, RestoreRuns and restores of VolumeRestore
+# claims wait, and runs in progress finish. A change restarts the pod.
+pause: false
+
 # The admission webhook that chooses how a CloudNativePG Cluster starts. A
 # Cluster whose object store already holds a base backup is recovered from it;
 # one whose store is empty bootstraps an empty database.
