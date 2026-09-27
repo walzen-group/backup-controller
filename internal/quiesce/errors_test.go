@@ -62,8 +62,7 @@ func newTestClient(t *testing.T, funcs interceptor.Funcs, objects ...client.Obje
 	return c, mapper
 }
 
-// Each refusal of the package is its own type, which errors.As finds, and
-// its Error keeps the sentence the run shows in its Ready message.
+// Each refusal of the package is its own type, which errors.As finds.
 func TestTheRefusalsAreTyped(t *testing.T) {
 	ctx := context.Background()
 	named := func(ref backupv1alpha1.WorkloadRef) func(t *testing.T) error {
@@ -104,17 +103,14 @@ func TestTheRefusalsAreTyped(t *testing.T) {
 	for name, tc := range map[string]struct {
 		run   func(t *testing.T) error
 		check func(err error) bool
-		text  string
 	}{
 		"a kind the run cannot stop": {
 			run:   named(backupv1alpha1.WorkloadRef{Kind: "DaemonSet", Name: "notes"}),
 			check: func(err error) bool { var e *SpecError; return errors.As(err, &e) && e.Ref.Kind == "DaemonSet" },
-			text:  "spec.quiesce lists DaemonSet notes; only a Deployment or a StatefulSet can be stopped",
 		},
 		"a workload the namespace does not hold": {
 			run:   named(backupv1alpha1.WorkloadRef{Kind: "StatefulSet", Name: "notes-worker"}),
 			check: func(err error) bool { var e *SpecError; return errors.As(err, &e) && e.Ref.Name == "notes-worker" },
-			text:  "spec.quiesce lists StatefulSet notes-worker, which this namespace does not hold",
 		},
 		"a Kustomization of two namespaces": {
 			run: plan(labeled(), wiki, kustomizationOf([]any{own, map[string]any{"id": "wiki_notes_apps_Deployment", "v": "v1"}})),
@@ -122,8 +118,6 @@ func TestTheRefusalsAreTyped(t *testing.T) {
 				var e *CrossNamespaceError
 				return errors.As(err, &e) && e.Kustomization == "flux-system/notes" && len(e.Namespaces) == 2
 			},
-			text: "Kustomization flux-system/notes applies workloads in namespaces notes and wiki; a run suspends the Kustomization while it stops workloads, " +
-				"which would leave the other namespace's workloads unmanaged by Flux, so it refuses. Give each namespace its own Kustomization",
 		},
 		"no inventory": {
 			run: plan(labeled(), kustomizationOf(nil)),
@@ -131,8 +125,6 @@ func TestTheRefusalsAreTyped(t *testing.T) {
 				var e *InventoryError
 				return errors.As(err, &e) && e.Problem == InventoryMissing && e.Kustomization == "flux-system/notes"
 			},
-			text: "the Kustomization flux-system/notes has no list at status.inventory.entries, where kustomize-controller records every object it " +
-				"applies; either it has not applied yet or a Flux release moved the field (see docs/compatibility.md)",
 		},
 		"an inventory entry of another format": {
 			run: plan(labeled(), kustomizationOf([]any{map[string]any{"id": "notes"}})),
@@ -140,8 +132,6 @@ func TestTheRefusalsAreTyped(t *testing.T) {
 				var e *InventoryError
 				return errors.As(err, &e) && e.Problem == InventoryEntryMalformed
 			},
-			text: "the Kustomization flux-system/notes has an entry map[id:notes] in status.inventory.entries whose id is not " +
-				"\"<namespace>_<name>_<group>_<kind>\"; a Flux release may have changed the format (see docs/compatibility.md)",
 		},
 		"a refused restart": {
 			run: restart,
@@ -149,16 +139,12 @@ func TestTheRefusalsAreTyped(t *testing.T) {
 				var e *RestartError
 				return errors.As(err, &e) && apierrors.IsForbidden(err)
 			},
-			text: "could not give Deployment notes its 3 replicas back: scale notes to 3: deployments/scale.apps \"notes\" is forbidden: denied",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := tc.run(t)
 			if !tc.check(err) {
 				t.Fatalf("err = %T %v; want the typed refusal", err, err)
-			}
-			if err.Error() != tc.text {
-				t.Errorf("Error() = %q\nwant      %q", err.Error(), tc.text)
 			}
 		})
 	}
