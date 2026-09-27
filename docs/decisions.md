@@ -2,7 +2,7 @@
 
 Each entry records what was chosen, what other options there were, and what
 would have gone wrong with them. A reader who finds one of the rejected options
-must be able to tell from the entry alone why the option was rejected.
+should be able to tell from the entry alone why the option was rejected.
 
 ## Build a populator of our own, and leave VolSync unpatched
 
@@ -51,7 +51,7 @@ A claim could continue to name `kind: ReplicationDestination` in
 `dataSourceRef`, and nothing in the app would change.
 
 VolSync registers its own populator for that kind. Two populators that watch
-the same kind both act on the same claims, and the result depends on which one
+the same kind would both act on the same claims, and the result depends on which one
 gets there first. No setting on the claim can pick one of the two, so the data
 source is a kind of ours.
 
