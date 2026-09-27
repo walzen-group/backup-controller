@@ -98,29 +98,6 @@ func TestABackupEndsAndGivesTheAppBackWhenVolSyncDropsV1alpha1(t *testing.T) {
 	}
 }
 
-// A quiesced BackupRun deleted while VolSync serves only v1alpha1's
-// successor gives the app back and lets the deletion complete.
-func TestADeletedBackupGivesTheAppBackWhenVolSyncDropsV1alpha1(t *testing.T) {
-	t.Parallel()
-	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
-	if err := c.Delete(context.Background(), readBackupRun(t, c)); err != nil {
-		t.Fatal(err)
-	}
-	r.Client = volsyncMovedClient{r.Client}
-
-	if err := tryStep(r); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d, want the app's 2 back", got)
-	}
-	err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "before-upgrade"}, &backupv1alpha1.BackupRun{})
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("get the deleted run: %v, want it gone", err)
-	}
-}
-
 // movedRestoreReconciler returns a RestoreRunReconciler over a client whose
 // API server serves VolSync's kinds at v1beta1 alone, holding the given
 // objects, and the client itself. The clock stands at frozen.

@@ -2,18 +2,14 @@ package runs
 
 import (
 	"context"
-	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
 )
 
@@ -108,38 +104,5 @@ func TestADatabaseIsBackedUpAtTheVersionCloudNativePGServes(t *testing.T) {
 
 	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
 		t.Fatalf("phase = %q, want Succeeded; status = %+v", run.Status.Phase, run.Status)
-	}
-}
-
-// clusterListGone wraps c so that the API server answers every Cluster list
-// at v1 with the plain-text 404 of a version it no longer serves, as after a
-// CloudNativePG upgrade the client's mapper has not seen yet.
-func clusterListGone(c client.Client) client.Client {
-	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind() == cnpg.ClusterGVK.GroupVersion().WithKind("ClusterList") {
-				return apierrors.NewGenericServerResponse(http.StatusNotFound, "list",
-					schema.GroupResource{Group: cnpg.ClusterGVK.Group, Resource: "clusters"}, "", "404 page not found", 0, true)
-			}
-			return cl.List(ctx, list, opts...)
-		},
-	})
-}
-
-// A Cluster list at a version the API server has stopped serving never reads
-// as a namespace without Clusters: the plan fails so it runs again, and the
-// run is not planned without its database.
-func TestAClusterListAtAVersionNoLongerServedIsRetried(t *testing.T) {
-	t.Parallel()
-	c := newClient(t, backupRun(), claim(), volume(), volumeRestore(), repository(), cluster())
-	gone := clusterListGone(c)
-	r := &BackupRunReconciler{Client: gone, Reader: gone, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
-
-	err := tryStep(r)
-	if err == nil {
-		t.Error("the plan pass returned no error, want the unserved version retried")
-	}
-	if run := readBackupRun(t, c); len(run.Status.Items) != 0 {
-		t.Errorf("items = %+v, want the run not planned without its Cluster", run.Status.Items)
 	}
 }

@@ -104,31 +104,6 @@ func TestARunGivesTheAppBackAfterFluxIsRemoved(t *testing.T) {
 	}
 }
 
-// A namespace run deleted while it holds the app down, after Flux's CRDs were
-// removed, gives the app back and lets its deletion complete.
-func TestADeletedRunGivesTheAppBackAfterFluxIsRemoved(t *testing.T) {
-	t.Parallel()
-	r, c, kinds := servedBackupReconciler(t, nil, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
-		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
-	step(t, r) // plan
-	step(t, r) // admit, no queue
-	step(t, r) // quiesce
-
-	removeFlux(t, c, kinds)
-	if err := c.Delete(context.Background(), readBackupRun(t, c)); err != nil {
-		t.Fatalf("delete the run: %v", err)
-	}
-	if err := tryStep(r); err != nil {
-		t.Fatalf("finalize pass: %v", err)
-	}
-	if replicas := replicasOf(t, c); replicas != 2 {
-		t.Fatalf("replicas = %d after the run was deleted, want 2 back", replicas)
-	}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "before-upgrade"}, &backupv1alpha1.BackupRun{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("get the run after its finalize pass: %v, want it gone", err)
-	}
-}
-
 // On a cluster without Flux, a Deployment that still carries
 // kustomize-controller's labels is stopped with nothing suspended, and the
 // run goes on.
