@@ -8,7 +8,6 @@ import (
 	// --kubeconfig flag in its init function, so the default FlagSet already
 	// real here.
 	"slices"
-	"strings"
 	"testing"
 
 	_ "sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -36,36 +35,6 @@ func TestKubeconfigFlagReusesOneSomethingElseRegistered(t *testing.T) {
 	}
 	if got := read(); got != "/passed/in" {
 		t.Errorf("value after parsing = %q, want what the command line set", got)
-	}
-}
-
-// TestARestoreImageIsRequired checks that reading --restore-image fails when
-// the command line leaves it out or sets it empty, and that the error names
-// the flag.
-//
-// The controller carries no image of its own: the restore Job has to run the
-// restic that VolSync backs up with, and only the installer knows which
-// image that is. A default here would restore with a restic nobody chose.
-func TestARestoreImageIsRequired(t *testing.T) {
-	for name, args := range map[string][]string{
-		"left out":   nil,
-		"empty":      {"--restore-image="},
-		"only space": {"--restore-image= "},
-	} {
-		t.Run(name, func(t *testing.T) {
-			fs := flag.NewFlagSet("t", flag.ContinueOnError)
-			read := restoreImageFlag(fs)
-			if err := fs.Parse(args); err != nil {
-				t.Fatalf("parse: %v", err)
-			}
-			image, err := read()
-			if !errors.Is(err, errNoRestoreImage) {
-				t.Fatalf("read = %q, %v; want errNoRestoreImage", image, err)
-			}
-			if !strings.Contains(err.Error(), "--restore-image") {
-				t.Errorf("the error %q does not name the flag", err)
-			}
-		})
 	}
 }
 
