@@ -177,3 +177,68 @@ func TestATransientResumeErrorIsRetried(t *testing.T) {
 		})
 	}
 }
+
+// staleRuns returns a client over c that answers every get of a RestoreRun
+// with stale, as an informer cache that has not seen the latest write does.
+func staleRuns(c client.Client, stale *backupv1alpha1.RestoreRun) client.Client {
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if run, ok := obj.(*backupv1alpha1.RestoreRun); ok {
+				stale.DeepCopyInto(run)
+				return nil
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+}
+
+// A pass whose cached copy of the run lags the stored run resumes nothing
+// the stored run no longer goes on with. The cache shows the item Running
+// on its suspended restore Job, while the stored run has recorded an
+// ending, is being deleted, has failed the item, or records another Job.
+// The pass returns an error for a retry and the Job stays suspended.
+func TestAStaleCachedRunResumesNothing(t *testing.T) {
+	for name, change := range map[string]func(t *testing.T, c client.Client, stored *backupv1alpha1.RestoreRun){
+		"ending recorded": func(t *testing.T, c client.Client, stored *backupv1alpha1.RestoreRun) {
+			stored.Status.Ending = &backupv1alpha1.RunEnding{Reason: backupv1alpha1.ReasonFailed, Message: "spec.quiesce lists Deployment notes"}
+			updateRunStatus(t, c, stored)
+		},
+		"being deleted": func(t *testing.T, c client.Client, stored *backupv1alpha1.RestoreRun) {
+			if err := c.Delete(context.Background(), stored); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"item failed": func(t *testing.T, c client.Client, stored *backupv1alpha1.RestoreRun) {
+			stored.Status.Items[0].Phase = backupv1alpha1.ItemFailed
+			updateRunStatus(t, c, stored)
+		},
+		"another Job recorded": func(t *testing.T, c client.Client, stored *backupv1alpha1.RestoreRun) {
+			stored.Status.Items[0].JobUID = "another-job-uid"
+			updateRunStatus(t, c, stored)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			run, job := quiescedMidRestore(t)
+			r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true), unresumed(job))
+			stale := readRestoreRun(t, c)
+			change(t, c, readRestoreRun(t, c))
+			r.Client = staleRuns(c, stale)
+
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err == nil {
+				t.Error("the stale pass succeeded, want an error for a retry")
+			}
+			if !suspendedJob(t, c, job.Name) {
+				t.Errorf("restore Job %s was resumed from a stale copy of the run, want it left suspended", job.Name)
+			}
+		})
+	}
+}
+
+// updateRunStatus writes the status of the given RestoreRun, failing the
+// test on an error.
+func updateRunStatus(t *testing.T, c client.Client, run *backupv1alpha1.RestoreRun) {
+	t.Helper()
+	if err := c.Status().Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+}

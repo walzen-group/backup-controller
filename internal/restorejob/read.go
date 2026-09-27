@@ -239,8 +239,10 @@ func ExitMeaning(code int32) string {
 //
 // It returns true for a Job with spec.suspend true that is neither Complete
 // nor Failed and not being deleted. A Job that Stop suspended also has
-// spec.suspend true; its caller stops only a Job it is done with, and never
-// asks about one.
+// spec.suspend true, and the answer alone does not tell the two apart. So
+// the caller resumes a Job only while the stored record of its creator,
+// read fresh from the API server, still restores with that Job and has not
+// decided to end.
 func AwaitsResume(job *batchv1.Job) bool {
 	return ptr.Deref(job.Spec.Suspend, false) && !finished(job) && job.DeletionTimestamp == nil
 }

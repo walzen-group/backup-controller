@@ -10,6 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // The code in this file moves a volume item a step further on its restore
@@ -214,35 +215,93 @@ func (r *RestoreRunReconciler) followJob(ctx context.Context, run *backupv1alpha
 // created suspended, so its pod can run.
 //
 // Parameters:
-//   - item is the Running volume item. The caller passes one whose Job name
-//     and UID it read from the stored status, so the status write that
-//     recorded them went through, and only in a pass that goes on with the
+//   - run is the RestoreRun as this pass read it, from the informer cache.
+//   - index is the item's position in status.items, where the stored run
+//     is checked for the same item.
+//   - item is the Running volume item, which names its Job and the Job's
+//     UID. The caller passes it only in a pass that goes on with the
 //     restore.
 //   - job is the item's Job as followJob just read it, still suspended.
 //
-// It returns nil once the resume went through, a *refusalError with reason
-// RestoreJobRefused, saying that nothing was written to the claim, when the
-// API server refuses it as Forbidden or Invalid, and a plain error from any
-// other failed patch, for a retry.
+// It returns nil once the resume went through. It returns a plain error,
+// for a retry, when the stored run no longer goes on with the item's Job
+// (see storedRunGoesOn) or can't be read, and when the patch fails for a
+// reason a retry may fix, such as a 500 from an admission webhook that
+// can't be reached, a 503 or a 504. When the API server refuses the resume
+// it returns a *refusalError: reason RestoreJobRefused, saying that nothing
+// was written to the claim, for Forbidden or Invalid.
 //
-// The patch carries the Job's UID, so a Job created under the name since
-// the read is left alone. The item's record comes first: a Job it does not
-// record, such as one whose create answered with an error and was stored
-// later, stays suspended with no pod, and the run stops it (see stopJobs).
-// A refused resume leaves the Job suspended too, and the run stops it once
-// the item has failed. A pass that ends the run never resumes: a stop right
-// after a resume could miss a pod the Job controller creates for it (see
-// restorejob.Stop).
-func (r *RestoreRunReconciler) resumeJob(ctx context.Context, item backupv1alpha1.RestoreItem, job *batchv1.Job) error {
-	err := r.jobs().ResumeJob(ctx, job)
+// The pass's copy of the run can lag the stored run, and a resume is a
+// write that no later status conflict undoes. So the stored run is read
+// through the uncached Reader right before the patch, and the Job is
+// resumed only while that run still has the item Running on this Job. The
+// patch carries the Job's UID, so a Job created under the name since the
+// read is left alone. A Job no stored status records, such as one whose
+// create answered with an error and was stored later, stays suspended with
+// no pod, and the run stops it (see stopJobs). A refused resume leaves the
+// Job suspended too, and the run stops it once the item has failed. A pass
+// that ends the run never resumes: a stop right after a resume could miss
+// a pod the Job controller creates for it (see restorejob.Stop).
+func (r *RestoreRunReconciler) resumeJob(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item backupv1alpha1.RestoreItem, job *batchv1.Job) error {
+	goesOn, err := r.storedRunGoesOn(ctx, run, index, item)
+	switch {
+	case err != nil:
+		return err
+	case !goesOn:
+		return fmt.Errorf("the stored RestoreRun %s/%s no longer has item %s Running on restore Job %s; "+
+			"this pass read an older copy of the run, resumes nothing and is retried", run.Namespace, run.Name, item.Name, job.Name)
+	}
+	err = r.jobs().ResumeJob(ctx, job)
 	switch {
 	case apierrors.IsForbidden(err) || apierrors.IsInvalid(err):
-		return nothingWrittenTo(item.Name, refuse(backupv1alpha1.ItemReasonRestoreJobRefused,
-			"the API server refused to resume restore Job %s, which never ran: %v", job.Name, err))
+		return refusedResume(item, job, err)
 	case err != nil:
 		return fmt.Errorf("resume restore Job %s: %w", job.Name, err)
 	}
 	return nil
+}
+
+// storedRunGoesOn reports whether the stored RestoreRun still restores a
+// volume item on the restore Job the pass is about to resume.
+//
+// Parameters:
+//   - run is the RestoreRun as this pass read it.
+//   - index is the item's position in status.items.
+//   - item is the item as this pass read it, Running and naming its Job.
+//
+// It returns true when the run read through the uncached Reader is the
+// same run, is not being deleted, has recorded no ending and has not
+// finished, and its item at that position is the same item, Running, with
+// the same Job name and UID. It returns false for a run that is gone, and
+// a failed read comes back as an error.
+func (r *RestoreRunReconciler) storedRunGoesOn(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item backupv1alpha1.RestoreItem) (bool, error) {
+	stored := &backupv1alpha1.RestoreRun{}
+	err := r.Reader.Get(ctx, client.ObjectKeyFromObject(run), stored)
+	switch {
+	case apierrors.IsNotFound(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("read RestoreRun %s/%s before resuming restore Job %s: %w", run.Namespace, run.Name, item.Job, err)
+	case stored.UID != run.UID || stored.DeletionTimestamp != nil || stored.Status.Ending != nil ||
+		stored.Status.Phase.Finished() || index >= len(stored.Status.Items):
+		return false, nil
+	}
+	s := stored.Status.Items[index]
+	return s.Name == item.Name && s.Phase == backupv1alpha1.ItemRunning && s.Job == item.Job && s.JobUID == item.JobUID, nil
+}
+
+// refusedResume returns the refusal for a resume the API server refused.
+//
+// Parameters:
+//   - item is the volume item, whose claim the message names.
+//   - job is the item's Job, which never ran.
+//   - err is the API server's refusal, which the message quotes.
+//
+// It returns a *refusalError with reason RestoreJobRefused that says
+// nothing was written to the claim.
+func refusedResume(item backupv1alpha1.RestoreItem, job *batchv1.Job, err error) error {
+	return nothingWrittenTo(item.Name, refuse(backupv1alpha1.ItemReasonRestoreJobRefused,
+		"the API server refused to resume restore Job %s, which never ran: %v", job.Name, err))
 }
 
 // recordJobEnd records on a volume item how its restore Job stands.
