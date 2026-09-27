@@ -173,3 +173,27 @@ func TestAPrefixWithoutWALStartsEmpty(t *testing.T) {
 		})
 	}
 }
+
+// TestWALFileFollowsBarman checks walFile against barman 3.20.0: a WAL
+// segment, a .partial segment, a backup label file and a .history file count,
+// also with one compression suffix of ALLOWED_COMPRESSIONS (cloud.py:90-97,
+// 2426-2446; xlog.py:39-56). Other names and a second suffix do not count.
+func TestWALFileFollowsBarman(t *testing.T) {
+	for key, want := range map[string]bool{
+		"app-pg/wals/0000000100000000/000000010000000000000004":                 true,
+		"app-pg/wals/0000000100000000/000000010000000000000004.gz":              true,
+		"app-pg/wals/0000000100000000/000000010000000000000004.zst":             true,
+		"app-pg/wals/0000000100000000/000000010000000000000004.partial":         true,
+		"app-pg/wals/0000000100000000/000000010000000000000004.00000028.backup": true,
+		"app-pg/wals/00000002.history":                                          true,
+		"app-pg/wals/00000002.history.bz2":                                      true,
+		"app-pg/wals/0000000100000000/000000010000000000000004.zip":             false,
+		"app-pg/wals/0000000100000000/000000010000000000000004.gz.gz":           false,
+		"app-pg/wals/0000000100000000/notes.txt":                                false,
+		"app-pg/wals/0000000100000000/00000001000000000000004":                  false,
+	} {
+		if got := walFile(key); got != want {
+			t.Errorf("walFile(%q) = %v, want %v", key, got, want)
+		}
+	}
+}
