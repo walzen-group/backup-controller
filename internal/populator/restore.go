@@ -223,6 +223,13 @@ func (c *Callbacks) startJob(ctx context.Context, r restore) error {
 // It returns the created Job, with its UID, and an error from the namespace
 // read, from restorejob.Build or from the create. A create that finds the
 // name taken returns its AlreadyExists error; the next pass follows that Job.
+//
+// Every Job restores with --delete. A Job that replaces a failed or deleted
+// one selects the snapshot again, perhaps a newer one, and restores it over
+// what the earlier Job left in the prime claim, so without the flag files of
+// the earlier snapshot would stay behind. On the first Job's new, empty
+// volume the flag removes nothing, and the prime claim is the populator's
+// own, so nothing in it needs keeping.
 func (c *Callbacks) createJob(ctx context.Context, r restore, snapshot restic.Snapshot) (*batchv1.Job, error) {
 	ns, err := c.operations.GetNamespace(ctx, c.namespace)
 	if err != nil {
@@ -236,6 +243,7 @@ func (c *Callbacks) createJob(ctx context.Context, r restore, snapshot restic.Sn
 			APIVersion: "v1", Kind: "PersistentVolumeClaim", Name: r.prime.Name, UID: r.prime.UID,
 		},
 		SnapshotID:            snapshot.ID,
+		Delete:                true,
 		Claim:                 r.prime.Name,
 		Repository:            SecretCopyName(r.claim.UID),
 		Image:                 c.image,

@@ -133,7 +133,7 @@ type Spec struct {
 	// Image is the restic image, the controller's --restore-image.
 	Image string
 	// Delete passes --delete, so files the snapshot does not hold are
-	// removed. A RestoreRun sets it; the populator's new claim is empty.
+	// removed. A RestoreRun and the populator set it on every Job.
 	Delete bool
 	// Privileged runs restic as root with the capabilities to restore file
 	// ownership. The caller sets it from PrivilegedMovers on the Job's
