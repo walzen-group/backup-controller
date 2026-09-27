@@ -6,7 +6,6 @@ import (
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,7 +42,7 @@ type BackupRunReconciler struct {
 	Recorder events.EventRecorder
 
 	// Paused is true when the controller runs with --pause. A new run then
-	// waits with reason Paused and starts no work (see holdNew).
+	// waits with reason Paused and starts no work (see runOps.pause).
 	Paused bool
 
 	// Now returns the current time. Tests replace it so they can move time
@@ -96,10 +95,7 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	before := readyReason(run.Status.Conditions)
 	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Backup") }()
-	if r.Paused && backupRunNew(run) {
-		return ctrl.Result{}, holdNew(ctx, r.Client, run, &run.Status.Conditions)
-	}
-	if err := markResumed(ctx, r.Client, run, run.Status.Conditions, &run.Status.ResumedAt, r.Now()); err != nil {
+	if held, err := r.ops().pause(ctx, fieldsOf(run), r.Paused, backupRunNew(run)); held || err != nil {
 		return ctrl.Result{}, err
 	}
 	// A run that may touch VolSync objects can't go on while VolSync serves
@@ -157,15 +153,10 @@ func (r *BackupRunReconciler) overdue(ctx context.Context, run *backupv1alpha1.B
 // waitFor moves the run to Waiting, sets its Ready condition to False with
 // reason and message, and writes the status.
 func (r *BackupRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
-	run.Status.Phase = backupv1alpha1.RunPhaseWaiting
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
-	return r.writeStatus(ctx, run)
+	return r.ops().waitFor(ctx, fieldsOf(run), reason, message)
 }
 
 // writeStatus writes the run's status subresource.
 func (r *BackupRunReconciler) writeStatus(ctx context.Context, run *backupv1alpha1.BackupRun) error {
-	if err := r.Status().Update(ctx, run); err != nil {
-		return fmt.Errorf("set BackupRun %s/%s status: %w", run.Namespace, run.Name, err)
-	}
-	return nil
+	return r.ops().writeStatus(ctx, fieldsOf(run))
 }

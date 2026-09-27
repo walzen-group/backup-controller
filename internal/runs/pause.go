@@ -2,13 +2,11 @@ package runs
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // pausedMessage is the Ready message of a new run that waits for the end of
@@ -56,61 +54,46 @@ func restoreRunNew(run *backupv1alpha1.RestoreRun) bool {
 		run.Status.StartedAt == nil && len(run.Status.Quiesced) == 0
 }
 
-// holdNew keeps a new run waiting while the controller runs with --pause.
+// pause keeps a new run waiting while the controller runs with --pause, and
+// records the end of the pause on a run that waited.
 //
 // Parameters:
-//   - c writes the run's status.
-//   - run is the new run. The caller checked it with backupRunNew or
-//     restoreRunNew.
-//   - conditions is the run's condition list, which holdNew changes.
+//   - f is the run that the pass read.
+//   - paused is true when the controller runs with --pause.
+//   - isNew is true when the run has started no work (see backupRunNew and
+//     restoreRunNew).
 //
-// It returns the error of the status write, with the run named. holdNew writes the status only
-// when the Ready condition changes to reason Paused, so a later pass writes
-// nothing. The run keeps its phase and changes no other object.
-func holdNew(ctx context.Context, c client.Client, run client.Object, conditions *[]metav1.Condition) error {
-	ready := meta.FindStatusCondition(*conditions, backupv1alpha1.ConditionReady)
-	if ready != nil && ready.Reason == backupv1alpha1.ReasonPaused && ready.Status == metav1.ConditionFalse &&
-		ready.ObservedGeneration == run.GetGeneration() {
-		return nil
-	}
-	backupv1alpha1.SetReady(conditions, run.GetGeneration(), metav1.ConditionFalse, backupv1alpha1.ReasonPaused, pausedMessage)
-	if err := c.Status().Update(ctx, run); err != nil {
-		return fmt.Errorf("set the Paused status of %s/%s: %w", run.GetNamespace(), run.GetName(), err)
-	}
-	return nil
-}
-
-// markResumed records the end of the pause on a run that waited with reason
-// Paused.
+// It returns held true when the pass ends here, and the error of the status
+// write.
 //
-// Parameters:
-//   - c writes the run's status.
-//   - run is the run that the pass read. The controller runs without --pause.
-//   - conditions is the run's condition list.
-//   - resumedAt points to the run's status.resumedAt, which markResumed sets.
-//   - now is the time of the pass.
-//
-// It returns the error of the status write. When the Ready condition has
-// reason Paused and the run has no resumedAt, markResumed sets resumedAt to
-// now and writes the status. Else it writes nothing. The timeout of the run
-// then counts from resumedAt (see clockStart), so the time the run waited
-// Paused does not count.
-func markResumed(ctx context.Context, c client.Client, run client.Object, conditions []metav1.Condition, resumedAt **metav1.Time, now time.Time) error {
-	ready := meta.FindStatusCondition(conditions, backupv1alpha1.ConditionReady)
-	if *resumedAt != nil || ready == nil || ready.Reason != backupv1alpha1.ReasonPaused {
-		return nil
+// A new run under --pause waits with reason Paused. pause writes the status
+// only when the Ready condition changes to reason Paused, so a later pass
+// writes nothing, and the run keeps its phase and changes no other object.
+// When the Ready condition has reason Paused and the run has no
+// status.resumedAt, and the run may go on, pause sets resumedAt to the time
+// of the pass and writes the status. The timeout of the run then counts from
+// resumedAt (see clockStart), so the time the run waited Paused does not
+// count.
+func (o runOps) pause(ctx context.Context, f runFields, paused, isNew bool) (held bool, err error) {
+	ready := meta.FindStatusCondition(*f.conditions, backupv1alpha1.ConditionReady)
+	waited := ready != nil && ready.Reason == backupv1alpha1.ReasonPaused
+	switch {
+	case paused && isNew:
+		if waited && ready.Status == metav1.ConditionFalse && ready.ObservedGeneration == f.GetGeneration() {
+			return true, nil
+		}
+		backupv1alpha1.SetReady(f.conditions, f.GetGeneration(), metav1.ConditionFalse, backupv1alpha1.ReasonPaused, pausedMessage)
+		return true, o.writeStatus(ctx, f)
+	case waited && *f.resumedAt == nil:
+		*f.resumedAt = newTime(metav1.NewTime(o.now()))
+		return false, o.writeStatus(ctx, f)
 	}
-	at := metav1.NewTime(now)
-	*resumedAt = &at
-	if err := c.Status().Update(ctx, run); err != nil {
-		return fmt.Errorf("record the end of the pause on %s/%s: %w", run.GetNamespace(), run.GetName(), err)
-	}
-	return nil
+	return false, nil
 }
 
 // clockStart returns the time from which the timeout of a run that has no
 // status.startedAt counts: status.resumedAt when the run waited Paused (see
-// markResumed), else the creation of the run. A zero result means that the
+// runOps.pause), else the creation of the run. A zero result means that the
 // run has no creation time yet.
 func clockStart(created metav1.Time, resumedAt *metav1.Time) time.Time {
 	if resumedAt != nil {

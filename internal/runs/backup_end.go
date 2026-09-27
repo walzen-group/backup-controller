@@ -8,8 +8,6 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/kueue"
-	"github.com/walzen-group/backup-controller/internal/quiesce"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
@@ -127,11 +125,11 @@ func startErrorNote(item backupv1alpha1.BackupItem, separator string) string {
 	return separator + item.LastStartError
 }
 
-// finish ends the run. It records the ending, starts any workload the run
-// still holds stopped, deletes the run's Workload, and records the terminal
-// phase: Succeeded when the ending's reason is ReasonSucceeded and Failed
-// for any other reason. It sets the Ready condition to the ending's reason
-// and message, records status.completedAt, and removes the finalizer.
+// finish ends the run. It records the ending, gives back what the run holds
+// (see release), and records the end (see runOps.end): the terminal phase,
+// Succeeded when the ending's reason is ReasonSucceeded and Failed for any
+// other reason, the Ready condition, status.completedAt, and the removal of
+// the finalizer.
 //
 // Parameters:
 //   - reason and message are the Ready reason and message the run ends
@@ -153,46 +151,16 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 	if run.Status.Ending == nil {
 		run.Status.Ending = &backupv1alpha1.RunEnding{Reason: reason, Message: message}
 	}
-	ending := *run.Status.Ending
 	if err := r.release(ctx, run); err != nil {
 		return r.releaseFailed(ctx, run, err, false)
 	}
-	now := metav1.NewTime(r.Now())
-	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
-	if ending.Reason != backupv1alpha1.ReasonSucceeded {
-		run.Status.Phase = backupv1alpha1.RunPhaseFailed
-	}
-	run.Status.CompletedAt = &now
 	run.Status.Workload = ""
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, ending.Reason, ending.Message)
-	if err := r.writeStatus(ctx, run); err != nil {
-		return err
-	}
-	// The stored status now shows the workloads back, so the quiesce Leases
-	// may go, and must go before the finalizer: a run whose finalizer is
-	// dropped while it still holds them keeps other runs out of the
-	// namespace until the Lease's holder reads as gone. Best effort, as in
-	// work: a Lease left behind is stale under holderLive's rule.
-	releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
-	return dropFinalizer(ctx, r.Client, run)
+	return r.ops().end(ctx, fieldsOf(run))
 }
 
-// release puts back what the run changed in the cluster. When the run stopped
-// workloads and has not started them again, release scales them back up,
-// resumes the Kustomizations it suspended, and records status.restartedAt. A
-// run that recorded its plan to stop them counts as having stopped them, even
-// before status.quiescedAt is set, because the pass that wrote the plan may
-// have stopped them and then lost its status write. release then releases
-// every Lease the run holds (see releaseLeases) and deletes the run's
-// Workload.
-//
-// A run with status.restartPending set has chosen its restart moment and may
-// not have started the workloads yet. release starts them and keeps that
-// moment. A run whose status shows the restart done starts nothing again, so
-// it never scales up a workload another run has stopped since. release
-// decides this on the run as stored: it reads the run again through the
-// uncached Reader first (see readStop), since the informer cache can lag
-// behind the pass that did the restart.
+// release puts back what the run changed in the cluster: it gives the app
+// back (see runOps.restart), releases every Lease the run holds (see
+// releaseLeases) and deletes the run's Workload.
 //
 // The Leases are released even when the restart fails: the run's items are
 // done, and otherMover still keeps another run's mover off a claim whose
@@ -204,24 +172,10 @@ func (r *BackupRunReconciler) finish(ctx context.Context, run *backupv1alpha1.Ba
 // a *quiesce.RestartError from quiesce.Restart, which names the workload or
 // Kustomization; a failed Lease release or Workload delete as a
 // *releaseError that names what it could not delete. When both the restart
-// and the Lease release fail, it returns both, joined with errors.Join. A
-// failed read of the stored run comes back as it is, with nothing started.
+// and the Lease release fail, it returns both, joined with errors.Join.
 // Every step is safe to repeat.
 func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.BackupRun) error {
-	if _, err := readStop(ctx, r.Reader, run); err != nil {
-		return err
-	}
-	var restartErr error
-	holding := (run.Status.QuiescedAt != nil || len(run.Status.Quiesced) > 0) && run.Status.RestartedAt == nil
-	if holding || run.Status.RestartPending {
-		restartErr = quiesce.Restart(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
-		if restartErr == nil {
-			if run.Status.RestartedAt == nil {
-				run.Status.RestartedAt = newTime(metav1.NewTime(r.Now()).Rfc3339Copy())
-			}
-			run.Status.RestartPending = false
-		}
-	}
+	restartErr := r.ops().restart(ctx, fieldsOf(run))
 	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(string) bool { return true }); err != nil {
 		return errors.Join(restartErr, leaseReleaseError(run, err))
 	}
@@ -251,9 +205,9 @@ func backupItemDone(run *backupv1alpha1.BackupRun, name string) bool {
 }
 
 // finalize puts back what a run changed when the run is deleted before it
-// finished, then removes the finalizer so the deletion can complete. When
-// release fails, it reports the failure through releaseFailed and keeps the
-// finalizer, so the deletion waits until the run has put everything back.
+// finished, then lets it go (see runOps.finalized). When release fails, it
+// reports the failure through releaseFailed and keeps the finalizer, so the
+// deletion waits until the run has put everything back.
 func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.BackupRun) error {
 	if !controllerutil.ContainsFinalizer(run, Finalizer) {
 		return nil
@@ -261,44 +215,21 @@ func (r *BackupRunReconciler) finalize(ctx context.Context, run *backupv1alpha1.
 	if err := r.release(ctx, run); err != nil {
 		return r.releaseFailed(ctx, run, err, false)
 	}
-	if err := dropFinalizer(ctx, r.Client, run); err != nil {
-		return err
-	}
-	// After dropFinalizer, and not before: finalize writes no status, so a
-	// release that happened while the drop still failed would let another run
-	// take the Lease and then watch this run repeat its restart on the retry.
-	// Best effort: a Lease left behind is stale under holderLive's rule.
-	releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
-	return nil
+	return r.ops().finalized(ctx, fieldsOf(run))
 }
 
 // releaseFailed reports on the run that it could not put back what it
-// changed, and returns err so the reconcile runs again with
-// controller-runtime's backoff.
+// changed (see runOps.releaseFailed), and returns err.
 //
 // Parameters:
-//   - err is the error from release, or the *quiesce.RestartError of the restart
-//     after the clones are cut.
+//   - err is the error from release, or the *quiesce.RestartError of the
+//     restart after the clones are cut.
 //   - working is true when work calls it for that restart, while the run is
 //     still backing up, and false when finish or finalize call it because
 //     release failed.
 //
-// It sets the Ready condition to the reason and message from releaseFailure,
-// which names what the run could not do and gives advice that fits, and
-// writes the status. Announce turns either reason into a Warning event. The
-// status write is best effort: a write that fails is made again by the next
-// pass that fails.
-//
-// The run never gives up. A run that finished while it still owed a restart
-// would lose the only record of the replicas the app had, and the next
-// namespace run would record the stopped workload's 0 as the count to give
-// back.
+// A run with spec.all set holds the namespace's schedule, and the message
+// says so.
 func (r *BackupRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.BackupRun, err error, working bool) error {
-	reason, message := releaseFailure(err, releasePlan{
-		stopped: run.Status.Quiesced, suspended: run.Status.SuspendedKustomizations,
-		kind: "BackupRun", working: working, deleting: !run.DeletionTimestamp.IsZero(), scheduled: run.Spec.All,
-	})
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
-	_ = r.writeStatus(ctx, run)
-	return err
+	return r.ops().releaseFailed(ctx, fieldsOf(run), err, releasePlan{working: working, scheduled: run.Spec.All})
 }

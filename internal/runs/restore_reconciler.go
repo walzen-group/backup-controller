@@ -59,7 +59,7 @@ type RestoreRunReconciler struct {
 	RestoreImage string
 
 	// Paused is true when the controller runs with --pause. A new run then
-	// waits with reason Paused and starts no work (see holdNew).
+	// waits with reason Paused and starts no work (see runOps.pause).
 	Paused bool
 
 	// Now returns the current time. Tests replace it so they can move time
@@ -118,10 +118,7 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	before := readyReason(run.Status.Conditions)
 	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Restore") }()
-	if r.Paused && restoreRunNew(run) {
-		return ctrl.Result{}, holdNew(ctx, r.Client, run, &run.Status.Conditions)
-	}
-	if err := markResumed(ctx, r.Client, run, run.Status.Conditions, &run.Status.ResumedAt, r.Now()); err != nil {
+	if held, err := r.ops().pause(ctx, fieldsOf(run), r.Paused, restoreRunNew(run)); held || err != nil {
 		return ctrl.Result{}, err
 	}
 	if !run.DeletionTimestamp.IsZero() {
@@ -341,15 +338,10 @@ func (r *RestoreRunReconciler) overdue(run *backupv1alpha1.RestoreRun) (time.Tim
 // waitFor moves the run to Waiting, sets its Ready condition to False with
 // reason and message, and writes the status.
 func (r *RestoreRunReconciler) waitFor(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) error {
-	run.Status.Phase = backupv1alpha1.RunPhaseWaiting
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
-	return r.writeStatus(ctx, run)
+	return r.ops().waitFor(ctx, fieldsOf(run), reason, message)
 }
 
 // writeStatus writes the run's status subresource.
 func (r *RestoreRunReconciler) writeStatus(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
-	if err := r.Status().Update(ctx, run); err != nil {
-		return fmt.Errorf("set RestoreRun %s/%s status: %w", run.Namespace, run.Name, err)
-	}
-	return nil
+	return r.ops().writeStatus(ctx, fieldsOf(run))
 }

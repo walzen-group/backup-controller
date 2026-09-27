@@ -82,7 +82,7 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 		return ctrl.Result{}, err
 	}
 	r.releaseFinished(ctx, run)
-	if done, result, err := r.quiesceFirst(ctx, run, now); done {
+	if done, result, err := r.quiesceFirst(ctx, run); done {
 		return result, err
 	}
 	limited, done, err := r.enforceQuiesceLimit(ctx, run, now)
@@ -196,16 +196,15 @@ func (r *BackupRunReconciler) releaseFinished(ctx context.Context, run *backupv1
 //
 // Parameters:
 //   - run is the admitted BackupRun.
-//   - now is the time of the pass.
 //
 // It returns done true, with the result and the error of quiesce, when it
 // called quiesce. It returns done false when the run has no spec.all or
 // has recorded status.quiescedAt.
-func (r *BackupRunReconciler) quiesceFirst(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (done bool, result ctrl.Result, err error) {
+func (r *BackupRunReconciler) quiesceFirst(ctx context.Context, run *backupv1alpha1.BackupRun) (done bool, result ctrl.Result, err error) {
 	if !run.Spec.All || run.Status.QuiescedAt != nil {
 		return false, ctrl.Result{}, nil
 	}
-	result, err = r.quiesce(ctx, run, now)
+	result, err = r.quiesce(ctx, run)
 	return true, result, err
 }
 

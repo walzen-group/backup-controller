@@ -6,7 +6,6 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -177,11 +176,8 @@ func leftDeleted(item backupv1alpha1.RestoreItem) bool {
 // timeOut, which fail the item with the note from clusterLeftDeleted first
 // (see failRemainingItems).
 func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
-	ending := backupv1alpha1.RunEnding{Reason: reason, Message: message}
-	if run.Status.Ending != nil {
-		ending = *run.Status.Ending
-	} else {
-		run.Status.Ending = ending.DeepCopy()
+	if run.Status.Ending == nil {
+		run.Status.Ending = &backupv1alpha1.RunEnding{Reason: reason, Message: message}
 		if err := r.writeStatus(ctx, run); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -189,21 +185,7 @@ func (r *RestoreRunReconciler) finish(ctx context.Context, run *backupv1alpha1.R
 	if done, result, err := r.giveBack(ctx, run); !done {
 		return result, err
 	}
-	now := metav1.NewTime(r.Now())
-	run.Status.Phase = backupv1alpha1.RunPhaseSucceeded
-	if ending.Reason != backupv1alpha1.ReasonSucceeded {
-		run.Status.Phase = backupv1alpha1.RunPhaseFailed
-	}
-	run.Status.CompletedAt = &now
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionTrue, ending.Reason, ending.Message)
-	if err := r.writeStatus(ctx, run); err != nil {
-		return ctrl.Result{}, err
-	}
-	// The stored status now shows the workloads back, so the quiesce Leases
-	// may go, before the finalizer: another run then takes the namespace over
-	// at once.
-	releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
-	return ctrl.Result{}, dropFinalizer(ctx, r.Client, run)
+	return ctrl.Result{}, r.ops().end(ctx, fieldsOf(run))
 }
 
 // finalize gives back what a run holds when the run is deleted, and then
@@ -236,16 +218,7 @@ func (r *RestoreRunReconciler) finalize(ctx context.Context, run *backupv1alpha1
 		return result, err
 	}
 	r.announceLeftDeleted(ctx, run)
-	if err := dropFinalizer(ctx, r.Client, run); err != nil {
-		return ctrl.Result{}, err
-	}
-	// The quiesce Lease goes after dropFinalizer. finalize does not store the
-	// restart in the run's status, so when the drop fails, the next pass
-	// restarts the app again. Released before that, the Lease would let
-	// another run stop the app in between, and the repeated restart would
-	// undo that stop.
-	releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, r.ops().finalized(ctx, fieldsOf(run))
 }
 
 // giveBack stops the run's movers, gives the app back and releases the
@@ -279,8 +252,8 @@ func (r *RestoreRunReconciler) giveBack(ctx context.Context, run *backupv1alpha1
 		result, err = r.waitForStopped(ctx, run, left)
 		return false, result, err
 	}
-	if stopped(run) {
-		if err := r.restart(ctx, run); err != nil {
+	if stopped(fieldsOf(run)) {
+		if err := r.ops().restart(ctx, fieldsOf(run)); err != nil {
 			return false, ctrl.Result{}, r.releaseFailed(ctx, run, err)
 		}
 	}
@@ -358,11 +331,5 @@ func (r *RestoreRunReconciler) announceLeftDeleted(ctx context.Context, run *bac
 // while it still held a claim, a repository or the app would lose the only
 // record of what it has to put back.
 func (r *RestoreRunReconciler) releaseFailed(ctx context.Context, run *backupv1alpha1.RestoreRun, err error) error {
-	reason, message := releaseFailure(err, releasePlan{
-		stopped: run.Status.Quiesced, suspended: run.Status.SuspendedKustomizations,
-		kind: backupv1alpha1.KindRestoreRun, deleting: !run.DeletionTimestamp.IsZero(), appDown: stopped(run),
-	})
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, reason, message)
-	_ = r.writeStatus(ctx, run)
-	return err
+	return r.ops().releaseFailed(ctx, fieldsOf(run), err, releasePlan{appDown: stopped(fieldsOf(run))})
 }

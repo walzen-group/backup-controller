@@ -3,169 +3,41 @@ package runs
 import (
 	"context"
 	"fmt"
-	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/quiesce"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 // quiesce stops the workloads in the run's namespace that are marked
-// backup.wlz.li/quiesce: "true", before the run does anything else. It stores
-// its now argument, the time of this pass, in status.quiescedAt.
-//
-// It first records the plan from quiesce.Plan in status.quiesced and
-// status.suspendedKustomizations, with each workload's replica count, and
-// writes the status. Only then does quiesce.Apply suspend the Kustomizations and
-// scale the workloads to zero. A pass that finds a plan in the status reuses
-// it, so a retry after a lost status write still gives back the counts the
-// workloads had before the run touched them. Before it stops from such a
-// plan, quiesce reads the run again through the uncached Reader (see
-// stopOwed), and stops nothing when the stored run has recorded the stop,
-// given the app back or ended. quiesce then writes status.quiescedAt. After
-// a failed stop, it narrows the plan with quiesce.Applied to what is stopped
-// now, and aborts the run, which puts that back. When no workload is marked, or no item is left Pending once the
-// checks below have failed the others, quiesce stops nothing and sets
-// status.restartedAt to the same moment, because there is nothing to start
-// again.
-//
-// Before it records a plan, with nothing stopped, quiesce waits with reason
-// SourceBusy while a volume is busy with another run, while another run is in
-// the way (see waitingOn), and while another run holds the namespace's
-// quiesce Lease.
-func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (ctrl.Result, error) {
-	if done, result, err := r.stopPlanned(ctx, run, now); done {
-		return result, err
-	}
-	stopErr := quiesce.Apply(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
-	if stopErr != nil {
-		run.Status.Quiesced, run.Status.SuspendedKustomizations = quiesce.Applied(ctx, r.Reader, r.RESTMapper(), run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
-	}
-	run.Status.QuiescedAt = newTime(now)
-	if err := r.writeStatus(ctx, run); err != nil {
-		return ctrl.Result{}, err
-	}
-	if stopErr != nil {
-		return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, stopErr.Error())
-	}
-	return ctrl.Result{RequeueAfter: time.Second}, nil
-}
-
-// stopPlanned makes sure that the run has a plan of what quiesce stops, and
-// still owes that stop.
-//
-// Parameters:
-//   - run is the namespace BackupRun.
-//   - now is the time of the pass.
-//
-// It returns done false when quiesce can stop the workloads of the plan.
-// It returns done true, with the result and the error the pass returns,
-// when recordPlan stops the pass, when the run no longer owes the stop, or
-// when a read failed.
-//
-// A run with no plan records one (see recordPlan).
-func (r *BackupRunReconciler) stopPlanned(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (done bool, result ctrl.Result, err error) {
+// backup.wlz.li/quiesce: "true", before the run does anything else (see
+// runOps.quiesce). The workloads are read only while the run has no plan.
+// Before it records a plan, with nothing stopped, quiesce checks the Pending
+// volume items (see precheckItems).
+func (r *BackupRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
+	var targets []quiesce.Workload
 	if len(run.Status.Quiesced) == 0 {
-		return r.recordPlan(ctx, run, now)
+		var err error
+		if targets, err = quiesce.Targets(ctx, r.Reader, run.Namespace); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
-	// The plan came from the run as the pass read it, and that copy may
-	// lag behind a pass that has since stopped the app, given it back
-	// and ended the run. The stored run decides (see stopOwed); a run
-	// that no longer owes the stop changes nothing and looks again.
-	owed, err := stopOwed(ctx, r.Reader, run)
-	if err != nil {
-		return true, ctrl.Result{}, err
-	}
-	if !owed {
-		return true, ctrl.Result{RequeueAfter: time.Second}, nil
-	}
-	return false, ctrl.Result{}, nil
+	return r.ops().quiesce(ctx, fieldsOf(run), targets, stopSteps{
+		precheck: func(ctx context.Context) (hold, error) { return r.precheckItems(ctx, run) },
+		abort: func(ctx context.Context, reason, message string) (ctrl.Result, error) {
+			return ctrl.Result{}, r.abort(ctx, run, reason, message)
+		},
+	})
 }
 
-// recordPlan records the plan of what quiesce stops, with nothing stopped
-// yet, once no item and no other run is in the way.
-//
-// Parameters:
-//   - run is the namespace BackupRun with no plan recorded. Its status is
-//     changed and written.
-//   - now is the time of the pass.
-//
-// It returns done false when it wrote the plan and quiesce can stop the
-// workloads. It returns done true, with the result and the error the pass
-// returns, when the run waits, when there is nothing to stop, when the
-// run ended, or when a call failed.
-func (r *BackupRunReconciler) recordPlan(ctx context.Context, run *backupv1alpha1.BackupRun, now metav1.Time) (done bool, result ctrl.Result, err error) {
-	busyItem, err := r.precheckItems(ctx, run)
-	if err != nil {
-		return true, ctrl.Result{}, err
-	}
-	if busyItem.held() {
-		return r.waitOn(ctx, run, busyItem)
-	}
-	targets, err := quiesce.Targets(ctx, r.Reader, run.Namespace)
-	if err != nil {
-		return true, ctrl.Result{}, err
-	}
-	// With no workload marked, or no item left to back up once the checks
-	// above failed the rest, there is nothing to stop.
-	if len(targets) == 0 || !anyPending(run.Status.Items) {
-		run.Status.QuiescedAt, run.Status.RestartedAt = newTime(now), newTime(now)
-		result, err = after(time.Second, r.writeStatus(ctx, run))
-		return true, result, err
-	}
-	// A restore that waits for the Cluster it deleted keeps this run
-	// waiting with nothing stopped and no Lease held (see waitingOn).
-	waiting, err := waitingOn(ctx, r.Reader, run)
-	if err != nil {
-		return true, ctrl.Result{}, err
-	}
-	if waiting.held() {
-		return r.waitOn(ctx, run, waiting)
-	}
-	// The namespace's quiesce Lease lets one run at a time stop its
-	// workloads. It is taken before the plan and held until the stored
-	// status shows the workloads back, so a second run waits here with
-	// the app running rather than recording the count the first stopped
-	// it at.
-	busy, err := acquireQuiesceLease(ctx, r.Client, r.Reader, run, "BackupRun")
-	if err != nil {
-		return true, ctrl.Result{}, err
-	}
-	if busy.held() {
-		return r.waitOn(ctx, run, busy)
-	}
-	// A Kustomization that also applies workloads of another namespace
-	// is refused before anything is stopped (see quiesce.Plan).
-	stop, suspend, err := quiesce.Plan(ctx, r.Reader, r.RESTMapper(), run.Namespace, targets)
-	if asRunRefusal(err) {
-		return true, ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
-	}
-	if err != nil {
-		return true, ctrl.Result{}, err
-	}
-	run.Status.Quiesced, run.Status.SuspendedKustomizations = stop, suspend
-	if err := r.writeStatus(ctx, run); err != nil {
-		return true, ctrl.Result{}, err
-	}
-	return false, ctrl.Result{}, nil
-}
-
-// waitOn makes the run wait for what a hold names, with the hold's Ready
-// reason and text, and look again after pollInterval.
-//
-// Parameters:
-//   - run is the BackupRun that waits. Its status is written.
-//   - h is the hold. It holds the run.
-//
-// It returns done true, with the result and the error the pass returns.
-func (r *BackupRunReconciler) waitOn(ctx context.Context, run *backupv1alpha1.BackupRun, h hold) (done bool, result ctrl.Result, err error) {
-	result, err = after(pollInterval, r.waitFor(ctx, run, h.readyReason(), h.text))
-	return true, result, err
+// ops returns the reconciler's client, Reader and clock for the steps both
+// kinds of run share.
+func (r *BackupRunReconciler) ops() runOps {
+	return runOps{c: r.Client, reader: r.Reader, now: r.Now}
 }
 
 // precheckItems checks every Pending volume item before quiesce stops the
