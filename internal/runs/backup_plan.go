@@ -52,7 +52,7 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 // be read in a way a retry may fix or when ending the run failed. The check
 // writes nothing else, so it is safe to repeat.
 func (r *BackupRunReconciler) schemaOutdated(ctx context.Context, run *backupv1alpha1.BackupRun) (bool, error) {
-	err := r.schemas.crdOutdated(ctx, r.Reader, backupRunsCRD, backupv1alpha1.KindBackupRun, backupv1alpha1.BackupRun{},
+	err := crdOutdated(ctx, r.Reader, backupRunsCRD, backupv1alpha1.KindBackupRun, backupv1alpha1.BackupRun{},
 		"the run could leave the workloads it stops at 0 replicas")
 	var outdated *crdOutdatedError
 	if !errors.As(err, &outdated) {

@@ -65,10 +65,6 @@ type RestoreRunReconciler struct {
 	// Now returns the current time. Tests replace it so they can move time
 	// forward without sleeping.
 	Now func() time.Time
-
-	// schemas caches the check that the installed CRD of the run's kind
-	// declares every field the controller writes (see crdOutdated).
-	schemas schemaCache
 }
 
 // SetupWithManager registers the reconciler with mgr so it runs for every
@@ -98,7 +94,7 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // has passed.
 //
 // A new run is first checked against the installed RestoreRun CRD (see
-// schemaCache.crdOutdated), and a run whose CRD lacks a field the controller
+// crdOutdated), and a run whose CRD lacks a field the controller
 // writes ends with reason CRDOutdated before anything is planned.
 // Whenever the Ready reason changes during a reconcile, Reconcile records an
 // event on the run.
@@ -197,7 +193,7 @@ func (r *RestoreRunReconciler) restore(ctx context.Context, run *backupv1alpha1.
 // with spec.into set is planned by planIntoNewClaim, and any other run by
 // plan.
 func (r *RestoreRunReconciler) start(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	err := r.schemas.crdOutdated(ctx, r.Reader, restoreRunsCRD, backupv1alpha1.KindRestoreRun, backupv1alpha1.RestoreRun{},
+	err := crdOutdated(ctx, r.Reader, restoreRunsCRD, backupv1alpha1.KindRestoreRun, backupv1alpha1.RestoreRun{},
 		"the run would lose the Cluster UIDs and snapshot times it records to check its own work")
 	var outdated *crdOutdatedError
 	if errors.As(err, &outdated) {

@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -29,22 +28,6 @@ const (
 // unstructured object, so the controller's scheme needs no apiextensions
 // types.
 var crdGVK = schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}
-
-// schemaCache remembers the result of the last schema check of each CRD,
-// keyed by the CRD's name and resourceVersion. A CRD changes rarely, so most
-// checks cost one read and no walk; any update to the CRD gives it a new
-// resourceVersion, and the next check walks the new schema. The zero value is
-// ready to use, and it is safe for concurrent use.
-type schemaCache struct {
-	mu      sync.Mutex
-	entries map[string]schemaCacheEntry
-}
-
-// schemaCacheEntry is the result of one walk of a CRD's schema.
-type schemaCacheEntry struct {
-	resourceVersion string
-	gaps            []string
-}
 
 // crdProblem says why a run can't trust the installed CRD of its kind.
 type crdProblem int
@@ -120,7 +103,7 @@ func (e *crdOutdatedError) Unwrap() error { return e.err }
 // may not read the CRD or the CRD does not exist, because a run that cannot
 // be checked must not go on (it fails closed). Any other failed read comes
 // back as a plain error, for a retry.
-func (c *schemaCache) crdOutdated(ctx context.Context, reader client.Reader, crdName, kind string, sample any, harm string) error {
+func crdOutdated(ctx context.Context, reader client.Reader, crdName, kind string, sample any, harm string) error {
 	crd := &unstructured.Unstructured{}
 	crd.SetGroupVersionKind(crdGVK)
 	if err := reader.Get(ctx, types.NamespacedName{Name: crdName}, crd); err != nil {
@@ -132,40 +115,14 @@ func (c *schemaCache) crdOutdated(ctx context.Context, reader client.Reader, crd
 		}
 		return fmt.Errorf("read the CustomResourceDefinition %s: %w", crdName, err)
 	}
-	gaps, ok := c.lookup(crdName, crd.GetResourceVersion())
-	if !ok {
-		var err error
-		if gaps, err = schemaGaps(crd, sample); err != nil {
-			return &crdOutdatedError{problem: crdUncheckable, crd: crdName, kind: kind, err: err}
-		}
-		c.store(crdName, crd.GetResourceVersion(), gaps)
+	gaps, err := schemaGaps(crd, sample)
+	if err != nil {
+		return &crdOutdatedError{problem: crdUncheckable, crd: crdName, kind: kind, err: err}
 	}
 	if len(gaps) == 0 {
 		return nil
 	}
 	return &crdOutdatedError{problem: crdGaps, crd: crdName, kind: kind, missing: gaps, harm: harm}
-}
-
-// lookup returns the cached gaps of crdName when the cache holds a walk of
-// the same resourceVersion.
-func (c *schemaCache) lookup(crdName, resourceVersion string) ([]string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.entries[crdName]
-	if !ok || resourceVersion == "" || e.resourceVersion != resourceVersion {
-		return nil, false
-	}
-	return e.gaps, true
-}
-
-// store records the gaps of crdName at resourceVersion.
-func (c *schemaCache) store(crdName, resourceVersion string, gaps []string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.entries == nil {
-		c.entries = map[string]schemaCacheEntry{}
-	}
-	c.entries[crdName] = schemaCacheEntry{resourceVersion: resourceVersion, gaps: gaps}
 }
 
 // schemaGaps returns the JSON path of every field the Go type of sample has

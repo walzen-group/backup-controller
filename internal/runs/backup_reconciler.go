@@ -49,10 +49,6 @@ type BackupRunReconciler struct {
 	// Now returns the current time. Tests replace it so they can move time
 	// forward without sleeping.
 	Now func() time.Time
-
-	// schemas caches the check that the installed CRD of the run's kind
-	// declares every field the controller writes (see crdOutdated).
-	schemas schemaCache
 }
 
 // SetupWithManager registers the reconciler with mgr so it runs for every
