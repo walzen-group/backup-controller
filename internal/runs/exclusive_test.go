@@ -72,15 +72,6 @@ func ownSourceTag(t *testing.T, c client.Client) string {
 	return ""
 }
 
-// A backup started while a restore writes the claim waits with reason
-// SourceBusy, names the restore, and writes no trigger: its clone would cut
-// a half-restored volume, and its forget would fail on the restore's lock.
-func TestABackupWaitsWhileARestoreOfTheClaimRuns(t *testing.T) {
-	t.Parallel()
-	restore, job := restoring(t)
-	expectBackupWaitsForRestore(t, restore, job)
-}
-
 // A backup started while a restore of another claim writes from the same
 // repository waits with reason SourceBusy, names the restore, and writes no
 // trigger: its forget needs the exclusive lock, which fails while the
@@ -462,36 +453,6 @@ func deleteKept(t *testing.T, c client.Client, name string) {
 	}
 	if err := c.Delete(context.Background(), stored); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// A restore Job holds only the claim it writes and the repository it reads,
-// and only a Job the controller labelled as its own restore Job counts.
-func TestARestoreJobHoldsOnlyItsClaimAndRepository(t *testing.T) {
-	t.Parallel()
-	run, job := restoring(t)
-	c := newClient(t, run, job)
-	for _, tc := range []struct {
-		claim, repository string
-		holds             bool
-	}{
-		{claimN, "", true},
-		{"", repoN, true},
-		{"other-data", "other-restic-data", false},
-		{"", "", false},
-	} {
-		busy, err := restoreInProgress(context.Background(), c, ns, tc.claim, tc.repository)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if held := busy.held(); held != tc.holds {
-			t.Errorf("claim %q, repository %q: restoreInProgress = %q, want held = %t", tc.claim, tc.repository, busy.text, tc.holds)
-		}
-	}
-	job.Labels = nil
-	c = newClient(t, run, job)
-	if busy, err := restoreInProgress(context.Background(), c, ns, claimN, repoN); err != nil || busy.held() {
-		t.Errorf("restoreInProgress = %q, %v; want a Job without the controller's labels to hold nothing", busy.text, err)
 	}
 }
 

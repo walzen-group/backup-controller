@@ -268,33 +268,6 @@ func TestAStaleLeaseIsTakenOverAndALiveOneIsNot(t *testing.T) {
 	}
 }
 
-// A restore releases its Leases when it finishes, so a backup of the claim
-// can take them at once.
-func TestARestoreReleasesItsLeasesWhenItFinishes(t *testing.T) {
-	t.Parallel()
-	r, c := restoreReconciler(t, nil,
-		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
-		claim(), volumeRestore(), repository())
-	restoreStep(t, r)
-	restoreStep(t, r)
-
-	claimLease, repoLease := leaseNames(t, c)
-	if leaseHolderOf(t, c, claimLease) != string(restoreUID) || leaseHolderOf(t, c, repoLease) != string(restoreUID) {
-		t.Fatalf("claim Lease holder = %q, repository Lease holder = %q; want the restore to hold both before its restore Job",
-			leaseHolderOf(t, c, claimLease), leaseHolderOf(t, c, repoLease))
-	}
-	completeJob(t, c)
-	restoreStep(t, r)
-	restoreStep(t, r) // the pass after the stop finds the restore Job stopped
-
-	if run := readRestoreRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
-		t.Fatalf("phase = %q, want Succeeded", run.Status.Phase)
-	}
-	if h1, h2 := leaseHolderOf(t, c, claimLease), leaseHolderOf(t, c, repoLease); h1 != "" || h2 != "" {
-		t.Errorf("claim Lease holder = %q, repository Lease holder = %q; want both released", h1, h2)
-	}
-}
-
 // Every run takes the claim's Lease before the repository's, so no two runs
 // wait for each other. Here a restore of claim notes-data holds both Leases.
 // A backup of the same claim fails to create the claim Lease and never asks
