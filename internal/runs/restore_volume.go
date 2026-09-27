@@ -3,10 +3,14 @@ package runs
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -422,4 +426,173 @@ func (r *RestoreRunReconciler) claimLostError(ctx context.Context, run *backupv1
 		return r.claimLost(ctx, run)
 	}
 	return r.inPlaceClaimLost(ctx, run, item.Name)
+}
+
+// restoreVolume moves one in-place volume restore a step further, through
+// the item's restore Job.
+//
+// Parameters:
+//   - run is the RestoreRun the item belongs to.
+//   - index is the item's position in status.items. It goes into the name of
+//     the item's restore Job (see jobName).
+//   - item is the volume item, which restoreVolume updates in place.
+//
+// It returns a Ready reason and message while a Pending item waits, and
+// empty strings otherwise, and an error, which leaves the item as it was,
+// when an API call fails for a reason a retry may fix.
+//
+// A Pending item starts its restore Job once nothing holds it back (see
+// startJob). A Running item follows its Job to its end (see followJob), and
+// its Job, created suspended, is resumed in a pass that does not end the
+// run, once the stored run, read again right before the resume, has the
+// item Running on that Job (see resumeJob). The run
+// stops the Job once the item's end is in the status (see stopJobs).
+func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1alpha1.RestoreRun, index int, item *backupv1alpha1.RestoreItem) (reason, message string, err error) {
+	switch item.Phase {
+	case backupv1alpha1.ItemPending:
+		return r.startJob(ctx, run, index, item)
+	case backupv1alpha1.ItemRunning:
+		seen, err := r.followJob(ctx, run, item)
+		if done, err := settled(item, err); done || seen.unresumed == nil {
+			return "", "", err
+		}
+		_, err = settled(item, r.resumeJob(ctx, run, index, *item, seen.unresumed))
+		return "", "", err
+	default:
+		// An item in any other phase has finished, so there is nothing
+		// left to restore.
+		return "", "", nil
+	}
+}
+
+// startRefusal checks whether the item's claim or repository settings refuse
+// a Pending in-place restore, and reads those settings when they don't.
+// restoreVolume calls it before it takes the Leases, and quiesce calls it in
+// its pre-check, so an item that cannot start fails before the app is
+// stopped for it.
+//
+// Parameters:
+//   - run is the asking run; its namespace is read, and spec.repository and
+//     spec.moverSecurityContext are used the way repositoryFor uses them.
+//   - claimName names the item's claim, which is also the item's name.
+//
+// It returns the settings from repositoryFor when the restore can go on. A
+// claim that is being deleted (reason ClaimDeleting), and a refusal from
+// repositoryFor (a claim that is gone, or a VolumeRestore that is missing
+// when the run names no repository), come back as a *refusalError that
+// says nothing was written to the claim (see nothingWrittenTo); the caller
+// fails the item with it through failRestoreItem. A claim being deleted is
+// refused because the mover would write into a claim that is about to go,
+// and the scheduler does not place a pod whose claim is being deleted
+// (podHasPVCs, in the PreFilter of the volumebinding plugin). A failed read
+// comes back as a plain error, and the caller leaves the item Pending.
+func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (restoreSettings, error) {
+	claim := &corev1.PersistentVolumeClaim{}
+	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim)
+	switch {
+	case apierrors.IsNotFound(err):
+		// repositoryFor refuses the claim that is gone with its message.
+	case err != nil:
+		return restoreSettings{}, fmt.Errorf("get PersistentVolumeClaim %s/%s: %w", run.Namespace, claimName, err)
+	case claim.DeletionTimestamp != nil:
+		return restoreSettings{}, nothingWrittenTo(claimName,
+			refuse(backupv1alpha1.ItemReasonClaimDeleting, "claim %s is being deleted", claimName))
+	}
+	settings, err := repositoryFor(ctx, r.Reader, run.Namespace, claimName, run.Spec.Repository, run.Spec.MoverSecurityContext)
+	return settings, nothingWrittenTo(claimName, err)
+}
+
+// inPlaceClaimLost checks that the claim an in-place item restored is
+// still the claim the run checked and took its Lease on.
+//
+// Parameters:
+//   - run is the RestoreRun. Its claim Leases are the ones labelled with its
+//     UID.
+//   - claimName names the claim, which is also the item's name.
+//
+// It returns nil while that claim is there, and a *refusalError with reason
+// ClaimLost when the claim is gone, is being deleted, or is another claim.
+// A run that holds no claim Lease for the item can't tell which claim the
+// restore Job wrote into, and gets that refusal too, since the item must not
+// succeed without that evidence. A failed read of the claim or the Leases
+// comes back as a plain error, and the caller leaves the item as it was.
+//
+// The claim the run checked is the one it took its claim Lease on right
+// before it created the item's restore Job: the Lease is named after that
+// claim's UID (see claimLeaseName) and lists the item. A claim whose UID is
+// not among the run's claim Leases for the item was created after that
+// create, so it replaced the claim the run checked. The Job mounts the claim
+// by name, so a pod of it that started after the replacement may have
+// written into the new claim, and the message asks for that claim's data to
+// be checked.
+//
+// A claim deleted while a pod of its restore Job mounts it stays,
+// Terminating, until the pod is gone (pvc-protection), so the Job can
+// complete into a claim that is about to go.
+func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) error {
+	leases := &coordinationv1.LeaseList{}
+	if err := r.Reader.List(ctx, leases, client.InNamespace(run.Namespace), client.MatchingLabels{labelLeaseHolderUID: string(run.UID)}); err != nil {
+		return fmt.Errorf("list the Leases of RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
+	}
+	prefix := claimLeaseName("")
+	var leased []string
+	for _, lease := range leases.Items {
+		if strings.HasPrefix(lease.Name, prefix) && slices.Contains(leaseItems(&lease), claimName) {
+			leased = append(leased, strings.TrimPrefix(lease.Name, prefix))
+		}
+	}
+	if len(leased) == 0 {
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "the run holds no claim Lease for claim %s, so it can't tell whether its restore Job wrote into the claim that is there now. "+
+			"Check the claim's data, and create a new RestoreRun to restore it", claimName)
+	}
+
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
+		if apierrors.IsNotFound(err) {
+			return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted while its restore Job wrote into it, and the restored data went with it", claimName)
+		}
+		return fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
+	}
+	if claim.DeletionTimestamp != nil {
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted while its restore Job wrote into it, and the restored data goes with it once the claim is released", claimName)
+	}
+	if !slices.Contains(leased, string(claim.UID)) {
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %[1]s was replaced while its restore Job wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
+			"and took its Lease on (UID %[3]s). The restore Job mounts claim %[1]s by name, so it may have written into it; check its data, "+
+			"and create a new RestoreRun to restore it", claimName, claim.UID, strings.Join(leased, ", "))
+	}
+	return nil
+}
+
+// claimHolder returns the name of a pod that mounts a claim.
+//
+// Parameters:
+//   - c lists the pods. The run passes its uncached Reader: without
+//     spec.quiesce this check is the only thing that keeps a second writer
+//     off the volume, and an informer cache that has not yet seen a new pod
+//     would report the claim free.
+//   - namespace is the run's namespace, which holds the claim and its pods.
+//   - claim is the name of the claim an in-place restore is about to write
+//     into.
+//
+// It returns the name of the first pod in the namespace, in the order the
+// list gives, whose volumes name the claim, and "" when none does. A pod in
+// phase Succeeded or Failed has no container left and doesn't count. A
+// failed list comes back as an error.
+func claimHolder(ctx context.Context, c client.Reader, namespace, claim string) (string, error) {
+	pods := &corev1.PodList{}
+	if err := c.List(ctx, pods, client.InNamespace(namespace)); err != nil {
+		return "", err
+	}
+	for _, pod := range pods.Items {
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == claim {
+				return pod.Name, nil
+			}
+		}
+	}
+	return "", nil
 }

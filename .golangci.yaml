@@ -121,11 +121,8 @@ linters:
       - path: '^internal/quiesce/restart\.go$'
         linters: [funlen, gocognit]
         source: '^func Restart\('
-      - path: '^internal/runs/(clusterwebhook|objects|release_report|restorerun)\.go$'
+      - path: '^internal/runs/(clusterwebhook|release_report|restore_end|restore_into|restore_plan|restore_quiesce|restore_work)\.go$'
         linters: [goconst]
-      - path: '^internal/runs/restorerun\.go$'
-        linters: [revive]
-        text: '^file-length-limit:'
       - path: '^internal/runs/crdcheck\.go$'
         linters: [funlen, gocognit]
         source: '^func walkFields\('
@@ -133,16 +130,31 @@ linters:
         linters: [revive]
         text: '^confusing-results:'
         source: '^func releaseFailure\('
-      - path: '^internal/runs/restorerun\.go$'
+      - path: '^internal/runs/restore_plan\.go$'
         linters: [funlen, gocognit]
-        source: '^func \(r \*RestoreRunReconciler\) (plan|items|clustersRestoredElsewhere|work|restoreDatabase|quiesce|finalize)\('
-      - path: '^internal/runs/restorerun\.go$'
+        source: '^func \(r \*RestoreRunReconciler\) (plan|items|clustersRestoredElsewhere)\('
+      - path: '^internal/runs/restore_work\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(r \*RestoreRunReconciler\) work\('
+      - path: '^internal/runs/restore_database\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(r \*RestoreRunReconciler\) restoreDatabase\('
+      - path: '^internal/runs/restore_quiesce\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(r \*RestoreRunReconciler\) quiesce\('
+      - path: '^internal/runs/restore_end\.go$'
+        linters: [funlen, gocognit]
+        source: '^func \(r \*RestoreRunReconciler\) finalize\('
+      - path: '^internal/runs/restore_checks\.go$'
         linters: [revive]
         text: '^confusing-results:'
         source: '^func \(r \*RestoreRunReconciler\) checkDatabase\('
-      - path: '^internal/runs/restorerun\.go$'
+      - path: '^internal/runs/restore_work\.go$'
         linters: [nestif]
-        source: '^\s*if (stopped\(run\) && anyRestorePending\(run\.Status\.Items\) |volumesDone |len\(run\.Status\.Quiesced\) == 0 )\{$'
+        source: '^\s*if (stopped\(run\) && anyRestorePending\(run\.Status\.Items\) |volumesDone )\{$'
+      - path: '^internal/runs/restore_quiesce\.go$'
+        linters: [nestif]
+        source: '^\s*if len\(run\.Status\.Quiesced\) == 0 \{$'
       - path: '^internal/runs/schedule\.go$'
         linters: [funlen, gocognit]
         source: '^func \(s \*Scheduler\) Reconcile\('

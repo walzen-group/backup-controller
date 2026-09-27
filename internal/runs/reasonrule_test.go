@@ -58,9 +58,9 @@ var reasonForwardingAllowlist = []reasonRuleEntry{
 		what: "copies the reason asItemFailure returned"},
 	{file: "failure.go", decl: "failRestoreItem", forwarded: []string{"failure.reason"},
 		what: "copies the reason asItemFailure returned"},
-	{file: "restorerun.go", decl: "failRemainingItems", forwarded: []string{"reason"},
+	{file: "restore_end.go", decl: "failRemainingItems", forwarded: []string{"reason"},
 		what: "passes to refuse the reason its callers give, which the rule checks at every call"},
-	{file: "restorerun.go", decl: "RestoreRunReconciler.abort", forwarded: []string{`""`},
+	{file: "restore_end.go", decl: "RestoreRunReconciler.abort", forwarded: []string{`""`},
 		what: "the items abort fails record no reason until RestoreRun step R5 adds RunEnded"},
 }
 
