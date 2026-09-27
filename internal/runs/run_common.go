@@ -258,3 +258,58 @@ func (o runOps) releaseFailed(ctx context.Context, f runFields, err error, plan 
 	_ = o.writeStatus(ctx, f)
 	return err
 }
+
+// passSteps are the steps of a pass that differ between a BackupRun and a
+// RestoreRun.
+type passSteps struct {
+	// paused is true when the controller runs with --pause.
+	paused bool
+	// isNew is true when the run has started no work (see backupRunNew and
+	// restoreRunNew).
+	isNew bool
+	// ttl is the run's spec.ttlSecondsAfterFinished.
+	ttl *int32
+	// finalize gives back what a deleted run holds and lets it go.
+	finalize func(ctx context.Context) (ctrl.Result, error)
+	// finish ends the run with the reason and the message.
+	finish func(ctx context.Context, reason, message string) (ctrl.Result, error)
+	// work moves an unfinished run with no ending one step further.
+	work func(ctx context.Context) (ctrl.Result, error)
+}
+
+// pass moves a run one step further, the same way for both kinds of run.
+//
+// Parameters:
+//   - f is the run as the pass read it.
+//   - steps are the steps that differ between the two kinds.
+//
+// It returns what the step it takes returns.
+//
+// A new run waits while the controller runs with --pause, and a run that
+// waited records the end of the pause (see runOps.pause). A run being
+// deleted gets its changes put back by steps.finalize, and a finished run is
+// deleted once its time to live has passed (see expire). Any other run gets
+// its finalizer first. A run that recorded status.ending has decided to end,
+// and every later pass only finishes it with that reason and message
+// (steps.finish), also one that waits for a stopped mover or retries a
+// failed restart. Any other run goes on in steps.work.
+func (o runOps) pass(ctx context.Context, f runFields, steps passSteps) (ctrl.Result, error) {
+	if held, err := o.pause(ctx, f, steps.paused, steps.isNew); held || err != nil {
+		return ctrl.Result{}, err
+	}
+	if !f.GetDeletionTimestamp().IsZero() {
+		return steps.finalize(ctx)
+	}
+	if f.phase.Finished() {
+		return expire(ctx, o.c, f.Object, steps.ttl, *f.completedAt, o.now())
+	}
+	if controllerutil.AddFinalizer(f.Object, Finalizer) {
+		if err := o.c.Update(ctx, f.Object); err != nil {
+			return ctrl.Result{}, fmt.Errorf("add the finalizer to %s %s/%s: %w", f.kind, f.GetNamespace(), f.GetName(), err)
+		}
+	}
+	if ending := *f.ending; ending != nil {
+		return steps.finish(ctx, ending.Reason, ending.Message)
+	}
+	return steps.work(ctx)
+}

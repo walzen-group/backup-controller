@@ -12,7 +12,6 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // RestoreRunReconciler runs RestoreRuns. A RestoreRun puts volumes and
@@ -80,21 +79,16 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// Reconcile moves the RestoreRun the request names one step further, and
-// requeues until the run has finished.
+// Reconcile moves the RestoreRun the request names one step further (see
+// runOps.pass), and requeues until the run has finished. Whenever the Ready
+// reason changes during a reconcile, Reconcile records an event on the run.
 //
 // A new run starts in plan, which checks that every item has a backup in reach
 // before anything is changed, or in planIntoNewClaim when spec.into is set. An
 // error that either of them returns for a retry goes through planFailed,
 // which reports it on the Ready condition and ends the run once spec.timeout
 // has passed since its creation. A run past its checks continues in work, or in
-// restoreIntoEmptyClaim for an into restore (see restore). Before any of these, Reconcile
-// adds the run's finalizer. A run being deleted gets its changes put back by
-// finalize, and a finished run is deleted once spec.ttlSecondsAfterFinished
-// has passed.
-//
-// Whenever the Ready reason changes during a reconcile, Reconcile records an
-// event on the run.
+// restoreIntoEmptyClaim for an into restore (see restore).
 //
 // While VolSync serves its kinds only at a version other than v1alpha1, a
 // pass that reads a VolSync object, such as the ReplicationSources a volume
@@ -107,10 +101,6 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // that passes it or is deleted still stops its restore Jobs and gives the
 // app back. VolSync is upgraded after the controller, so a supported
 // cluster never gets there.
-//
-// A run that recorded status.ending has decided to end, and every later pass
-// only finishes it with that reason and message (see finish), also one that
-// waits for a stopped mover or retries a failed restart.
 func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	run := &backupv1alpha1.RestoreRun{}
 	if err := r.Get(ctx, req.NamespacedName, run); err != nil {
@@ -118,29 +108,19 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	before := readyReason(run.Status.Conditions)
 	defer func() { announce(r.Recorder, run, run.Status.Conditions, before, "Restore") }()
-	if held, err := r.ops().pause(ctx, fieldsOf(run), r.Paused, restoreRunNew(run)); held || err != nil {
-		return ctrl.Result{}, err
-	}
-	if !run.DeletionTimestamp.IsZero() {
-		return r.finalize(ctx, run)
-	}
-	if run.Status.Phase.Finished() {
-		return expire(ctx, r.Client, run, run.Spec.TTLSecondsAfterFinished, run.Status.CompletedAt, r.Now())
-	}
-	if !controllerutil.ContainsFinalizer(run, Finalizer) {
-		controllerutil.AddFinalizer(run, Finalizer)
-		if err := r.Update(ctx, run); err != nil {
-			return ctrl.Result{}, fmt.Errorf("add the finalizer to RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
-		}
-	}
-	if ending := run.Status.Ending; ending != nil {
-		return r.finish(ctx, run, ending.Reason, ending.Message)
-	}
-
-	if run.Status.Phase == "" {
-		return r.start(ctx, run)
-	}
-	return r.restore(ctx, run)
+	return r.ops().pass(ctx, fieldsOf(run), passSteps{
+		paused: r.Paused, isNew: restoreRunNew(run), ttl: run.Spec.TTLSecondsAfterFinished,
+		finalize: func(ctx context.Context) (ctrl.Result, error) { return r.finalize(ctx, run) },
+		finish: func(ctx context.Context, reason, message string) (ctrl.Result, error) {
+			return r.finish(ctx, run, reason, message)
+		},
+		work: func(ctx context.Context) (ctrl.Result, error) {
+			if run.Status.Phase == "" {
+				return r.start(ctx, run)
+			}
+			return r.restore(ctx, run)
+		},
+	})
 }
 
 // restore makes one pass over a RestoreRun past its checks: through
