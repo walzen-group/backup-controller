@@ -274,12 +274,12 @@ func TestALostWriteAtTheLimitKeepsTheRestartAfterTheMoment(t *testing.T) {
 	}
 	var scaledUp time.Time
 	r.Client = interceptor.NewClient(healthy.(client.WithWatch), interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if data, _ := patch.Data(obj); scaledUp.IsZero() && strings.Contains(string(data), `"replicas":2`) {
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if replicas, ok := deploymentScale(sub, obj, opts); ok && scaledUp.IsZero() && replicas == 2 {
 				// The latest time the run has read.
 				scaledUp = clock.Add(-time.Second)
 			}
-			return cl.Patch(ctx, obj, patch, opts...)
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
 	step(t, r)

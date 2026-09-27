@@ -439,7 +439,7 @@ func TestADeletedQuiescedRunKeepsOthersWaitingUntilItGaveTheAppBack(t *testing.T
 
 	// The run is deleted while the app is down, and its restart is refused.
 	healthy := br.Client
-	br.Client = refuseDeploymentPatches(c)
+	br.Client = refuseDeploymentScales(c)
 	if err := c.Delete(context.Background(), backupRun()); err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +533,7 @@ func TestReleaseLeasesLeavesTheQuiesceLease(t *testing.T) {
 
 	// The restart is refused, so the pass ends after the early release and
 	// nothing has removed the quiesce Lease yet.
-	br.Client = refuseDeploymentPatches(c)
+	br.Client = refuseDeploymentScales(c)
 	_ = tryStep(br)
 	if got := leaseHolderOf(t, c, claimLease); got != "" {
 		t.Errorf("the claim Lease holder = %q after the early release, want it gone", got)

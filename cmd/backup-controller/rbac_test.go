@@ -80,8 +80,10 @@ var grants = []grant{
 	{"postgresql.cnpg.io", "clusters", []string{"get", "list", "delete"}, "a database run reads its Cluster, and a restore deletes it"},
 	{"barmancloud.cnpg.io", "objectstores", []string{"get", "list"}, "the webhook reads the admitted Cluster's ObjectStore, and lists them all once for the collision check"},
 	{"postgresql.cnpg.io", "backups", []string{"get", "create"}, "a base backup on demand"},
-	{"apps", "deployments", []string{"get", "list", "patch"}, "quiesce scales a marked Deployment to zero and back"},
-	{"apps", "statefulsets", []string{"get", "list", "patch"}, "quiesce scales a marked StatefulSet to zero and back"},
+	{"apps", "deployments", []string{"get", "list"}, "quiesce finds and reads the marked Deployments"},
+	{"apps", "statefulsets", []string{"get", "list"}, "quiesce finds and reads the marked StatefulSets"},
+	{"apps", "deployments/scale", []string{"get", "update"}, "quiesce scales a marked Deployment to zero and back"},
+	{"apps", "statefulsets/scale", []string{"get", "update"}, "quiesce scales a marked StatefulSet to zero and back"},
 	{"kustomize.toolkit.fluxcd.io", "kustomizations", []string{"get", "patch"}, "quiesce suspends the Kustomization that would put the replicas back"},
 	{"kueue.x-k8s.io", "workloads", []string{"get", "create", "delete"}, "the Workload that admits a run"},
 	{"kueue.x-k8s.io", "workloads/status", []string{"update"}, "the PodsReady condition on that Workload"},
@@ -142,6 +144,26 @@ func TestTheChartGrantsTheSameRulesAsDeploy(t *testing.T) {
 	}
 	for _, extra := range difference(inChart, inDeploy) {
 		t.Errorf("the chart grants %s and deploy/ does not", extra)
+	}
+}
+
+// TestNoRuleWritesAWorkloadItself checks that neither ClusterRole, in
+// deploy/ or in the chart, lets the controller write a Deployment or a
+// StatefulSet itself. Quiesce changes the replica count through the scale
+// subresource (see scale in internal/runs), which can change nothing else.
+// A write verb on the objects would let the controller's ServiceAccount
+// change any workload's image, command or volumes in any namespace.
+func TestNoRuleWritesAWorkloadItself(t *testing.T) {
+	deploy := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
+	chart := &rbacv1.ClusterRole{Rules: readChartRules(t, filepath.Join("..", "..", "chart", "templates", "rbac.yaml"))}
+	for source, role := range map[string]*rbacv1.ClusterRole{"deploy/": deploy, "the chart": chart} {
+		for _, resource := range []string{"deployments", "statefulsets"} {
+			for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
+				if allows(role, "apps", resource, verb) || allows(role, "*", resource, verb) || allows(role, "apps", "*", verb) {
+					t.Errorf("%s allows %s on %s; quiesce needs only the scale subresource", source, verb, resourceName("apps", resource))
+				}
+			}
+		}
 	}
 }
 

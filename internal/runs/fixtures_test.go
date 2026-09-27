@@ -17,6 +17,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
 	"github.com/walzen-group/backup-controller/internal/testinfra/versions"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -412,6 +413,27 @@ func loseStatusWriteAt(c client.Client, replicas int32) client.Client {
 			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
+}
+
+// deploymentScale reports whether a subresource update is a write to a
+// Deployment's scale subresource, the way quiesce and restart set the app's
+// replica count, and returns the count it sets.
+//
+// Parameters:
+//   - sub is the subresource the update names.
+//   - obj is the object whose subresource is written.
+//   - opts are the update's options, which carry the Scale as its body.
+func deploymentScale(sub string, obj client.Object, opts []client.SubResourceUpdateOption) (int32, bool) {
+	if _, ok := obj.(*appsv1.Deployment); !ok || sub != "scale" {
+		return 0, false
+	}
+	o := &client.SubResourceUpdateOptions{}
+	o.ApplyOptions(opts)
+	scale, ok := o.SubResourceBody.(*autoscalingv1.Scale)
+	if !ok {
+		return 0, false
+	}
+	return scale.Spec.Replicas, true
 }
 
 // ownCRDObjects reads this project's CustomResourceDefinitions, the files in

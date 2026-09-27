@@ -562,16 +562,16 @@ func TestAnIntoRestoreChecksBeforeCreatingAnything(t *testing.T) {
 	}
 }
 
-// refuseDeploymentPatches returns a client over c that refuses every patch to
-// a Deployment, the way the API server does when the controller's
-// ServiceAccount lacks patch on deployments.
-func refuseDeploymentPatches(c client.Client) client.Client {
+// refuseDeploymentScales returns a client over c that refuses every write to
+// a Deployment's scale subresource, the way the API server does when the
+// controller's ServiceAccount lacks update on deployments/scale.
+func refuseDeploymentScales(c client.Client) client.Client {
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if _, ok := obj.(*appsv1.Deployment); ok {
-				return apierrors.NewForbidden(appsv1.Resource("deployments"), obj.GetName(), errors.New("patch refused"))
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := deploymentScale(sub, obj, opts); ok {
+				return apierrors.NewForbidden(appsv1.Resource("deployments/scale"), obj.GetName(), errors.New("patch refused"))
 			}
-			return cl.Patch(ctx, obj, patch, opts...)
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
 }
@@ -584,7 +584,7 @@ func TestAQuiescedRestoreThatCannotStopTheAppFailsAtOnce(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
 		deployment(), kustomization(false), writerPod())
-	r.Client = refuseDeploymentPatches(c)
+	r.Client = refuseDeploymentScales(c)
 
 	restoreStep(t, r) // plan
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}); err != nil {

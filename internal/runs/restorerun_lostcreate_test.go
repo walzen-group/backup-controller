@@ -272,7 +272,7 @@ func TestAJobCreateThatLandsAfterATimeoutIsStopped(t *testing.T) {
 		t.Fatal("the pass whose Job create timed out succeeded, want the timeout returned")
 	}
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
-	r.Client = refuseDeploymentPatches(c)
+	r.Client = refuseDeploymentScales(c)
 	if _, err := r.Reconcile(context.Background(), req); err == nil {
 		t.Fatal("the pass whose restart was refused succeeded, want the refusal returned")
 	}

@@ -105,10 +105,16 @@ rules:
     resources: ["backups"]
     verbs: ["get", "create"]
   # Quiesce scales a marked workload to zero and back, and suspends the Flux
-  # Kustomization that would otherwise put the replicas back mid-run.
+  # Kustomization that would otherwise put the replicas back mid-run. It
+  # reads the workloads and changes only their replica count, through the
+  # scale subresource, which can change nothing else; the controller has no
+  # write verb on the workloads themselves.
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
-    verbs: ["get", "list", "patch"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "update"]
   - apiGroups: ["kustomize.toolkit.fluxcd.io"]
     resources: ["kustomizations"]
     verbs: ["get", "patch"]

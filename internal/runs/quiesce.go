@@ -574,7 +574,7 @@ func inventoryLists(kustomization *unstructured.Unstructured, t workload) bool {
 
 // applyStop carries out a plan from planStop. It suspends the Kustomizations
 // first, so that Flux can't scale the workloads back up, then scales each
-// workload to zero. Both patches set a fixed value, so calling it again with
+// workload to zero. Both writes set a fixed value, so calling it again with
 // the same plan changes nothing more.
 //
 // Parameters:
@@ -669,7 +669,7 @@ func specReplicas(object client.Object) *int32 {
 }
 
 // workloadObject returns an empty Deployment or StatefulSet that carries the
-// namespace and name of a recorded workload, ready for a patch. It returns
+// namespace and name of a recorded workload, ready for a scale. It returns
 // nil for any other kind.
 func workloadObject(namespace string, w backupv1alpha1.QuiescedWorkload) client.Object {
 	var object client.Object
@@ -729,8 +729,8 @@ func podsGone(ctx context.Context, c client.Reader, namespace string, targets []
 // have been removed (see served.Kind). A workload that already stands at its
 // recorded count, and a Kustomization that is no longer suspended, are
 // skipped as well, so a person who puts the app back by hand while the API
-// server refuses the run's own patches lets the run go on. A read that fails
-// leaves the patch to decide. It returns the first other error it meets as
+// server refuses the run's own writes lets the run go on. A read that fails
+// leaves the write to decide. It returns the first other error it meets as
 // a *restartError, which names the object it could not put back.
 //
 // The reads are of unstructured objects, which the manager's client sends
@@ -966,16 +966,6 @@ func byHand(stopped []backupv1alpha1.QuiescedWorkload, suspended []string) strin
 		return "put the workloads back"
 	}
 	return strings.Join(steps, " and ")
-}
-
-// scale sets a workload's spec.replicas. It sends a merge patch that names
-// only that field, so every other field of the object stays as it is.
-func scale(ctx context.Context, c client.Client, object client.Object, replicas int32) error {
-	body := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
-	if err := c.Patch(ctx, object, client.RawPatch(types.MergePatchType, []byte(body)), FieldOwner); err != nil {
-		return fmt.Errorf("scale %s to %d: %w", object.GetName(), replicas, err)
-	}
-	return nil
 }
 
 // setSuspend sets spec.suspend on one Kustomization with a merge patch, at

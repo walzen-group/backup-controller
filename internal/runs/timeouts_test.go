@@ -9,7 +9,6 @@ import (
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -190,11 +189,11 @@ func TestATimedOutRunKeepsItsEndingAcrossAFailedRestart(t *testing.T) {
 	}), claim(), volume(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true))
 	refused := true
 	refusing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if _, ok := obj.(*appsv1.Deployment); ok && refused {
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := deploymentScale(sub, obj, opts); ok && refused {
 				return apierrors.NewInternalError(errors.New("the API server cannot scale the Deployment"))
 			}
-			return cl.Patch(ctx, obj, patch, opts...)
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
 	br := &BackupRunReconciler{Client: refusing, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{},

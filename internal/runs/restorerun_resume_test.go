@@ -9,7 +9,6 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/testinfra/strictclient"
-	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -239,19 +238,19 @@ func lateJob(t *testing.T, c client.Client, other types.UID) *batchv1.Job {
 	return nil
 }
 
-// landOnRestart returns a client over c that calls land at the first patch
-// of a Deployment, so a restore Job whose create timed out is stored while
-// the run gives the app back. The Job is then all there is of the restore:
-// the run has not recorded it. The function returned reports the landed Job
-// as it was stored, or nil before it landed.
+// landOnRestart returns a client over c that calls land at the first write
+// to a Deployment's scale subresource, so a restore Job whose create timed
+// out is stored while the run gives the app back. The Job is then all there
+// is of the restore: the run has not recorded it. The function returned
+// reports the landed Job as it was stored, or nil before it landed.
 func landOnRestart(c client.Client, land func() *batchv1.Job) (client.Client, func() *batchv1.Job) {
 	var landed *batchv1.Job
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if _, ok := obj.(*appsv1.Deployment); ok && landed == nil {
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := deploymentScale(sub, obj, opts); ok && landed == nil {
 				landed = land().DeepCopy()
 			}
-			return cl.Patch(ctx, obj, patch, opts...)
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	}), func() *batchv1.Job { return landed }
 }
@@ -291,7 +290,7 @@ func TestAJobThatLandsAfterTheAppIsBackNeverRuns(t *testing.T) {
 			if whileRestarting {
 				stored := landed()
 				if stored == nil {
-					t.Fatal("the run gave the app back without a Deployment patch, want the Job landed during the restart")
+					t.Fatal("the run gave the app back without a Deployment scale write, want the Job landed during the restart")
 				}
 				if stored.Spec.Suspend == nil || !*stored.Spec.Suspend {
 					t.Fatalf("the late restore Job %s could run while the app came back, want it stored suspended", stored.Name)

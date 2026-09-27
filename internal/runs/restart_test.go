@@ -172,13 +172,11 @@ func TestARestartThatKeepsFailingIsReportedAndRetried(t *testing.T) {
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	refuse := false
 	r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if _, ok := obj.(*appsv1.Deployment); ok && refuse {
-				if data, _ := patch.Data(obj); !strings.Contains(string(data), `"replicas":0`) {
-					return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, obj.GetName(), errors.New("a policy refuses the change"))
-				}
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if replicas, ok := deploymentScale(sub, obj, opts); ok && refuse && replicas != 0 {
+				return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments/scale"}, obj.GetName(), errors.New("a policy refuses the change"))
 			}
-			return cl.Patch(ctx, obj, patch, opts...)
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
 	step(t, r) // plan
@@ -388,13 +386,11 @@ func TestARestartThatFailsBeforeTheTimeoutIsReported(t *testing.T) {
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	refuse := false
 	r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if _, ok := obj.(*appsv1.Deployment); ok && refuse {
-				if data, _ := patch.Data(obj); !strings.Contains(string(data), `"replicas":0`) {
-					return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, obj.GetName(), errors.New("a policy refuses the change"))
-				}
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if replicas, ok := deploymentScale(sub, obj, opts); ok && refuse && replicas != 0 {
+				return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments/scale"}, obj.GetName(), errors.New("a policy refuses the change"))
 			}
-			return cl.Patch(ctx, obj, patch, opts...)
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
 	step(t, r) // plan
@@ -537,13 +533,11 @@ func TestARefusedRestartStillReleasesTheLeases(t *testing.T) {
 				claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 			refuse := false
 			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
-				Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-					if _, ok := obj.(*appsv1.Deployment); ok && refuse {
-						if data, _ := patch.Data(obj); !strings.Contains(string(data), `"replicas":0`) {
-							return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, obj.GetName(), errors.New("a policy refuses the change"))
-						}
+				SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					if replicas, ok := deploymentScale(sub, obj, opts); ok && refuse && replicas != 0 {
+						return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments/scale"}, obj.GetName(), errors.New("a policy refuses the change"))
 					}
-					return cl.Patch(ctx, obj, patch, opts...)
+					return cl.SubResource(sub).Update(ctx, obj, opts...)
 				},
 				Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 					if _, ok := obj.(*coordinationv1.Lease); ok && refuse && refuseLeases {
@@ -604,13 +598,11 @@ func TestAnAppGivenBackByHandLetsTheRunGoOn(t *testing.T) {
 				claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 			refuse := false
 			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
-				Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-					if _, ok := obj.(*appsv1.Deployment); ok && refuse {
-						if data, _ := patch.Data(obj); !strings.Contains(string(data), `"replicas":0`) {
-							return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, obj.GetName(), errors.New("a policy refuses the change"))
-						}
+				SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					if replicas, ok := deploymentScale(sub, obj, opts); ok && refuse && replicas != 0 {
+						return apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments/scale"}, obj.GetName(), errors.New("a policy refuses the change"))
 					}
-					return cl.Patch(ctx, obj, patch, opts...)
+					return cl.SubResource(sub).Update(ctx, obj, opts...)
 				},
 			})
 			step(t, r) // plan

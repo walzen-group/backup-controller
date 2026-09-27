@@ -96,7 +96,7 @@ func TestARestoreThatCannotGiveTheAppBackSaysWhatFailed(t *testing.T) {
 	lease := heldClaimLease(run, claimN)
 	r, c := restoreReconciler(t, nil, run, claim(), volumeRestore(), repository(),
 		stoppedDeployment(), kustomization(true), job, lease)
-	r.Client = refuseDeploymentPatches(c)
+	r.Client = refuseDeploymentScales(c)
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
 	recorder := events.NewFakeRecorder(10)
 	r.Recorder = recorder
