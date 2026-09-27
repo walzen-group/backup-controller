@@ -64,6 +64,29 @@ type heldError struct {
 // Error returns the text of the hold.
 func (e *heldError) Error() string { return e.hold.text }
 
+// heldOf gets the hold that stopped the source write in ensureSource.
+//
+// Parameters:
+//   - err is the error of controllerutil.CreateOrUpdate.
+//
+// It returns found false when err carries no *heldError. It returns the hold
+// and found true when err carries a *heldError. It returns an error with
+// found true when that *heldError carries the zero hold.
+//
+// The zero hold does not hold the run. If ensureSource took it as a hold,
+// the item would go Running with a tag that the write did not put on the
+// source. The error stops the item, and the pass runs again.
+func heldOf(err error) (h hold, found bool, bad error) {
+	var held *heldError
+	if !errors.As(err, &held) {
+		return hold{}, false, nil
+	}
+	if !held.hold.held() {
+		return hold{}, true, errors.New("a hold with no kind stopped the write, and the run writes nothing")
+	}
+	return held.hold, true, nil
+}
+
 // holder returns why the run with the trigger tag must not write the
 // ReplicationSource source, which is in use (see inUse) with another tag or
 // with none.

@@ -224,6 +224,8 @@ func foreignSource(name string) error {
 // invalid. Any other failed read or write comes back as a plain error, which
 // the caller retries. That includes a Conflict or AlreadyExists when another
 // writer changed or created the source after the read the write is based on.
+// A check that stops the write with the zero hold also gives a plain error
+// (see heldOf).
 //
 // The checks run inside the mutate function of controllerutil.CreateOrUpdate,
 // on the object whose resourceVersion the update carries. When another run
@@ -262,9 +264,11 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 		}
 		return write.fill(source)
 	})
-	var held *heldError
-	if errors.As(err, &held) {
-		return source, held.hold, nil
+	if busy, found, bad := heldOf(err); found {
+		if bad != nil {
+			return nil, hold{}, fmt.Errorf("write ReplicationSource %s/%s: %w", claim.Namespace, claim.Name, bad)
+		}
+		return source, busy, nil
 	}
 	_, refused := asItemFailure(err)
 	switch {
