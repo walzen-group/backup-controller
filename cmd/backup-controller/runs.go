@@ -100,6 +100,32 @@ func runScheme() (*runtime.Scheme, error) {
 	return scheme, nil
 }
 
+// RunOptions carries the command line settings the run controllers start
+// with. main fills it from its flags and hands it to startRunControllers.
+type RunOptions struct {
+	// Kubeconfig is the path from the --kubeconfig flag. Empty means the
+	// in-cluster configuration.
+	Kubeconfig string
+	// Namespace is the controller namespace from the --namespace flag,
+	// where the populator keeps its prime claims, Secret copies and
+	// ReplicationDestinations. populator.OrphanReconciler cleans up there
+	// after a claim whose VolumeRestore is gone.
+	Namespace string
+	// MetricsAddr is the address where the manager serves the scheduler's
+	// metrics. The populator library serves its own registry on another
+	// port, and nothing else can register metrics into that one.
+	MetricsAddr string
+	// HealthAddr is the address where the manager serves /healthz and
+	// /readyz for the Deployment's probes. "0" serves neither.
+	HealthAddr string
+	// Hook says where the bootstrap webhook listens. An empty Hook.CertDir
+	// serves no webhook.
+	Hook BootstrapWebhook
+	// RestoreImage is the image from the required --restore-image flag,
+	// which the RestoreRun reconciler's restore Jobs run restic in.
+	RestoreImage string
+}
+
 // startRunControllers starts the controller-runtime manager that reconciles
 // BackupRun and RestoreRun, finishes the cleanup of claims whose VolumeRestore
 // is gone, runs the namespace scheduler, and serves the
@@ -112,19 +138,7 @@ func runScheme() (*runtime.Scheme, error) {
 //     ctrl.SetupSignalHandler, because the populator library installs the
 //     process's only signal handler and a second one on the same channel
 //     panics.
-//   - kubeconfig is the path from the --kubeconfig flag. Empty means the
-//     in-cluster configuration.
-//   - namespace is the controller namespace from the --namespace flag, where
-//     the populator keeps its prime claims, Secret copies and
-//     ReplicationDestinations. populator.OrphanReconciler cleans up there
-//     after a claim whose VolumeRestore is gone.
-//   - metricsAddr is the address where the manager serves the scheduler's
-//     metrics. The populator library serves its own registry on another port,
-//     and nothing else can register metrics into that one.
-//   - healthAddr is the address where the manager serves /healthz and
-//     /readyz for the Deployment's probes. "0" serves neither.
-//   - hook says where the bootstrap webhook listens. An empty hook.CertDir
-//     serves no webhook.
+//   - options holds the settings from the command line (see RunOptions).
 //   - fail is called, from the manager's goroutine, when the manager stops
 //     while the context is still live, with the error it stopped on. main
 //     passes exitOnFailure, so the kubelet restarts the pod. A manager that
@@ -134,7 +148,8 @@ func runScheme() (*runtime.Scheme, error) {
 // It returns an error when the client configuration can't be built, a scheme
 // fails to register, or the manager or one of its controllers can't be set
 // up. An error from a manager stopped by the context is only logged.
-func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr, healthAddr string, hook BootstrapWebhook, fail func(error)) error {
+func startRunControllers(ctx context.Context, options RunOptions, fail func(error)) error {
+	kubeconfig, namespace, hook := options.Kubeconfig, options.Namespace, options.Hook
 	config, err := restConfig(kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client configuration: %w", err)
@@ -147,7 +162,7 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 		return err
 	}
 
-	manager, err := ctrl.NewManager(config, managerOptions(scheme, metricsAddr, healthAddr, hook))
+	manager, err := ctrl.NewManager(config, managerOptions(scheme, options.MetricsAddr, options.HealthAddr, hook))
 	if err != nil {
 		return fmt.Errorf("create the manager: %w", err)
 	}
@@ -206,7 +221,7 @@ func startRunControllers(ctx context.Context, kubeconfig, namespace, metricsAddr
 	if err := backups.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the BackupRun controller: %w", err)
 	}
-	restores := &runs.RestoreRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Prober: bootstrap.S3Prober{}, Recorder: recorder}
+	restores := &runs.RestoreRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Prober: bootstrap.S3Prober{}, Recorder: recorder, RestoreImage: options.RestoreImage}
 	if err := restores.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the RestoreRun controller: %w", err)
 	}

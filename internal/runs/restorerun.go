@@ -68,6 +68,12 @@ type RestoreRunReconciler struct {
 	// Recorder writes an event on the run each time its Ready reason changes.
 	Recorder events.EventRecorder
 
+	// RestoreImage is the image the run's restore Jobs run restic in, from
+	// the controller's required --restore-image flag: the image VolSync runs
+	// its restic mover in, so a restore runs the restic that wrote the
+	// backup.
+	RestoreImage string
+
 	// Now returns the current time. Tests replace it so they can move time
 	// forward without sleeping.
 	Now func() time.Time

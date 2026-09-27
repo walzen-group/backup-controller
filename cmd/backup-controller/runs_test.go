@@ -37,7 +37,7 @@ func TestAManagerThatStopsOnItsOwnIsReported(t *testing.T) {
 
 	failed := make(chan error, 1)
 	fail := func(err error) { failed <- err }
-	if err := startRunControllers(ctx, testKubeconfig(t, server.URL), "backup-system", taken.Addr().String(), "0", BootstrapWebhook{}, fail); err != nil {
+	if err := startRunControllers(ctx, testRunOptions(t, server.URL, taken.Addr().String(), "0"), fail); err != nil {
 		t.Fatalf("startRunControllers: %v", err)
 	}
 
@@ -71,7 +71,7 @@ func TestTheManagerServesHealthAndReadiness(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	fail := func(err error) { t.Errorf("the manager stopped: %v", err) }
-	if err := startRunControllers(ctx, testKubeconfig(t, server.URL), "backup-system", "0", addr, BootstrapWebhook{}, fail); err != nil {
+	if err := startRunControllers(ctx, testRunOptions(t, server.URL, "0", addr), fail); err != nil {
 		t.Fatalf("startRunControllers: %v", err)
 	}
 
@@ -104,5 +104,28 @@ func TestTheRunSchemeKnowsTheMoverJob(t *testing.T) {
 	}
 	if job := batchv1.SchemeGroupVersion.WithKind("Job"); !scheme.Recognizes(job) {
 		t.Errorf("the run manager's scheme does not hold %s", job)
+	}
+}
+
+// testRunOptions returns the options startRunControllers gets in these
+// tests.
+//
+// Parameters:
+//   - t writes the kubeconfig file, which testKubeconfig removes when the
+//     test ends.
+//   - server is the URL of the test's API server.
+//   - metricsAddr and healthAddr are the listen addresses the test wants
+//     for the metrics and probe servers.
+//
+// The run controllers start without a webhook, in namespace backup-system,
+// with an image that is only carried, since no test here starts a restore.
+func testRunOptions(t *testing.T, server, metricsAddr, healthAddr string) RunOptions {
+	t.Helper()
+	return RunOptions{
+		Kubeconfig:   testKubeconfig(t, server),
+		Namespace:    "backup-system",
+		MetricsAddr:  metricsAddr,
+		HealthAddr:   healthAddr,
+		RestoreImage: "restic.example/restic:test",
 	}
 }

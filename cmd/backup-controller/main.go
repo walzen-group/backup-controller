@@ -42,14 +42,9 @@ var version = "dev"
 // populator library until it stops.
 func main() {
 	var (
-		kubeconfig  = kubeconfigFlag(flag.CommandLine)
-		namespace   = flag.String("namespace", "backup-system", "namespace the prime claim and the ReplicationDestination live in")
+		runOptions  = runFlags(flag.CommandLine)
 		metricsAddr = flag.String("metrics-addr", ":8080", "address the populator library's metrics listener binds")
 		metricsPath = flag.String("metrics-path", "/metrics", "path the metrics listener serves")
-		runsMetrics = flag.String("runs-metrics-addr", ":8081", "address the scheduler's metrics listener binds, at /metrics")
-		healthAddr  = flag.String("health-probe-addr", ":8082", "address serving /healthz and /readyz for the run controllers; 0 serves none")
-		webhookCert = flag.String("webhook-cert-dir", "", "directory holding tls.crt and tls.key; empty serves no webhook")
-		webhookPort = flag.Int("webhook-port", 9443, "port the admission webhook listens on")
 		printVer    = flag.Bool("version", false, "print the version and exit")
 	)
 	klog.InitFlags(nil)
@@ -60,12 +55,21 @@ func main() {
 		return
 	}
 
-	operations, err := newClientOperations(kubeconfig())
+	// The restore Jobs need an image and the controller carries none of its
+	// own, so a command line without one ends the process here, before it
+	// builds a client or starts a controller.
+	options, err := runOptions()
+	if err != nil {
+		klog.Errorf("refusing to start: %v", err)
+		os.Exit(1)
+	}
+
+	operations, err := newClientOperations(options.Kubeconfig)
 	if err != nil {
 		klog.Errorf("failed to build the Kubernetes client: %v", err)
 		os.Exit(1)
 	}
-	callbacks := populator.New(operations, *namespace, restic.S3Lister{})
+	callbacks := populator.New(operations, options.Namespace, restic.S3Lister{})
 
 	// The populator library drives only the one kind it is given, so
 	// BackupRun and RestoreRun are reconciled by a controller-runtime manager
@@ -75,8 +79,7 @@ func main() {
 	// process never runs on with the populator alone.
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
-	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
-	if err := startRunControllers(runs, kubeconfig(), *namespace, *runsMetrics, *healthAddr, hook, exitOnFailure); err != nil {
+	if err := startRunControllers(runs, options, exitOnFailure); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1) //nolint:gocritic // exitAfterDefer: the exit ends all stopRuns would stop; T3 moves the exit
 	}
@@ -90,10 +93,10 @@ func main() {
 	// klog.Fatalf, which exits the process with a non-zero status, so a
 	// failed populator restarts the pod without help from this binary.
 	populatormachinery.RunControllerWithConfig(populatormachinery.VolumePopulatorConfig{
-		Kubeconfig:   kubeconfig(),
+		Kubeconfig:   options.Kubeconfig,
 		HttpEndpoint: *metricsAddr,
 		MetricsPath:  *metricsPath,
-		Namespace:    *namespace,
+		Namespace:    options.Namespace,
 		Prefix:       populator.Prefix,
 		Gk:           schema.GroupKind{Group: backupv1alpha1.GroupVersion.Group, Kind: "VolumeRestore"},
 		Gvr:          backupv1alpha1.GroupVersion.WithResource("volumerestores"),
