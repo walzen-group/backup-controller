@@ -11,7 +11,8 @@
 #              download; nothing else is downloaded.
 #   install    waits for cert-manager and Kueue (installed by their own
 #              scripts), applies config/crd and deploy/ through overlay/ with
-#              the image replaced by the local build, and creates the
+#              the image replaced by the local build and --restore-image set
+#              to hack/e2e/volsync's mover image, and creates the
 #              LocalQueue the kueue-managed namespace needs. The Deployment
 #              names the image as backup-controller:e2e-<image id>, so every
 #              build is a tag the kubelet has not seen and pulls through
@@ -33,6 +34,7 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
 pins="$here/pins.json"
+volsync_pins="$here/../volsync/pins.json"
 
 context=docker-desktop
 kc() { kubectl --context "$context" "$@"; }
@@ -42,6 +44,10 @@ ns=$(pin namespace)
 image=$(pin image.name)
 local_queue=$(pin kueue.localQueue)
 cluster_queue=$(pin kueue.clusterQueue)
+# The restic image the controller's restore Jobs run: VolSync's mover image
+# as hack/e2e/volsync pins it, so the e2e restores with the restic that wrote
+# the backups, as prod does.
+restore_image=$(jq -r '.volsync.image | "\(.repository):\(.tag)@\(.digest)"' "$volsync_pins")
 deploy=backup-controller
 webhook_config=backup-controller-bootstrap
 probe_ns=e2e-backup-controller-check
@@ -105,13 +111,16 @@ fetch() {
   echo "built $image, tagged $tag"
 }
 
-# apply_controller renders overlay/ with the image named by its id and applies it.
+# apply_controller renders overlay/ with the image named by its id, appends
+# --restore-image to the controller container's args the way prod's infra
+# module does (deploy/ leaves the flag to the installer), and applies it.
 apply_controller() {
   local tag
   tag=$(image_tag)
   docker tag "$image" "$tag"
   kc apply --server-side --field-manager=e2e-backup-controller -f "$repo/config/crd"
   kc kustomize "$here/overlay" | sed "s|image: $image\$|image: $tag|" |
+    RESTORE_IMAGE=$restore_image yq '(select(.kind == "Deployment") | .spec.template.spec.containers[] | select(.name == "controller") | .args) += ["--restore-image=" + strenv(RESTORE_IMAGE)]' |
     kc apply --server-side --field-manager=e2e-backup-controller -f -
 }
 
@@ -161,6 +170,10 @@ check() {
   want=$(image_tag)
   got=$(kc -n "$ns" get pod "$pod" -o jsonpath='{.spec.containers[?(@.name=="controller")].image}')
   [[ "$got" == "$want" ]] || fail "pod runs $got, want $want"
+
+  # The controller runs its restore Jobs in VolSync's pinned mover image.
+  got=$(kc -n "$ns" get pod "$pod" -o jsonpath='{.spec.containers[?(@.name=="controller")].args}')
+  [[ "$got" == *"\"--restore-image=$restore_image\""* ]] || fail "the controller's args $got do not set --restore-image=$restore_image"
 
   # The scratch image has no shell, so the endpoints are read through the
   # API server's pod proxy.
