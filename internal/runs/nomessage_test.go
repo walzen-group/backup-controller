@@ -14,14 +14,14 @@ import (
 
 // messageRuleScope is the code TestNoDecisionReadsAMessage reads: the
 // non-test Go files of each directory, or only the named files when a scope
-// lists them. It covers what restic-jobs steps 3 and 4 left free of message
-// reads, internal/restorejob from step 5, whose Read renders the
-// termination message restic leaves and must never decide on it, and the
-// RestoreRun's restore Job code from steps 7a and 8; steps 7b and 10 widen it
-// until it holds every non-test file of internal/runs and
-// internal/populator.
+// lists them. It covers every non-test file of internal/runs but trigger.go,
+// whose mover log reads restic-jobs step 10 (J3) removes, and
+// internal/populator; and internal/restorejob, whose Read renders the
+// termination message restic leaves and must never decide on it. Step 10
+// drops the exception, so the scope then holds every non-test file of
+// internal/runs.
 var messageRuleScope = []messageRuleDir{
-	{dir: ".", files: []string{"backuprun.go", "restorerun.go", "restore_into.go", "restore_jobs.go", "restore_volume.go"}},
+	{dir: ".", except: []string{"trigger.go"}},
 	{dir: "../populator"},
 	{dir: "../restorejob"},
 }
@@ -33,6 +33,10 @@ type messageRuleDir struct {
 	// files names the files to read in it. Empty means every non-test Go
 	// file.
 	files []string
+	// except names files the rule leaves out of a scope that reads every
+	// non-test Go file. The test fails when one of them is not there, so a
+	// renamed file never widens the exception.
+	except []string
 }
 
 // messageRuleEntry names one top-level declaration the rule lets through,
@@ -50,11 +54,29 @@ type messageRuleEntry struct {
 
 // textMatcherAllowlist lets a declaration use a text matcher (part 1 of
 // the rule). A new entry needs a reviewer's eye like any rule exception.
-// walkFields, applyStop, appliedPart, restartWorkloads, retention,
-// resticSpan and lastLines join it with the files that hold them.
 var textMatcherAllowlist = []messageRuleEntry{
 	{pkg: "runs", decl: "RestoreRunReconciler.inPlaceClaimLost",
 		what: "strings.HasPrefix and TrimPrefix on a Lease name, to find the claim Leases by the prefix the controller gives them"},
+	{pkg: "runs", decl: "walkFields",
+		what: "strings.Cut on a Go struct field's json tag, to get the field name the CRD schema must declare"},
+	{pkg: "runs", decl: "leaseItems",
+		what: "strings.Split on the Lease's items annotation, the comma-separated item names acquireLeases wrote"},
+	{pkg: "runs", decl: "otherNamespaces",
+		what: "strings.Split on a Kustomization inventory entry id, <namespace>_<name>_<group>_<kind> as kustomize-controller records it"},
+	{pkg: "runs", decl: "inventoryIDs",
+		what: "strings.Count on a Kustomization inventory entry id, to check its four-part format"},
+	{pkg: "runs", decl: "applyStop",
+		what: "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built"},
+	{pkg: "runs", decl: "appliedPart",
+		what: "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built"},
+	{pkg: "runs", decl: "restartWorkloads",
+		what: "strings.Cut on a status.suspendedKustomizations entry, the namespace/name key the controller built"},
+	{pkg: "runs", decl: "resticSpan",
+		what: "the regexp of the span syntax restic's --keep-within takes"},
+	{pkg: "runs", decl: "retention",
+		what: "resticSpan.MatchString on the claim's retain-within annotation, a setting a person declared"},
+	{pkg: "runs", decl: "lastLines",
+		what: "strings.Split and TrimSpace on a mover log, to show its last lines in a message; no decision reads the result"},
 }
 
 // textMatcherPending holds the text matchers a later step removes. Each
@@ -211,8 +233,13 @@ func scanMessageRule(t *testing.T, scope messageRuleDir) []messageFinding {
 			t.Fatal(err)
 		}
 		for _, path := range all {
-			if !strings.HasSuffix(path, "_test.go") {
+			if !strings.HasSuffix(path, "_test.go") && !slices.Contains(scope.except, filepath.Base(path)) {
 				paths = append(paths, path)
+			}
+		}
+		for _, name := range scope.except {
+			if !slices.Contains(all, filepath.Join(scope.dir, name)) {
+				t.Fatalf("the scope %s leaves out %s, which it does not hold", scope.dir, name)
 			}
 		}
 	}
