@@ -428,6 +428,19 @@ the backup. The repository then grows by snapshots that nothing deletes.
 from another host. Thus the trigger clears the lock left behind without an
 operator. It does not delete a lock that belongs to a mover that still runs.
 
+## What Kueue, VolSync and restic already prevent
+
+The controller adds a guard only where no other part prevents the case.
+
+| Case | Prevented by | Guard in the controller |
+| --- | --- | --- |
+| Two scheduled backups of one namespace at the same time | the Scheduler: it creates no run while a run with `spec.all` is unfinished (`lastTick`, internal/runs/schedule.go) | none more |
+| More backups at once than the cluster can run | Kueue: the ClusterQueue quota admits a Workload only when quota is free | none more |
+| Two syncs of one ReplicationSource | VolSync: one sync at a time per source | none more |
+| A backup and a restore of one claim at the same time | nothing: a RestoreRun does not go through Kueue, the Kueue quota counts pods and not claims, and restic takes a non-exclusive lock for both `backup` and `restore` | the claim and repository Leases below |
+| Two runs that stop and restart one namespace | nothing: the other parts do not know about quiesce | the quiesce Lease below |
+| A status write that fails after a create | nothing: the API server keeps the created Job, Workload or claim | the next pass finds the object by name and label and records it |
+
 ## Take one Lease per claim and repository
 
 From v0.9.0 a BackupRun and a RestoreRun each take two `coordination.k8s.io`
