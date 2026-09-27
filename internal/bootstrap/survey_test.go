@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -141,7 +142,7 @@ func TestAFailedGetWithNoDoneBackupIsRefused(t *testing.T) {
 	recorded := withoutNewest(t, barmanstore.MustLoad(t, "many-failed"))
 	ids := recorded.Backups()["app-pg"]
 	endpoint, proxy := faultyS3(t, recordedS3(t, recorded))
-	proxy.Add(s3fault.Rule{Match: s3fault.Match{Methods: []string{"GET"}, KeySuffix: ids[0] + "/backup.info"}, Status: 500})
+	proxy.Add(s3fault.Rule{Match: s3fault.Match{Methods: []string{"GET"}, KeySuffix: ids[0] + "/backup.info"}, Status: http.StatusForbidden, Code: "AccessDenied"})
 
 	response := decideWithin(t, cluster(t, nil), endpoint, 3*time.Second)
 

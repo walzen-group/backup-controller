@@ -710,13 +710,13 @@ func TestAClusterThatArchivesNowhereIsLeftAlone(t *testing.T) {
 // exists to remove.
 //
 // The store is the recorded done-base store behind an s3fault proxy that
-// answers every request with 503 SlowDown, so the real S3Prober gets the
-// error after minio-go has spent its own retries. The refusal has to name the
-// 503 and SlowDown, and the same store without the rule has to recover the
-// Cluster, so the refusal is known to come from the 503.
+// answers every request with 403 AccessDenied, which minio-go does not retry.
+// The refusal has to name the 403 and AccessDenied, and the same store
+// without the rule has to recover the Cluster, so the refusal is known to
+// come from the 403.
 func TestAnUnreadableStoreRefusesTheCluster(t *testing.T) {
 	endpoint, proxy := faultyS3(t, recordedS3(t, barmanstore.MustLoad(t, "done-base")))
-	unavailable := proxy.Add(s3fault.Rule{Status: http.StatusServiceUnavailable, Code: "SlowDown"})
+	unavailable := proxy.Add(s3fault.Rule{Status: http.StatusForbidden, Code: "AccessDenied"})
 
 	response := decideWith(t, cluster(t, nil), S3Prober{}, storeAt(endpoint))
 
@@ -724,16 +724,16 @@ func TestAnUnreadableStoreRefusesTheCluster(t *testing.T) {
 		t.Fatal("a cluster was admitted while its store could not be read")
 	}
 	if unavailable.Hits() == 0 {
-		t.Error("the store was refused without a request reaching the 503 rule")
+		t.Error("the store was refused without a request reaching the 403 rule")
 	}
-	for _, want := range []string{"503", "SlowDown"} {
+	for _, want := range []string{"403", "AccessDenied"} {
 		if !strings.Contains(response.Result.Message, want) {
 			t.Errorf("the refusal %q does not name the store's answer %q", response.Result.Message, want)
 		}
 	}
 
 	// The control: the same store behind the same proxy, without the rule,
-	// recovers the Cluster, so the refusal above came from the 503.
+	// recovers the Cluster, so the refusal above came from the 403.
 	unavailable.Remove()
 	response = decideWith(t, cluster(t, nil), S3Prober{}, storeAt(endpoint))
 	if !response.Allowed || len(response.Patches) == 0 {
