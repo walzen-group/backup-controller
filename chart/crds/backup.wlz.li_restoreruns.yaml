@@ -580,6 +580,13 @@ spec:
                         Job is the name of the restore Job the run created for a volume, in the
                         run's namespace.
                       type: string
+                    jobUID:
+                      description: |-
+                        JobUID is the UID of that Job, recorded with its name. The run stops
+                        the Job by this UID: when someone deletes the Job while it runs, its
+                        pods keep this UID in their batch.kubernetes.io/controller-uid label,
+                        and the run gives nothing back until each of them has ended.
+                      type: string
                     kind:
                       description: Kind is PersistentVolumeClaim for a volume and
                         Cluster for a database.

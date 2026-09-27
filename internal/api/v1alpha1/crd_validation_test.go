@@ -284,9 +284,10 @@ func TestCRDRoundTrip(t *testing.T) {
 // installed CRD keeps and what the API server prunes. A field the schema lacks
 // is dropped silently, and a run would then lose the state its later passes
 // decide on: the ending a failed restart must repeat, the last start error, a
-// Cluster left deleted, the full snapshot ID, the restore Job and the item's
-// reason. The stored run is then decoded into the Go type and encoded again,
-// so a JSON name in the Go type that differs from the CRD's fails as well.
+// Cluster left deleted, the full snapshot ID, the restore Job, its UID and the
+// item's reason. The stored run is then decoded into the Go type and encoded
+// again, so a JSON name in the Go type that differs from the CRD's fails as
+// well.
 func TestRunStatusFieldsRoundTrip(t *testing.T) {
 	ending := map[string]any{"reason": "TimedOut", "message": "the run timed out after 6h0m0s"}
 	runs := []struct {
@@ -314,6 +315,7 @@ func TestRunStatusFieldsRoundTrip(t *testing.T) {
 				"kind": "Cluster", "name": "notes-pg", "phase": "Failed",
 				"snapshotID":         "4f3c2b1a0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a",
 				"job":                "notes-data-restore",
+				"jobUID":             "0b6c1a52-8f4e-4d3a-9c7b-2e5f6a7b8c9d",
 				"reason":             "RestoreJobFailed",
 				"clusterLeftDeleted": true,
 			},
