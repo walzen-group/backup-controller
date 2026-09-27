@@ -202,3 +202,10 @@ func firstLine(s string) string {
 	line, _, _ := strings.Cut(s, "\n")
 	return line
 }
+
+// lastLine returns the last line of s that holds anything but spaces,
+// trimmed, or "" when there is none.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
+}

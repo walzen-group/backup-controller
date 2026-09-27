@@ -197,11 +197,12 @@ stringData:
 // resticSnapshot is the part of restic's snapshots --json output the tests
 // read.
 type resticSnapshot struct {
-	ID      string    `json:"id"`
-	ShortID string    `json:"short_id"`
-	Time    time.Time `json:"time"`
-	Paths   []string  `json:"paths"`
-	Tags    []string  `json:"tags"`
+	ID       string    `json:"id"`
+	ShortID  string    `json:"short_id"`
+	Time     time.Time `json:"time"`
+	Paths    []string  `json:"paths"`
+	Tags     []string  `json:"tags"`
+	Hostname string    `json:"hostname"`
 }
 
 // snapshots lists the repository's snapshots with the restic release VolSync's
@@ -422,4 +423,18 @@ func runEvidence(namespace string) string {
 		[]string{"-n", controllerNamespace, "logs", "deploy/backup-controller", "--tail=300"},
 		[]string{"get", "workloads.kueue.x-k8s.io", "-n", namespace, "-o", "wide"},
 	)
+}
+
+// getJSON reads one object of kind named name in namespace into into. An
+// empty name reads the list of every object of kind.
+func getJSON(namespace, kind, name string, into any) error {
+	args := []string{"get", kind}
+	if name != "" {
+		args = append(args, name)
+	}
+	out, err := kubectlQuick(namespace, append(args, "-o", "json")...)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(out), into)
 }
