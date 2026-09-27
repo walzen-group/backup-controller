@@ -16,7 +16,7 @@ import (
 
 // TestEnvtestTheVolSyncCheckNamesReplicationSourceOnAFreshMapper starts a
 // kube-apiserver that serves VolSync's two kinds at v1beta1 alone and asks
-// volsyncUnsupported through a fresh lazy RESTMapper, as the controller's
+// volsyncSourceUnserved through a fresh lazy RESTMapper, as the controller's
 // startup check does before any run has looked a kind up. The first answer
 // names ReplicationSource, the one VolSync kind the controller uses, and
 // never ReplicationDestination, which it no longer uses. The second answer

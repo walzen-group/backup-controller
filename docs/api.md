@@ -247,7 +247,7 @@ that ended by a path that records no reason leaves it empty
 | ClusterHibernated | BackupRun | the run skipped a hibernated Cluster |
 | BackupRefused | BackupRun | the API server refused the CloudNativePG Backup as invalid |
 | BackupFailed | BackupRun | the CloudNativePG Backup ended in the phase `failed` or `invalid backup definition`. The message carries the error from CloudNativePG |
-| RunEnded | BackupRun | the run ended before the item finished, for a cause other than the timeout. The run's `status.ending` says why the run ended |
+| RunEnded | both | the run ended before the item finished, for a cause other than the timeout. The run's `status.ending` says why the run ended |
 | NotStarted | BackupRun | the run did not start the item before the `backup.wlz.li/max-quiesce` limit ran out. The run then gave the workloads back |
 | CloneNotCut | BackupRun | VolSync did not cut the clone before the `backup.wlz.li/max-quiesce` limit ran out. The run then gave the workloads back |
 | RestoreJobFailed | RestoreRun | the restore Job ended with `Failed=True`, and the message carries restic's exit code and its meaning. The reason also applies in two other cases. The run's own Job restores a snapshot other than the one the run selected, or the run no longer controls the Job |
@@ -256,13 +256,14 @@ that ended by a path that records no reason leaves it empty
 | SnapshotChanged | RestoreRun | the selected snapshot was no longer in the repository when the run listed it again immediately before it created the Job |
 | ClaimLost | RestoreRun | the claim stopped being the run's while the restore ran: someone deleted it, replaced it, or took it |
 | ClaimDeleting | RestoreRun | the claim was in deletion when the run was about to start the restore |
-| IntoClaimTaken | RestoreRun | the claim `spec.into` names holds a claim the run did not create |
+| IntoClaimTaken | RestoreRun | the name that `spec.into` gives holds a claim, or a VolumeRestore, that the run did not create. The run finds it before it creates the claim. It also finds it when it takes over a restore Job that an earlier pass created and did not record. The run then stops that Job before the Job writes. The run wrote nothing to that claim |
 | ClusterRestoredElsewhere | RestoreRun | another unfinished RestoreRun restores the Cluster |
 | NoBackupInReach | RestoreRun | no backup is in reach of the run's moment. No snapshot or base backup is at or before the moment, or `spec.previous` reaches past the oldest one. For a synced restore, the items can also have no quiesced moment in common. The run wrote and deleted nothing |
 | ClusterArchivesNowhere | RestoreRun | the Cluster archives its WAL nowhere, so it has no backup to restore. The run skips the item |
 | OtherItemFailed | RestoreRun | the run left the item alone because another item failed. Before the restore starts, the cause is another item with no backup in reach. Later, the cause is a failed volume restore, and the run leaves the Cluster running |
-| ClusterLeftAlone | RestoreRun | the Cluster opts out of the bootstrap webhook or declares its own bootstrap method. The run cannot make the next creation of the Cluster its recovery, so it does not delete the Cluster |
-| ClusterNotRecovered | RestoreRun | the Cluster came back without the run's recovery, or someone deleted or replaced the recovered Cluster. The run leaves that Cluster alone |
+| ClusterLeftAlone | RestoreRun | the Cluster opts out of the bootstrap webhook or declares its own bootstrap method. The run cannot make the next creation of the Cluster its recovery, so it does not delete the Cluster. The item is Skipped. The run records this reason at plan for a Cluster that `backup.wlz.li/enabled` selects, before it deletes a Pending Cluster, and for an old Cluster that a Deleted item finds still there. A run whose `spec.database` names such a Cluster ends with the Ready reason Invalid instead, and no item records the reason |
+| ClusterNotRecovered | RestoreRun | the Cluster came back without the run's recovery, or someone deleted or replaced the recovered Cluster. The item fails. The run records this reason for a Deleted item that finds a new Cluster without the mark of the run, and for a Recovering item whose Cluster someone deletes or replaces. The message says why, such as an opt-out annotation or an own `spec.bootstrap` on the new Cluster. The run leaves that Cluster alone |
+| ClusterVersionUnsupported | RestoreRun | the API server serves CloudNativePG's Cluster at another version and no longer at `postgresql.cnpg.io/v1`. The rules of the bootstrap webhook name that version. The run fails each Pending Cluster item with this reason, at plan or in a later pass, before it deletes the Cluster. At plan, the run also skips each other Pending item with this reason. The run deleted nothing for the item. When the run then ends with a failed item, its Ready reason is ClusterVersionUnsupported in place of Failed |
 
 ### Ready reasons
 
@@ -387,7 +388,7 @@ A run writes only into a claim that it created itself:
 | WaitingForShutdown | the run waits for something to be gone before it continues. That is the instance pods and PVCs of a Cluster it deleted, or the pods of a restore Job it stopped: `waiting for the restore Job of claim <claim>, which the run stopped, to end: restore Job <job>: waiting for pods <pod> to end. The run gives the app back and lets other runs at the claim only after that`. Until then, the app stays stopped and the run keeps its Leases |
 | WaitingForRecreate | the run deleted a Cluster and waits for its owner to create it again: `recreate <cluster> to finish the restore: resume the app's Flux Kustomization, or apply the terragrunt unit that declares it` |
 | VolSyncUnsupported | the API server no longer serves VolSync's ReplicationSource at v1alpha1. The run changes nothing and retries every pass. At `timeout` it ends TimedOut and gives the app back ([compatibility.md](compatibility.md#following-the-versions-the-api-server-serves)) |
-| ClusterVersionUnsupported | the API server no longer serves CloudNativePG's Cluster at v1, so the bootstrap webhook would not see a new Cluster. A run that deleted no Cluster ends with this reason. A run that already deleted one waits with it |
+| ClusterVersionUnsupported | the API server no longer serves CloudNativePG's Cluster at v1, so the bootstrap webhook would not see a new Cluster. A run that deleted no Cluster ends with this reason. A run that already deleted one waits with it. A run that failed a Cluster item for this cause ends with this reason, also when it ends in a later pass |
 | RestartFailed | the run could not give a workload it stopped its replicas back. Or it could not resume a Kustomization it suspended. Or it could not stop a restore Job while the app is down. The message names what failed and what to scale, resume or delete by hand |
 | ReleaseFailed | the app is back. The run cannot finish because it could not release its Leases or stop a restore Job. The message tells what to delete by hand |
 | CRDOutdated | the same as on a [BackupRun](#ready-reasons): the CRD of its kind is not installed, lacks a field the controller writes, or may not be read by the controller |
@@ -395,13 +396,15 @@ A run writes only into a claim that it created itself:
 | NoBackupInReach | the run ended before it deleted or wrote anything. An item has no backup at or before `restoreAsOf`. Or the repository of an item holds no snapshot with the layout a VolSync mover writes. The reason also applies to a run that restored nothing because every item was Skipped |
 | TimedOut | the run had not finished by its `timeout`. Or it had not passed its checks by then (`the run had not passed its checks by <deadline>: <message>`). Or its `into` claim had not been restored by then (`claim <into> had not been restored by <deadline>`). A run that waited for another run carries that wait: `the run had not finished by <deadline>; it was waiting: <the wait>`. An item whose restore Job still ran gets the timeout's message. When the Job's newest pod waited, the message also gets `; the restore Job's pod was waiting: <container>: <reason>: "<message>"` |
 | Succeeded | every item holds the restored data |
-| Failed | an item failed. The message names each failed item and its message |
+| Failed | an item failed, and no Cluster item failed with the item reason ClusterVersionUnsupported. The message names each failed item and its message |
 
 A RestoreRun records an event at each new Ready reason, the same as a
 [BackupRun](#backuprun). A run that deleted a Cluster can itself be deleted.
 It then records a Warning event with reason ClusterLeftDeleted for each such
 Cluster that its owner has not created again yet. It records the event
-immediately before it removes its finalizer. The note says that the webhook
+immediately before it removes its finalizer. If the read of such a Cluster
+fails, the run logs the error and records no event for it. It then removes
+its finalizer. The note says that the webhook
 now recovers that Cluster to the end of its archive, or to the time in its own
 `backup.wlz.li/restore-as-of` annotation.
 [restores.md](restores.md#databases-restore-themselves) quotes it.

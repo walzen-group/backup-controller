@@ -603,7 +603,10 @@ no longer applies.
 The item of the run says this, after the reason the run ended. A run that was
 deleted also records a Warning event with reason ClusterLeftDeleted that says
 the same. It does not record the event if its owner has created the Cluster
-again by then:
+again by then. To find this, the run reads the Cluster. If that read fails, for
+example because CloudNativePG is not installed or the controller has no access
+to Clusters, the run logs the error and records no event for that Cluster. It
+then removes its finalizer:
 
 ```text
 Cluster notes-pg was deleted, and the run ended before it was created again. No run waits for it now, so when Flux or tofu creates it, the bootstrap webhook recovers it to the end of its archive, or to the time in its own backup.wlz.li/restore-as-of annotation; the moment this run chose no longer applies

@@ -78,7 +78,7 @@ func target(run *backupv1alpha1.RestoreRun) (*time.Time, error) {
 // from items, such as a Cluster that another unfinished RestoreRun is
 // restoring.
 //
-// While clusterWebhookBlind reports that the API server no longer serves
+// While clusterWebhookUnserved reports that the API server no longer serves
 // Cluster at the version the bootstrap webhook's rules name, a run with a
 // Pending Cluster item ends Failed with reason ClusterVersionUnsupported
 // before anything is stopped or deleted: each such item fails with the

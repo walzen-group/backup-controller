@@ -9,8 +9,8 @@
 // persisted. That is the one moment the choice can be made.
 //
 // The RestoreRun controller in internal/runs also uses Archiver,
-// ResolveLocation and a Prober from this package, to check that a database has
-// a base backup before it deletes the Cluster.
+// ResolveLocation and S3Prober from this package, to check that a database
+// has a base backup before it deletes the Cluster.
 package bootstrap
 
 import (
@@ -100,8 +100,9 @@ func (l Location) BasePrefix() string {
 }
 
 // Prober asks an object store which base backups exist at a Location.
-// S3Prober is the real one. The interface exists so the webhook and the
-// RestoreRun controller can be tested without an object store.
+// S3Prober is the real one. ArchiveProber embeds it, so that the tests of the
+// webhook can give a fake and run without an object store. The RestoreRun
+// controller uses its own interface, runs.BaseBackupLister.
 type Prober interface {
 	// BaseBackups lists the location's completed base backups, oldest
 	// first.

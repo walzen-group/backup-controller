@@ -81,7 +81,7 @@ func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // during a reconcile, Reconcile records an event on the run.
 //
 // An unfinished run with no spec.database that is not being deleted first
-// goes through volsyncUnsupported. While VolSync serves its kinds only at a
+// goes through volsyncSourceUnserved. While VolSync serves its kinds only at a
 // version other than v1alpha1, the run ends through endForVolSync with
 // reason VolSyncUnsupported, which gives the app back: that needs no
 // VolSync object. A run being deleted goes to finalize as usual.
