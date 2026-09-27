@@ -610,11 +610,21 @@ spec:
 	if ended.Status.Phase != corev1.PodFailed || terminated == nil || terminated.ExitCode != 130 {
 		t.Fatalf("pod %s ended in phase %s with restore %+v, want Failed with exit 130\n%s", restorePod, ended.Status.Phase, terminated, f.evidence())
 	}
-	if ended.DeletionTimestamp == nil || ended.DeletionGracePeriodSeconds == nil {
+	// The kubelet deletes an ended pod again with a grace period of 0, which
+	// moves deletionTimestamp to that moment. The first state with a
+	// deletionTimestamp holds the stop that the controller asked for.
+	var stopping corev1.Pod
+	for _, pod := range pods.history(restorePod) {
+		if pod.DeletionTimestamp != nil {
+			stopping = pod
+			break
+		}
+	}
+	if stopping.DeletionTimestamp == nil || stopping.DeletionGracePeriodSeconds == nil {
 		t.Fatalf("pod %s ended without being deleted: %+v", restorePod, ended.ObjectMeta)
 	}
-	grace := time.Duration(*ended.DeletionGracePeriodSeconds) * time.Second
-	stopAsked := ended.DeletionTimestamp.Add(-grace)
+	grace := time.Duration(*stopping.DeletionGracePeriodSeconds) * time.Second
+	stopAsked := stopping.DeletionTimestamp.Add(-grace)
 	took := terminated.FinishedAt.Sub(stopAsked)
 	t.Logf("pod %s was asked to stop at %s with %s grace; restic exited %d at %s, %s later: %q",
 		restorePod, stopAsked.Format(time.RFC3339), grace, terminated.ExitCode, terminated.FinishedAt.Format(time.RFC3339), took, terminated.Message)
