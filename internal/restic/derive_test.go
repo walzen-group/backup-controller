@@ -32,9 +32,10 @@ func TestKeyDerivationsRunOneAtATime(t *testing.T) {
 	d := newKeyDeriver(watch)
 
 	var wg sync.WaitGroup
-	for range 4 {
+	for i := range 4 {
 		wg.Go(func() {
-			if _, err := d.derive("backup", keyFile{KDF: "scrypt", N: 2, R: 1, P: 1}); err != nil {
+			file := keyFile{KDF: "scrypt", N: 2, R: 1, P: 1, Salt: []byte{byte(i)}}
+			if _, err := d.derive("backup", file); err != nil {
 				t.Errorf("derive: %v", err)
 			}
 		})
@@ -51,5 +52,54 @@ func TestKeyDerivationsRunOneAtATime(t *testing.T) {
 func TestTheControllersDerivationsShareOneGate(t *testing.T) {
 	if got := cap(derivations.gate); got != 1 {
 		t.Errorf("the controller's key derivations admit %d at a time, want 1", got)
+	}
+}
+
+// TestAKeyFileIsDerivedOnce checks that a keyDeriver runs scrypt once for a
+// password and a key file, and gives the key it derived to every later Open
+// of the same key file, while a key file with another salt, or another
+// password, gets its own derivation.
+//
+// The e2e restore tests opened their repositories 37 times, and each Open
+// allocated scrypt's 32 MiB again. The large spans left the heap at 181 MB
+// though it held about 60 MB.
+func TestAKeyFileIsDerivedOnce(t *testing.T) {
+	var calls atomic.Int32
+	count := func(password, salt []byte, _, _, _, keyLen int) ([]byte, error) {
+		calls.Add(1)
+		out := make([]byte, keyLen)
+		copy(out, append(append([]byte{}, password...), salt...))
+		return out, nil
+	}
+	d := newKeyDeriver(count)
+	file := keyFile{KDF: "scrypt", N: 2, R: 1, P: 1, Salt: []byte("salt")}
+
+	first, err := d.derive("backup", file)
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	for range 3 {
+		again, err := d.derive("backup", file)
+		if err != nil {
+			t.Fatalf("derive again: %v", err)
+		}
+		if again != first {
+			t.Error("a second derivation of the same key file gave another key")
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("four Opens of one key file ran scrypt %d times, want 1", got)
+	}
+
+	other := file
+	other.Salt = []byte("other")
+	if _, err := d.derive("backup", other); err != nil {
+		t.Fatalf("derive another salt: %v", err)
+	}
+	if _, err := d.derive("changed", file); err != nil {
+		t.Fatalf("derive another password: %v", err)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("another salt and another password ran scrypt %d times in all, want 3", got)
 	}
 }
