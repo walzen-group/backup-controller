@@ -1,28 +1,29 @@
 # Implementation plan
 
-Status, 2026-09-25: complete, and kept as the record of how v0.1 was built. All
-seven milestones are done; the populator has run on the walzen test and prod
-clusters since v0.2, and every backed-up claim the infrastructure repository
-writes names a VolumeRestore. The work after v0.1 (the runs, the webhook, the
-scheduler) was planned in the infrastructure repository's docs/agent/specs/,
-and [namespace-backups.md](namespace-backups.md) describes what it built.
+Status, 2026-09-25: complete. This page stays as the record of how v0.1 was
+built. All seven milestones are done. The populator has run on the walzen test
+and prod clusters since v0.2. Every backed-up claim that the infrastructure
+repository writes names a VolumeRestore. The plans for the work after v0.1 (the
+runs, the webhook, the scheduler) are in the infrastructure repository's
+docs/agent/specs/. [namespace-backups.md](namespace-backups.md) describes what
+that work built.
 
-Milestones 6 and 7 swapped order while the work ran. A cluster run needed a
-claim to run against, and the walzen infrastructure repository's own canary was
-that claim, so milestone 7's module, unit and backup path came first and
-milestone 6 was the canary standing on them. The steps are in
+Milestones 6 and 7 changed order during the work. A cluster run needed a
+claim to run against. The canary of the walzen infrastructure repository was
+that claim. Thus the module, unit and backup path of milestone 7 came first, and
+milestone 6 was the canary on top of them. The steps are in
 [.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md](../.cortex/reports/2026-09-14-backup-controller-cluster-runbook.md).
 
-Written for an agent starting from an empty repository with no memory of the
-design conversation. Read [overview.md](overview.md) and
-[architecture.md](architecture.md) first; this page is the order of work and
+This page is for an agent that starts from an empty repository with no memory
+of the design conversation. Read [overview.md](overview.md) and
+[architecture.md](architecture.md) first. This page gives the order of work and
 what proves each step.
 
 ## Before writing code
 
-Confirm three things against the version of the library you are about to pin,
-because the design rests on them and this plan was written from master rather
-than from a tag:
+Check three things against the version of the library that you will pin. The
+design rests on them, and this plan was written from master and not from a
+tag:
 
 | Check | Where |
 | --- | --- |
@@ -30,8 +31,8 @@ than from a tag:
 | the exact fields of `PopulatorParams`, particularly the prime claim and the data source object | the same file |
 | the prime claim is created in the controller's namespace, named `prime-<uid>`, and carries `volume.kubernetes.io/selected-node` for a WaitForFirstConsumer class | the same file |
 
-If any differs, say so before building around it rather than working around it
-quietly.
+If one of them is different, say so before you build on it. Do not quietly
+work around it.
 
 ## Milestone 1: the repository stands up
 
@@ -51,8 +52,8 @@ Proof: CI green on an empty package.
    lists.
 3. `config/samples` with a VolumeRestore and a claim that names it.
 
-Proof: `kubectl apply --dry-run=server -f config/crd` on a cluster, then
-applying a sample and reading it back.
+Proof: `kubectl apply --dry-run=server -f config/crd` on a cluster. Then apply
+a sample and read it back.
 
 ## Milestone 3: the populator, against a fake
 
@@ -75,8 +76,8 @@ Proof: `go test ./... -race` green, and the tests name the cases above.
 2. Wire `RunControllerWithConfig` to the callbacks.
 3. A `Dockerfile` on a distroless base, non-root, read-only root filesystem.
 
-Proof: the image builds and the binary starts against a kubeconfig, logs that it
-is watching the kind, and exits cleanly on SIGTERM.
+Proof: the image builds. The binary starts against a kubeconfig, logs that it
+watches the kind, and exits cleanly on SIGTERM.
 
 ## Milestone 5: the install
 
@@ -88,12 +89,12 @@ is watching the kind, and exits cleanly on SIGTERM.
    digest grep and the semver guard intact.
 
 Proof: a tag attaches three assets to the release and pushes the chart to the
-registry, and the rendered manifest contains `@sha256:`. v0.1.0 did all four.
+registry. The rendered manifest contains `@sha256:`. v0.1.0 did all four.
 
 ## Milestone 6: it works on the test cluster
 
-Every step here is on the walzen test cluster, and every command that changes
-the cluster is the admin's to run.
+Every step here is on the walzen test cluster. Only the admin runs a command
+that changes the cluster.
 
 1. Install the unit, as [integration.md](integration.md) describes.
 2. Point one canary's claim at a VolumeRestore.
@@ -107,26 +108,27 @@ the cluster is the admin's to run.
 | delete the claim | it is recreated, refilled, and the app comes back with its data |
 | the mover pod | admitted by Kueue, like every other mover |
 
-The third row is the project. Record the numbers beside the same measurement
-taken on a volume still using the snapshot path, so the infrastructure
-repository's documentation can state a magnitude rather than a mechanism.
+The third row is the project. Record the numbers beside the same measurement on
+a volume that still uses the snapshot path. Then the documentation of the
+infrastructure repository can state a measured magnitude. Without the numbers,
+it can state only a mechanism.
 
-The mover pod in the last row runs in the controller's namespace now, so Kueue
-sees it only when that namespace carries the label Kueue's
-managedJobsNamespaceSelector matches and holds a LocalQueue of the name the
-mover's label gives. [integration.md](integration.md) says which unit writes
+The mover pod in the last row now runs in the controller's namespace. Kueue
+sees it only when that namespace has two things. The namespace must carry the
+label that Kueue's managedJobsNamespaceSelector matches. It must also hold a
+LocalQueue with the name that the mover's label gives. [integration.md](integration.md) says which unit writes
 both.
 
 ## Milestone 7: the infrastructure repository
 
 Follow [integration.md](integration.md): the module, the unit, the terragrunt
-backup path, the Flux component change, and the documentation search. Leave both
-paths working until a canary has survived a delete-and-refill and a cluster
+backup path, the Flux component change, and the documentation search. Keep both
+paths in operation until a canary survives a delete-and-refill and a cluster
 reboot.
 
 ## What would make this project wrong
 
-Say so rather than working around it:
+If you find one of these, say so. Do not work around it:
 
 - the library's prime claim cannot be given the app's storage class or node, so
   the volume lands somewhere the pod cannot follow
@@ -138,11 +140,11 @@ Say so rather than working around it:
 - the restore of a large volume takes long enough that the library's own
   timeouts fire before a mover finishes
 
-The fourth is the most likely of the four, and it shows up on its own the first
-time a large volume is restored in the normal course of running the cluster.
-Watch for it then. Do not stage a fifty gigabyte restore to find out: the
-library requeues the claim for as long as `PopulateCompleteFn` reports false,
-so the wall time a restore takes is only a problem if a timeout inside the
-library interrupts it, and the symptom of that is a claim that returns to
-Pending or a ReplicationDestination deleted and recreated mid-restore. Either
-one is visible in a restore of any size.
+The fourth is the most likely of the four. It becomes visible by itself the first
+time the cluster restores a large volume in normal operation. Watch for it then.
+Do not stage a fifty gigabyte restore to find it. The library requeues the claim
+for as long as `PopulateCompleteFn` reports false. Thus the wall time of a
+restore is only a problem if a timeout inside the library interrupts it. The
+symptom of that is a claim that returns to Pending, or a ReplicationDestination
+that is deleted and recreated during the restore. Both are visible in a restore
+of any size.
