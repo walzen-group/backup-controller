@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -477,5 +478,27 @@ func TestOnlyMoverSnapshotsAreCandidates(t *testing.T) {
 		"5e1f0000 (host volsync, paths [/srv/notes])", "77770000 (host laptop, paths [/data])")
 	if item := readRestoreRun(t, c).Status.Items[0]; item.SnapshotID != "" {
 		t.Errorf("item = %+v, want no snapshot recorded", item)
+	}
+}
+
+// A repository with no snapshot of the mover's layout fails the item naming
+// only the five newest snapshots it passed over, newest first, and counting
+// the older ones, so a large repository still gives a short message.
+func TestTheNoMoverSnapshotMessageNamesTheFiveNewest(t *testing.T) {
+	var all snapshots
+	for i := range 7 {
+		s := moverSnapshot(fmt.Sprintf("5e1f000%d", i), monday.Time.Add(time.Duration(i)*time.Hour))
+		s.Hostname = "laptop"
+		all = append(all, s)
+	}
+	r, _ := restoreReconciler(t, nil, restoreRun(inPlace), claim(), volumeRestore(), repository())
+	r.Snapshots = all
+	restoreStep(t, r)
+
+	expectRefused(t, r, "the repository holds 7 snapshots, none written by a VolSync mover (host volsync, paths [/data]): "+
+		"5e1f0006 (host laptop, paths [/data]), 5e1f0005 (host laptop, paths [/data]), 5e1f0004 (host laptop, paths [/data]), "+
+		"5e1f0003 (host laptop, paths [/data]), 5e1f0002 (host laptop, paths [/data]), and 2 older")
+	if message := readRestoreRun(t, r.Client).Status.Items[0].Message; strings.Contains(message, "5e1f0001") || strings.Contains(message, "5e1f0000") {
+		t.Errorf("message = %q, want the two oldest snapshots left out", message)
 	}
 }

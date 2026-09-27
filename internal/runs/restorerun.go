@@ -745,8 +745,8 @@ func (r *RestoreRunReconciler) selectSnapshot(ctx context.Context, run *backupv1
 //     quiesced.
 //
 // It says the repository is empty; or that none of its snapshots has the
-// mover's layout, naming each snapshot with its host and paths; or that
-// none of those is tagged quiesced.
+// mover's layout, naming the newest ones with their hosts and paths (see
+// passedOver); or that none of those is tagged quiesced.
 func noCandidate(all []restic.Snapshot, quiescedOnly bool) string {
 	if len(all) == 0 {
 		return "the repository holds no snapshot"
@@ -754,12 +754,34 @@ func noCandidate(all []restic.Snapshot, quiescedOnly bool) string {
 	if slices.ContainsFunc(all, restic.MoverLayout) && quiescedOnly {
 		return fmt.Sprintf("the repository holds no snapshot tagged %s; only a BackupRun that stopped the workloads writes one", restic.QuiescedTag)
 	}
-	passed := make([]string, 0, len(all))
-	for _, s := range all {
-		passed = append(passed, fmt.Sprintf("%s (host %s, paths %v)", s.ShortID(), s.Hostname, s.Paths))
-	}
 	return fmt.Sprintf("the repository holds %d snapshots, none written by a VolSync mover (host volsync, paths [/data]): %s",
-		len(all), strings.Join(passed, ", "))
+		len(all), passedOver(all))
+}
+
+// passedOverShown is how many snapshots the reason of a repository with no
+// snapshot of the mover's layout names at most, so a large repository still
+// gives an item message of a few lines.
+const passedOverShown = 5
+
+// passedOver names the newest snapshots of a repository that has none of
+// the mover's layout, for noCandidate.
+//
+// Parameters:
+//   - all is every snapshot in the repository, oldest first, and not empty.
+//
+// It returns the newest passedOverShown snapshots, newest first, each with
+// its short ID, host and paths, and a count of the older ones it leaves out.
+func passedOver(all []restic.Snapshot) string {
+	shown := all[max(0, len(all)-passedOverShown):]
+	names := make([]string, 0, len(shown)+1)
+	for i := len(shown) - 1; i >= 0; i-- {
+		s := shown[i]
+		names = append(names, fmt.Sprintf("%s (host %s, paths %v)", s.ShortID(), s.Hostname, s.Paths))
+	}
+	if older := len(all) - len(shown); older > 0 {
+		names = append(names, fmt.Sprintf("and %d older", older))
+	}
+	return strings.Join(names, ", ")
 }
 
 // recordSnapshot records on a volume item the snapshot the checks selected:
