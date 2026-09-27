@@ -75,9 +75,9 @@ func volsyncUnserved(err error) (schema.GroupKind, bool) {
 // for VolSync to serve v1alpha1 again.
 //
 // Parameters:
-//   - run is the RestoreRun as this pass read it. Its Ready condition is
-//     set in place too, so the reconcile records an event when the reason
-//     changes.
+//   - run is the RestoreRun as this pass read it. Once the stored run
+//     shows the condition, it is set on this copy too, so the reconcile
+//     records an event when the reason changes.
 //   - kind is the VolSync kind the pass's request failed for.
 //   - err is the pass's error, which the message quotes.
 //
@@ -89,13 +89,14 @@ func volsyncUnserved(err error) (schema.GroupKind, bool) {
 // the kind at. It is written on the stored run, read through the uncached
 // Reader, so nothing else the failed pass changed in its copy is written. A
 // stored run that is gone, is being deleted, has recorded an ending or has
-// finished keeps its condition.
+// finished keeps its condition, and so does the pass's copy. The copy also
+// keeps its condition when the write fails, so no event announces a
+// condition the status never held.
 func (r *RestoreRunReconciler) showVolSyncWait(ctx context.Context, run *backupv1alpha1.RestoreRun, kind schema.GroupKind, err error) error {
 	message := fmt.Sprintf("the API server serves VolSync's %s %s and no longer at %s, the one version this backup-controller "+
 		"reads and writes; the run changes nothing and retries until that version is served again or spec.timeout has passed, "+
 		"and then ends TimedOut and gives the app back (see docs/compatibility.md): %v",
 		kind.Kind, served.Describe(r.RESTMapper(), kind), volsyncv1alpha1.GroupVersion, err)
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonVolSyncUnsupported, message)
 	stored := &backupv1alpha1.RestoreRun{}
 	if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(run), stored); err != nil {
 		return client.IgnoreNotFound(fmt.Errorf("read RestoreRun %s/%s to show the VolSync wait: %w", run.Namespace, run.Name, err))
@@ -104,5 +105,9 @@ func (r *RestoreRunReconciler) showVolSyncWait(ctx context.Context, run *backupv
 		return nil
 	}
 	backupv1alpha1.SetReady(&stored.Status.Conditions, stored.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonVolSyncUnsupported, message)
-	return r.writeChangedStatus(ctx, stored)
+	if err := r.writeChangedStatus(ctx, stored); err != nil {
+		return err
+	}
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonVolSyncUnsupported, message)
+	return nil
 }

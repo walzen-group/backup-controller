@@ -10,8 +10,10 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -238,5 +240,37 @@ func TestARestoreWaitsOnAnUnservedVolSyncUntilItTimesOut(t *testing.T) {
 	}
 	if got := replicasOf(t, c); got != 2 || suspended(t, c) {
 		t.Errorf("replicas = %d, Kustomization suspended = %t; want the app's 2 back and the Kustomization resumed", got, suspended(t, c))
+	}
+}
+
+// A pass that read a stale copy of a RestoreRun that has since ended, and
+// then met an unserved VolSync version, records no VolSyncUnsupported event.
+// showVolSyncWait leaves the ended run's condition alone, and the pass's
+// copy keeps the Ready condition it had, so the reconcile announces no
+// condition it never wrote.
+func TestAVolSyncWaitOnAnEndedRunRecordsNoEvent(t *testing.T) {
+	run, job := quiescedMidRestore(t)
+	ended := run.DeepCopy()
+	ended.Status.Phase = backupv1alpha1.RunPhaseFailed
+	backupv1alpha1.SetReady(&ended.Status.Conditions, ended.Generation, metav1.ConditionTrue, backupv1alpha1.ReasonTimedOut, "the run had not finished")
+	r, c := movedRestoreReconciler(t, ended, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true), job)
+	recorder := events.NewFakeRecorder(10)
+	r.Recorder = recorder
+
+	stale := readRestoreRun(t, c)
+	stale.Status.Phase, stale.Status.Conditions = run.Status.Phase, run.Status.Conditions
+	before := readyReason(stale.Status.Conditions)
+	kind := schema.GroupKind{Group: volsyncv1alpha1.GroupVersion.Group, Kind: "ReplicationSource"}
+	cause := &meta.NoKindMatchError{GroupKind: kind, SearchedVersions: []string{"v1alpha1"}}
+	if err := r.showVolSyncWait(context.Background(), stale, kind, cause); err != nil {
+		t.Fatalf("show the wait: %v", err)
+	}
+	announce(r.Recorder, stale, stale.Status.Conditions, before, "Restore")
+
+	if got := recorded(recorder); len(got) != 0 {
+		t.Errorf("events = %q, want none for a wait on a run that has ended", got)
+	}
+	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonTimedOut {
+		t.Errorf("stored Ready reason = %q, want the ending's %s kept", reason, backupv1alpha1.ReasonTimedOut)
 	}
 }
