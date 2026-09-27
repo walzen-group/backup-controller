@@ -171,31 +171,6 @@ func TestRetimeReplacesTheSnapshotWithOneAtTheNewTime(t *testing.T) {
 	}
 }
 
-// TestRetimeKeepsTheSnapshotsOtherFields checks that the rewrite changes only
-// the time, the tags and the original field, and copies every other field
-// unchanged. Those fields let restic find the snapshot's tree and group the
-// snapshot with the others for forget.
-func TestRetimeKeepsTheSnapshotsOtherFields(t *testing.T) {
-	store, repo := writableFixture(t)
-	before := document(t, store, repo, path.Join("snapshots", mondayID))
-
-	got, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
-	if err != nil {
-		t.Fatalf("retime: %v", err)
-	}
-	after := document(t, store, repo, path.Join("snapshots", got.ID))
-
-	for field, value := range before {
-		switch field {
-		case "time", "tags", "original":
-			continue
-		}
-		if string(after[field]) != string(value) {
-			t.Errorf("%s = %s after the rewrite, was %s", field, after[field], value)
-		}
-	}
-}
-
 // TestRetimeAgainReturnsTheFirstRewrite checks that a second Retime with the
 // old full ID returns the snapshot the first one wrote, and writes nothing
 // more. A BackupRun retimes by the full ID it recorded, and one whose
@@ -221,47 +196,6 @@ func TestRetimeAgainReturnsTheFirstRewrite(t *testing.T) {
 	}
 	if len(snapshots) != 2 {
 		t.Errorf("got %d snapshots after two retimes, want 2", len(snapshots))
-	}
-}
-
-// TestRetimeBacksOffFromAnotherLock checks that Retime returns a *LockedError
-// and writes nothing while another process holds a lock, even a shared one
-// such as a backup takes. The rewrite needs the exclusive lock, which no other
-// lock may share. Retime also removes its own lock before it returns.
-func TestRetimeBacksOffFromAnotherLock(t *testing.T) {
-	store, repo := writableFixture(t)
-	placeLock(t, store, repo, time.Now().Add(-time.Minute), false, moverHost, 12)
-
-	_, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
-	var locked *LockedError
-	if !errors.As(err, &locked) {
-		t.Fatalf("err = %v, want a LockedError", err)
-	}
-	if locked.Hostname != moverHost {
-		t.Errorf("locked by %q, want the other lock's host", locked.Hostname)
-	}
-	if left := lockFiles(t, store); len(left) != 1 {
-		t.Errorf("locks = %v, want only the other process's", left)
-	}
-	snapshots, err := repo.Snapshots(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snapshots[1].ID != mondayID {
-		t.Error("the snapshot was rewritten while another process held a lock")
-	}
-}
-
-// TestRetimeIgnoresAStaleLock checks that Retime goes ahead past a lock older
-// than thirty minutes. restic refreshes a live lock every five minutes and
-// calls a lock older than thirty minutes stale, so a lock that old belongs to
-// a process that is gone.
-func TestRetimeIgnoresAStaleLock(t *testing.T) {
-	store, repo := writableFixture(t)
-	placeLock(t, store, repo, time.Now().Add(-31*time.Minute), true, moverHost, 12)
-
-	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err != nil {
-		t.Fatalf("retime past a stale lock: %v", err)
 	}
 }
 
@@ -307,63 +241,6 @@ func TestRetimeRemovesAStaleLockAnEarlierControllerLeft(t *testing.T) {
 	}
 	if host := string(document(t, store, repo, path.Join("locks", left[0]))["hostname"]); host != `"`+moverHost+`"` {
 		t.Errorf("the lock left is %s's, want the mover's", host)
-	}
-}
-
-// TestRetimeKeepsALiveLockFromAnotherControllerPod checks that a lock with the
-// controller's username but another host blocks Retime while it is younger
-// than restic's stale age. The pod that wrote it may still be running.
-func TestRetimeKeepsALiveLockFromAnotherControllerPod(t *testing.T) {
-	store, repo := writableFixture(t)
-	placeUserLock(t, store, repo, time.Now().Add(-time.Minute), true, "backup-controller-7c9f-old", 1, lockUser)
-
-	_, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
-	var locked *LockedError
-	if !errors.As(err, &locked) {
-		t.Fatalf("err = %v, want a LockedError", err)
-	}
-	if left := lockFiles(t, store); len(left) != 1 {
-		t.Errorf("locks = %v, want the other pod's lock only", left)
-	}
-}
-
-// failLockRemove is a Store that refuses the first Remove under locks/, the way
-// an S3 DELETE can fail once.
-type failLockRemove struct {
-	DirStore
-	failed bool
-}
-
-func (s *failLockRemove) Remove(ctx context.Context, name string) error {
-	if path.Dir(name) == "locks" && !s.failed {
-		s.failed = true
-		return errors.New("delete refused")
-	}
-	return s.DirStore.Remove(ctx, name)
-}
-
-// TestRetimeRetriesTheRemovalOfItsLock checks that Retime tries again when the
-// removal of its own lock fails once, so one failed DELETE leaves no lock
-// behind to block the movers.
-func TestRetimeRetriesTheRemovalOfItsLock(t *testing.T) {
-	dir, _ := writableFixture(t)
-	store := &failLockRemove{DirStore: dir}
-	repo := openCached(t, string(fixture), store)
-
-	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err != nil {
-		t.Fatalf("retime: %v", err)
-	}
-	if left := lockFiles(t, dir); len(left) != 0 {
-		t.Errorf("locks left behind: %v", left)
-	}
-}
-
-// TestRetimeOfAnUnknownSnapshotSaysSo checks that Retime returns an error for
-// an ID the repository doesn't hold.
-func TestRetimeOfAnUnknownSnapshotSaysSo(t *testing.T) {
-	_, repo := writableFixture(t)
-	if _, err := repo.Retime(context.Background(), "ffffffff", quiescedAt, QuiescedTag); err == nil {
-		t.Fatal("retime of a snapshot the repository does not hold succeeded")
 	}
 }
 

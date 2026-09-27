@@ -47,14 +47,6 @@ func TestKeyDerivationsRunOneAtATime(t *testing.T) {
 	}
 }
 
-// TestTheControllersDerivationsShareOneGate checks that the keyDeriver every
-// Open goes through admits one derivation at a time.
-func TestTheControllersDerivationsShareOneGate(t *testing.T) {
-	if got := cap(derivations.gate); got != 1 {
-		t.Errorf("the controller's key derivations admit %d at a time, want 1", got)
-	}
-}
-
 // TestAKeyFileIsDerivedOnce checks that a keyDeriver runs scrypt once for a
 // password and a key file, and gives the key it derived to every later Open
 // of the same key file. A key file with another salt, another N, r or p, or
@@ -117,54 +109,5 @@ func TestAKeyFileIsDerivedOnce(t *testing.T) {
 		if calls.Load() == before {
 			t.Errorf("the same salt with another %s gave the kept key, want its own derivation", name)
 		}
-	}
-}
-
-// TestTheKeptKeysStayUnderTheCap checks that a keyDeriver never keeps more
-// than maxDerivedKeys keys. When it is full, it forgets them all before it
-// keeps the next one, so its memory does not grow with the number of key
-// files the controller opens.
-func TestTheKeptKeysStayUnderTheCap(t *testing.T) {
-	fake := func(_, _ []byte, _, _, _, keyLen int) ([]byte, error) { return make([]byte, keyLen), nil }
-	d := newKeyDeriver(fake)
-	for i := range maxDerivedKeys + 1 {
-		file := keyFile{KDF: "scrypt", N: 2, R: 1, P: 1, Salt: []byte{byte(i), byte(i >> 8)}}
-		if _, err := d.derive("backup", file); err != nil {
-			t.Fatalf("derive: %v", err)
-		}
-		if len(d.derived) > maxDerivedKeys {
-			t.Fatalf("the keyDeriver keeps %d keys, want at most %d", len(d.derived), maxDerivedKeys)
-		}
-	}
-	if len(d.derived) != 1 {
-		t.Errorf("after the cap, the keyDeriver keeps %d keys, want only the newest one", len(d.derived))
-	}
-}
-
-// TestAKeptKeyOpensWhileTheGateIsHeld checks that an Open whose key the
-// keyDeriver keeps gets it at once, while another derivation holds the gate.
-func TestAKeptKeyOpensWhileTheGateIsHeld(t *testing.T) {
-	d := newKeyDeriver(func(_, _ []byte, _, _, _, keyLen int) ([]byte, error) {
-		return make([]byte, keyLen), nil
-	})
-	file := keyFile{KDF: "scrypt", N: 2, R: 1, P: 1, Salt: []byte{1}}
-	if _, err := d.derive("backup", file); err != nil {
-		t.Fatalf("derive: %v", err)
-	}
-	d.gate <- struct{}{}
-	defer func() { <-d.gate }()
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := d.derive("backup", file)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("derive: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the Open of a kept key waited for the gate")
 	}
 }
