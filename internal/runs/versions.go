@@ -12,6 +12,7 @@ import (
 	"github.com/walzen-group/backup-controller/internal/served"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -180,23 +181,15 @@ func (r *BackupRunReconciler) endForVolSync(ctx context.Context, run *backupv1al
 	return r.abort(ctx, run, backupv1alpha1.ReasonVolSyncUnsupported, unservedErr.Error())
 }
 
-// serve wraps the reconciler's client and reader so that a request at a
+// serve wraps a reconciler's client and reader so that a request at a
 // version the API server has stopped serving is an error the reconcile
 // retries, never a NotFound (see served.Client). SetupWithManager calls it.
-func (r *BackupRunReconciler) serve() {
-	r.Client = served.Client(r.Client)
-	r.Reader = served.Reader(r.Reader, r.Client)
-}
-
-// serve wraps the reconciler's client and reader as
-// BackupRunReconciler.serve does. A request for a VolSync object at a
-// version VolSync no longer serves then fails with an error that names the
-// kind and v1alpha1, which the run retries and shows on its Ready
-// condition, and no caller that checks for NotFound reads it as an object
-// that is gone.
-func (r *RestoreRunReconciler) serve() {
-	r.Client = served.Client(r.Client)
-	r.Reader = served.Reader(r.Reader, r.Client)
+// A request for a VolSync object at a version VolSync no longer serves then
+// fails with an error that names the kind and v1alpha1, and no caller that
+// checks for NotFound reads it as an object that is gone.
+func serve(c client.Client, reader client.Reader) (client.Client, client.Reader) {
+	c = served.Client(c)
+	return c, served.Reader(reader, c)
 }
 
 // recreateMessage returns the Ready message for a run that has deleted the

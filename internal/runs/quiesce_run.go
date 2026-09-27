@@ -384,3 +384,50 @@ func waitedFor(conditions []metav1.Condition) string {
 	}
 	return "; it was waiting: " + ready.Message
 }
+
+// waitForPods keeps a run that stopped its workloads waiting while a pod of
+// them still runs.
+//
+// Parameters:
+//   - f is the run.
+//   - targets are the workloads the run stopped.
+//   - before says what the run does once the pods are gone, for the Ready
+//     message.
+//
+// It returns done false once every pod of the workloads is gone. It returns
+// done true with the error of a failed read, and while a pod is left: the
+// run then waits with reason Running and looks again after two seconds.
+func (o runOps) waitForPods(ctx context.Context, f runFields, targets []quiesce.Workload, before string) (done bool, result ctrl.Result, err error) {
+	gone, pod, err := quiesce.PodsGone(ctx, o.reader, f.GetNamespace(), targets)
+	if err != nil || gone {
+		return err != nil, ctrl.Result{}, err
+	}
+	result, err = after(2*time.Second, o.waitFor(ctx, f, backupv1alpha1.ReasonRunning,
+		fmt.Sprintf("waiting for pod %s to stop before %s", pod, before)))
+	return true, result, err
+}
+
+// releaseFinished releases the Leases that the run no longer needs.
+//
+// Parameters:
+//   - f is the run in its work pass.
+//   - done reports whether the run has finished with the item a Lease
+//     names (see backupItemDone and restoreItemDone).
+//
+// It returns the error of the release of an item's Leases. A failed release
+// of the quiesce Leases is only logged.
+//
+// The Leases of an item that finished in an earlier pass go now, so another
+// run of that claim need not wait for the rest of the run. The quiesce
+// Leases go once the stored status shows every workload back, since the run
+// then never touches them again. Best effort: a Lease left behind is stale
+// under holderLive's rule and the next run takes it over.
+func (o runOps) releaseFinished(ctx context.Context, f runFields, done func(item string) bool) error {
+	if err := releaseLeases(ctx, o.c, o.reader, f.Object, done); err != nil {
+		return err
+	}
+	if durablyRestarted(f.Object) {
+		releaseQuiesceLeases(ctx, o.c, o.reader, f.Object)
+	}
+	return nil
+}

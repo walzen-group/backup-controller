@@ -72,7 +72,7 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Now == nil {
 		r.Now = time.Now
 	}
-	r.serve()
+	r.Client, r.Reader = serve(r.Client, r.Reader)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&backupv1alpha1.RestoreRun{}).
 		Named("restorerun").

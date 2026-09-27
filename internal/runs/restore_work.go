@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/cnpg"
@@ -65,7 +64,10 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	if done, result, err := r.endIfOverdue(ctx, run); done {
 		return result, err
 	}
-	if err := r.releaseFinished(ctx, run); err != nil {
+	// An item whose stopped restore Job may still write keeps its Lease:
+	// another run's mover must not start on the claim or the repository
+	// meanwhile (rule X2, see restoreItemDone).
+	if err := r.ops().releaseFinished(ctx, fieldsOf(run), func(name string) bool { return restoreItemDone(run, name) }); err != nil {
 		return ctrl.Result{}, err
 	}
 	if done, result, err := r.quiesceFirst(ctx, run); done {
@@ -142,34 +144,6 @@ func (r *RestoreRunReconciler) endIfOverdue(ctx context.Context, run *backupv1al
 	return true, result, err
 }
 
-// releaseFinished releases the Leases that the run no longer needs.
-//
-// Parameters:
-//   - run is the RestoreRun in its work pass.
-//
-// It returns an error when the release of an item's Leases fails. A failed
-// release of the quiesce Leases is only logged.
-//
-// The Leases of an item that finished in an earlier pass go now, so a
-// backup of that claim need not wait for the rest of the run. An item
-// whose stopped restore Job may still write keeps its Lease: another run's
-// mover must not start on the claim or the repository meanwhile (rule X2,
-// see restoreItemDone). The quiesce Leases go once the stored status shows
-// every workload back, since the run then never touches them again. Best
-// effort: a Lease left behind is stale under holderLive's rule and the next
-// run takes it over.
-func (r *RestoreRunReconciler) releaseFinished(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
-	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(name string) bool {
-		return restoreItemDone(run, name)
-	}); err != nil {
-		return err
-	}
-	if durablyRestarted(run) {
-		releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
-	}
-	return nil
-}
-
 // waitForStoppedPods keeps a run that stopped its workloads from restoring
 // while a pod of them still runs.
 //
@@ -193,13 +167,7 @@ func (r *RestoreRunReconciler) waitForStoppedPods(ctx context.Context, run *back
 		result, err = r.abort(ctx, run, backupv1alpha1.ReasonFailed, err.Error())
 		return true, result, err
 	}
-	gone, pod, err := quiesce.PodsGone(ctx, r.Reader, run.Namespace, targets)
-	if err != nil || gone {
-		return err != nil, ctrl.Result{}, err
-	}
-	result, err = after(2*time.Second, r.waitFor(ctx, run, backupv1alpha1.ReasonRunning,
-		fmt.Sprintf("waiting for pod %s to stop before anything is restored", pod)))
-	return true, result, err
+	return r.ops().waitForPods(ctx, fieldsOf(run), targets, "anything is restored")
 }
 
 // restoreVolumes moves each volume item a step further (see restoreVolume).

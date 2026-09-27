@@ -28,9 +28,7 @@ import (
 // A run past its deadline, or past its timeout in the Kueue queue, ends
 // through endTimedOut instead.
 func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
-	r.failUnfinished(ctx, run, message, func(item *backupv1alpha1.BackupItem, text string) {
-		failBackupItem(item, refuse(backupv1alpha1.ItemReasonRunEnded, "%s", text))
-	})
+	r.failUnfinished(ctx, run, message, backupv1alpha1.ItemReasonRunEnded)
 	return r.finish(ctx, run, reason, message)
 }
 
@@ -66,9 +64,7 @@ func (r *BackupRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.B
 // failUnfinished). timeOut and awaitAdmission call it, so a run gives its
 // items the same reason for each timeout.
 func (r *BackupRunReconciler) endTimedOut(ctx context.Context, run *backupv1alpha1.BackupRun, message string) error {
-	r.failUnfinished(ctx, run, message, func(item *backupv1alpha1.BackupItem, text string) {
-		failBackupItem(item, refuse(backupv1alpha1.ItemReasonTimedOut, "%s", text))
-	})
+	r.failUnfinished(ctx, run, message, backupv1alpha1.ItemReasonTimedOut)
 	return r.finish(ctx, run, backupv1alpha1.ReasonFailed, message)
 }
 
@@ -79,16 +75,14 @@ func (r *BackupRunReconciler) endTimedOut(ctx context.Context, run *backupv1alph
 //   - run is the BackupRun that ends. Its items are changed in place, and
 //     the caller writes the status.
 //   - message is the run's Ready message.
-//   - fail sets an item Failed with its message; the caller decides which
-//     reason the item records.
+//   - reason is the reason each failed item records.
 //
 // A Pending item whose last start attempt failed adds "; last error: " and
 // status.items[].lastStartError to the message. A Running volume item adds
 // the snapshot it recorded and did not move, or what data a snapshot of the
 // sync VolSync goes on with holds, and a Running database item names a
 // Backup phase CloudNativePG 1.30 does not have (see runningNote).
-func (r *BackupRunReconciler) failUnfinished(ctx context.Context, run *backupv1alpha1.BackupRun, message string,
-	fail func(item *backupv1alpha1.BackupItem, text string)) {
+func (r *BackupRunReconciler) failUnfinished(ctx context.Context, run *backupv1alpha1.BackupRun, message string, reason backupv1alpha1.ItemReason) {
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		text := message
@@ -103,7 +97,7 @@ func (r *BackupRunReconciler) failUnfinished(ctx context.Context, run *backupv1a
 			// An item that has ended keeps how it ended.
 			continue
 		}
-		fail(item, text)
+		failBackupItem(item, refuse(reason, "%s", text))
 	}
 }
 

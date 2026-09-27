@@ -81,7 +81,13 @@ func (r *BackupRunReconciler) work(ctx context.Context, run *backupv1alpha1.Back
 	if done, err := r.endIfEvicted(ctx, run); done {
 		return ctrl.Result{}, err
 	}
-	r.releaseFinished(ctx, run)
+	// Best effort: an error here must not keep the workloads down past the
+	// quiesce limit below. A Lease left behind is taken over once its item
+	// is done (see holderLive), and finish releases it again.
+	if err := r.ops().releaseFinished(ctx, fieldsOf(run), func(name string) bool { return backupItemDone(run, name) }); err != nil {
+		log.FromContext(ctx).Error(err, "could not release the Leases of the run's finished items; the run goes on",
+			"namespace", run.Namespace, "name", run.Name)
+	}
 	if done, result, err := r.quiesceFirst(ctx, run); done {
 		return result, err
 	}
@@ -139,9 +145,7 @@ func (r *BackupRunReconciler) endIfEvicted(ctx context.Context, run *backupv1alp
 	}
 	message := fmt.Sprintf("Kueue evicted the run's Workload %s/%s after it admitted the run; "+
 		"the run stopped and gave the app back, and the next scheduled run tries again", run.Namespace, workload.GetName())
-	r.failUnfinished(ctx, run, message, func(item *backupv1alpha1.BackupItem, text string) {
-		failBackupItem(item, refuse(backupv1alpha1.ItemReasonEvicted, "%s", text))
-	})
+	r.failUnfinished(ctx, run, message, backupv1alpha1.ItemReasonEvicted)
 	return true, r.finish(ctx, run, backupv1alpha1.ReasonEvicted, message)
 }
 
@@ -162,33 +166,6 @@ func (r *BackupRunReconciler) endIfOverdue(ctx context.Context, run *backupv1alp
 		return false, nil
 	}
 	return true, r.timeOut(ctx, run, deadline)
-}
-
-// releaseFinished releases the Leases that the run no longer needs. It is
-// best effort: it logs a failure and the pass goes on.
-//
-// Parameters:
-//   - run is the admitted BackupRun.
-//
-// The Leases of an item that finished in an earlier pass go first. The
-// quiesce Leases go once the stored status shows every workload back.
-func (r *BackupRunReconciler) releaseFinished(ctx context.Context, run *backupv1alpha1.BackupRun) {
-	// The Leases of an item that finished in an earlier pass go now, so a
-	// restore of that claim need not wait for the rest of the run. This is
-	// best effort: an error here must not keep the workloads down past the
-	// limit below. A Lease left behind is taken over once its item is done
-	// (see holderLive), and finish releases it again.
-	if err := releaseLeases(ctx, r.Client, r.Reader, run, func(name string) bool { return backupItemDone(run, name) }); err != nil {
-		log.FromContext(ctx).Error(err, "could not release the Leases of the run's finished items; the run goes on",
-			"namespace", run.Namespace, "name", run.Name)
-	}
-	// The quiesce Leases go once the stored status shows every workload back,
-	// since the run then never touches them again. Best effort as well: a
-	// Lease left behind is stale under holderLive's rule and the next run
-	// takes it over.
-	if durablyRestarted(run) {
-		releaseQuiesceLeases(ctx, r.Client, r.Reader, run)
-	}
 }
 
 // quiesceFirst stops the workloads of a namespace run that has not stopped
@@ -257,16 +234,7 @@ func (r *BackupRunReconciler) waitForStoppedPods(ctx context.Context, run *backu
 	if err != nil {
 		return true, ctrl.Result{}, err
 	}
-	gone, pod, err := quiesce.PodsGone(ctx, r.Reader, run.Namespace, targets)
-	if err != nil {
-		return true, ctrl.Result{}, err
-	}
-	if gone {
-		return false, ctrl.Result{}, nil
-	}
-	result, err = after(2*time.Second, r.waitFor(ctx, run, backupv1alpha1.ReasonRunning,
-		fmt.Sprintf("waiting for pod %s to stop before the clones are cut", pod)))
-	return true, result, err
+	return r.ops().waitForPods(ctx, fieldsOf(run), targets, "the clones are cut")
 }
 
 // restartAfterCut starts the workloads of a namespace run again once every

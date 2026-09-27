@@ -61,13 +61,12 @@ func holderLive(ctx context.Context, reader client.Reader, lease *coordinationv1
 // needsLease reports whether a run, read with the UID the Lease names,
 // still needs the Lease (see holderLive).
 func needsLease(run client.Object, lease *coordinationv1.Lease) bool {
-	quiesceLease := lease.Labels[labelLeaseScope] == scopeQuiesce
+	if finished := fieldsOf(run).phase.Finished(); finished || lease.Labels[labelLeaseScope] == scopeQuiesce {
+		return !finished && !durablyRestarted(run)
+	}
 	items := leaseItems(lease)
 	switch r := run.(type) {
 	case *backupv1alpha1.BackupRun:
-		if r.Status.Phase.Finished() || quiesceLease {
-			return !r.Status.Phase.Finished() && !durablyRestarted(r)
-		}
 		kind := backupv1alpha1.ItemKindSource
 		if lease.Labels[labelLeaseScope] == scopeCluster {
 			kind = backupv1alpha1.ItemKindCluster
@@ -76,9 +75,6 @@ func needsLease(run client.Object, lease *coordinationv1.Lease) bool {
 			return item.Kind == kind && slices.Contains(items, item.Name) && backupItemOpen(item)
 		})
 	case *backupv1alpha1.RestoreRun:
-		if r.Status.Phase.Finished() || quiesceLease {
-			return !r.Status.Phase.Finished() && !durablyRestarted(r)
-		}
 		// A finished item that still records its restore Job's UID has a
 		// Job the run has stopped and not yet seen stopped (rule X2), and a
 		// pod of that Job may still write.

@@ -37,13 +37,7 @@ import (
 // deleted (see leftDeletedNotes). A run past its deadline ends through
 // timeOut instead.
 func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.RestoreRun, reason, message string) (ctrl.Result, error) {
-	waits, err := r.settleJobs(ctx, run)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	failRemainingItems(run, message, backupv1alpha1.ItemReasonRunEnded)
-	addWaits(run, waits)
-	return r.finish(ctx, run, reason, leftDeletedNotes(run.Status.Items, message))
+	return r.endEarly(ctx, run, reason, backupv1alpha1.ItemReasonRunEnded, message)
 }
 
 // timeOut ends a run whose deadline has passed, with reason TimedOut.
@@ -68,13 +62,29 @@ func (r *RestoreRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Re
 // after the wait for a stopped mover replaced the SourceBusy condition,
 // ends with it as recorded.
 func (r *RestoreRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.RestoreRun, message string) (ctrl.Result, error) {
+	return r.endEarly(ctx, run, backupv1alpha1.ReasonTimedOut, backupv1alpha1.ItemReasonTimedOut, message)
+}
+
+// endEarly ends a run before its items finished, for abort and timeOut.
+//
+// Parameters:
+//   - reason is the Ready reason the run ends with.
+//   - itemReason is the reason each item that fails records.
+//   - message is the Ready message, and the start of each unfinished item's
+//     message.
+//
+// It reads the restore Job of each unfinished volume item first (see
+// settleJobs), then fails every item still unfinished (see
+// failRemainingItems), adds why a Job's pod waited, and calls finish with
+// the message and the note of each Cluster the run left deleted.
+func (r *RestoreRunReconciler) endEarly(ctx context.Context, run *backupv1alpha1.RestoreRun, reason string, itemReason backupv1alpha1.ItemReason, message string) (ctrl.Result, error) {
 	waits, err := r.settleJobs(ctx, run)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	failRemainingItems(run, message, backupv1alpha1.ItemReasonTimedOut)
+	failRemainingItems(run, message, itemReason)
 	addWaits(run, waits)
-	return r.finish(ctx, run, backupv1alpha1.ReasonTimedOut, leftDeletedNotes(run.Status.Items, message))
+	return r.finish(ctx, run, reason, leftDeletedNotes(run.Status.Items, message))
 }
 
 // failRemainingItems fails every item of a run that ends early and has not
