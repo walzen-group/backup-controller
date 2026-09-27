@@ -230,7 +230,7 @@ that ended by a path that records no reason leaves it empty
 
 | Reason | Kind | Item |
 | --- | --- | --- |
-| TimedOut | both | the run's timeout ran out before the item finished |
+| TimedOut | both | the run's timeout ran out before the item finished. This includes the items of a BackupRun that Kueue did not admit within its timeout |
 | MoverFailed | BackupRun | VolSync's backup mover reported the result Failed. The message is `Mover logs: ` and the logs as VolSync kept them |
 | NoMoverSnapshot | BackupRun | the sync completed, but the ReplicationSource status has no `lastSyncTime` or `lastSyncDuration`, or records a negative duration. Thus the run cannot tell which snapshot in the repository the sync wrote |
 | ClaimMissing | both | the claim does not exist when the run checks or starts the item |
@@ -248,6 +248,7 @@ that ended by a path that records no reason leaves it empty
 | BackupRefused | BackupRun | the API server refused the CloudNativePG Backup as invalid |
 | BackupFailed | BackupRun | the CloudNativePG Backup ended in the phase `failed` or `invalid backup definition`. The message carries the error from CloudNativePG |
 | RunEnded | both | the run ended before the item finished, for a cause other than the timeout. The run's `status.ending` says why the run ended |
+| CRDOutdated | BackupRun | the installed BackupRun CRD lacks a field the controller writes, or the controller may not read that CRD. The run ended with the Ready reason CRDOutdated before it changed anything |
 | NotStarted | BackupRun | the run did not start the item before the `backup.wlz.li/max-quiesce` limit ran out. The run then gave the workloads back |
 | CloneNotCut | BackupRun | VolSync did not cut the clone before the `backup.wlz.li/max-quiesce` limit ran out. The run then gave the workloads back |
 | RestoreJobFailed | RestoreRun | the restore Job ended with `Failed=True`, and the message carries restic's exit code and its meaning. The reason also applies in two other cases. The run's own Job restores a snapshot other than the one the run selected, or the run no longer controls the Job |

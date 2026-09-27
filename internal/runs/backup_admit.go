@@ -134,9 +134,10 @@ func (r *BackupRunReconciler) abortOnInvalidSetting(ctx context.Context, run *ba
 // The wait is bounded by the run's timeout (spec.timeout, the namespace's
 // backup.wlz.li/timeout, or 6h), counted from the run's creation. Past it,
 // the run ends Failed with a message that names Kueue, the Workload and the
-// LocalQueue, and finish deletes the Workload. Until then it returns a
-// result that looks again after pollInterval. It returns an error when the
-// timeout can't be read or ending the run fails.
+// LocalQueue. Its items record the reason TimedOut (see endTimedOut), and
+// finish deletes the Workload. Until then it returns a result that looks
+// again after pollInterval. It returns an error when the timeout can't be
+// read or ending the run fails.
 func (r *BackupRunReconciler) awaitAdmission(ctx context.Context, run *backupv1alpha1.BackupRun, workload *unstructured.Unstructured, queue string) (ctrl.Result, error) {
 	timeout, err := timeoutFor(ctx, r.Reader, run)
 	if err != nil {
@@ -150,5 +151,5 @@ func (r *BackupRunReconciler) awaitAdmission(ctx context.Context, run *backupv1a
 		"the Workload's status.conditions hold no Admitted condition with status True. Check the LocalQueue and its ClusterQueue; "+
 		"if the queue has quota to give, a Kueue release may have changed the Workload's fields (see docs/compatibility.md)",
 		workload.GetNamespace(), workload.GetName(), queue, timeout)
-	return ctrl.Result{}, r.abort(ctx, run, backupv1alpha1.ReasonFailed, message)
+	return ctrl.Result{}, r.endTimedOut(ctx, run, message)
 }

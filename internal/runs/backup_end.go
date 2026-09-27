@@ -27,7 +27,8 @@ import (
 //     message.
 //
 // The items it fails record the reason RunEnded. The run's ending says why.
-// A run past its deadline ends through timeOut instead.
+// A run past its deadline, or past its timeout in the Kueue queue, ends
+// through endTimedOut instead.
 func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.BackupRun, reason, message string) error {
 	r.failUnfinished(ctx, run, message, func(item *backupv1alpha1.BackupItem, text string) {
 		failBackupItem(item, refuse(backupv1alpha1.ItemReasonRunEnded, "%s", text))
@@ -51,7 +52,22 @@ func (r *BackupRunReconciler) abort(ctx context.Context, run *backupv1alpha1.Bac
 // retries a failed restart after releaseFailed replaced the SourceBusy
 // condition, ends with the recorded ending and builds no message again.
 func (r *BackupRunReconciler) timeOut(ctx context.Context, run *backupv1alpha1.BackupRun, deadline time.Time) error {
-	message := timedOutMessage(deadline, run.Status.Conditions)
+	return r.endTimedOut(ctx, run, timedOutMessage(deadline, run.Status.Conditions))
+}
+
+// endTimedOut ends a run whose timeout ran out, as Failed.
+//
+// Parameters:
+//   - run is the BackupRun whose timeout ran out.
+//   - message is the Ready message, and the start of each unfinished item's
+//     message.
+//
+// It returns what finish returns.
+//
+// Every Pending or Running item fails with reason TimedOut (see
+// failUnfinished). timeOut and awaitAdmission call it, so a run gives its
+// items the same reason for each timeout.
+func (r *BackupRunReconciler) endTimedOut(ctx context.Context, run *backupv1alpha1.BackupRun, message string) error {
 	r.failUnfinished(ctx, run, message, func(item *backupv1alpha1.BackupItem, text string) {
 		failBackupItem(item, refuse(backupv1alpha1.ItemReasonTimedOut, "%s", text))
 	})

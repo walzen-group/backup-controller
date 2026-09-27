@@ -12,7 +12,8 @@ type ItemReason string
 
 const (
 	// ItemReasonTimedOut is an item the run failed because the run's timeout
-	// ran out before the item finished.
+	// ran out before the item finished. This includes the items of a
+	// BackupRun that Kueue did not admit within its timeout.
 	ItemReasonTimedOut ItemReason = "TimedOut"
 
 	// ItemReasonMoverFailed is a volume backup whose VolSync mover reported
@@ -129,6 +130,12 @@ const (
 	// before the item finished, for a cause other than the timeout. The
 	// run's status.ending says why the run ended.
 	ItemReasonRunEnded ItemReason = "RunEnded"
+
+	// ItemReasonCRDOutdated is an item the run failed because the installed
+	// CRD of the run's kind lacks a field the controller writes, or the
+	// controller may not read that CRD. The run ended with the Ready reason
+	// CRDOutdated before it changed anything.
+	ItemReasonCRDOutdated ItemReason = "CRDOutdated"
 
 	// ItemReasonBackupFailed is a database backup whose CloudNativePG
 	// Backup ended in the phase failed.

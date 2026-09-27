@@ -45,7 +45,8 @@ func (r *BackupRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Back
 // schemaOutdated checks that the installed BackupRun CRD declares every
 // field the controller writes on a BackupRun, such as status.restartPending,
 // and ends the run as Failed with reason CRDOutdated when it does not. Items
-// a planned run has not finished fail with the same message.
+// a planned run has not finished fail with the reason CRDOutdated and the
+// same message.
 //
 // It returns true when it ended the run, and an error when the CRD could not
 // be read in a way a retry may fix or when ending the run failed. The check
@@ -60,7 +61,7 @@ func (r *BackupRunReconciler) schemaOutdated(ctx context.Context, run *backupv1a
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		if item.Phase == backupv1alpha1.ItemPending || item.Phase == backupv1alpha1.ItemRunning {
-			item.Phase, item.Message = backupv1alpha1.ItemFailed, outdated.Error()
+			item.Phase, item.Reason, item.Message = backupv1alpha1.ItemFailed, backupv1alpha1.ItemReasonCRDOutdated, outdated.Error()
 		}
 	}
 	return true, r.finish(ctx, run, backupv1alpha1.ReasonCRDOutdated, outdated.Error())

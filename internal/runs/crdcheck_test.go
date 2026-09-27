@@ -204,6 +204,25 @@ func TestABackupRunWithoutCRDAccessFailsClosed(t *testing.T) {
 	}
 }
 
+// An item that the CRD check fails records the reason CRDOutdated, so that
+// an alert on items[].reason sees why the item ended.
+func TestAnItemTheCRDCheckFailsRecordsCRDOutdated(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) {
+		b.Spec.Source = claimN
+		b.Status.Items = []backupv1alpha1.BackupItem{{Kind: backupv1alpha1.ItemKindSource, Name: claimN, Phase: backupv1alpha1.ItemPending}}
+	}), claim(), volume(), volumeRestore(), repository())
+	r.Reader = forbidCRDs{c}
+	step(t, r)
+
+	run := readBackupRun(t, c)
+	if len(run.Status.Items) != 1 {
+		t.Fatalf("items = %+v, want the one item", run.Status.Items)
+	}
+	if item := run.Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonCRDOutdated {
+		t.Errorf("item = %+v, want Failed with reason CRDOutdated", item)
+	}
+}
+
 // forbidCRDs is a Reader that refuses every read of a
 // CustomResourceDefinition as RBAC would, and passes any other read on.
 type forbidCRDs struct{ client.Reader }
