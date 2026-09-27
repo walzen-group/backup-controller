@@ -9,6 +9,7 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/kueue"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -172,5 +173,61 @@ func TestTheSchedulerCreatesNoRunWhilePaused(t *testing.T) {
 	tick(t, s)
 	if runs := scheduledRuns(t, c); len(runs) != 1 || runs[0].Name != "scheduled-20260926-0500" {
 		t.Fatalf("runs = %v after the pause, want one for the newest tick", runs)
+	}
+}
+
+// A new BackupRun that waited Paused for longer than its timeout does not
+// fail on its first pass after the pause. The admission wait counts from the
+// moment the controller first worked on the run after the pause, so the run
+// waits Queued, and it fails only when its timeout has passed since then.
+func TestABackupRunPausedPastItsTimeoutWaitsForAdmissionAfterThePause(t *testing.T) {
+	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) {
+		b.Spec.Source = claimN
+		b.CreationTimestamp = metav1.NewTime(frozen)
+	}), claim(), volume(), volumeRestore(), repository(), localQueueObject())
+	r.Paused = true
+	step(t, r)
+
+	resumed := frozen.Add(2 * time.Hour) // the run's timeout is an hour
+	r.Now = func() time.Time { return resumed }
+	r.Paused = false
+	step(t, r) // plan
+	step(t, r) // admit: the Workload waits
+	step(t, r)
+	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseQueued {
+		t.Fatalf("phase = %q (%s) after the pause, want Queued", run.Status.Phase, readyMessage(run.Status.Conditions))
+	}
+
+	r.Now = func() time.Time { return resumed.Add(2 * time.Hour) }
+	step(t, r)
+	if run := readBackupRun(t, c); run.Status.Phase != backupv1alpha1.RunPhaseFailed {
+		t.Fatalf("phase = %q past the timeout after the pause, want Failed", run.Status.Phase)
+	}
+}
+
+// A new RestoreRun that waited Paused for longer than its timeout does not
+// fail on its first pass after the pause. Its checks wait for a backup, and
+// the timeout counts from the moment the controller first worked on the run
+// after the pause.
+func TestARestoreRunPausedPastItsTimeoutWaitsAtItsChecksAfterThePause(t *testing.T) {
+	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.CreationTimestamp = metav1.NewTime(frozen) }),
+		claim(), volumeRestore(), repository(), otherRun(), backingUp())
+	r.Paused = true
+	restoreStep(t, r)
+
+	resumed := frozen.Add(5 * time.Hour) // the run's timeout is four hours
+	r.Now = func() time.Time { return resumed }
+	r.Paused = false
+	restoreStep(t, r)
+	restoreStep(t, r)
+	if run := readRestoreRun(t, c); run.Status.Phase.Finished() {
+		t.Fatalf("phase = %q (%s) after the pause, want the run waiting at its checks", run.Status.Phase, readyMessage(run.Status.Conditions))
+	}
+
+	r.Now = func() time.Time { return resumed.Add(5 * time.Hour) }
+	restoreStep(t, r)
+	run := readRestoreRun(t, c)
+	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+		t.Fatalf("phase = %q, reason = %q past the timeout after the pause; want Failed, TimedOut", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
 }

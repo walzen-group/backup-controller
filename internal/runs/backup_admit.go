@@ -21,7 +21,8 @@ import (
 // the queue's quota. Once Kueue admits it, admit marks the Workload PodsReady,
 // so that Kueue's waitForPodsReady does not evict it. While the Workload
 // waits, admit requeues after pollInterval, and a run Kueue does not admit
-// within its timeout from its creation fails (see awaitAdmission).
+// within its timeout from its creation, or from the end of the pause, fails
+// (see awaitAdmission).
 func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
 	if done, result, err := r.admitThroughKueue(ctx, run); done {
 		return result, err
@@ -132,7 +133,8 @@ func (r *BackupRunReconciler) abortOnInvalidSetting(ctx context.Context, run *ba
 // word. That happens when a Kueue release renames the Workload's queueName
 // field or its Admitted condition, and when the queue has no quota to give.
 // The wait is bounded by the run's timeout (spec.timeout, the namespace's
-// backup.wlz.li/timeout, or 6h), counted from the run's creation. Past it,
+// backup.wlz.li/timeout, or 6h), counted from the run's creation, or from
+// status.resumedAt when the run waited Paused (see clockStart). Past it,
 // the run ends Failed with a message that names Kueue, the Workload and the
 // LocalQueue. Its items record the reason TimedOut (see endTimedOut), and
 // finish deletes the Workload. Until then it returns a result that looks
@@ -143,13 +145,14 @@ func (r *BackupRunReconciler) awaitAdmission(ctx context.Context, run *backupv1a
 	if err != nil {
 		return ctrl.Result{}, r.abortOnInvalidSetting(ctx, run, err)
 	}
-	deadline := run.CreationTimestamp.Add(timeout)
-	if run.CreationTimestamp.IsZero() || r.Now().Before(deadline) {
+	start := clockStart(run.CreationTimestamp, run.Status.ResumedAt)
+	deadline := start.Add(timeout)
+	if start.IsZero() || r.Now().Before(deadline) {
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
 	}
-	message := fmt.Sprintf("Kueue did not admit the run's Workload %s/%s in LocalQueue %s within the run's timeout of %s from its creation: "+
+	message := fmt.Sprintf("Kueue did not admit the run's Workload %s/%s in LocalQueue %s within the run's timeout of %s from %s: "+
 		"the Workload's status.conditions hold no Admitted condition with status True. Check the LocalQueue and its ClusterQueue; "+
 		"if the queue has quota to give, a Kueue release may have changed the Workload's fields (see docs/compatibility.md)",
-		workload.GetNamespace(), workload.GetName(), queue, timeout)
+		workload.GetNamespace(), workload.GetName(), queue, timeout, startWord(run.Status.ResumedAt))
 	return ctrl.Result{}, r.endTimedOut(ctx, run, message)
 }

@@ -128,6 +128,9 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if r.Paused && restoreRunNew(run) {
 		return ctrl.Result{}, r.holdForPause(ctx, run)
 	}
+	if err := markResumed(ctx, r.Client, run, run.Status.Conditions, &run.Status.ResumedAt, r.Now()); err != nil {
+		return ctrl.Result{}, err
+	}
 	if !run.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, run)
 	}
@@ -246,14 +249,17 @@ func (r *RestoreRunReconciler) planFailed(ctx context.Context, run *backupv1alph
 }
 
 // checksOverdue returns the deadline of a run that has not passed its checks,
-// its creation plus spec.timeout, and reports whether the run has worked past
-// it. Such a run has no status.startedAt, so overdue never fires for it. A run
-// with no timeout, or with no creation time yet, is never overdue.
+// which is the start from clockStart plus spec.timeout, and reports whether
+// the run has worked past it. Such a run has no status.startedAt, so overdue
+// never fires for it. A run with no timeout, or with no creation time yet, is
+// never overdue. The start is the creation of the run, or status.resumedAt
+// when the run waited Paused.
 func (r *RestoreRunReconciler) checksOverdue(run *backupv1alpha1.RestoreRun) (time.Time, bool) {
-	if run.Spec.Timeout == nil || run.CreationTimestamp.IsZero() {
+	start := clockStart(run.CreationTimestamp, run.Status.ResumedAt)
+	if run.Spec.Timeout == nil || start.IsZero() {
 		return time.Time{}, false
 	}
-	deadline := run.CreationTimestamp.Add(run.Spec.Timeout.Duration)
+	deadline := start.Add(run.Spec.Timeout.Duration)
 	return deadline, !r.Now().Before(deadline)
 }
 

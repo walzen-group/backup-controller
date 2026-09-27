@@ -835,14 +835,16 @@ If the repository Secret is missing, the check fails with `no repository Secret
 the API server or a repository that the controller cannot open. If a check
 fails with such an error, the phase stays empty. Ready gets reason Retrying with
 the error as the message, and the controller tries again. If the run still
-retries after its `timeout` from creation, it ends Failed with reason TimedOut.
+retries after its `timeout` from creation, or from `status.resumedAt` when it
+waited Paused, it ends Failed with reason TimedOut.
 Thus a wrong repository password shows in `kubectl get rrun` and ends the run.
 If the same kind of error occurs while a volume item waits to start, the run
 tries again and leaves the item as it was.
 
 While a backup of a claim or its repository is in progress, the checks leave the
 run unplanned. Ready is False with reason SourceBusy and the message of the
-other run. If the run did not pass its checks by its creation plus `timeout`, it
+other run. If the run did not pass its checks by its creation (or its
+`status.resumedAt` after a pause) plus `timeout`, it
 ends Failed with reason TimedOut and `the run had not passed its checks by
 <time>: <message>`.
 

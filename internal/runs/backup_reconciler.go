@@ -103,6 +103,9 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if r.Paused && backupRunNew(run) {
 		return ctrl.Result{}, r.holdForPause(ctx, run)
 	}
+	if err := markResumed(ctx, r.Client, run, run.Status.Conditions, &run.Status.ResumedAt, r.Now()); err != nil {
+		return ctrl.Result{}, err
+	}
 	// A run that may touch VolSync objects can't go on while VolSync serves
 	// its kinds only at a version this controller has no Go types for, and
 	// ends. A database-only run needs no VolSync object and goes on.

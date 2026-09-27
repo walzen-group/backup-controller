@@ -328,6 +328,14 @@ spec:
                   replicas back.
                 format: date-time
                 type: string
+              resumedAt:
+                description: |-
+                  ResumedAt is when the controller first worked on the run after the run
+                  waited with reason Paused. The timeout of a run that has no startedAt
+                  counts from this time. A run that never waited Paused has no resumedAt,
+                  and its timeout counts from its creation.
+                format: date-time
+                type: string
               startedAt:
                 description: StartedAt is when the run was admitted and began backing
                   up.

@@ -178,6 +178,13 @@ type RestoreRunStatus struct {
 	// +optional
 	SuspendedKustomizations []string `json:"suspendedKustomizations,omitempty"`
 
+	// ResumedAt is when the controller first worked on the run after the run
+	// waited with reason Paused. The timeout of a run that has no startedAt
+	// counts from this time. A run that never waited Paused has no resumedAt,
+	// and its timeout counts from its creation.
+	// +optional
+	ResumedAt *metav1.Time `json:"resumedAt,omitempty"`
+
 	// StartedAt is when the run passed its checks and began restoring.
 	// +optional
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`

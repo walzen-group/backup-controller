@@ -172,7 +172,7 @@ spec:
 | `source` | one of the three | the claim to back up. The claim must carry `backup.wlz.li/enabled: "true"`. Its ReplicationSource has the same name |
 | `database` | one of the three | the CloudNativePG Cluster to take a base backup of |
 | `all` | one of the three | every enabled claim and Cluster in the namespace. The run stops the workloads marked `backup.wlz.li/quiesce` until it cuts the clones. Only one run at a time in the namespace stops its workloads. The stop lasts at most the namespace's `backup.wlz.li/max-quiesce`, ten minutes by default |
-| `timeout` | no | how long the run may work after admission, e.g. `10h`. Omitted, the namespace's `backup.wlz.li/timeout`, and 6h without one |
+| `timeout` | no | how long the run may work after admission, e.g. `10h`. The same time also limits the wait for Kueue to admit the run. That wait counts from the creation of the run, or from `status.resumedAt` when the run waited with reason Paused. Omitted, the namespace's `backup.wlz.li/timeout`, and 6h without one |
 | `ttlSecondsAfterFinished` | no | delete the run that long after it finishes. Omitted, it stays as the record |
 
 A CEL rule on the CRD accepts exactly one of `source`, `database` and `all`. A
@@ -184,6 +184,7 @@ scheduled run is an ordinary BackupRun with the name
 | `phase` | Queued, Running, Waiting, Succeeded or Failed. `kubectl get brun` prints it as a column |
 | `workload` | the Kueue Workload that admits the run, while it exists |
 | `startedAt`, `completedAt` | when Kueue admitted the run, and when it finished |
+| `resumedAt` | when the controller first worked on the run after the run waited with reason Paused. The wait for Kueue counts from this time. A run that never waited Paused has no `resumedAt` |
 | `quiescedAt`, `restartedAt` | when the run stopped and restarted the quiesced workloads, in whole seconds |
 | `restartPending` | true from the moment the run records `restartedAt`. It stays true until the run gives every workload its replicas back and resumes every Kustomization. A pass that finds it set repeats the restart and keeps the recorded `restartedAt`. When `restartedAt` is set and this field is false, the run never restarts the workloads again |
 | `quiesced[]` | the workloads the run stops. Each has the replica count it had before the run touched it, which the run gives back |
@@ -321,7 +322,7 @@ spec:
 | `previous` | no | how many snapshots further back than the selected one. One volume only |
 | `syncDatabaseToVolume` | no | with `all` only. The run recovers the databases to the moment of the volumes' newest `quiesced` snapshot at or before `restoreAsOf`, so the files and the rows agree. It is refused when a volume has no such snapshot, or when the snapshots of two volumes are from different moments |
 | `quiesce` | no | Deployments and StatefulSets, as `{kind, name}`, to stop while the run restores. Not with `into`. The run waits, with the workloads still running, in three cases. A backup of one of its claims uploads. Another run holds the Lease of one of its claims. Or another run stopped this namespace's workloads. A volume item whose repository Secret is gone fails before the run stops anything. A run with no item left to restore stops nothing. The run gives the workloads back after it restores the volumes and deletes the databases. A workload whose Flux Kustomization also applies workloads in another namespace ends the run Invalid before the run stops anything |
-| `timeout` | no | how long to wait for the restore Jobs and the recovered databases. The time counts from when the run passes its checks. While its checks continue to fail, or while it waits for a backup of its repository, the time counts from its creation. Defaults to `4h` |
+| `timeout` | no | how long to wait for the restore Jobs and the recovered databases. The time counts from when the run passes its checks. While its checks continue to fail, or while it waits for a backup of its repository, the time counts from its creation. When the run waited with reason Paused, it counts from `status.resumedAt`, so the time in the pause does not count. Defaults to `4h` |
 | `moverSecurityContext` | no | the pod `securityContext` of the run's restore Jobs. Omitted, the source claim's VolumeRestore supplies it. The admission policy refuses one that sets sysctls, SELinux options or an unconfined profile, and the item fails with reason RestoreJobRefused |
 | `ttlSecondsAfterFinished` | no | delete the run that long after it finishes. An `into` claim goes with it |
 
@@ -330,6 +331,7 @@ spec:
 | `phase` | Queued, Running, Waiting, Succeeded or Failed. `kubectl get rrun` prints it as a column |
 | `target` | the claim an `into` restore creates and fills |
 | `startedAt`, `completedAt` | when the run passed its checks and began, and when it finished |
+| `resumedAt` | when the controller first worked on the run after the run waited with reason Paused. Until the run passes its checks, its `timeout` counts from this time. A run that never waited Paused has no `resumedAt` |
 | `syncedTo` | the moment a `syncDatabaseToVolume` run restores the volumes and recovers the databases to |
 | `quiescedAt`, `restartedAt`, `quiesced[]`, `suspendedKustomizations[]` | when the run stopped and gave back the workloads `quiesce` lists, the replicas it gave back to each, and the Flux Kustomizations it suspended and resumed |
 | `items[]` | one for each volume and each database. Each item holds these fields: kind, name, phase (Pending, Running, Deleted, Recovering, Succeeded, Failed, Skipped), message and the item's `reason`. It also holds the `snapshot` (short ID), `snapshotID` (full ID) and `snapshotTime` a volume restores, and the restore `job` and its `jobUID`. For a database, it holds the `baseBackup` a recovery starts from, the `clusterUID` of the Cluster the item deletes, and `clusterLeftDeleted` |

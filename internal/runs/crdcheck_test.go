@@ -58,8 +58,8 @@ const v081CRDDir = crdDir + "backup-controller/v0.8.1/"
 // and each released CRD lacks exactly the fields the releases after it added.
 // This is also the guard against the generated CRDs drifting from the types.
 func TestSchemaGapsNamesTheFieldsAnOldCRDLacks(t *testing.T) {
-	v09Backup := []string{"status.ending", "status.items[].lastStartError", "status.items[].noSnapshotListedAt", "status.items[].reason", "status.items[].snapshotID"}
-	v09Restore := []string{"status.ending", "status.items[].clusterLeftDeleted", "status.items[].job", "status.items[].jobUID", "status.items[].reason", "status.items[].snapshotID"}
+	v09Backup := []string{"status.ending", "status.items[].lastStartError", "status.items[].noSnapshotListedAt", "status.items[].reason", "status.items[].snapshotID", "status.resumedAt"}
+	v09Restore := []string{"status.ending", "status.items[].clusterLeftDeleted", "status.items[].job", "status.items[].jobUID", "status.items[].reason", "status.items[].snapshotID", "status.resumedAt"}
 	for _, tc := range []struct {
 		file   string
 		sample any
@@ -68,12 +68,12 @@ func TestSchemaGapsNamesTheFieldsAnOldCRDLacks(t *testing.T) {
 	}{
 		{
 			"backup.wlz.li_backupruns.yaml", backupv1alpha1.BackupRun{},
-			[]string{"status.ending", "status.items[].lastStartError", "status.items[].noSnapshotListedAt", "status.items[].reason", "status.items[].snapshotID", "status.restartPending"},
+			[]string{"status.ending", "status.items[].lastStartError", "status.items[].noSnapshotListedAt", "status.items[].reason", "status.items[].snapshotID", "status.restartPending", "status.resumedAt"},
 			v09Backup,
 		},
 		{
 			"backup.wlz.li_restoreruns.yaml", backupv1alpha1.RestoreRun{},
-			[]string{"status.ending", "status.items[].clusterLeftDeleted", "status.items[].clusterUID", "status.items[].job", "status.items[].jobUID", "status.items[].reason", "status.items[].snapshotID", "status.items[].snapshotTime"},
+			[]string{"status.ending", "status.items[].clusterLeftDeleted", "status.items[].clusterUID", "status.items[].job", "status.items[].jobUID", "status.items[].reason", "status.items[].snapshotID", "status.items[].snapshotTime", "status.resumedAt"},
 			v09Restore,
 		},
 		{"backup.wlz.li_volumerestores.yaml", backupv1alpha1.VolumeRestore{}, nil, nil},
