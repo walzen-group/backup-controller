@@ -3,6 +3,7 @@ package runs
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/quiesce"
@@ -192,7 +193,8 @@ type itemFailure struct {
 // invalidSettingError (SettingsInvalid), a *sourceHeldError for a source no
 // run waits for (SourceAbandoned), a *restorejob.FailureError of a restore
 // Job that ended Failed (RestoreJobFailed), a *restorejob.SpecError of a
-// restore Job the run could not build (RestoreJobRefused), and an
+// restore Job the run could not build (RestoreJobRefused), a
+// *claimLostError of a claim that is no longer the run's (ClaimLost), and an
 // *identifyError of a completed sync that left no record of when it ran
 // (NoMoverSnapshot). The message is
 // err.Error(). Any other error, and nil, gives false: the pass returns the
@@ -219,6 +221,10 @@ func asItemFailure(err error) (itemFailure, bool) {
 	var badSpec *restorejob.SpecError
 	if errors.As(err, &badSpec) {
 		return itemFailure{reason: backupv1alpha1.ItemReasonRestoreJobRefused, message: err.Error()}, true
+	}
+	var lost *claimLostError
+	if errors.As(err, &lost) {
+		return itemFailure{reason: backupv1alpha1.ItemReasonClaimLost, message: err.Error()}, true
 	}
 	var unidentified *identifyError
 	if errors.As(err, &unidentified) {
@@ -285,4 +291,55 @@ func asRunRefusal(err error) bool {
 	var inventory *quiesce.InventoryError
 	return errors.As(err, &spec) || errors.As(err, &refused) || errors.As(err, &bad) ||
 		errors.As(err, &quiesceSpec) || errors.As(err, &crossNamespace) || errors.As(err, &inventory)
+}
+
+// claimLoss is how the claim of an in-place item stopped being the claim
+// the run checked.
+type claimLoss int
+
+const (
+	// lossUnleased is a run that holds no claim Lease for the item, so it
+	// can not tell which claim the restore Job wrote into.
+	lossUnleased claimLoss = iota
+	// lossGone is a claim that was deleted and is gone.
+	lossGone
+	// lossDeleting is a claim that is being deleted.
+	lossDeleting
+	// lossReplaced is a claim whose UID is not the UID of a claim Lease of
+	// the run for the item.
+	lossReplaced
+)
+
+// claimLostError says that the claim an in-place item restored is no longer
+// the claim the run checked, so the item can not succeed. asItemFailure
+// fails the item with reason ClaimLost.
+type claimLostError struct {
+	// claim names the claim, which is also the item's name.
+	claim string
+	// loss is how the run lost the claim.
+	loss claimLoss
+	// found is the UID of the claim there now, for lossReplaced.
+	found string
+	// leased are the claim UIDs of the run's claim Leases for the item, for
+	// lossReplaced.
+	leased []string
+}
+
+// Error returns the sentence for a person that says how the run lost the
+// claim and what to do next.
+func (e *claimLostError) Error() string {
+	switch e.loss {
+	case lossUnleased:
+		return fmt.Sprintf("the run holds no claim Lease for claim %s, so it can't tell whether its restore Job wrote into the claim that is there now. "+
+			"Check the claim's data, and create a new RestoreRun to restore it", e.claim)
+	case lossGone:
+		return fmt.Sprintf("claim %s was deleted while its restore Job wrote into it, and the restored data went with it", e.claim)
+	case lossDeleting:
+		return fmt.Sprintf("claim %s was deleted while its restore Job wrote into it, and the restored data goes with it once the claim is released", e.claim)
+	case lossReplaced:
+		return fmt.Sprintf("claim %[1]s was replaced while its restore Job wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
+			"and took its Lease on (UID %[3]s). The restore Job mounts claim %[1]s by name, so it may have written into it; check its data, "+
+			"and create a new RestoreRun to restore it", e.claim, e.found, strings.Join(e.leased, ", "))
+	}
+	return fmt.Sprintf("claim %s is no longer the claim the run checked", e.claim)
 }

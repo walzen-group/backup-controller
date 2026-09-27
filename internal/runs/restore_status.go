@@ -103,3 +103,26 @@ func finishedWithMover(items []backupv1alpha1.RestoreItem) bool {
 	}
 	return false
 }
+
+// anyRestoreFailed reports whether any item is Failed. The run ends Failed
+// when its items are all finished and one of them failed.
+func anyRestoreFailed(items []backupv1alpha1.RestoreItem) bool {
+	for _, item := range items {
+		if item.Phase == backupv1alpha1.ItemFailed {
+			return true
+		}
+	}
+	return false
+}
+
+// anyRestoreSucceeded reports whether any item is Succeeded. A run that
+// restored nothing must not end Succeeded, so a finished run without a
+// Succeeded item ends with reason NoBackupInReach.
+func anyRestoreSucceeded(items []backupv1alpha1.RestoreItem) bool {
+	for _, item := range items {
+		if item.Phase == backupv1alpha1.ItemSucceeded {
+			return true
+		}
+	}
+	return false
+}
