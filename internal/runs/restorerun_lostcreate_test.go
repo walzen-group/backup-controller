@@ -11,9 +11,11 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // The tests in this file cover an in-place restore whose pass created the
@@ -216,5 +218,141 @@ func TestARunDeletedWithOrphanStopsTheJobOfALostCreate(t *testing.T) {
 				t.Errorf("restore Jobs = %v, want the stopped Job deleted", jobs)
 			}
 		})
+	}
+}
+
+// createLandsLater returns a client over c whose restore Job creates answer
+// 504 Timeout without storing the Job, and a function that stores the last
+// such Job later. The API server behaves that way: when a request outlives
+// its deadline it answers with a timeout and leaves the handler running,
+// which may still store the object (k8s.io/apiserver
+// pkg/endpoints/handlers/finisher/finisher.go).
+func createLandsLater(t *testing.T, c client.Client) (client.Client, func() *batchv1.Job) {
+	var pending *batchv1.Job
+	timingOut := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if job, ok := obj.(*batchv1.Job); ok {
+				pending = job.DeepCopy()
+				return apierrors.NewTimeoutError("request did not complete within requested timeout", 0)
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+	land := func() *batchv1.Job {
+		t.Helper()
+		if pending == nil {
+			t.Fatal("no restore Job create was sent, want one that timed out")
+		}
+		pending.ResourceVersion = ""
+		if err := c.Create(context.Background(), pending); err != nil {
+			t.Fatal(err)
+		}
+		return &restoreJobs(t, c)[0]
+	}
+	return timingOut, land
+}
+
+// A restore Job whose create answered 504 Timeout and was stored only after
+// the pass that timed the run out is still stopped before the app comes
+// back. The item names no Job, because the create reported an error, and
+// the timeout failed it with reason TimedOut. The restart fails once, so the
+// run is still finishing when the Job lands. The next pass records the Job
+// on the failed item, suspends it and keeps the app down while its pod runs
+// (rule X2), and gives the app back once the pod has ended.
+func TestAJobCreateThatLandsAfterATimeoutIsStopped(t *testing.T) {
+	r, c := restoreReconciler(t, nil, quiescedRestore(), claim(), volumeRestore(), repository(),
+		deployment(), kustomization(false))
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // quiesce
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}
+
+	var land func() *batchv1.Job
+	r.Client, land = createLandsLater(t, c)
+	if _, err := r.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("the pass whose Job create timed out succeeded, want the timeout returned")
+	}
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	r.Client = refuseDeploymentPatches(c)
+	if _, err := r.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("the pass whose restart was refused succeeded, want the refusal returned")
+	}
+	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonTimedOut || item.Job != "" {
+		t.Fatalf("item = %+v, want Failed with reason TimedOut and no Job", item)
+	}
+	r.Client = c
+
+	job := land()
+	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
+	createPod(t, c, pod)
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 0 || !suspendedJob(t, c, job.Name) {
+		t.Fatalf("replicas = %d, Job suspended = %t while pod %s of the run's own Job runs; want the app down and the Job stopped",
+			got, suspendedJob(t, c, job.Name), pod.Name)
+	}
+	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.Reason != backupv1alpha1.ItemReasonTimedOut || item.JobUID != job.UID {
+		t.Errorf("item = %+v, want Failed with reason TimedOut, naming the late Job's UID %s", item, job.UID)
+	}
+
+	markSuspended(t, c, job)
+	setPodPhase(t, c, pod, corev1.PodFailed)
+	restoreStep(t, r)
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d once the pod had ended, want the 2 the app had", got)
+	}
+	if jobs := restoreJobs(t, c); len(jobs) != 0 {
+		t.Errorf("restore Jobs = %v, want the late Job deleted", jobs)
+	}
+}
+
+// A restore Job whose create answered 504 Timeout and was stored only after
+// the next pass refused its item is stopped before the app comes back. The
+// run restores two claims. The first item's create times out, and on the
+// next pass its VolumeRestore is gone, so the item fails with reason
+// VolumeRestoreMissing and names no Job, while the second item's Job still
+// restores. The first item's Job lands then. Once the second Job completes,
+// the run records the late Job on the failed item, suspends it and keeps
+// the app down while its pod runs (rule X2).
+func TestAJobCreateThatLandsAfterARefusalIsStopped(t *testing.T) {
+	run, _ := quiescedMidRestore(t)
+	run.Status.Items = []backupv1alpha1.RestoreItem{
+		{Kind: backupv1alpha1.ItemKindClaim, Name: claimN, Phase: backupv1alpha1.ItemPending,
+			Snapshot: monday.ShortID(), SnapshotID: monday.ID, SnapshotTime: &metav1.Time{Time: monday.Time}},
+		runningOnJob(cacheN, 1),
+	}
+	run.Status.Items[1].JobUID = "second-job-uid"
+	second := restoreJobFor(t, run, cacheN, monday.ID)
+	second.Name, second.UID = jobName(restoreUID, 1), "second-job-uid"
+	cacheLease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: claimLeaseName("cache-claim-uid"), Namespace: ns}}
+	stamp(cacheLease, leaseHolder{kind: "RestoreRun", run: run, item: cacheN}, []string{cacheN})
+	r, c := restoreReconciler(t, nil, append([]client.Object{run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), second, cacheLease}, cacheClaim()...)...)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "back-to-monday"}}
+
+	var land func() *batchv1.Job
+	r.Client, land = createLandsLater(t, c)
+	if _, err := r.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("the pass whose Job create timed out succeeded, want the timeout returned")
+	}
+	r.Client = c
+	deleteVolumeRestore(t, c)
+	restoreStep(t, r)
+	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed ||
+		item.Reason != backupv1alpha1.ItemReasonVolumeRestoreMissing || item.Job != "" {
+		t.Fatalf("item = %+v, want Failed with reason VolumeRestoreMissing and no Job", item)
+	}
+
+	job := land()
+	pod := jobPodOf(job, "restore-pod", corev1.PodRunning)
+	createPod(t, c, pod)
+	endJob(t, c, second.Name, batchv1.JobComplete, "CompletionsReached", "Reached expected number of succeeded pods")
+	restoreStep(t, r)
+
+	if got := replicasOf(t, c); got != 0 || !suspendedJob(t, c, job.Name) {
+		t.Fatalf("replicas = %d, Job suspended = %t while pod %s of the run's own Job runs; want the app down and the Job stopped",
+			got, suspendedJob(t, c, job.Name), pod.Name)
+	}
+	if item := readRestoreRun(t, c).Status.Items[0]; item.Phase != backupv1alpha1.ItemFailed || item.JobUID != job.UID {
+		t.Errorf("item = %+v, want Failed, naming the late Job's UID %s", item, job.UID)
 	}
 }

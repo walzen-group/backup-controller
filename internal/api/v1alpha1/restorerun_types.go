@@ -240,13 +240,16 @@ type RestoreItem struct {
 	// +optional
 	SnapshotID string `json:"snapshotID,omitempty"`
 	// Job is the name of the restore Job the run created for a volume, in the
-	// run's namespace.
+	// run's namespace. It stays once the run has stopped the Job, as the
+	// record that the item had one.
 	// +optional
 	Job string `json:"job,omitempty"`
 	// JobUID is the UID of that Job, recorded with its name. The run stops
 	// the Job by this UID: when someone deletes the Job while it runs, its
 	// pods keep this UID in their batch.kubernetes.io/controller-uid label,
-	// and the run gives nothing back until each of them has ended.
+	// and the run gives nothing back until each of them has ended. The run
+	// clears it once the Job is stopped and none of its pods can still
+	// write.
 	// +optional
 	JobUID types.UID `json:"jobUID,omitempty"`
 	// SnapshotTime is the time of that snapshot. The run hands it to the mover
