@@ -32,7 +32,9 @@ func recordedSuspendedJob(t *testing.T) *fakeOperations {
 // TestNoJobIsResumedOnceTheVolumeIsHandedOver checks that Populate resumes
 // no Job once the library has handed the prime claim's volume to the app
 // claim: the app claim names a volume, or the volume's claimRef no longer
-// names the prime claim. The Job's pod would write the app's volume.
+// names the prime claim by its namespace, name and UID. The Job's pod would
+// write the app's volume. A prime claim that names no volume resumes no Job
+// either, and Populate returns no error for it.
 func TestNoJobIsResumedOnceTheVolumeIsHandedOver(t *testing.T) {
 	for name, handOver := range map[string]func(*testing.T, *fakeOperations){
 		"the app claim names a volume": func(t *testing.T, ops *fakeOperations) {
@@ -52,6 +54,23 @@ func TestNoJobIsResumedOnceTheVolumeIsHandedOver(t *testing.T) {
 			}
 			volume.Spec.ClaimRef = &corev1.ObjectReference{Kind: "PersistentVolumeClaim", APIVersion: "v1", Namespace: appNS, Name: "notes", UID: "claim-123"}
 			if err := ops.cluster.Update(context.Background(), volume); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"the volume's claimRef names the prime claim with another UID": func(t *testing.T, ops *fakeOperations) {
+			volume, err := ops.GetVolume(context.Background(), "pv-123")
+			if err != nil {
+				t.Fatal(err)
+			}
+			volume.Spec.ClaimRef.UID = "prime-uid-OTHER"
+			if err := ops.cluster.Update(context.Background(), volume); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"the prime claim names no volume": func(t *testing.T, ops *fakeOperations) {
+			prime := ops.prime(t, "claim-123")
+			prime.Spec.VolumeName = ""
+			if err := ops.cluster.Update(context.Background(), prime); err != nil {
 				t.Fatal(err)
 			}
 		},
