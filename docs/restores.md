@@ -594,7 +594,7 @@ object store through which the Cluster archives:
 | What it finds | What it does |
 | --- | --- |
 | nothing at all under the Cluster's prefix, and no completed backup in the ObjectStore status for its server name | nothing. The Cluster bootstraps as written, which is `initdb` |
-| nothing at all under the prefix, and the ObjectStore status records a completed backup for the server name of the Cluster | refuses the Cluster: `The listing of s3://<bucket>/<prefix>/ found nothing. The status of ObjectStore ...` ([When the store status disagrees with the listing](#when-the-store-status-disagrees-with-the-listing) has the full text) |
+| no WAL under `wals/` and no complete base backup under the prefix, and the ObjectStore status records a completed backup for the server name of the Cluster | refuses the Cluster: `The listing of s3://<bucket>/<prefix>/ found no WAL under wals/ and no complete base backup. The status of ObjectStore ...` ([When the store status disagrees with the listing](#when-the-store-status-disagrees-with-the-listing) has the full text) |
 | a completed base backup | rewrites the Cluster to recover from it, to the end of the archive |
 | a completed base backup, and a RestoreRun that deleted this Cluster | rewrites it to recover to the run's `restoreAsOf`, and names the run in `backup.wlz.li/restore-run` |
 | a completed base backup, and `backup.wlz.li/restore-as-of` on the Cluster | rewrites it to recover to that moment |
@@ -693,11 +693,13 @@ Before the webhook lets a Cluster start empty over an empty prefix, it reads
 the status of the ObjectStore. After each backup, the sidecar of the
 barman-cloud plugin writes `status.serverRecoveryWindow.<serverName>`. The
 field `lastSuccessfulBackupTime` in that entry holds the end of the newest
-completed base backup. If the listing found nothing and the plugin has set
+completed base backup. If the listing found no WAL under `wals/` and no
+complete base backup, and the plugin has set
 this field, the webhook refuses the Cluster:
 
 ```text
-The listing of s3://backups/app/app-pg/ found nothing. The status of
+The listing of s3://backups/app/app-pg/ found no WAL under wals/ and no
+complete base backup. The status of
 ObjectStore app/app-pg-store records a completed backup for serverName
 "app-pg" (status.serverRecoveryWindow, lastSuccessfulBackupTime
 2026-09-20T03:00:01Z). The webhook does not start an empty database while the

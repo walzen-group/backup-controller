@@ -35,10 +35,10 @@ func recordedBackup(store *unstructured.Unstructured, serverName string) string 
 	return last
 }
 
-// contradicted refuses a create when the listing found nothing under the
-// prefix of the Cluster, and the status of its ObjectStore records a
-// completed backup for the server name. optOut and withoutBaseBackup call it
-// before they let the Cluster start empty.
+// contradicted refuses a create when the listing found no WAL under wals/ and
+// no complete base backup under the prefix of the Cluster, and the status of
+// its ObjectStore records a completed backup for the server name. optOut and
+// withoutBaseBackup call it before they let the Cluster start empty.
 //
 // It returns the refusal and true when the status records a backup. It
 // returns false when the status records none.
@@ -52,7 +52,7 @@ func contradicted(c creation) (admission.Response, bool) {
 	if c.recorded == "" {
 		return admission.Response{}, false
 	}
-	c.logger.Info("refusing the Cluster", "reason", "the listing found nothing, and the ObjectStore status records a backup", "prefix", c.at.ServerPrefix(), "lastSuccessfulBackupTime", c.recorded)
+	c.logger.Info("refusing the Cluster", "reason", "the listing found no WAL and no complete base backup, and the ObjectStore status records a backup", "prefix", c.at.ServerPrefix(), "lastSuccessfulBackupTime", c.recorded)
 	return admission.Denied(recordedButEmpty(c)), true
 }
 
@@ -62,7 +62,7 @@ func contradicted(c creation) (admission.Response, bool) {
 func recordedButEmpty(c creation) string {
 	pointer := strings.NewReplacer("~", "~0", "/", "~1").Replace(c.serverName)
 	return fmt.Sprintf(
-		"The listing of s3://%s/%s found nothing. The status of ObjectStore %s/%s records a completed backup for serverName %q (status.serverRecoveryWindow, lastSuccessfulBackupTime %s). The webhook does not start an empty database while the two disagree. Make sure that the destinationPath, endpointURL and credentials of the ObjectStore reach the bucket that holds the backups. If you deleted that archive on purpose, delete the old entry from the status with this command, then create the Cluster again: kubectl -n %s patch objectstores.barmancloud.cnpg.io %s --subresource=status --type=json -p '[{\"op\":\"remove\",\"path\":\"/status/serverRecoveryWindow/%s\"}]'",
+		"The listing of s3://%s/%s found no WAL under wals/ and no complete base backup. The status of ObjectStore %s/%s records a completed backup for serverName %q (status.serverRecoveryWindow, lastSuccessfulBackupTime %s). The webhook does not start an empty database while the two disagree. Make sure that the destinationPath, endpointURL and credentials of the ObjectStore reach the bucket that holds the backups. If you deleted that archive on purpose, delete the old entry from the status with this command, then create the Cluster again: kubectl -n %s patch objectstores.barmancloud.cnpg.io %s --subresource=status --type=json -p '[{\"op\":\"remove\",\"path\":\"/status/serverRecoveryWindow/%s\"}]'",
 		c.at.Bucket, c.at.ServerPrefix(), c.req.Namespace, c.store, c.serverName, c.recorded,
 		c.req.Namespace, c.store, pointer,
 	)
