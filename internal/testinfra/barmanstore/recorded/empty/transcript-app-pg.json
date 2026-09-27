@@ -27,13 +27,13 @@
     "step": "prober-survey",
     "method": "GET",
     "path": "/recorded/",
-    "query": "delimiter=\u0026encoding-type=url\u0026fetch-owner=true\u0026list-type=2\u0026max-keys=1\u0026prefix=empty%2Fapp-pg%2F",
+    "query": "delimiter=\u0026encoding-type=url\u0026fetch-owner=true\u0026list-type=2\u0026prefix=empty%2Fapp-pg%2Fwals%2F",
     "status": 200,
     "headers": {
-      "Content-Length": "280",
+      "Content-Length": "288",
       "Content-Type": "application/xml"
     },
-    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003e\u003cName\u003erecorded\u003c/Name\u003e\u003cPrefix\u003eempty/app-pg/\u003c/Prefix\u003e\u003cMaxKeys\u003e1\u003c/MaxKeys\u003e\u003cKeyCount\u003e0\u003c/KeyCount\u003e\u003cIsTruncated\u003efalse\u003c/IsTruncated\u003e\u003cEncodingType\u003eurl\u003c/EncodingType\u003e\u003c/ListBucketResult\u003e"
+    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003e\u003cName\u003erecorded\u003c/Name\u003e\u003cPrefix\u003eempty/app-pg/wals/\u003c/Prefix\u003e\u003cMaxKeys\u003e1000\u003c/MaxKeys\u003e\u003cKeyCount\u003e0\u003c/KeyCount\u003e\u003cIsTruncated\u003efalse\u003c/IsTruncated\u003e\u003cEncodingType\u003eurl\u003c/EncodingType\u003e\u003c/ListBucketResult\u003e"
   },
   {
     "step": "prober-base-backups",

@@ -26,6 +26,18 @@
   {
     "step": "prober-survey",
     "method": "GET",
+    "path": "/recorded/",
+    "query": "delimiter=\u0026encoding-type=url\u0026fetch-owner=true\u0026list-type=2\u0026prefix=failed-base%2Fapp-pg%2Fwals%2F",
+    "status": 200,
+    "headers": {
+      "Content-Length": "2174",
+      "Content-Type": "application/xml"
+    },
+    "body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"\u003e\u003cName\u003erecorded\u003c/Name\u003e\u003cPrefix\u003efailed-base/app-pg/wals/\u003c/Prefix\u003e\u003cMaxKeys\u003e1000\u003c/MaxKeys\u003e\u003cKeyCount\u003e5\u003c/KeyCount\u003e\u003cIsTruncated\u003efalse\u003c/IsTruncated\u003e\u003cContents\u003e\u003cETag\u003e\"b42530b6aa7d25c4b2b4adb1dcd5ca9f\"\u003c/ETag\u003e\u003cKey\u003efailed-base/app-pg/wals/0000000100000000/000000010000000000000001\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:49:47.112Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e16777216\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cContents\u003e\u003cETag\u003e\"78c0bda73869a7d6b706c7fee079c6b6\"\u003c/ETag\u003e\u003cKey\u003efailed-base/app-pg/wals/0000000100000000/000000010000000000000002\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:49:47.670Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e16777216\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cContents\u003e\u003cETag\u003e\"4e2732634fbd7105de49614f540679aa\"\u003c/ETag\u003e\u003cKey\u003efailed-base/app-pg/wals/0000000100000000/000000010000000000000003\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:52:03.856Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e16777216\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cContents\u003e\u003cETag\u003e\"84d8c3847d103876179739c9a4734019\"\u003c/ETag\u003e\u003cKey\u003efailed-base/app-pg/wals/0000000100000000/000000010000000000000004\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:52:04.369Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e16777216\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cContents\u003e\u003cETag\u003e\"deab48a96e3dbd62f949a2a9c232b31f\"\u003c/ETag\u003e\u003cKey\u003efailed-base/app-pg/wals/0000000100000000/000000010000000000000005\u003c/Key\u003e\u003cLastModified\u003e2026-09-25T21:52:04.884Z\u003c/LastModified\u003e\u003cOwner\u003e\u003cDisplayName\u003erustfs\u003c/DisplayName\u003e\u003cID\u003ec19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66\u003c/ID\u003e\u003c/Owner\u003e\u003cSize\u003e16777216\u003c/Size\u003e\u003cStorageClass\u003eSTANDARD\u003c/StorageClass\u003e\u003c/Contents\u003e\u003cEncodingType\u003eurl\u003c/EncodingType\u003e\u003c/ListBucketResult\u003e"
+  },
+  {
+    "step": "prober-survey",
+    "method": "GET",
     "path": "/recorded/failed-base/app-pg/base/20260925T215203/backup.info",
     "query": "",
     "status": 200,
