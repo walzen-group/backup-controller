@@ -219,7 +219,7 @@ type Lister interface {
 // S3Lister is the implementation the controller runs with. The controllers
 // take the interface so that their tests can run without an object store.
 type Retimer interface {
-	Retime(ctx context.Context, secret *corev1.Secret, short string, at time.Time, tag string) (Snapshot, error)
+	Retime(ctx context.Context, secret *corev1.Secret, id string, at time.Time, tag string) (Snapshot, error)
 }
 
 // S3Lister is the Lister and Retimer the controller runs with. Each call opens
@@ -258,10 +258,10 @@ func (l S3Lister) Snapshots(ctx context.Context, secret *corev1.Secret) ([]Snaps
 // Retime opens the repository that the Secret names and calls
 // Repository.Retime on it with the other arguments. Repository.Retime
 // describes what they mean.
-func (l S3Lister) Retime(ctx context.Context, secret *corev1.Secret, short string, at time.Time, tag string) (Snapshot, error) {
+func (l S3Lister) Retime(ctx context.Context, secret *corev1.Secret, id string, at time.Time, tag string) (Snapshot, error) {
 	repo, err := l.open(ctx, secret)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return repo.Retime(ctx, short, at, tag)
+	return repo.Retime(ctx, id, at, tag)
 }

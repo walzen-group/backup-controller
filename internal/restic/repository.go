@@ -64,8 +64,7 @@ type Snapshot struct {
 }
 
 // ShortID returns the first eight characters of the snapshot's ID, the form
-// restic prints. A VolSync mover logs it in a line such as
-// "snapshot 6e473100 saved".
+// restic prints and the controller shows in a run's status.
 func (s Snapshot) ShortID() string {
 	if len(s.ID) < 8 {
 		return s.ID
@@ -316,8 +315,7 @@ func AtOrBefore(snapshots []Snapshot, t time.Time) (Snapshot, bool) {
 }
 
 // ByShortID returns the first snapshot whose ID starts with the prefix in
-// short, and false when none does or the prefix is empty. A BackupRun passes
-// the short ID that a mover logged.
+// short, and false when none does or the prefix is empty.
 func ByShortID(snapshots []Snapshot, short string) (Snapshot, bool) {
 	for _, s := range snapshots {
 		if short != "" && strings.HasPrefix(s.ID, short) {

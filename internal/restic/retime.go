@@ -79,9 +79,10 @@ func (e *LockedError) Error() string {
 //
 // Parameters:
 //   - ctx cancels the wait for the lock and the calls to the storage backend.
-//   - short is the snapshot's ID, or the start of it. A BackupRun passes the
-//     eight characters a mover logs in "snapshot da4d7eb4 saved", because that
-//     log line is the only place it learns the ID.
+//   - id is the snapshot's ID. A BackupRun passes the full ID it recorded
+//     when it found the snapshot its sync wrote in the repository. The start
+//     of an ID works too: Retime then takes the first snapshot whose ID
+//     starts with it.
 //   - at is the time the snapshot should carry. A BackupRun passes its
 //     restartedAt: the volume didn't change between the last pod stopping and
 //     that moment, so a database recovered to that time matches the files.
@@ -108,15 +109,15 @@ func (e *LockedError) Error() string {
 // same time as a mover. If the snapshot was already retimed, Retime finds the
 // copy through its original field and returns it. A controller that restarts
 // before it records the new ID gets the same snapshot back.
-func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag string) (Snapshot, error) {
-	if short == "" {
+func (r *Repository) Retime(ctx context.Context, id string, at time.Time, tag string) (Snapshot, error) {
+	if id == "" {
 		return Snapshot{}, errors.New("no snapshot named")
 	}
 	unlock, err := r.lockExclusive(ctx)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	written, err := r.retime(ctx, short, at.Truncate(time.Second), tag)
+	written, err := r.retime(ctx, id, at.Truncate(time.Second), tag)
 	if unlockErr := unlock(); unlockErr != nil {
 		return Snapshot{}, errors.Join(err, fmt.Errorf("remove the controller's lock: %w", unlockErr))
 	}

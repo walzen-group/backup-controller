@@ -197,17 +197,18 @@ func TestRetimeKeepsTheSnapshotsOtherFields(t *testing.T) {
 }
 
 // TestRetimeAgainReturnsTheFirstRewrite checks that a second Retime with the
-// old ID returns the snapshot the first one wrote, and writes nothing more. A
-// controller that restarts after the rewrite and before it records the new ID
+// old full ID returns the snapshot the first one wrote, and writes nothing
+// more. A BackupRun retimes by the full ID it recorded, and one whose
+// controller restarts after the rewrite and before it records the new ID
 // makes exactly that second call.
 func TestRetimeAgainReturnsTheFirstRewrite(t *testing.T) {
 	_, repo := writableFixture(t)
 
-	first, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	first, err := repo.Retime(context.Background(), mondayID, quiescedAt, QuiescedTag)
 	if err != nil {
 		t.Fatalf("first retime: %v", err)
 	}
-	second, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	second, err := repo.Retime(context.Background(), mondayID, quiescedAt, QuiescedTag)
 	if err != nil {
 		t.Fatalf("second retime: %v", err)
 	}
