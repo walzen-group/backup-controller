@@ -29,12 +29,13 @@ import (
 // TimedOut (see timeOut), and a message that names the SourceBusy wait it
 // was in. A run whose items have all finished only waits for its stopped
 // movers to go before it gives the app back, so a deadline that passes
-// during that wait leaves it waiting, and it ends as its items say. With
-// spec.quiesce set, the first passes call quiesce to stop the listed
-// workloads, and later passes restore nothing until every pod of those
-// workloads is gone. work then moves each volume item a step further (see
-// restoreVolume), and stops the restore Job of each item that has finished
-// once its end is in the status (see stopJobs). The databases wait
+// during that wait leaves it waiting, and it ends as its items say. The
+// first passes call quiesce to stop the workloads spec.quiesce lists and the
+// ones marked backup.wlz.li/quiesce (see quiesceFirst), and later passes
+// restore nothing until every pod of those workloads is gone. work then
+// moves each volume item a step further (see restoreVolume), and stops the
+// restore Job of each item that has finished once its end is in the status
+// (see stopJobs). The databases wait
 // until every volume item is done; when a volume restore failed, the
 // databases still Pending are skipped and left running, and otherwise each
 // is moved a step further (see restoreDatabase).
@@ -172,22 +173,6 @@ func (r *RestoreRunReconciler) releaseFinished(ctx context.Context, run *backupv
 	return nil
 }
 
-// quiesceFirst stops the workloads of spec.quiesce before anything else.
-//
-// Parameters:
-//   - run is the RestoreRun in its work pass.
-//
-// It returns done true, with the result and error of quiesce, while the run
-// has workloads to stop and has not recorded status.quiescedAt, and done
-// false otherwise.
-func (r *RestoreRunReconciler) quiesceFirst(ctx context.Context, run *backupv1alpha1.RestoreRun) (done bool, result ctrl.Result, err error) {
-	if len(run.Spec.Quiesce) == 0 || run.Status.QuiescedAt != nil {
-		return false, ctrl.Result{}, nil
-	}
-	result, err = r.quiesce(ctx, run)
-	return true, result, err
-}
-
 // waitForStoppedPods keeps a run that stopped its workloads from restoring
 // while a pod of them still runs.
 //
@@ -203,7 +188,7 @@ func (r *RestoreRunReconciler) waitForStoppedPods(ctx context.Context, run *back
 	if !stopped(run) || !anyRestorePending(run.Status.Items) {
 		return false, ctrl.Result{}, nil
 	}
-	targets, err := quiesce.Named(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
+	targets, err := quiesce.NamedAndMarked(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
 	if err != nil {
 		if !asRunRefusal(err) {
 			return true, ctrl.Result{}, err

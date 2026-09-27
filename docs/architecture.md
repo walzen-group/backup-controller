@@ -31,7 +31,7 @@ In the app's namespace:
 | CloudNativePG Backup `<cluster>-<suffix>` | each BackupRun, one per Cluster marked `backup.wlz.li/enabled` | stays, as CloudNativePG's backup record |
 | restore Job `restore-<run uid>-<item index>`, with the run as its controller | a RestoreRun that restores a volume: in place, or with `claim:` and `into:`, or with `repository:` and `into:`. The run creates the Job suspended. The run resumes the Job after the run's status records it | the run stops and deletes the Job after the item's end is in the run's status. If the run never recorded a Job, the garbage collector deletes that Job when the run goes |
 | Lease `backup-controller-claim-<claim uid>` and `backup-controller-repo-<secret uid>` | a run, immediately before it creates its ReplicationSource trigger or restore Job for an item | the run releases the Lease after two conditions are true. The item's end is in the run's status. No pod of its stopped restore Job can still write. Another run takes over the Lease when its holder is gone or finished |
-| Lease `backup-controller-quiesce` in the run's namespace | a run, before it records the plan that stops the workloads of a BackupRun with `all: true`, or of a RestoreRun that lists `quiesce` | the run releases the Lease after the run's stored status shows the workloads back. Another run takes over the Lease when its holder finished, is gone or gave the workloads back |
+| Lease `backup-controller-quiesce` in the run's namespace | a run, before it records the plan that stops the workloads of a BackupRun with `all: true`, or of a RestoreRun in place that has a workload to stop | the run releases the Lease after the run's stored status shows the workloads back. Another run takes over the Lease when its holder finished, is gone or gave the workloads back |
 | a scratch claim named by `into:` | a RestoreRun with `into:`, owned by the run. The claim carries no data source, and the run's restore Job fills it | deleted with the RestoreRun, the claim's dataset included |
 
 In the controller's namespace, three objects exist for each claim that the
@@ -51,7 +51,7 @@ On objects the controller does not own:
 
 | Object | Write | When |
 | --- | --- | --- |
-| Deployment or StatefulSet marked `backup.wlz.li/quiesce` | the replica count to 0, then back to the recorded value, through the `scale` subresource. The run reads the Scale, then sends an update without a resourceVersion. This update changes only `spec.replicas` (internal/quiesce/stop.go) | during a BackupRun with `all: true` |
+| Deployment or StatefulSet marked `backup.wlz.li/quiesce` | the replica count to 0, then back to the recorded value, through the `scale` subresource. The run reads the Scale, then sends an update without a resourceVersion. This update changes only `spec.replicas` (internal/quiesce/stop.go) | during a BackupRun with `all: true`, and during a RestoreRun in place |
 | Deployment or StatefulSet a RestoreRun's `quiesce` lists | the same | from the RestoreRun's start until the run restores its volumes and deletes its databases |
 | the workload's Flux Kustomization | `spec.suspend` on, then off, only when the run found it running and its `status.inventory` lists the workload | the same as its workload |
 | a snapshot in the volume's restic repository | a new snapshot file at the run's `restartedAt`, tagged `quiesced`, replacing the one the mover wrote, under a lock file in locks/ | after the mover of a BackupRun that stopped workloads |

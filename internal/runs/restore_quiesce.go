@@ -10,20 +10,60 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-// quiesce stops the workloads spec.quiesce lists, before the run restores
+// quiesceFirst stops the workloads of the app before the run restores
+// anything in place: the ones spec.quiesce lists and the ones marked
+// backup.wlz.li/quiesce, which a BackupRun of the namespace stops (see
+// quiesce.NamedAndMarked). A volume restored into its own claim and a
+// Cluster that the restore deletes both change the data under the running
+// app. An into restore does not come here (see restoreIntoEmptyClaim).
+//
+// Parameters:
+//   - run is the RestoreRun in its work pass.
+//
+// It returns done false when the run has recorded status.quiescedAt, and
+// when it has no plan and nothing to stop: that run restores with the app
+// as it is, and looks again at the next pass. It returns done true, with
+// what quiesce returns, while the run has workloads to stop. A spec.quiesce
+// entry the namespace does not hold ends the run as Failed with reason
+// Invalid before anything is stopped. Any other failed read comes back as
+// an error, and the pass is retried.
+func (r *RestoreRunReconciler) quiesceFirst(ctx context.Context, run *backupv1alpha1.RestoreRun) (done bool, result ctrl.Result, err error) {
+	if run.Status.QuiescedAt != nil {
+		return false, ctrl.Result{}, nil
+	}
+	var targets []quiesce.Workload
+	if len(run.Status.Quiesced) == 0 {
+		targets, err = quiesce.NamedAndMarked(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
+		if asRunRefusal(err) {
+			result, err = r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
+			return true, result, err
+		}
+		if err != nil {
+			return true, ctrl.Result{}, err
+		}
+		if len(targets) == 0 {
+			return false, ctrl.Result{}, nil
+		}
+	}
+	result, err = r.quiesce(ctx, run, targets)
+	return true, result, err
+}
+
+// quiesce stops the workloads of the app, before the run restores
 // anything.
 //
 // Parameters:
 //   - run is the RestoreRun, Running with its items planned and no
 //     status.quiescedAt yet. quiesce records its plan and the stop in the
 //     run's status.
+//   - targets are the workloads to stop (see quiesceFirst). quiesce reads
+//     them only when the run has no plan recorded yet.
 //
 // It returns a result that requeues the run: after pollInterval while it
 // waits, after a second or two once the stop is recorded. A run it ends
-// returns what finish or abort returns. A failed read of an entry or a
-// Kustomization, a failed Lease call and a failed status write come back as
-// an error, and the pass is retried with nothing stopped that the status
-// does not record.
+// returns what finish or abort returns. A failed read of a Kustomization, a
+// failed Lease call and a failed status write come back as an error, and
+// the pass is retried with nothing stopped that the status does not record.
 //
 // Before it records a plan, with nothing stopped, quiesce fails a Pending
 // volume item that restoreVolume would refuse before its restore Job exists
@@ -34,10 +74,9 @@ import (
 // holds the namespace's quiesce Lease (see acquireQuiesceLease). A run
 // left with no Pending item, by that or because the plan Skipped every item,
 // stops nothing: quiesce records status.quiescedAt and status.restartedAt at
-// the same moment, and work then finishes the run. A spec.quiesce entry the
-// namespace does not hold ends the run as Failed with reason Invalid before
-// anything is stopped, and a Kustomization that also applies workloads of
-// another namespace aborts it with reason Invalid (see quiesce.Plan).
+// the same moment, and work then finishes the run. A Kustomization that also
+// applies workloads of another namespace aborts the run with reason Invalid
+// (see quiesce.Plan).
 //
 // quiesce then records the plan from quiesce.Plan in status.quiesced and
 // status.suspendedKustomizations, with each workload's replica count, and
@@ -51,8 +90,8 @@ import (
 // a failed stop, it narrows the plan with quiesce.Applied to what is stopped
 // now, and aborts the run with reason Failed, which starts those workloads
 // again and resumes the Kustomizations, the same as a BackupRun does.
-func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	if done, result, err := r.readyToStop(ctx, run); done {
+func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.RestoreRun, targets []quiesce.Workload) (ctrl.Result, error) {
+	if done, result, err := r.readyToStop(ctx, run, targets); done {
 		return result, err
 	}
 	stopErr := quiesce.Apply(ctx, r.Client, run.Namespace, run.Status.Quiesced, run.Status.SuspendedKustomizations)
@@ -75,6 +114,7 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 //
 // Parameters:
 //   - run is the RestoreRun, with no status.quiescedAt yet.
+//   - targets are the workloads to stop, which planStop plans.
 //
 // It returns done false when quiesce can apply the plan. It returns done
 // true, with the result and the error that the pass returns, when the pass
@@ -85,9 +125,9 @@ func (r *RestoreRunReconciler) quiesce(ctx context.Context, run *backupv1alpha1.
 // since stopped the app, given it back and ended the run. The stored run
 // decides (see stopOwed). A run that no longer owes the stop changes
 // nothing and looks again after a second.
-func (r *RestoreRunReconciler) readyToStop(ctx context.Context, run *backupv1alpha1.RestoreRun) (done bool, result ctrl.Result, err error) {
+func (r *RestoreRunReconciler) readyToStop(ctx context.Context, run *backupv1alpha1.RestoreRun, targets []quiesce.Workload) (done bool, result ctrl.Result, err error) {
 	if len(run.Status.Quiesced) == 0 {
-		return r.planStop(ctx, run)
+		return r.planStop(ctx, run, targets)
 	}
 	owed, err := stopOwed(ctx, r.Reader, run)
 	if err != nil {
@@ -105,25 +145,17 @@ func (r *RestoreRunReconciler) readyToStop(ctx context.Context, run *backupv1alp
 // Parameters:
 //   - run is the RestoreRun, with no plan recorded yet. planStop fails its
 //     items and records its plan in place.
+//   - targets are the workloads to stop (see quiesceFirst).
 //
 // It returns done false once planStop recorded the plan, and quiesce then
 // applies it. It returns done true, with the result and the error that the
 // pass returns, when the pass ends here: the run ends, waits, has nothing
 // to stop, or a read or a write failed.
 //
-// The steps are the ones quiesce describes: the spec.quiesce entries (see
-// quiesce.Named), the pre-check of the items (see precheckItems), the
-// record of a run with no Pending item, the waits (see waitingOn and
-// acquireQuiesceLease), and the plan (see quiesce.Plan).
-func (r *RestoreRunReconciler) planStop(ctx context.Context, run *backupv1alpha1.RestoreRun) (done bool, result ctrl.Result, err error) {
-	targets, err := quiesce.Named(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
-	if asRunRefusal(err) {
-		result, err = r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
-		return true, result, err
-	}
-	if err != nil {
-		return true, ctrl.Result{}, err
-	}
+// The steps are the ones quiesce describes: the pre-check of the items (see
+// precheckItems), the record of a run with no Pending item, the waits (see
+// waitingOn and acquireQuiesceLease), and the plan (see quiesce.Plan).
+func (r *RestoreRunReconciler) planStop(ctx context.Context, run *backupv1alpha1.RestoreRun, targets []quiesce.Workload) (done bool, result ctrl.Result, err error) {
 	held, err := r.precheckItems(ctx, run)
 	if err != nil || held.held() {
 		result, err = r.waitAtQuiesce(ctx, run, held, err)
@@ -166,7 +198,7 @@ func (r *RestoreRunReconciler) planStop(ctx context.Context, run *backupv1alpha1
 //   - run is the RestoreRun, which holds the namespace's quiesce Lease.
 //     recordPlan records the plan in status.quiesced and
 //     status.suspendedKustomizations.
-//   - targets are the workloads spec.quiesce names (see quiesce.Named).
+//   - targets are the workloads to stop (see quiesceFirst).
 //
 // It returns done false once recordPlan wrote the plan. It returns done
 // true when quiesce.Plan refuses a Kustomization that also applies

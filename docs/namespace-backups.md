@@ -53,7 +53,7 @@ metadata:
 | backup.wlz.li/prune-interval-days | Namespace | days between prunes of each repository that the sources of the namespace write. Without it, 1. |
 | backup.wlz.li/enabled | claim, Cluster | whether a run includes it. The controller reads nothing else to find what to back up. |
 | backup.wlz.li/retain-last and the six other retain- annotations | claim | which snapshots the repository of the volume keeps. See [Retention](#retention). |
-| backup.wlz.li/quiesce | Deployment, StatefulSet | whether the workload stops while the volumes' clones are cut |
+| backup.wlz.li/quiesce | Deployment, StatefulSet | whether the workload stops while the volumes' clones are cut, and while a RestoreRun restores in place |
 | backup.wlz.li/restore-as-of | claim, Cluster | the moment every automatic restore of it goes back to |
 
 A claim still names its VolumeRestore in `dataSourceRef`. That object gives the
@@ -727,7 +727,8 @@ run writes a stop plan, it gets the `coordination.k8s.io` Lease
 `backup-controller-quiesce` in its own namespace. Only two kinds of run get it:
 
 - A BackupRun with `all: true` that has at least one target.
-- A RestoreRun whose `spec.quiesce` lists a workload.
+- A RestoreRun in place that has a workload to stop: one marked
+  `backup.wlz.li/quiesce` or one that its `spec.quiesce` lists.
 
 A run with `source:` or `database:` gets no quiesce Lease.
 
@@ -801,10 +802,10 @@ archive.
 
 A run with `all: true` also accepts `syncDatabaseToVolume`. It recovers the
 databases to the moment that the snapshot of the volumes holds. Each run except
-an `into` restore accepts `quiesce`, a list of workloads that the run stops
-while it restores. The `backup.wlz.li/quiesce` annotation has no part in a
-restore. [Restore a whole namespace to one
-moment](#restore-a-whole-namespace-to-one-moment) uses both.
+an `into` restore stops the workloads marked `backup.wlz.li/quiesce` while it
+restores, the same ones that a BackupRun with `all: true` stops. It also
+accepts `quiesce`, a list of more workloads to stop. [Restore a whole
+namespace to one moment](#restore-a-whole-namespace-to-one-moment) uses both.
 
 ### Checks before anything is touched
 
@@ -876,7 +877,7 @@ Thus the run waits with reason WaitingForShutdown until no pod or PVC with the
 label `cnpg.io/cluster: <name>` stays in the namespace. Its message names the
 pod or PVC that it waits for. After that, the run does these steps:
 
-1. It gives the workloads under `quiesce` back.
+1. It gives the workloads that it stopped back.
 2. It resumes the Kustomizations that it suspended.
 3. It waits in phase Waiting until the Cluster is created again:
 
@@ -969,8 +970,9 @@ or before the moment.
 ### Restore a whole namespace to one moment
 
 If you add `syncDatabaseToVolume: true` to a run with `all: true`, the databases
-recover to the time on the snapshot of the volumes. If you add the workloads of
-the app under `quiesce`, the run stops them and gives them back itself. This is
+recover to the time on the snapshot of the volumes. The run stops the workloads
+marked `backup.wlz.li/quiesce` and the ones under `quiesce`, and gives them
+back itself. This is
 the run used on the prod canary on v0.7.0:
 
 ```yaml
@@ -996,8 +998,8 @@ spec:
      writes one`.
    - The snapshots of two claims have different times.
    - The namespace does not hold a listed workload.
-2. It suspends the Flux Kustomization of each listed workload, by the rule in
-   [Which Kustomization a run suspends](#which-kustomization-a-run-suspends).
+2. It suspends the Flux Kustomization of each workload that it stops, by
+   the rule in [Which Kustomization a run suspends](#which-kustomization-a-run-suspends).
    It scales the workload to zero and waits until no pod of it is left.
 3. It restores each volume from the quiesced snapshot that it selected, whose
    time is `syncedTo`. A restore Job restores that snapshot by its full ID.

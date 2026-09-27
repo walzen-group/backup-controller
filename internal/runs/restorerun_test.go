@@ -483,21 +483,78 @@ func TestAQuiescedRestoreOfAMissingWorkloadFailsBeforeStoppingAnything(t *testin
 	}
 }
 
-// A restore without spec.quiesce leaves the app running and waits with reason
-// ClaimInUse for its pod to stop. The backup.wlz.li/quiesce annotation only
-// tells a BackupRun what to stop, so it makes no difference here.
-func TestARestoreWithoutQuiesceLeavesTheAppRunning(t *testing.T) {
+// A restore in place stops the workloads marked backup.wlz.li/quiesce, the
+// set a BackupRun of the namespace stops, also when spec.quiesce is empty.
+// The run scales them to zero before it creates a restore Job, and gives
+// them back once the restore is done.
+func TestARestoreStopsTheMarkedAppBeforeItsJob(t *testing.T) {
 	r, c := restoreReconciler(t, prober{saturday}, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true }),
 		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
 		deployment(), kustomization(false), writerPod())
-	restoreStep(t, r)
-	restoreStep(t, r)
 
-	if got := replicasOf(t, c); got != 2 {
-		t.Errorf("replicas = %d, want the app left at 2", got)
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // quiesce
+	if got := replicasOf(t, c); got != 0 {
+		t.Fatalf("replicas = %d after the run started, want 0", got)
 	}
-	if reason := readyReason(readRestoreRun(t, c).Status.Conditions); reason != backupv1alpha1.ReasonClaimInUse {
-		t.Errorf("reason = %q, want ClaimInUse", reason)
+	if !suspended(t, c) {
+		t.Error("the Kustomization was not suspended, and Flux would put the replicas back")
+	}
+	restoreStep(t, r) // the pod is still there
+	jobs := &batchv1.JobList{}
+	if err := c.List(context.Background(), jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("restore Job %s exists while the app's pod still ran", jobs.Items[0].Name)
+	}
+
+	if err := c.Delete(context.Background(), writerPod()); err != nil {
+		t.Fatal(err)
+	}
+	restoreStep(t, r) // restore the volume
+	completeJob(t, c)
+	restoreStep(t, r) // volume done, database deleted
+	restoreStep(t, r) // the volume's stopped mover is gone
+	if got := replicasOf(t, c); got != 2 {
+		t.Errorf("replicas = %d once the restore was done, want the 2 it had", got)
+	}
+	if suspended(t, c) {
+		t.Error("the Kustomization is still suspended after the restore")
+	}
+}
+
+// A restore stops the workloads spec.quiesce lists together with the ones
+// marked backup.wlz.li/quiesce, and gives each back its own count.
+func TestARestoreStopsTheListedAndTheMarkedWorkloads(t *testing.T) {
+	worker := deployment()
+	worker.Name, worker.Annotations, worker.Labels = "notes-worker", nil, nil
+	run := restoreRun(func(r *backupv1alpha1.RestoreRun) {
+		r.Spec.All = true
+		r.Spec.Quiesce = []backupv1alpha1.WorkloadRef{{Kind: "Deployment", Name: worker.Name}}
+	})
+	r, c := restoreReconciler(t, prober{saturday}, run,
+		claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret(),
+		deployment(), worker, kustomization(false), writerPod())
+	replicas := func(name string) int32 {
+		d := &appsv1.Deployment{}
+		get(t, c, ns, name, d)
+		return *d.Spec.Replicas
+	}
+
+	restoreStep(t, r) // plan
+	restoreStep(t, r) // quiesce
+	if replicas(appN) != 0 || replicas(worker.Name) != 0 {
+		t.Fatalf("replicas = %d and %d after the run started, want both 0", replicas(appN), replicas(worker.Name))
+	}
+	if got := readRestoreRun(t, c).Status.Quiesced; len(got) != 2 {
+		t.Errorf("quiesced = %+v, want the listed and the marked Deployment", got)
+	}
+
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	restoreStep(t, r)
+	if replicas(appN) != 2 || replicas(worker.Name) != 2 {
+		t.Errorf("replicas = %d and %d after the run ended, want both back at 2", replicas(appN), replicas(worker.Name))
 	}
 }
 
