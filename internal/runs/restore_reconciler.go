@@ -327,7 +327,7 @@ func (r *RestoreRunReconciler) waitAtChecks(ctx context.Context, run *backupv1al
 //   - run is the RestoreRun that waits, with the status this pass computed.
 //     Its status is written when it differs from the stored one.
 //   - message is the Ready message that says what the run waits for: a
-//     mover it stopped (see jobList.message).
+//     mover it stopped (see stopJobs).
 //
 // It returns a result that looks again after pollInterval, and the error of
 // the status read or write, if any.

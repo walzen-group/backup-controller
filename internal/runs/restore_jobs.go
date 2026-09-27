@@ -288,26 +288,6 @@ func addWaits(run *backupv1alpha1.RestoreRun, waits map[int]*restorejob.Waiting)
 	}
 }
 
-// jobLeft is a restore Job the run has stopped that may still write.
-type jobLeft struct {
-	// item is the name of the item the Job restored.
-	item string
-	// state is how far Stop got, for the wait message.
-	state restorejob.StopState
-}
-
-// jobList holds the restore Jobs a run has stopped that may still write, in
-// the order of status.items.
-type jobList []jobLeft
-
-// message returns the Ready message for a run that waits for the first Job
-// in the list. The caller asks only for a list that is not empty.
-func (l jobList) message() string {
-	j := l[0]
-	return fmt.Sprintf("waiting for the restore Job of claim %s, which the run stopped, to end: %s. "+
-		"The run gives the app back and lets other runs at the claim only after that", j.item, j.state)
-}
-
 // stopJobs stops the restore Jobs of the volume items a run is done with,
 // and reports those that may still write (rule X2).
 //
@@ -317,10 +297,12 @@ func (l jobList) message() string {
 //   - which chooses the items to stop: finished from work, so a Job that
 //     still restores keeps running, and anyItem from finish and finalize.
 //
-// It returns the chosen Jobs that are not stopped yet, in the order of
-// status.items, and an error that is a *releaseError naming the Job when a
-// read, the suspend, the pod list or the delete fails. The caller keeps
-// waiting on an error, and the next pass tries again.
+// It returns "" once every chosen Job is stopped. While one is not, it
+// returns the Ready message of a run that waits for the first such Job in
+// the order of status.items, and it still stops the others. It returns an
+// error that is a *releaseError naming the Job when a read, the suspend,
+// the pod list or the delete fails. The caller keeps waiting on an error,
+// and the next pass tries again.
 //
 // A chosen volume item that never named a Job gets the one the run created
 // under the item's name, if there is one, whatever the item's phase (see
@@ -331,30 +313,31 @@ func (l jobList) message() string {
 // item's Leases while it names a UID. The stop then clears only the UID:
 // the name stays as the record that the item had a Job and the run stopped
 // it, so a Job that holds the name later is never taken for a lost one.
-func (r *RestoreRunReconciler) stopJobs(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) (jobList, error) {
-	var left jobList
+func (r *RestoreRunReconciler) stopJobs(ctx context.Context, run *backupv1alpha1.RestoreRun, which func(backupv1alpha1.RestoreItem) bool) (string, error) {
+	waiting := ""
 	for i := range run.Status.Items {
 		item := &run.Status.Items[i]
 		if item.Kind != backupv1alpha1.ItemKindClaim || !which(*item) {
 			continue
 		}
 		if err := r.nameLostJob(ctx, run, i, item); err != nil {
-			return nil, jobReleaseError(jobName(run.UID, i), err)
+			return "", jobReleaseError(jobName(run.UID, i), err)
 		}
 		if item.JobUID == "" {
 			continue
 		}
 		state, err := restorejob.Stop(ctx, r.jobs(), jobRef(run, *item))
 		if err != nil {
-			return nil, jobReleaseError(item.Job, err)
+			return "", jobReleaseError(item.Job, err)
 		}
-		if !state.Stopped {
-			left = append(left, jobLeft{item: item.Name, state: state})
-			continue
+		if state.Stopped {
+			item.JobUID = ""
+		} else if waiting == "" {
+			waiting = fmt.Sprintf("waiting for the restore Job of claim %s, which the run stopped, to end: %s. "+
+				"The run gives the app back and lets other runs at the claim only after that", item.Name, state)
 		}
-		item.JobUID = ""
 	}
-	return left, nil
+	return waiting, nil
 }
 
 // nameLostJob records on a volume item that never named a restore Job the

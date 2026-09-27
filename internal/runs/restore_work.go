@@ -91,8 +91,8 @@ func (r *RestoreRunReconciler) work(ctx context.Context, run *backupv1alpha1.Res
 	// still holds until no pod of that Job can write (rule X2, see
 	// stopJobs). Only a finished item counts here: the Job of an item that
 	// is still Pending or Running is doing the restore, and belongs there.
-	if len(stopping) > 0 {
-		return r.waitForStopped(ctx, run, stopping.message())
+	if stopping != "" {
+		return r.waitForStopped(ctx, run, stopping)
 	}
 	if err := r.giveBackWhenDone(ctx, run, volumes, databases); err != nil {
 		return ctrl.Result{}, err
@@ -242,8 +242,8 @@ func (r *RestoreRunReconciler) restoreVolumes(ctx context.Context, run *backupv1
 // Parameters:
 //   - run is the RestoreRun in its work pass.
 //
-// It returns the Jobs that Stop has not reported stopped yet, and an error
-// when the status write or a stop fails.
+// It returns the wait message of stopJobs while a Job is not stopped yet,
+// and an error when the status write or a stop fails.
 //
 // A finished volume item's phase goes into the status before its restore
 // Job is stopped. The Job's conditions are the only record of how the
@@ -254,12 +254,12 @@ func (r *RestoreRunReconciler) restoreVolumes(ctx context.Context, run *backupv1
 // differs from the stored one: a pass that waits for the same stopped
 // Job as the pass before has its items stored already, and a write
 // would only start another reconcile.
-func (r *RestoreRunReconciler) stopFinishedJobs(ctx context.Context, run *backupv1alpha1.RestoreRun) (jobList, error) {
+func (r *RestoreRunReconciler) stopFinishedJobs(ctx context.Context, run *backupv1alpha1.RestoreRun) (string, error) {
 	if !finishedWithMover(run.Status.Items) {
-		return nil, nil
+		return "", nil
 	}
 	if err := r.writeChangedStatus(ctx, run); err != nil {
-		return nil, err
+		return "", err
 	}
 	return r.stopJobs(ctx, run, finished)
 }

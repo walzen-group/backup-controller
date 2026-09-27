@@ -275,8 +275,8 @@ func (r *RestoreRunReconciler) giveBack(ctx context.Context, run *backupv1alpha1
 	if err != nil {
 		return false, ctrl.Result{}, r.releaseFailed(ctx, run, err)
 	}
-	if len(left) > 0 {
-		result, err = r.waitForStopped(ctx, run, left.message())
+	if left != "" {
+		result, err = r.waitForStopped(ctx, run, left)
 		return false, result, err
 	}
 	if stopped(run) {
