@@ -164,29 +164,44 @@ func ResolveLocation(
 	mapper meta.RESTMapper,
 	namespace, objectStore, serverName string,
 ) (Location, error) {
+	at, _, err := resolveStore(ctx, c, mapper, namespace, objectStore, serverName)
+	return at, err
+}
+
+// resolveStore is ResolveLocation that also returns the ObjectStore it read.
+// The webhook reads the status of that ObjectStore (see recordedBackup).
+//
+// The arguments, the Location and the errors are those of ResolveLocation.
+// The ObjectStore is nil when the error is not nil.
+func resolveStore(
+	ctx context.Context,
+	c client.Reader,
+	mapper meta.RESTMapper,
+	namespace, objectStore, serverName string,
+) (Location, *unstructured.Unstructured, error) {
 	at, store, err := archiveAt(ctx, c, mapper, namespace, objectStore, serverName)
 	if err != nil {
-		return Location{}, err
+		return Location{}, nil, err
 	}
 
 	accessKey, err := credential(ctx, c, namespace, store, "accessKeyId")
 	if err != nil {
-		return Location{}, err
+		return Location{}, nil, err
 	}
 	secretKey, err := credential(ctx, c, namespace, store, "secretAccessKey")
 	if err != nil {
-		return Location{}, err
+		return Location{}, nil, err
 	}
 
 	bundle, err := endpointCA(ctx, c, namespace, store)
 	if err != nil {
-		return Location{}, err
+		return Location{}, nil, err
 	}
 
 	at.AccessKey = accessKey
 	at.SecretKey = secretKey
 	at.CABundle = bundle
-	return at, nil
+	return at, store, nil
 }
 
 // archiveAt works out where one database archives from its ObjectStore alone,

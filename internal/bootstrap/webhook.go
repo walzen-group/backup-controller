@@ -110,7 +110,9 @@ const DefaultBudget = 10 * time.Second
 //   - A Cluster that carries OptOutAnnotation set to OptOutValue and declares
 //     no bootstrap other than initdb is allowed unchanged when nothing exists
 //     under its prefix, and refused when anything does, since CloudNativePG
-//     would never archive the new database there.
+//     would never archive the new database there. It is also refused when
+//     the status of the ObjectStore records a completed backup for its
+//     serverName (see contradicted).
 //   - A Cluster that declares a bootstrap other than initdb, such as
 //     recovery or pg_basebackup (see declaredBootstrap), is allowed unchanged,
 //     unless a RestoreRun is waiting for it. Then it's refused.
@@ -127,7 +129,9 @@ const DefaultBudget = 10 * time.Second
 //     allowed unchanged and starts empty when nothing at all exists under
 //     its prefix, and refused when anything does (WAL, or base backups that
 //     failed or never finished): CloudNativePG would never archive a new
-//     database there, and a recovery has nothing to start from.
+//     database there, and a recovery has nothing to start from. It is also
+//     refused over an empty prefix when the status of the ObjectStore
+//     records a completed backup for its serverName (see contradicted).
 //
 // Failures to read the store, list Clusters or RestoreRuns, or talk to the
 // object store return an HTTP 500 error response, which the API server treats
@@ -196,6 +200,9 @@ type creation struct {
 	store, serverName string
 	// at is the Location of the archive, from ResolveLocation.
 	at Location
+	// recorded is the lastSuccessfulBackupTime that the status of the
+	// ObjectStore records for serverName, or empty (see recordedBackup).
+	recorded string
 }
 
 // create decides a Cluster create that is not a dry run.
@@ -228,7 +235,7 @@ func (d *Decider) create(ctx context.Context, c creation) admission.Response {
 	// A lookup that runs discovery ends with the budget too.
 	mapper = boundedMapper{RESTMapper: mapper, ctx: ctx}
 
-	at, err := ResolveLocation(ctx, d.Client, mapper, c.req.Namespace, c.store, c.serverName)
+	at, objectStore, err := resolveStore(ctx, d.Client, mapper, c.req.Namespace, c.store, c.serverName)
 	if err != nil {
 		// The store is named and unreadable. Refusing is the failure that gets
 		// noticed; allowing would create an empty database beside a full
@@ -236,6 +243,7 @@ func (d *Decider) create(ctx context.Context, c creation) admission.Response {
 		return readFailed(ctx, c.logger, c.budget, fmt.Sprintf("reading the ObjectStore %s/%s and its Secrets", c.req.Namespace, c.store), err)
 	}
 	c.at = at
+	c.recorded = recordedBackup(objectStore, c.serverName)
 
 	if refusal, refused := d.sharedArchive(ctx, mapper, c); refused {
 		return refusal
@@ -270,6 +278,8 @@ func (d *Decider) create(ctx context.Context, c creation) admission.Response {
 // refuses a prefix that holds WAL, and the skip annotation would let the new
 // database overwrite the segments of the old one. So optOut allows the create
 // when the prefix is empty and refuses it when the prefix holds anything.
+// It also refuses an empty prefix when the status of the ObjectStore
+// records a completed backup for the server name (see contradicted).
 func (d *Decider) optOut(ctx context.Context, c creation) admission.Response {
 	archive, err := d.Prober.Survey(ctx, c.at, nil)
 	if err != nil {
@@ -281,6 +291,9 @@ func (d *Decider) optOut(ctx context.Context, c creation) admission.Response {
 			"The Cluster asks for an empty database (%s: %s), and s3://%s/%s still holds the archive of an earlier one. CloudNativePG will not archive a new database into a prefix that holds WAL, so this one would never be backed up. To discard the old archive, delete everything under s3://%s/%s and create the Cluster again. To keep it, give this Cluster a serverName that is not %q.",
 			OptOutAnnotation, OptOutValue, c.at.Bucket, c.at.ServerPrefix(), c.at.Bucket, c.at.ServerPrefix(), c.serverName,
 		))
+	}
+	if refusal, refused := contradicted(c); refused {
+		return refusal
 	}
 	c.logger.Info("leaving the Cluster to initdb", "reason", "opted out by annotation, and the prefix is empty")
 	return admission.Allowed("opted out")
@@ -352,9 +365,11 @@ func (d *Decider) recover(ctx context.Context, c creation, run *backupv1alpha1.R
 //     a recovery.
 //   - source names what asks for the recovery, for the message.
 //
-// It refuses the create when something asks for a recovery, and when the
-// prefix holds anything. It allows the Cluster unchanged when nothing asks
-// for a recovery and the prefix is empty.
+// It refuses the create when something asks for a recovery, when the prefix
+// holds anything, and when the status of the ObjectStore records a completed
+// backup for the server name (see contradicted). It allows the Cluster
+// unchanged when nothing asks for a recovery, the prefix is empty and the
+// status records no backup.
 func withoutBaseBackup(c creation, archive Archive, asked bool, source string) admission.Response {
 	if asked {
 		return admission.Denied(fmt.Sprintf(
@@ -369,6 +384,9 @@ func withoutBaseBackup(c creation, archive Archive, asked bool, source string) a
 	if !archive.Empty {
 		c.logger.Info("refusing the Cluster", "reason", "an archive with no completed base backup", "prefix", c.at.ServerPrefix())
 		return admission.Denied(noDoneBackup(c.at, c.serverName, archive.Backups))
+	}
+	if refusal, refused := contradicted(c); refused {
+		return refusal
 	}
 	c.logger.Info("leaving the Cluster to initdb", "reason", "no completed base backup in the store", "prefix", c.at.BasePrefix())
 	return admission.Allowed("no base backup")
