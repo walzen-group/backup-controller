@@ -87,8 +87,8 @@ func refuse(reason backupv1alpha1.ItemReason, format string, args ...any) error 
 //   - claim names the claim the item restores into.
 //   - err is the error the start check returned. It may be nil.
 //
-// It returns err marked with the claim spared when err holds a
-// *refusalError, and any other error, nil included, unchanged (see
+// It returns err marked with the claim spared when err holds a refusal
+// (see refusal), and any other error, nil included, unchanged (see
 // withSpared).
 func nothingWrittenTo(claim string, err error) error {
 	return withSpared(err, spared{kind: sparedClaim, claim: claim})
@@ -100,8 +100,8 @@ func nothingWrittenTo(claim string, err error) error {
 // Parameters:
 //   - err is the error the check returned. It may be nil.
 //
-// It returns err marked with the Cluster spared when err holds a
-// *refusalError, and any other error, nil included, unchanged (see
+// It returns err marked with the Cluster spared when err holds a refusal
+// (see refusal), and any other error, nil included, unchanged (see
 // withSpared).
 func nothingDeleted(err error) error {
 	return withSpared(err, spared{kind: sparedCluster})
@@ -111,22 +111,36 @@ func nothingDeleted(err error) error {
 // shared part of nothingWrittenTo and nothingDeleted.
 //
 // Parameters:
-//   - err is the error a check returned: a *refusalError, an error that
-//     wraps one, any other error, or nil.
+//   - err is the error a check returned: a refusal (see refusal), an error
+//     that wraps one, any other error, or nil.
 //   - what names the object the run left untouched.
 //
 // It returns a *sparedError that holds err whole, wrapper included, when
-// errors.As finds a *refusalError in err, so the message is err's own text
-// followed by the sentence on what was spared. It returns any other error,
-// nil included, unchanged, and an error already marked unchanged too, so
-// the sentence never appears twice.
+// err holds a refusal, so the message is err's own text followed by the
+// sentence on what was spared. It returns any other error, nil included,
+// unchanged, and an error already marked unchanged too, so the sentence
+// never appears twice.
 func withSpared(err error, what spared) error {
-	var refused *refusalError
 	var marked *sparedError
-	if !errors.As(err, &refused) || errors.As(err, &marked) {
+	if !refusal(err) || errors.As(err, &marked) {
 		return err
 	}
 	return &sparedError{err: err, spared: what}
+}
+
+// refusal reports whether an error refuses an item before the run wrote
+// anything for it.
+//
+// Parameters:
+//   - err is the error a check or a create returned. It may be nil.
+//
+// It returns true when errors.As finds a *refusalError in err, or a
+// *restorejob.SpecError, which Build returns for a restore Job spec it
+// refuses before the run creates the Job.
+func refusal(err error) bool {
+	var refused *refusalError
+	var badSpec *restorejob.SpecError
+	return errors.As(err, &refused) || errors.As(err, &badSpec)
 }
 
 // invalidSpecError is a refusal of the run as a whole: its spec names

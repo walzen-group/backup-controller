@@ -147,12 +147,12 @@ func (r *RestoreRunReconciler) recheckJobSnapshot(ctx context.Context, run *back
 //
 // It returns nil once the Job exists and the item names it. It returns the
 // *restorejob.SpecError of a spec Build refuses, and a *refusalError with
-// reason RestoreJobRefused, which says nothing was written to the claim,
-// when the API server refuses the create as Forbidden or Invalid (the
-// admission policy on the controller's Jobs, or a spec the server rejects).
-// Any other failed read or create comes back as a plain error for a retry;
-// a create that went through although it answered with an error is taken
-// over by the next pass (see takeOverJob).
+// reason RestoreJobRefused when the API server refuses the create as
+// Forbidden or Invalid (the admission policy on the controller's Jobs, or a
+// spec the server rejects). Both say that nothing was written to the claim
+// (see nothingWrittenTo). Any other failed read or create comes back as a
+// plain error for a retry; a create that went through although it answered
+// with an error is taken over by the next pass (see takeOverJob).
 //
 // The Job restores with --delete, so the claim ends up holding exactly the
 // snapshot. It runs as root with the capabilities to restore file ownership
@@ -180,7 +180,7 @@ func (r *RestoreRunReconciler) createJob(ctx context.Context, run *backupv1alpha
 		CacheCapacity:         settings.CacheCapacity,
 	})
 	if err != nil {
-		return err
+		return nothingWrittenTo(item.Name, err)
 	}
 	err = r.jobs().CreateJob(ctx, job)
 	switch {

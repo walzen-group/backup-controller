@@ -404,6 +404,25 @@ func TestAnItemWithoutAFullSnapshotIDFailsBeforeItStarts(t *testing.T) {
 	expectNothingCreated(t, c, "")
 }
 
+// An item whose restore Job spec Build refuses fails with reason
+// RestoreJobRefused before the Job exists, and its message says that
+// nothing was written to the claim, as every other refusal before the
+// create does. The repository lists a snapshot whose ID is no full ID, which
+// the recheck finds and Build refuses; no restic writes such an ID.
+func TestARefusedJobSpecSaysNothingWasWritten(t *testing.T) {
+	odd := monday
+	odd.ID = "6e473100"
+	r, c := restoreReconciler(t, nil, checkedRestore(inPlace, func(r *backupv1alpha1.RestoreRun) {
+		r.Status.Items[0].SnapshotID = odd.ID
+	}), claim(), volumeRestore(), repository())
+	r.Snapshots = snapshots{odd}
+	restoreStep(t, r)
+
+	expectItemFailed(t, c, "restore Job spec", "Nothing was written to claim "+claimN)
+	expectItemReason(t, c, backupv1alpha1.ItemReasonRestoreJobRefused)
+	expectNothingCreated(t, c, "")
+}
+
 // expectItemReason checks that the run's first item records the reason
 // given.
 func expectItemReason(t *testing.T, c client.Client, want backupv1alpha1.ItemReason) {
