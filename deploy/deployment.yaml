@@ -44,6 +44,18 @@ spec:
         args:
         - --namespace=backup-system
         - --webhook-cert-dir=/etc/webhook/tls
+        # The Go runtime collects garbage before the heap reaches the
+        # container's memory limit. Without GOMEMLIMIT it collects only when
+        # the heap doubles, and the 32 MiB a restic key derivation leaves
+        # behind grew the heap past the limit until the kubelet OOMKilled
+        # the pod. The divisor of 1 hands the limit over in bytes.
+        env:
+        - name: GOMEMLIMIT
+          valueFrom:
+            resourceFieldRef:
+              containerName: controller
+              resource: limits.memory
+              divisor: "1"
         ports:
         - name: metrics
           containerPort: 8080

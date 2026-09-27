@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
 )
 
@@ -66,13 +68,13 @@ func renderChart(t *testing.T, set ...string) (string, error) {
 	return string(output), err
 }
 
-// controllerArgs returns the args of the controller container of the
-// Deployment in a multi-document YAML render.
+// controllerContainer returns the controller container of the Deployment
+// in a multi-document YAML render.
 //
 // Parameters:
 //   - t fails the test when the render holds no such Deployment or container.
 //   - render is the output of helm template or the content of a manifest.
-func controllerArgs(t *testing.T, render string) []string {
+func controllerContainer(t *testing.T, render string) corev1.Container {
 	t.Helper()
 	for _, document := range strings.Split(render, "\n---") {
 		deployment := &appsv1.Deployment{}
@@ -81,12 +83,19 @@ func controllerArgs(t *testing.T, render string) []string {
 		}
 		for _, container := range deployment.Spec.Template.Spec.Containers {
 			if container.Name == "controller" {
-				return container.Args
+				return container
 			}
 		}
 	}
 	t.Fatalf("no Deployment with a controller container in:\n%s", render)
-	return nil
+	return corev1.Container{}
+}
+
+// controllerArgs returns the args of the controller container of the
+// Deployment in a multi-document YAML render (see controllerContainer).
+func controllerArgs(t *testing.T, render string) []string {
+	t.Helper()
+	return controllerContainer(t, render).Args
 }
 
 // TestTheChartRefusesToRenderWithoutARestoreImage checks that helm template
@@ -153,4 +162,61 @@ func restoreImageArgs(args []string) []string {
 		}
 	}
 	return found
+}
+
+// TestTheGoMemoryLimitIsTheContainersLimit checks that the controller
+// container in deploy/deployment.yaml and in the chart's render sets
+// GOMEMLIMIT from its own memory limit through the downward API, in bytes,
+// and that both set it the same way.
+//
+// Without GOMEMLIMIT the Go runtime collects only when the heap doubles
+// since the last collection. A repository Open holds 32 MiB for scrypt, and
+// the garbage it leaves let the heap grow past the container's 128Mi limit
+// until the kubelet OOMKilled the controller during the e2e suite. With the
+// limit known, the runtime collects before the heap reaches it.
+func TestTheGoMemoryLimitIsTheContainersLimit(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deployment.yaml"))
+	if err != nil {
+		t.Fatalf("read deploy/deployment.yaml: %v", err)
+	}
+	render, err := renderChart(t, "restoreImage="+pinnedRestoreImage)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, render)
+	}
+	want := corev1.EnvVar{
+		Name: "GOMEMLIMIT",
+		ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
+			ContainerName: "controller",
+			Resource:      "limits.memory",
+			Divisor:       resource.MustParse("1"),
+		}},
+	}
+	for source, manifest := range map[string]string{"deploy/deployment.yaml": string(content), "the chart": render} {
+		container := controllerContainer(t, manifest)
+		got := goMemLimit(container.Env)
+		if got == nil {
+			t.Errorf("%s sets no GOMEMLIMIT on the controller container", source)
+			continue
+		}
+		if got.Value != "" || got.ValueFrom == nil || got.ValueFrom.ResourceFieldRef == nil ||
+			got.ValueFrom.ResourceFieldRef.ContainerName != want.ValueFrom.ResourceFieldRef.ContainerName ||
+			got.ValueFrom.ResourceFieldRef.Resource != want.ValueFrom.ResourceFieldRef.Resource ||
+			got.ValueFrom.ResourceFieldRef.Divisor.Cmp(want.ValueFrom.ResourceFieldRef.Divisor) != 0 {
+			t.Errorf("%s sets GOMEMLIMIT to %+v, want the controller's limits.memory in bytes", source, got)
+		}
+		if _, ok := container.Resources.Limits[corev1.ResourceMemory]; !ok {
+			t.Errorf("%s sets no memory limit for GOMEMLIMIT to follow", source)
+		}
+	}
+}
+
+// goMemLimit returns the GOMEMLIMIT entry of a container's env, or nil when
+// there is none.
+func goMemLimit(env []corev1.EnvVar) *corev1.EnvVar {
+	for i := range env {
+		if env[i].Name == "GOMEMLIMIT" {
+			return &env[i]
+		}
+	}
+	return nil
 }
