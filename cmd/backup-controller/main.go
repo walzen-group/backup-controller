@@ -94,13 +94,14 @@ func main() {
 	// klog.Fatalf, which exits the process with a non-zero status, so a
 	// failed populator restarts the pod without help from this binary.
 	populatormachinery.RunControllerWithConfig(populatormachinery.VolumePopulatorConfig{
-		Kubeconfig:   options.Kubeconfig,
-		HttpEndpoint: *metricsAddr,
-		MetricsPath:  *metricsPath,
-		Namespace:    options.Namespace,
-		Prefix:       populator.Prefix,
-		Gk:           schema.GroupKind{Group: backupv1alpha1.GroupVersion.Group, Kind: "VolumeRestore"},
-		Gvr:          backupv1alpha1.GroupVersion.WithResource("volumerestores"),
+		Kubeconfig:            options.Kubeconfig,
+		HttpEndpoint:          *metricsAddr,
+		MetricsPath:           *metricsPath,
+		Namespace:             options.Namespace,
+		Prefix:                populator.Prefix,
+		SharedInformerOptions: populatorInformerOptions(),
+		Gk:                    schema.GroupKind{Group: backupv1alpha1.GroupVersion.Group, Kind: "VolumeRestore"},
+		Gvr:                   backupv1alpha1.GroupVersion.WithResource("volumerestores"),
 		ProviderFunctionConfig: &populatormachinery.ProviderFunctionConfig{
 			PopulateFn:         callbacks.Populate,
 			PopulateCompleteFn: callbacks.Complete,
