@@ -320,15 +320,15 @@ func TestAMissingRepositorySecretFailsTheItemBeforeTheAppStops(t *testing.T) {
 // Deployment's scale subresource, which is how quiesce and restart scale
 // the app, and returns the wrapped client and the counter.
 func countDeploymentScales(c client.Client) (client.Client, *int) {
-	patches := 0
+	scales := 0
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 			if _, ok := deploymentScale(sub, obj, opts); ok {
-				patches++
+				scales++
 			}
 			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
-	}), &patches
+	}), &scales
 }
 
 // A quiesced RestoreRun whose claim's repository Secret is gone by the time
@@ -339,7 +339,7 @@ func countDeploymentScales(c client.Client) (client.Client, *int) {
 // BackupRun).
 func TestARestoreWhoseRepositorySecretIsGoneFailsBeforeTheAppStops(t *testing.T) {
 	c := newClient(t, quiescedRestore(), claim(), volumeRestore(), repository(), deployment(), kustomization(false))
-	watching, patches := countDeploymentScales(c)
+	watching, scales := countDeploymentScales(c)
 	r := &RestoreRunReconciler{Client: watching, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
 
 	restoreStep(t, r) // plan
@@ -354,8 +354,8 @@ func TestARestoreWhoseRepositorySecretIsGoneFailsBeforeTheAppStops(t *testing.T)
 		!strings.Contains(run.Status.Items[0].Message, "repository Secret "+repoN) {
 		t.Fatalf("phase = %q, items = %+v; want Failed with the item naming repository Secret %s", run.Status.Phase, run.Status.Items, repoN)
 	}
-	if *patches != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
-		t.Errorf("Deployment scale writes = %d, quiesced = %+v, suspended = %t; want the app never stopped", *patches, run.Status.Quiesced, suspended(t, c))
+	if *scales != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
+		t.Errorf("Deployment scale writes = %d, quiesced = %+v, suspended = %t; want the app never stopped", *scales, run.Status.Quiesced, suspended(t, c))
 	}
 }
 
@@ -364,7 +364,7 @@ func TestARestoreWhoseRepositorySecretIsGoneFailsBeforeTheAppStops(t *testing.T)
 // and ends Failed saying nothing was restored.
 func TestAQuiescedRestoreWithNothingToRestoreStopsNothing(t *testing.T) {
 	c := newClient(t, quiescedRestore(), cluster(optedOut), objectStore(), storeSecret(), deployment(), kustomization(false))
-	watching, patches := countDeploymentScales(c)
+	watching, scales := countDeploymentScales(c)
 	r := &RestoreRunReconciler{Client: watching, Reader: c, Prober: prober{saturday}, Now: frozenNow}
 
 	restoreStep(t, r) // plan: the Cluster is Skipped
@@ -375,8 +375,8 @@ func TestAQuiescedRestoreWithNothingToRestoreStopsNothing(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonNoBackupInReach {
 		t.Fatalf("phase = %q, reason = %q; want Failed, NoBackupInReach", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
-	if *patches != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
-		t.Errorf("Deployment scale writes = %d, quiesced = %+v, suspended = %t; want the app never stopped", *patches, run.Status.Quiesced, suspended(t, c))
+	if *scales != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
+		t.Errorf("Deployment scale writes = %d, quiesced = %+v, suspended = %t; want the app never stopped", *scales, run.Status.Quiesced, suspended(t, c))
 	}
 }
 
@@ -482,7 +482,7 @@ func TestAnItemRestoreVolumeWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newClient(t, quiescedRestore(), claim(), volumeRestore(), repository(), deployment(), kustomization(false))
-			watching, patches := countDeploymentScales(c)
+			watching, scales := countDeploymentScales(c)
 			r := &RestoreRunReconciler{Client: watching, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
 
 			restoreStep(t, r) // plan
@@ -495,8 +495,8 @@ func TestAnItemRestoreVolumeWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
 				run.Status.Items[0].Phase != backupv1alpha1.ItemFailed || run.Status.Items[0].Message != want {
 				t.Fatalf("phase = %q, items = %+v; want Failed with the item message %q", run.Status.Phase, run.Status.Items, want)
 			}
-			if *patches != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
-				t.Errorf("Deployment scale writes = %d, quiesced = %+v, suspended = %t; want the app never stopped", *patches, run.Status.Quiesced, suspended(t, c))
+			if *scales != 0 || len(run.Status.Quiesced) != 0 || suspended(t, c) {
+				t.Errorf("Deployment scale writes = %d, quiesced = %+v, suspended = %t; want the app never stopped", *scales, run.Status.Quiesced, suspended(t, c))
 			}
 		})
 	}

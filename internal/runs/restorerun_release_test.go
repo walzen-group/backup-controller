@@ -120,7 +120,7 @@ func TestARestoreThatCannotGiveTheAppBackSaysWhatFailed(t *testing.T) {
 		t.Errorf("replicas = %d, want the app still down", got)
 	}
 	message := readyMessage(after.Status.Conditions)
-	for _, want := range []string{"Deployment " + appN, "2", "patch refused"} {
+	for _, want := range []string{"Deployment " + appN, "2", "scale refused"} {
 		if !strings.Contains(message, want) {
 			t.Errorf("message %q does not name %q", message, want)
 		}

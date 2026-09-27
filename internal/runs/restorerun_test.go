@@ -569,7 +569,7 @@ func refuseDeploymentScales(c client.Client) client.Client {
 	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 			if _, ok := deploymentScale(sub, obj, opts); ok {
-				return apierrors.NewForbidden(appsv1.Resource("deployments/scale"), obj.GetName(), errors.New("patch refused"))
+				return apierrors.NewForbidden(appsv1.Resource("deployments/scale"), obj.GetName(), errors.New("scale refused"))
 			}
 			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
@@ -595,7 +595,7 @@ func TestAQuiescedRestoreThatCannotStopTheAppFailsAtOnce(t *testing.T) {
 	if run.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(run.Status.Conditions) != backupv1alpha1.ReasonFailed {
 		t.Fatalf("phase = %q, reason = %q; want Failed with reason Failed", run.Status.Phase, readyReason(run.Status.Conditions))
 	}
-	if !strings.Contains(readyMessage(run.Status.Conditions), "patch refused") {
+	if !strings.Contains(readyMessage(run.Status.Conditions), "scale refused") {
 		t.Errorf("ready message = %q, want the scale error", readyMessage(run.Status.Conditions))
 	}
 	if suspended(t, c) {

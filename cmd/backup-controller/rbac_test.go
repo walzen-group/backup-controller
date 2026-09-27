@@ -156,7 +156,8 @@ func TestNoRuleWritesAWorkloadItself(t *testing.T) {
 	for source, role := range map[string]*rbacv1.ClusterRole{"deploy/": deploy, "the chart": chart} {
 		for _, resource := range []string{"deployments", "statefulsets"} {
 			for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
-				if allows(role, "apps", resource, verb) || allows(role, "*", resource, verb) || allows(role, "apps", "*", verb) {
+				if allows(role, "apps", resource, verb) || allows(role, "*", resource, verb) || allows(role, "apps", "*", verb) ||
+					allows(role, "*", "*", verb) {
 					t.Errorf("%s allows %s on %s; quiesce needs only the scale subresource", source, verb, resourceName("apps", resource))
 				}
 			}
