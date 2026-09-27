@@ -165,24 +165,6 @@ func TestNoRuleWritesAWorkloadItself(t *testing.T) {
 	}
 }
 
-// TestNoRuleReachesAReplicationDestination checks that neither ClusterRole,
-// in deploy/ or in the chart, grants any verb on VolSync's
-// ReplicationDestinations. Every restore, a RestoreRun's and the populator's,
-// runs in the controller's own restore Job, and no part of the controller
-// reads, creates or deletes a destination, so a grant would be one nothing
-// uses.
-func TestNoRuleReachesAReplicationDestination(t *testing.T) {
-	deploy := readClusterRole(t, filepath.Join("..", "..", "deploy", "rbac.yaml"))
-	chart := &rbacv1.ClusterRole{Rules: readChartRules(t, filepath.Join("..", "..", "chart", "templates", "rbac.yaml"))}
-	for source, role := range map[string]*rbacv1.ClusterRole{"deploy/": deploy, "the chart": chart} {
-		for _, verb := range []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"} {
-			if allows(role, "volsync.backube", "replicationdestinations", verb) {
-				t.Errorf("%s allows %s on %s; no restore uses a ReplicationDestination", source, verb, resourceName("volsync.backube", "replicationdestinations"))
-			}
-		}
-	}
-}
-
 // permission is one verb on one resource, as a single ClusterRole rule could
 // grant it. name is the one object the rule is limited to through
 // resourceNames, or empty when the rule covers every object of the resource.

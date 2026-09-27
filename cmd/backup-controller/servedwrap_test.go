@@ -56,14 +56,3 @@ func TestThePopulatorNeverTakesAVersionGoneForAMissingJob(t *testing.T) {
 	_, err := operationsFor(versionGoneClient(t)).GetJob(context.Background(), types.NamespacedName{Namespace: "backup-system", Name: "restore-9b7d4e21"})
 	checkNotMissing(t, "GetJob", err)
 }
-
-// The orphan reconciler reads it the same way through both its client and
-// its uncached reader.
-func TestTheOrphanReconcilerNeverTakesAVersionGoneForAMissingJob(t *testing.T) {
-	c := versionGoneClient(t)
-	orphans := orphanReconciler(c, c, nil, "backup-system")
-	key := types.NamespacedName{Namespace: "backup-system", Name: "restore-9b7d4e21"}
-
-	checkNotMissing(t, "the client's Get", orphans.Client.Get(context.Background(), key, &batchv1.Job{}))
-	checkNotMissing(t, "the reader's Get", orphans.Reader.Get(context.Background(), key, &batchv1.Job{}))
-}

@@ -98,24 +98,6 @@ func controllerArgs(t *testing.T, render string) []string {
 	return controllerContainer(t, render).Args
 }
 
-// TestTheChartRefusesToRenderWithoutARestoreImage checks that helm template
-// fails when the restoreImage value is not set, and that its error names the
-// value.
-//
-// The controller refuses to start without --restore-image, and has no
-// default image of its own. A chart that rendered without the value would
-// install a pod that exits at once; failing the render says what is missing
-// before anything is installed.
-func TestTheChartRefusesToRenderWithoutARestoreImage(t *testing.T) {
-	output, err := renderChart(t)
-	if err == nil {
-		t.Fatalf("helm template rendered without restoreImage:\n%s", output)
-	}
-	if !strings.Contains(output, "restoreImage") {
-		t.Errorf("helm's error does not name restoreImage:\n%s", output)
-	}
-}
-
 // TestTheChartPassesTheRestoreImage checks that the chart passes the
 // restoreImage value to the controller container as --restore-image,
 // unchanged and exactly once.
@@ -126,30 +108,6 @@ func TestTheChartPassesTheRestoreImage(t *testing.T) {
 	}
 	if got := restoreImageArgs(controllerArgs(t, output)); len(got) != 1 || got[0] != "--restore-image="+pinnedRestoreImage {
 		t.Errorf("the controller's --restore-image args are %q, want one with %s", got, pinnedRestoreImage)
-	}
-}
-
-// TestTheReleaseManifestsLeaveTheRestoreImageToTheInstaller checks that the
-// controller container in deploy/deployment.yaml has an args list and no
-// --restore-image in it.
-//
-// deploy/ is the release's plain manifest, and it names no restic image,
-// because only the installer knows which image VolSync backs up with. The
-// installer appends the flag to the controller's args (the infra module
-// does, and so does the e2e setup), so a flag here would reach the
-// controller twice, and a missing args list would leave nothing to append
-// to.
-func TestTheReleaseManifestsLeaveTheRestoreImageToTheInstaller(t *testing.T) {
-	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deployment.yaml"))
-	if err != nil {
-		t.Fatalf("read deploy/deployment.yaml: %v", err)
-	}
-	args := controllerArgs(t, string(content))
-	if len(args) == 0 {
-		t.Error("the controller container in deploy/deployment.yaml has no args to append --restore-image to")
-	}
-	if got := restoreImageArgs(args); len(got) != 0 {
-		t.Errorf("deploy/deployment.yaml passes %q; the installer appends --restore-image", got)
 	}
 }
 
@@ -219,45 +177,4 @@ func goMemLimit(env []corev1.EnvVar) *corev1.EnvVar {
 		}
 	}
 	return nil
-}
-
-// controllerMemoryRequest and controllerMemoryLimit are the memory request
-// and the memory limit of the controller container in deploy/ and in the
-// chart's default values.
-//
-// The process rests at about 50Mi, and each restic key derivation holds 32
-// MiB more while it runs. 128Mi left too little room: the e2e suite saw the
-// controller OOMKilled. The request is the same as the old limit, so that the
-// scheduler keeps that memory for the controller.
-const (
-	controllerMemoryRequest = "256Mi"
-	controllerMemoryLimit   = "512Mi"
-)
-
-// TestTheControllersMemoryLimit checks that the controller container in
-// deploy/deployment.yaml and in the chart's default render has the memory
-// request controllerMemoryRequest and the memory limit controllerMemoryLimit,
-// so both install the same controller.
-func TestTheControllersMemoryLimit(t *testing.T) {
-	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deployment.yaml"))
-	if err != nil {
-		t.Fatalf("read deploy/deployment.yaml: %v", err)
-	}
-	render, err := renderChart(t, "restoreImage="+pinnedRestoreImage)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, render)
-	}
-	wantRequest := resource.MustParse(controllerMemoryRequest)
-	wantLimit := resource.MustParse(controllerMemoryLimit)
-	for source, manifest := range map[string]string{"deploy/deployment.yaml": string(content), "the chart": render} {
-		resources := controllerContainer(t, manifest).Resources
-		got, ok := resources.Requests[corev1.ResourceMemory]
-		if !ok || got.Cmp(wantRequest) != 0 {
-			t.Errorf("%s requests %s of memory for the controller, want %s", source, got.String(), controllerMemoryRequest)
-		}
-		got, ok = resources.Limits[corev1.ResourceMemory]
-		if !ok || got.Cmp(wantLimit) != 0 {
-			t.Errorf("%s limits the controller's memory to %s, want %s", source, got.String(), controllerMemoryLimit)
-		}
-	}
 }

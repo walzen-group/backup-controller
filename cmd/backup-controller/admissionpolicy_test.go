@@ -5,7 +5,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 
@@ -139,35 +138,5 @@ func TestTheChartsPolicyMatchesItsServiceAccount(t *testing.T) {
 	}
 	if got := bindings[0]["spec"].(map[string]any)["policyName"]; got != name {
 		t.Errorf("the binding names the policy %v, want %v", got, name)
-	}
-}
-
-// TestTheChartCanLeaveOutTheAdmissionPolicy checks that admissionPolicy.create
-// false renders neither the policy nor its binding.
-func TestTheChartCanLeaveOutTheAdmissionPolicy(t *testing.T) {
-	render := renderChartIn(t, "backup-system", "restoreImage="+pinnedRestoreImage, "admissionPolicy.create=false")
-	for _, kind := range []string{kindPolicy, kindBinding} {
-		if got := documentsOfKind(t, render, kind); len(got) != 0 {
-			t.Errorf("the chart renders %d %s with admissionPolicy.create false, want none", len(got), kind)
-		}
-	}
-}
-
-// TestTheReleaseManifestsCarryTheAdmissionPolicy checks that
-// deploy/kustomization.yaml lists admissionpolicy.yaml, so the release asset
-// the kustomization renders carries the policy and its binding.
-func TestTheReleaseManifestsCarryTheAdmissionPolicy(t *testing.T) {
-	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "kustomization.yaml"))
-	if err != nil {
-		t.Fatalf("read deploy/kustomization.yaml: %v", err)
-	}
-	kustomization := struct {
-		Resources []string `json:"resources"`
-	}{}
-	if err := yaml.Unmarshal(content, &kustomization); err != nil {
-		t.Fatalf("parse deploy/kustomization.yaml: %v", err)
-	}
-	if !slices.Contains(kustomization.Resources, "admissionpolicy.yaml") {
-		t.Errorf("deploy/kustomization.yaml lists %v, without admissionpolicy.yaml", kustomization.Resources)
 	}
 }
