@@ -99,7 +99,7 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // error that either of them returns for a retry goes through planFailed,
 // which reports it on the Ready condition and ends the run once spec.timeout
 // has passed since its creation. A run past its checks continues in work, or in
-// restoreIntoEmptyClaim for an into restore. Before any of these, Reconcile
+// restoreIntoEmptyClaim for an into restore (see restore). Before any of these, Reconcile
 // adds the run's finalizer. A run being deleted gets its changes put back by
 // finalize, and a finished run is deleted once spec.ttlSecondsAfterFinished
 // has passed.
@@ -114,11 +114,13 @@ func (r *RestoreRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // pass that reads a VolSync object, such as the ReplicationSources a volume
 // item lists before it starts its restore Job (see otherMover), gets an
 // error naming the kind and v1alpha1, which it returns for a retry (see
-// serve). The run changes nothing on that error, and an app it has already
-// stopped stays stopped while it retries. Ending the run needs no VolSync
-// object, so a run that passes spec.timeout or is deleted still stops its
-// restore Jobs and gives the app back. VolSync is upgraded after the
-// controller, so a supported cluster never gets there.
+// serve). The run changes nothing on that error, shows it on its Ready
+// condition with reason VolSyncUnsupported (see restore), and an app it has
+// already stopped stays stopped while it retries. Ending the run needs no
+// VolSync object, so a run that passes spec.timeout ends TimedOut, and a run
+// that passes it or is deleted still stops its restore Jobs and gives the
+// app back. VolSync is upgraded after the controller, so a supported
+// cluster never gets there.
 //
 // A run that recorded status.ending has decided to end, and every later pass
 // only finishes it with that reason and message (see finish), also one that
@@ -149,10 +151,7 @@ func (r *RestoreRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if run.Status.Phase == "" {
 		return r.start(ctx, run)
 	}
-	if run.Spec.Into != "" {
-		return r.restoreIntoEmptyClaim(ctx, run)
-	}
-	return r.work(ctx, run)
+	return r.restore(ctx, run)
 }
 
 // start makes the first pass over a new run: it checks the installed

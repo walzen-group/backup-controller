@@ -142,18 +142,18 @@ const (
 	// records a Warning event when it first reports this.
 	ReasonReleaseFailed = "ReleaseFailed"
 
-	// ReasonVolSyncUnsupported reports a BackupRun that met an API server
-	// that does not serve VolSync's ReplicationSource or
-	// ReplicationDestination at volsync.backube/v1alpha1, the one version
-	// this controller reads and writes, while it serves the kind at another
-	// version. The message names the kind, v1alpha1 and the versions served.
-	// Giving the app back needs no VolSync object, so the run ends Failed
-	// with this reason, after it starts the workloads it stopped. Only
-	// BackupRuns use it. A RestoreRun's VolSync reads fail instead, and the
-	// run retries them, with an app it has already stopped kept stopped.
-	// Ending a RestoreRun needs no VolSync object, so one that passes its
-	// spec.timeout or is deleted still stops its restore Jobs and gives the
-	// app back.
+	// ReasonVolSyncUnsupported reports a run that met an API server that
+	// does not serve VolSync's ReplicationSource or ReplicationDestination
+	// at volsync.backube/v1alpha1, the one version this controller reads
+	// and writes, while it serves the kind at another version. The message
+	// names the kind, v1alpha1 and the versions served. Giving the app back
+	// needs no VolSync object, so a BackupRun ends Failed with this reason,
+	// after it starts the workloads it stopped. A RestoreRun past its checks
+	// shows it while it waits: it retries its VolSync reads on every pass,
+	// with an app it has already stopped kept stopped. Ending a RestoreRun
+	// needs no VolSync object, so one that passes its spec.timeout ends with
+	// reason TimedOut, and one that passes it or is deleted still stops its
+	// restore Jobs and gives the app back.
 	ReasonVolSyncUnsupported = "VolSyncUnsupported"
 
 	// ReasonClusterVersionUnsupported reports a RestoreRun that found the API

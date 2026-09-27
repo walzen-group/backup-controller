@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -187,5 +188,51 @@ func TestADeletedRestoreStopsItsJobWhenVolSyncDropsV1alpha1(t *testing.T) {
 	err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "back-to-monday"}, &backupv1alpha1.RestoreRun{})
 	if !apierrors.IsNotFound(err) {
 		t.Errorf("get the deleted run: %v, want it gone", err)
+	}
+}
+
+// A RestoreRun that meets a VolSync no longer serving v1alpha1 in the
+// middle of a restore waits and retries: each pass returns the error, and
+// the run's Ready condition shows it with reason VolSyncUnsupported, naming
+// the kind and the versions served, while the app stays stopped. Once the
+// run passes spec.timeout it ends TimedOut: it stops the restore Job of its
+// Running item, which needs no VolSync object, and gives the app back.
+func TestARestoreWaitsOnAnUnservedVolSyncUntilItTimesOut(t *testing.T) {
+	run, job := quiescedMidRestore(t)
+	pending := runningOnJob(cacheN, 1)
+	pending.Phase, pending.Job, pending.JobUID = backupv1alpha1.ItemPending, "", ""
+	run.Status.Items = append(run.Status.Items, pending)
+	r, c := movedRestoreReconciler(t, append([]client.Object{run, claim(), volumeRestore(), repository(),
+		stoppedDeployment(), kustomization(true), job}, cacheClaim()...)...)
+
+	for range 2 {
+		checkVolSyncRefused(t, tryRestoreStep(r), "ReplicationSource")
+	}
+	waiting := readRestoreRun(t, c)
+	checkVolSyncUnsupported(t, waiting.Status.Conditions, "ReplicationSource")
+	if waiting.Status.Phase.Finished() || replicasOf(t, c) != 0 {
+		t.Fatalf("phase = %q, replicas = %d; want the run waiting with the app stopped", waiting.Status.Phase, replicasOf(t, c))
+	}
+
+	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }
+	if err := tryRestoreStep(r); err != nil {
+		t.Fatalf("reconcile past the deadline: %v", err)
+	}
+	markSuspended(t, c, job)
+	for range 3 {
+		if err := tryRestoreStep(r); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+
+	done := readRestoreRun(t, c)
+	if done.Status.Phase != backupv1alpha1.RunPhaseFailed || readyReason(done.Status.Conditions) != backupv1alpha1.ReasonTimedOut {
+		t.Errorf("phase = %q, reason = %q; want Failed, TimedOut", done.Status.Phase, readyReason(done.Status.Conditions))
+	}
+	if jobs := restoreJobs(t, c); len(jobs) != 0 {
+		t.Errorf("restore Jobs = %v, want the stopped Job deleted", jobs)
+	}
+	if got := replicasOf(t, c); got != 2 || suspended(t, c) {
+		t.Errorf("replicas = %d, Kustomization suspended = %t; want the app's 2 back and the Kustomization resumed", got, suspended(t, c))
 	}
 }
