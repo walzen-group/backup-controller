@@ -37,6 +37,7 @@ type quiesceRefusalCase struct {
 // the stop. A caller that misses one would retry the error until the run's
 // timeout.
 func TestEveryQuiesceRefusalEndsTheRun(t *testing.T) {
+	t.Parallel()
 	crossNamespace := []client.Object{deploymentApplying(ns, appN), deploymentApplying(wikiNS, "wiki"), sharedKustomization(false)}
 	inventoryMissing := []client.Object{deployment(), kustomizationWithEntries(nil)}
 	entryMalformed := []client.Object{deployment(), kustomizationWithEntries([]any{map[string]any{"id": "notes-deployment", "v": "v1"}})}

@@ -68,6 +68,7 @@ func leaseHolderOf(t *testing.T, c client.Client, name string) string {
 // claim's Lease first creates its mover object, and the other waits with
 // reason SourceBusy and names it.
 func TestTwoRunsWhoseChecksPassTogetherStartOneMover(t *testing.T) {
+	t.Parallel()
 	orders := map[string][]string{
 		"in turn, backup first":  {"b", "r", "b", "r", "b", "r", "b", "r"},
 		"in turn, restore first": {"r", "b", "r", "b", "r", "b", "r", "b"},
@@ -139,6 +140,7 @@ func blindToQuiesce(c client.Client) client.Client {
 // plan and stops the app, and the other waits naming it. The namespace Lease
 // alone keeps them apart, in either order.
 func TestOnlyTheLeaseKeepsTwoQuiescesApart(t *testing.T) {
+	t.Parallel()
 	objects := func() []client.Object {
 		return []client.Object{
 			backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -197,6 +199,7 @@ func TestOnlyTheLeaseKeepsTwoQuiescesApart(t *testing.T) {
 // item for the claim has finished is taken over. One held by a run whose item
 // is still Pending is not: the backup waits and names that run.
 func TestAStaleLeaseIsTakenOverAndALiveOneIsNot(t *testing.T) {
+	t.Parallel()
 	finishedRestore := restoreRun(func(r *backupv1alpha1.RestoreRun) {
 		r.Spec.Claim = claimN
 		r.Status.Phase = backupv1alpha1.RunPhaseFailed
@@ -268,6 +271,7 @@ func TestAStaleLeaseIsTakenOverAndALiveOneIsNot(t *testing.T) {
 // A restore releases its Leases when it finishes, so a backup of the claim
 // can take them at once.
 func TestARestoreReleasesItsLeasesWhenItFinishes(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
 		claim(), volumeRestore(), repository())
@@ -299,6 +303,7 @@ func TestARestoreReleasesItsLeasesWhenItFinishes(t *testing.T) {
 // order. Had the backup taken the repository Lease first, it would hold it
 // while the restore held the claim, and each would wait for the other.
 func TestLeasesAreTakenClaimFirstSoNoTwoRunsDeadlock(t *testing.T) {
+	t.Parallel()
 	restore := restoreRun(func(r *backupv1alpha1.RestoreRun) {
 		r.Spec.Claim = claimN
 		r.Status.Phase = backupv1alpha1.RunPhaseRunning
@@ -348,6 +353,7 @@ func TestLeasesAreTakenClaimFirstSoNoTwoRunsDeadlock(t *testing.T) {
 // PersistentVolumeClaim item. A Cluster item that shares the claim's name
 // does not keep the claim's Lease live once the volume item has finished.
 func TestALeaseIsLiveOnlyForTheVolumeItemThatTookIt(t *testing.T) {
+	t.Parallel()
 	backupWith := func(volume backupv1alpha1.ItemPhase) *backupv1alpha1.BackupRun {
 		run := otherRun()
 		run.Spec.Source, run.Spec.All = "", true
@@ -395,6 +401,7 @@ func TestALeaseIsLiveOnlyForTheVolumeItemThatTookIt(t *testing.T) {
 // then would be unguarded once the Secret appears. Before, the run took no
 // repository Lease and wrote the source anyway (BRF1F3).
 func TestABackupWithoutItsRepositorySecretStartsNoMover(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore())
 	step(t, r) // plan
@@ -413,6 +420,7 @@ func TestABackupWithoutItsRepositorySecretStartsNoMover(t *testing.T) {
 // A restore whose repository Secret is deleted after its checks fails its
 // item before it creates a restore Job, and names the Secret.
 func TestARestoreWhoseRepositorySecretIsGoneStartsNoMover(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
 		claim(), volumeRestore(), repository())
 	restoreStep(t, r) // plan

@@ -87,6 +87,7 @@ func nextGVK(gvk schema.GroupVersionKind) schema.GroupVersionKind {
 // run finds the Cluster, creates its Backup at that version, and succeeds
 // once the Backup completes.
 func TestADatabaseIsBackedUpAtTheVersionCloudNativePGServes(t *testing.T) {
+	t.Parallel()
 	c := newClientWithCRDs(t, crdsServedAtNext(t), backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), atNext(cluster()))
 	served := servingOnly(c)
 	r := &BackupRunReconciler{Client: served, Reader: served, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
@@ -129,6 +130,7 @@ func clusterListGone(c client.Client) client.Client {
 // as a namespace without Clusters: the plan fails so it runs again, and the
 // run is not planned without its database.
 func TestAClusterListAtAVersionNoLongerServedIsRetried(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, backupRun(), claim(), volume(), volumeRestore(), repository(), cluster())
 	gone := clusterListGone(c)
 	r := &BackupRunReconciler{Client: gone, Reader: gone, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}

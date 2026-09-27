@@ -95,6 +95,7 @@ func workloadWrites(c client.Client) (client.Client, *[]string) {
 // those objects. The stop and the restart change spec.replicas and nothing
 // else in the spec, and each raises the generation as the API server does.
 func TestScaleUsesTheScaleSubresource(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, deployment(), statefulSet())
 	watched, writes := workloadWrites(c)
 	ctx := context.Background()
@@ -196,6 +197,7 @@ func changeBetweenReadAndWrite(t *testing.T, c client.Client, changes int) (clie
 // the API server applies it to whatever it holds then. The count is the
 // only field the write sets, and the change it raced stays as it was.
 func TestAChangeBetweenReadAndScaleDoesNotFailIt(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	stop := []backupv1alpha1.QuiescedWorkload{{Kind: backupv1alpha1.WorkloadKindDeployment, Name: appN, Replicas: 2}}
 

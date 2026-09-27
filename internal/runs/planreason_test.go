@@ -46,6 +46,7 @@ func plannedItems(t *testing.T, lister SnapshotLister, backups prober, run *back
 // store with no base backup in reach. The items plan leaves alone because
 // another item failed record OtherItemFailed.
 func TestPlanRecordsWhyAnItemIsOutOfReach(t *testing.T) {
+	t.Parallel()
 	inPlace := func(mutate ...func(*backupv1alpha1.RestoreRun)) *backupv1alpha1.RestoreRun {
 		return restoreRun(append([]func(*backupv1alpha1.RestoreRun){func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }}, mutate...)...)
 	}

@@ -118,8 +118,8 @@ func (r *RestoreRunReconciler) startIntoJob(ctx context.Context, run *backupv1al
 // It returns the repository and mover settings, and whether the run waits.
 // It returns true, with the run moved to Waiting with reason SourceBusy and
 // a message naming the other run, while another run holds the Lease of the
-// source claim or the repository (see acquireLeases) or a backup of either
-// is in progress (see otherMover); the caller creates nothing in that pass. It returns a
+// source claim or the repository, or a backup of either is in progress (see
+// takeSource); the caller creates nothing in that pass. It returns a
 // *refusalError, which the caller fails the item with (see settled), for a
 // source claim, VolumeRestore or repository Secret that is gone, each
 // saying nothing was written to the claim spec.into names, and for a claim
@@ -146,15 +146,7 @@ func (r *RestoreRunReconciler) intoChecks(ctx context.Context, run *backupv1alph
 	if leased == "" {
 		leased = run.Spec.Into
 	}
-	// The Leases are taken first; otherMover then catches a backup whose
-	// mover object is written already.
-	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseRequest{
-		holder:    leaseHolder{kind: backupv1alpha1.KindRestoreRun, run: run, item: run.Status.Items[0].Name},
-		namespace: run.Namespace, claim: leased, secret: settings.Secret,
-	})
-	if err == nil && !busy.held() {
-		busy, err = otherMover(ctx, r.Reader, run.Namespace, leased, settings.Secret, backupMover)
-	}
+	busy, err := r.takeSource(ctx, run, run.Status.Items[0].Name, leased, settings.Secret)
 	if err != nil || !busy.held() {
 		return settings, false, nothingWrittenTo(run.Spec.Into, err)
 	}

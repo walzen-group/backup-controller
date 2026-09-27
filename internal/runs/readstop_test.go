@@ -19,6 +19,7 @@ import (
 // changes no workload. If it took the stored restart of another object, a
 // run could start the workloads again under a stop it does not own.
 func TestReadStopRefusesAnotherObjectAndAFailedRead(t *testing.T) {
+	t.Parallel()
 	restarted := metav1.NewTime(frozen)
 	runs := map[string]func() client.Object{
 		"BackupRun": func() client.Object {

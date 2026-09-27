@@ -21,6 +21,7 @@ import (
 // a volume item that never started records NotStarted and a Running one
 // whose clone is not cut records CloneNotCut. The messages stay as before.
 func TestABackupItemRecordsWhyItStopped(t *testing.T) {
+	t.Parallel()
 	t.Run("a Backup in phase failed", func(t *testing.T) {
 		r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
 		step(t, r) // plan

@@ -21,6 +21,7 @@ import (
 // Pending), and a max-quiesce limit that stops to parse while the item
 // runs (the item is Running).
 func TestAnAbortedBackupItemRecordsRunEnded(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		// run reconciles a new run until abort has ended it, and returns

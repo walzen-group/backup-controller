@@ -67,6 +67,7 @@ func scheduledRuns(t *testing.T, c client.Client) []backupv1alpha1.BackupRun {
 // one BackupRun with spec.all set, named and labelled after the tick. With
 // the next tick a day away, the scheduler requeues after refresh.
 func TestADueTickCreatesARunOfTheWholeNamespace(t *testing.T) {
+	t.Parallel()
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
 
@@ -89,6 +90,7 @@ func TestADueTickCreatesARunOfTheWholeNamespace(t *testing.T) {
 // puts the schedule on that zone's clock. 04:00 in Berlin is 02:00 UTC in
 // September.
 func TestAScheduleWithAZoneTicksOnThatZonesClock(t *testing.T) {
+	t.Parallel()
 	created := time.Date(2026, 9, 24, 1, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 2, 0, 30, 0, time.UTC)
 
@@ -103,6 +105,7 @@ func TestAScheduleWithAZoneTicksOnThatZonesClock(t *testing.T) {
 // TestATickNotYetDueCreatesNothing checks that a tick two minutes away creates
 // no run, and that the scheduler requeues for the moment the tick is due.
 func TestATickNotYetDueCreatesNothing(t *testing.T) {
+	t.Parallel()
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 4, 58, 0, 0, time.UTC)
 
@@ -119,6 +122,7 @@ func TestATickNotYetDueCreatesNothing(t *testing.T) {
 // TestMissedTicksRunOnceForTheNewest checks that the ticks missed while the
 // controller was down produce one run, for the newest of them.
 func TestMissedTicksRunOnceForTheNewest(t *testing.T) {
+	t.Parallel()
 	created := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 30, 0, 0, time.UTC)
 
@@ -135,6 +139,7 @@ func TestMissedTicksRunOnceForTheNewest(t *testing.T) {
 // namespace backup runs at a time, because a second would find every source
 // busy.
 func TestAnUnfinishedNamespaceRunHoldsTheTick(t *testing.T) {
+	t.Parallel()
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
 	running := &backupv1alpha1.BackupRun{
@@ -156,6 +161,7 @@ func TestAnUnfinishedNamespaceRunHoldsTheTick(t *testing.T) {
 // tick can be due before anything is marked, and a run created then would
 // find nothing to back up and fail.
 func TestADueTickWaitsForSomethingMarkedEnabled(t *testing.T) {
+	t.Parallel()
 	created := time.Date(2026, 9, 22, 16, 25, 56, 0, time.UTC)
 	now := time.Date(2026, 9, 25, 9, 37, 16, 0, time.UTC)
 	unmarked := claim()
@@ -192,6 +198,7 @@ func TestADueTickWaitsForSomethingMarkedEnabled(t *testing.T) {
 // TestAnEnabledClusterAloneLetsTheTickRun checks that a namespace whose only
 // marked object is a Cluster gets its scheduled run.
 func TestAnEnabledClusterAloneLetsTheTickRun(t *testing.T) {
+	t.Parallel()
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
 
@@ -205,6 +212,7 @@ func TestAnEnabledClusterAloneLetsTheTickRun(t *testing.T) {
 // TestANamespaceWithoutAScheduleIsLeftAlone checks that a namespace without
 // backup.wlz.li/schedule gets no run.
 func TestANamespaceWithoutAScheduleIsLeftAlone(t *testing.T) {
+	t.Parallel()
 	plain := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 	_, c := schedule(t, frozen, plain)
 	if runs := scheduledRuns(t, c); len(runs) != 0 {

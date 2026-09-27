@@ -38,6 +38,7 @@ func (k kueueLookupFails) RESTMapping(gk schema.GroupKind, versions ...string) (
 // fails so that it runs again. If the run started, it would start past its
 // queue.
 func TestAFailedKueueLookupKeepsTheRunQueued(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"LocalQueue", "Workload"} {
 		t.Run(kind, func(t *testing.T) {
 			c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),

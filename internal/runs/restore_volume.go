@@ -78,27 +78,12 @@ func (r *RestoreRunReconciler) startJob(ctx context.Context, run *backupv1alpha1
 	if done, err := settled(item, err); done {
 		return hold{}, err
 	}
-	// The Leases make the restore and a backup of the claim or its
-	// repository exclusive: of two runs that get here in the same instant,
-	// only one creates each Lease.
-	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseRequest{
-		holder:    leaseHolder{kind: backupv1alpha1.KindRestoreRun, run: run, item: item.Name},
-		namespace: run.Namespace, claim: item.Name, secret: settings.Secret,
-	})
+	busy, err := r.takeSource(ctx, run, item.Name, item.Name, settings.Secret)
 	if done, err := settled(item, nothingWrittenTo(item.Name, err)); done {
 		return hold{}, err
 	}
 	if busy.held() {
 		return busy, nil
-	}
-	// A backup that already has its trigger on a ReplicationSource goes
-	// first, as one started before the controller took Leases does.
-	backing, err := otherMover(ctx, r.Reader, run.Namespace, item.Name, settings.Secret, backupMover)
-	if err != nil {
-		return hold{}, err
-	}
-	if backing.held() {
-		return backing, nil
 	}
 	err = nothingWrittenTo(item.Name, r.recheckJobSnapshot(ctx, run, *item, settings.Secret))
 	if done, err := settled(item, err); done {
@@ -106,6 +91,39 @@ func (r *RestoreRunReconciler) startJob(ctx context.Context, run *backupv1alpha1
 	}
 	_, err = settled(item, r.createJob(ctx, run, index, item, settings))
 	return hold{}, err
+}
+
+// takeSource takes the Leases of the claim and the repository a volume
+// item's restore Job writes or reads, right before the run creates it.
+//
+// Parameters:
+//   - run is the RestoreRun that takes the Leases.
+//   - item is the name of the volume item, which the Leases list.
+//   - claim is the claim the Lease is taken on: the item's own claim in
+//     place, and the source claim, or else the new claim, for an into
+//     restore.
+//   - secret names the repository Secret.
+//
+// It returns the hold of kind holdSourceBusy that names the other run while
+// another run holds one of the Leases (see acquireLeases) or a backup of the
+// claim or the repository has its mover object already (see otherMover),
+// and the zero hold once the run holds both Leases. A repository Secret
+// that does not exist comes back as the refusal of acquireLeases, and a
+// failed read or write as a plain error.
+//
+// The Leases make the restore and a backup of the claim or its repository
+// exclusive: of two runs that get here in the same instant, only one creates
+// each Lease. A backup whose trigger is already on a ReplicationSource goes
+// first, as one started before the controller took Leases does.
+func (r *RestoreRunReconciler) takeSource(ctx context.Context, run *backupv1alpha1.RestoreRun, item, claim, secret string) (hold, error) {
+	busy, err := acquireLeases(ctx, r.Client, r.Reader, leaseRequest{
+		holder:    leaseHolder{kind: backupv1alpha1.KindRestoreRun, run: run, item: item},
+		namespace: run.Namespace, claim: claim, secret: secret,
+	})
+	if err != nil || busy.held() {
+		return busy, err
+	}
+	return otherMover(ctx, r.Reader, run.Namespace, claim, secret, backupMover)
 }
 
 // takeOverJob gives an item the restore Job an earlier pass created

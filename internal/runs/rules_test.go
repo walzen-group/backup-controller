@@ -67,6 +67,7 @@ var textMatchers = []string{
 // conversion to ItemReason, since that is the only way to give an item a
 // reason docs/api.md does not list.
 func TestNoDecisionReadsAMessage(t *testing.T) {
+	t.Parallel()
 	used := map[string]bool{}
 	for _, dir := range ruleScope {
 		files := parseRuleScope(t, dir)

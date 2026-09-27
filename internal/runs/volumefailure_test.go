@@ -11,6 +11,7 @@ import (
 // the sentence it was before the reason existed. The volume fails at its
 // start checks: its VolumeRestore is deleted after plan.
 func TestAVolumeFailureSkipsTheClusterWithOtherItemFailed(t *testing.T) {
+	t.Parallel()
 	run := restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.All = true })
 	r, c := restoreReconciler(t, prober{saturday},
 		run, claim(), volumeRestore(), repository(), cluster(), objectStore(), storeSecret())

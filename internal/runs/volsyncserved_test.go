@@ -68,6 +68,7 @@ func (c volsyncMovedClient) RESTMapper() meta.RESTMapper {
 // replicas back and resumes its Kustomization, rather than holding the app
 // down past spec.maxQuiesce and the run's timeout.
 func TestABackupEndsAndGivesTheAppBackWhenVolSyncDropsV1alpha1(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
 	if got := replicasOf(t, c); got != 0 {
 		t.Fatalf("replicas = %d after the quiesce, want 0", got)
@@ -100,6 +101,7 @@ func TestABackupEndsAndGivesTheAppBackWhenVolSyncDropsV1alpha1(t *testing.T) {
 // A quiesced BackupRun deleted while VolSync serves only v1alpha1's
 // successor gives the app back and lets the deletion complete.
 func TestADeletedBackupGivesTheAppBackWhenVolSyncDropsV1alpha1(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
 	if err := c.Delete(context.Background(), readBackupRun(t, c)); err != nil {
 		t.Fatal(err)
@@ -165,6 +167,7 @@ func checkVolSyncRefused(t *testing.T, err error, kind string) {
 // Before, the run wrote through a ReplicationDestination, and each pass
 // failed with the app down until v1alpha1 was served again.
 func TestADeletedRestoreStopsItsJobWhenVolSyncDropsV1alpha1(t *testing.T) {
+	t.Parallel()
 	run, job := quiescedMidRestore(t)
 	r, c := movedRestoreReconciler(t, run, claim(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true), job)
 	if err := c.Delete(context.Background(), readRestoreRun(t, c)); err != nil {
@@ -199,6 +202,7 @@ func TestADeletedRestoreStopsItsJobWhenVolSyncDropsV1alpha1(t *testing.T) {
 // the VolSync wait: it stops the restore Job of its
 // Running item, which needs no VolSync object, and gives the app back.
 func TestARestoreWaitsOnAnUnservedVolSyncUntilItTimesOut(t *testing.T) {
+	t.Parallel()
 	run, job := quiescedMidRestore(t)
 	pending := runningOnJob(cacheN, 1)
 	pending.Phase, pending.Job, pending.JobUID = backupv1alpha1.ItemPending, "", ""

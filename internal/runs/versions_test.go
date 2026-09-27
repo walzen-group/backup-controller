@@ -13,6 +13,7 @@ import (
 // CloudNativePG's Cluster at the version the controller uses, the startup
 // error names both on one line. A newline would split the one log entry.
 func TestTwoUnservedKindsMakeOneLine(t *testing.T) {
+	t.Parallel()
 	volsync := schema.GroupVersion{Group: volsyncSourceKind.Group, Version: "v1beta1"}
 	cnpg := schema.GroupVersion{Group: webhookClusterKind.Group, Version: "v2"}
 	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{volsync, cnpg})

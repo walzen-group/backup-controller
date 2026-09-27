@@ -72,6 +72,7 @@ func removeFlux(t *testing.T, c client.Client, kinds *servedKinds) {
 // once the clone is cut and finishes. No version of Kustomization is served,
 // so there is nothing left to resume.
 func TestARunGivesTheAppBackAfterFluxIsRemoved(t *testing.T) {
+	t.Parallel()
 	r, c, kinds := servedBackupReconciler(t, nil, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	step(t, r) // plan
@@ -106,6 +107,7 @@ func TestARunGivesTheAppBackAfterFluxIsRemoved(t *testing.T) {
 // A namespace run deleted while it holds the app down, after Flux's CRDs were
 // removed, gives the app back and lets its deletion complete.
 func TestADeletedRunGivesTheAppBackAfterFluxIsRemoved(t *testing.T) {
+	t.Parallel()
 	r, c, kinds := servedBackupReconciler(t, nil, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	step(t, r) // plan
@@ -131,6 +133,7 @@ func TestADeletedRunGivesTheAppBackAfterFluxIsRemoved(t *testing.T) {
 // kustomize-controller's labels is stopped with nothing suspended, and the
 // run goes on.
 func TestANamespaceIsQuiescedWithoutFlux(t *testing.T) {
+	t.Parallel()
 	r, c, _ := servedBackupReconciler(t, []string{fluxGroup}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment())
 	step(t, r) // plan
@@ -150,6 +153,7 @@ func TestANamespaceIsQuiescedWithoutFlux(t *testing.T) {
 // On a cluster without Kueue's CRDs a run starts without admission and has
 // no Workload to delete, so a volume run finishes.
 func TestASourceRunFinishesWithoutKueue(t *testing.T) {
+	t.Parallel()
 	r, c, _ := servedBackupReconciler(t, []string{kueueGroup}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
 	step(t, r) // plan
@@ -170,6 +174,7 @@ func TestASourceRunFinishesWithoutKueue(t *testing.T) {
 // retries on every pass, and the first pass the API server accepts gives the
 // app back and finishes the run.
 func TestARestartThatKeepsFailingIsReportedAndRetried(t *testing.T) {
+	t.Parallel()
 	r, c, _ := servedBackupReconciler(t, nil, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	refuse := false
@@ -254,6 +259,7 @@ func (m failingMapper) RESTMapping(schema.GroupKind, ...string) (*meta.RESTMappi
 // some versions of the group, is an error the caller retries, so nothing is
 // skipped on it.
 func TestOnlyAKindNoVersionOfWhichIsServedIsGone(t *testing.T) {
+	t.Parallel()
 	gk := quiesce.KustomizationGVK.GroupKind()
 	partial := apiutil.ErrResourceDiscoveryFailed{
 		{Group: fluxGroup, Version: "v1"}: &meta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{Group: fluxGroup, Version: "v1"}},
@@ -301,6 +307,7 @@ func staleFluxReconciler(t *testing.T, aggregated bool, objects ...client.Object
 // that read at the cached version makes the mapper look the version up
 // again, and the same pass resumes the Kustomization at the new version.
 func TestAKustomizationVersionFluxStopsServingIsNotTakenForGone(t *testing.T) {
+	t.Parallel()
 	for name, aggregated := range map[string]bool{"aggregated discovery": true, "legacy discovery": false} {
 		t.Run(name, func(t *testing.T) {
 			r, c, d := staleFluxReconciler(t, aggregated, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -337,6 +344,7 @@ func TestAKustomizationVersionFluxStopsServingIsNotTakenForGone(t *testing.T) {
 // The quiesce pass fails and stops nothing; the next one suspends the
 // Kustomization at the new version.
 func TestAQuiesceAfterFluxMovesVersionStillSuspends(t *testing.T) {
+	t.Parallel()
 	r, c, d := staleFluxReconciler(t, true, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	step(t, r) // plan
@@ -364,6 +372,7 @@ func TestAQuiesceAfterFluxMovesVersionStillSuspends(t *testing.T) {
 // still keeps a restore off a claim whose mover runs. When the Lease delete
 // fails as well, the Ready message names both failures.
 func TestARefusedRestartStillReleasesTheLeases(t *testing.T) {
+	t.Parallel()
 	for name, refuseLeases := range map[string]bool{"Leases deleted": false, "Lease delete refused too": true} {
 		t.Run(name, func(t *testing.T) {
 			r, c, _ := servedBackupReconciler(t, nil, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -424,6 +433,7 @@ func TestARefusedRestartStillReleasesTheLeases(t *testing.T) {
 // Kustomization already resumed. That holds for the restart after the clones
 // are cut, and for the restart when the run ends at its timeout.
 func TestAnAppGivenBackByHandLetsTheRunGoOn(t *testing.T) {
+	t.Parallel()
 	for name, fail := range map[string]func(t *testing.T, r *BackupRunReconciler, c client.Client){
 		"after the clones are cut": func(t *testing.T, _ *BackupRunReconciler, c client.Client) { cutClone(t, c) },
 		"at the timeout": func(_ *testing.T, r *BackupRunReconciler, _ client.Client) {

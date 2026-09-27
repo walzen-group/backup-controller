@@ -63,6 +63,7 @@ func failingReads(c client.Client, kind string) client.Client {
 // use: the pass comes back as an error and the app keeps running, for a read
 // of the claim, of its VolumeRestore, and of the ReplicationSource.
 func TestThePreCheckFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"PersistentVolumeClaim", "VolumeRestore", "ReplicationSource"} {
 		t.Run(kind, func(t *testing.T) {
 			c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -102,6 +103,7 @@ func TestThePreCheckFailsClosed(t *testing.T) {
 // A claim whose Lease a live RestoreRun holds, and no restore Job
 // yet, makes a namespace BackupRun wait before it stops anything.
 func TestThePreCheckSeesAClaimLeaseHeldByARestore(t *testing.T) {
+	t.Parallel()
 	restoring := restoreRun(func(r *backupv1alpha1.RestoreRun) {
 		r.Spec.Claim = claimN
 		r.Status.Phase = backupv1alpha1.RunPhaseRunning
@@ -134,6 +136,7 @@ func TestThePreCheckSeesAClaimLeaseHeldByARestore(t *testing.T) {
 // stops the app, rather than stopping it and waiting for the backup with the
 // app down.
 func TestAQuiescedRestoreWaitsForABackupBeforeStopping(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, otherRun(), quiescedRestoreOf(), idleSource(),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	rr := &RestoreRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Now: frozenNow}
@@ -198,6 +201,7 @@ func countDeploymentScales(c client.Client) (client.Client, *int) {
 // namespace whose only marked object is an opted-out Cluster, stops nothing
 // and ends Failed saying nothing was restored.
 func TestAQuiescedRestoreWithNothingToRestoreStopsNothing(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, quiescedRestore(), cluster(optedOut), objectStore(), storeSecret(), deployment(), kustomization(false))
 	watching, scales := countDeploymentScales(c)
 	r := &RestoreRunReconciler{Client: watching, Reader: c, Prober: prober{saturday}, Now: frozenNow}
@@ -224,6 +228,7 @@ func TestAQuiescedRestoreWithNothingToRestoreStopsNothing(t *testing.T) {
 // left those to startItem, so the run stopped the app for a backup that
 // could not start (AB4).
 func TestAnItemStartItemWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
+	t.Parallel()
 	foreign := idleSource()
 	foreign.Labels = nil
 	unbound := claim()
@@ -288,6 +293,7 @@ func TestAnItemStartItemWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
 // stopped the app, failed the item and gave the app back (AB9, like AB4 on a
 // BackupRun).
 func TestAnItemRestoreVolumeWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		breakIt func(t *testing.T, c client.Client)
@@ -342,6 +348,7 @@ func TestAnItemRestoreVolumeWouldRefuseFailsBeforeTheAppStops(t *testing.T) {
 // pre-check gives: the mover would write into a claim that is about to go,
 // and the scheduler does not place a pod whose claim is being deleted.
 func TestARestoreIntoAClaimBeingDeletedFailsBeforeTheMoverStarts(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }),
 		claim(), volumeRestore(), repository())
 

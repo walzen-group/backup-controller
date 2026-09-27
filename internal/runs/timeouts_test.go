@@ -50,6 +50,7 @@ func phaseAt(t *testing.T, r *BackupRunReconciler, after time.Duration) backupv1
 // TestARunWithoutATimeoutGivesUpAfterSixHours checks that a run with no
 // timeout of its own, in a namespace without one, fails at six hours.
 func TestARunWithoutATimeoutGivesUpAfterSixHours(t *testing.T) {
+	t.Parallel()
 	r := startedVolumeRun(t, nil, annotatedNamespace(nil))
 
 	if phase := phaseAt(t, r, 6*time.Hour-time.Minute); phase != backupv1alpha1.RunPhaseRunning {
@@ -64,6 +65,7 @@ func TestARunWithoutATimeoutGivesUpAfterSixHours(t *testing.T) {
 // backup.wlz.li/timeout of 10h keeps a run going past six hours and fails it
 // at ten.
 func TestANamespaceTimeoutReplacesTheDefault(t *testing.T) {
+	t.Parallel()
 	r := startedVolumeRun(t, nil, annotatedNamespace(map[string]string{backupv1alpha1.AnnotationTimeout: "10h"}))
 
 	if phase := phaseAt(t, r, 6*time.Hour); phase != backupv1alpha1.RunPhaseRunning {
@@ -79,6 +81,7 @@ func TestANamespaceTimeoutReplacesTheDefault(t *testing.T) {
 // component can then write the key from a substitution that defaults to "",
 // and the controller's default applies.
 func TestEmptyNamespaceSettingsFallBackToTheDefaults(t *testing.T) {
+	t.Parallel()
 	r := startedVolumeRun(t, nil, annotatedNamespace(map[string]string{
 		backupv1alpha1.AnnotationTimeout:           "",
 		backupv1alpha1.AnnotationPruneIntervalDays: "",
@@ -97,6 +100,7 @@ func TestEmptyNamespaceSettingsFallBackToTheDefaults(t *testing.T) {
 // TestARunsOwnTimeoutWinsOverTheNamespace checks that a run's spec.timeout of
 // one hour takes precedence over the namespace's 10h.
 func TestARunsOwnTimeoutWinsOverTheNamespace(t *testing.T) {
+	t.Parallel()
 	r := startedVolumeRun(t, &metav1.Duration{Duration: time.Hour},
 		annotatedNamespace(map[string]string{backupv1alpha1.AnnotationTimeout: "10h"}))
 
@@ -109,6 +113,7 @@ func TestARunsOwnTimeoutWinsOverTheNamespace(t *testing.T) {
 // timeout that isn't a Go duration fails the run, with a message that names
 // the annotation.
 func TestANamespaceTimeoutThatDoesNotParseFailsTheRun(t *testing.T) {
+	t.Parallel()
 	r := startedVolumeRun(t, nil, annotatedNamespace(map[string]string{backupv1alpha1.AnnotationTimeout: "six hours"}))
 
 	run := readBackupRun(t, r.Client)
@@ -126,6 +131,7 @@ func TestANamespaceTimeoutThatDoesNotParseFailsTheRun(t *testing.T) {
 // so a manual run and a scheduled one in the same namespace give up at the
 // same point.
 func TestAScheduledRunLeavesTheTimeoutToItsNamespace(t *testing.T) {
+	t.Parallel()
 	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
 	_, c := schedule(t, time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC), scheduledNamespace("0 5 * * *", created), claim())
 
@@ -139,6 +145,7 @@ func TestAScheduledRunLeavesTheTimeoutToItsNamespace(t *testing.T) {
 // ReplicationSource's pruneIntervalDays is 1 without an annotation, and the
 // annotation's value when the namespace sets one.
 func TestTheNamespacePruneIntervalReachesTheSource(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct {
 		annotations map[string]string
 		want        int32
@@ -161,6 +168,7 @@ func TestTheNamespacePruneIntervalReachesTheSource(t *testing.T) {
 // TestAPruneIntervalThatDoesNotParseFailsTheItem checks that a prune interval
 // of 0 fails the claim's item, with a message that names the annotation.
 func TestAPruneIntervalThatDoesNotParseFailsTheItem(t *testing.T) {
+	t.Parallel()
 	r := startedVolumeRun(t, nil, annotatedNamespace(map[string]string{backupv1alpha1.AnnotationPruneIntervalDays: "0"}))
 
 	run := readBackupRun(t, r.Client)
@@ -177,6 +185,7 @@ func TestAPruneIntervalThatDoesNotParseFailsTheItem(t *testing.T) {
 // out on. The timed-out items record reason TimedOut, and a Pending item
 // whose start failed keeps its last error in its own message only.
 func TestATimedOutRunKeepsItsEndingAcrossAFailedRestart(t *testing.T) {
+	t.Parallel()
 	wait := "RestoreRun back-to-monday is restoring claim " + claimN + "; this run starts once that restore has finished"
 	c := newClient(t, quiescedBackup(func(b *backupv1alpha1.BackupRun) {
 		b.Finalizers = []string{Finalizer}

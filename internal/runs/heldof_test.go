@@ -10,6 +10,7 @@ import (
 // ensureSource took it as a hold, the item would go Running with a tag that
 // the write did not put on the source.
 func TestAnEmptyHoldStopsTheItem(t *testing.T) {
+	t.Parallel()
 	busy := sourceBusy("ReplicationSource %s is busy", claimN)
 	for name, tc := range map[string]struct {
 		err   error

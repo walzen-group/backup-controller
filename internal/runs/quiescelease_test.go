@@ -114,6 +114,7 @@ func secondBackupRun(mutate ...func(*backupv1alpha1.BackupRun)) *backupv1alpha1.
 // Were it to plan while the app stands at 0, it would record 0 as the count to
 // give back and leave the app down.
 func TestARestoreAndANamespaceBackupNeverStopTheAppTogether(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		restoreRun(func(r *backupv1alpha1.RestoreRun) {
 			r.Spec.Claim = claimN
@@ -187,6 +188,7 @@ func TestARestoreAndANamespaceBackupNeverStopTheAppTogether(t *testing.T) {
 // and the retry plans with that same Lease: nothing is written onto it and its
 // holder does not change. A restore that runs in between waits.
 func TestALostPlanWriteAfterTheLeaseRetriesWithItsOwnLease(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }), quiescedRestoreOf(),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
@@ -237,6 +239,7 @@ func TestALostPlanWriteAfterTheLeaseRetriesWithItsOwnLease(t *testing.T) {
 // another run waits until the retry has stored it. Without that, the other run
 // would stop the app and the retry would scale it back up under it.
 func TestALostWriteAfterTheRestartKeepsTheQuiesceLease(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }), quiescedRestoreOf(),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
@@ -304,6 +307,7 @@ func TestALostWriteAfterTheRestartKeepsTheQuiesceLease(t *testing.T) {
 // holder that still owes a restart, has no plan yet, or is being deleted is
 // live.
 func TestAQuiesceLeaseIsTakenOverOnlyWhenItsHolderRestarted(t *testing.T) {
+	t.Parallel()
 	restarted := func(b *backupv1alpha1.BackupRun) {
 		b.Status.RestartedAt = atFrozen(0)
 		b.Status.RestartPending = false
@@ -370,6 +374,7 @@ func TestAQuiesceLeaseIsTakenOverOnlyWhenItsHolderRestarted(t *testing.T) {
 // tag stays open on the source; its Cluster item is what it still stops the
 // app for.
 func TestADeletedQuiescedRunKeepsOthersWaitingUntilItGaveTheAppBack(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		secondBackupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
@@ -426,6 +431,7 @@ func TestADeletedQuiescedRunKeepsOthersWaitingUntilItGaveTheAppBack(t *testing.T
 // keeps it while its plan stands; a source BackupRun never takes one, so it
 // can start beside a quiesced namespace.
 func TestOnlyARunThatIsAboutToStopTheAppTakesTheQuiesceLease(t *testing.T) {
+	t.Parallel()
 	objects := append([]client.Object{quiescedRestoreOf(),
 		secondBackupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = cacheN }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false)}, cacheClaim()...)
@@ -458,6 +464,7 @@ func TestOnlyARunThatIsAboutToStopTheAppTakesTheQuiesceLease(t *testing.T) {
 // has stopped it since. Before, a restart whose plan did not read back was
 // repeated, which scaled the app up under the other run's stop (BRF1F1).
 func TestARunNeverRepeatsARestartItsStatusShowsDone(t *testing.T) {
+	t.Parallel()
 	source := idleSource()
 	source.Spec.Trigger.Manual = TriggerFor(runUID)
 	r, c := backupReconciler(t, quiescedBackup(func(b *backupv1alpha1.BackupRun) {
@@ -486,6 +493,7 @@ func TestARunNeverRepeatsARestartItsStatusShowsDone(t *testing.T) {
 // app back again while it waits for its Cluster to be created, even when the
 // app stands at 0 once more.
 func TestARestoreNeverRepeatsARestartItsStatusShowsDone(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(func(r *backupv1alpha1.RestoreRun) {
 		r.Spec.Database = pgN
 		r.Spec.Quiesce = []backupv1alpha1.WorkloadRef{{Kind: "Deployment", Name: appN}}
@@ -512,6 +520,7 @@ func TestARestoreNeverRepeatsARestartItsStatusShowsDone(t *testing.T) {
 // for it to be created again: the Kustomization the backup would suspend may
 // be the one Flux needs to create that Cluster (see waitingOn).
 func TestANamespaceBackupWaitsForARestoreThatDeletedItsCluster(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		restoreRun(func(r *backupv1alpha1.RestoreRun) {
 			r.Finalizers = []string{Finalizer}
@@ -569,6 +578,7 @@ func seedQuiesceLease(t *testing.T, c client.Client, kind string, run metav1.Obj
 // chosen, and restartPending says the workloads may still be down, so
 // release starts them again.
 func TestATimeoutDuringAPendingRestartGivesTheAppBack(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, pendingRestartBackup(), claim(), volume(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true))
 	br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{},
 		Now: func() time.Time { return frozen.Add(time.Hour + time.Second) }}
@@ -590,6 +600,7 @@ func TestATimeoutDuringAPendingRestartGivesTheAppBack(t *testing.T) {
 // another run that took the Lease then could stop the app and see the retry
 // scale it back up. The retry stores the end and releases the Lease.
 func TestAFinishWhoseStatusWriteIsLostKeepsTheQuiesceLease(t *testing.T) {
+	t.Parallel()
 	t.Run("BackupRun", func(t *testing.T) {
 		c := newClient(t, pendingRestartBackup(), claim(), volume(), volumeRestore(), repository(), stoppedDeployment(), kustomization(true))
 		br := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{},

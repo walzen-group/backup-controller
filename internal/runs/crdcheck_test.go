@@ -72,6 +72,7 @@ const v081CRDDir = crdDir + "backup-controller/v0.8.1/"
 // and each released CRD lacks exactly the fields the releases after it added.
 // This is also the guard against the generated CRDs drifting from the types.
 func TestSchemaGapsNamesTheFieldsAnOldCRDLacks(t *testing.T) {
+	t.Parallel()
 	v09Backup := []string{"status.ending", "status.items[].lastStartError", "status.items[].noSnapshotListedAt", "status.items[].reason", "status.items[].snapshotID", "status.resumedAt"}
 	v09Restore := []string{"status.ending", "status.items[].clusterLeftDeleted", "status.items[].job", "status.items[].jobUID", "status.items[].reason", "status.items[].snapshotID", "status.resumedAt"}
 	for _, tc := range []struct {
@@ -109,6 +110,7 @@ func TestSchemaGapsNamesTheFieldsAnOldCRDLacks(t *testing.T) {
 // still declares it holds a run without a gap for it: the walk checks the
 // fields of the Go types and ignores properties the types lack.
 func TestARemovedFieldIsNoGap(t *testing.T) {
+	t.Parallel()
 	const file = "backup.wlz.li_restoreruns.yaml"
 	declares := func(crd *unstructured.Unstructured) bool {
 		versions, _, _ := unstructured.NestedSlice(crd.Object, "spec", "versions")
@@ -143,6 +145,7 @@ func TestARemovedFieldIsNoGap(t *testing.T) {
 // A quiesced run under the v0.7.2 BackupRun CRD, which drops
 // status.restartPending, ends CRDOutdated at plan, and its app keeps running.
 func TestABackupRunUnderAnOldCRDStopsNothing(t *testing.T) {
+	t.Parallel()
 	c := newClientWithCRDs(t, withOldCRD("backup.wlz.li_backupruns.yaml"),
 		backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
@@ -174,6 +177,7 @@ func TestABackupRunUnderAnOldCRDStopsNothing(t *testing.T) {
 // A controller that may not read the CRD refuses the run and names the
 // permission, since an unchecked run could leave workloads stopped.
 func TestABackupRunWithoutCRDAccessFailsClosed(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
 	r.Reader = forbidCRDs{c}
@@ -189,6 +193,7 @@ func TestABackupRunWithoutCRDAccessFailsClosed(t *testing.T) {
 // An item that the CRD check fails records the reason CRDOutdated, so that
 // an alert on items[].reason sees why the item ended.
 func TestAnItemTheCRDCheckFailsRecordsCRDOutdated(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) {
 		b.Spec.Source = claimN
 		b.Status.Items = []backupv1alpha1.BackupItem{{Kind: backupv1alpha1.ItemKindSource, Name: claimN, Phase: backupv1alpha1.ItemPending}}

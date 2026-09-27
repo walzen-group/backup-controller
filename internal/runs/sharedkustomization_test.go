@@ -97,6 +97,7 @@ func expectSharedRefusal(t *testing.T, c client.Client, phase backupv1alpha1.Run
 // Kustomization another run has already suspended too. Before, the run took
 // a Lease per Kustomization and waited for any other run holding one.
 func TestANamespaceBackupRefusesAKustomizationSharedAcrossNamespaces(t *testing.T) {
+	t.Parallel()
 	for name, suspended := range map[string]bool{"running": false, "already suspended": true} {
 		t.Run(name, func(t *testing.T) {
 			r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -118,6 +119,7 @@ func TestANamespaceBackupRefusesAKustomizationSharedAcrossNamespaces(t *testing.
 // A quiesced RestoreRun refuses the same Kustomization before it stops
 // anything, and creates no mover.
 func TestAQuiescedRestoreRefusesAKustomizationSharedAcrossNamespaces(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, quiescedRestoreOf(),
 		deploymentApplying(ns, appN), deploymentApplying(wikiNS, "wiki"), sharedKustomization(false),
 		claim(), volumeRestore(), repository())
@@ -134,6 +136,7 @@ func TestAQuiescedRestoreRefusesAKustomizationSharedAcrossNamespaces(t *testing.
 // Kustomization's inventory lists in another namespace, and no other kind:
 // a StatefulSet there is a workload a run in that namespace stops too.
 func TestOtherNamespacesCountsDeploymentsAndStatefulSets(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct {
 		id   string
 		want []string

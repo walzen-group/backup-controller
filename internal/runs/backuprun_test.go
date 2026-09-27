@@ -81,6 +81,7 @@ func complete(t *testing.T, c client.Client) {
 // volume's node. Once the mover finishes, the run reports the snapshot and the
 // time restic stamped on it.
 func TestAVolumeRunWritesTheSourceAndReportsResticsTime(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
 
@@ -155,6 +156,7 @@ func startVolumeRun(t *testing.T, annotations map[string]string) client.Client {
 // retain-yearly and retain-within annotations, gets those values in its
 // source's retain block, and no retain-last.
 func TestTieredRetentionReachesTheSource(t *testing.T) {
+	t.Parallel()
 	c := startVolumeRun(t, map[string]string{
 		backupv1alpha1.AnnotationEnabled:       "true",
 		backupv1alpha1.AnnotationRetainHourly:  "24",
@@ -192,6 +194,7 @@ func TestTieredRetentionReachesTheSource(t *testing.T) {
 // would keep every snapshot forever. The message names the annotations that
 // would fix it.
 func TestAClaimWithNoRetentionFails(t *testing.T) {
+	t.Parallel()
 	c := startVolumeRun(t, map[string]string{backupv1alpha1.AnnotationEnabled: "true"})
 
 	run := readBackupRun(t, c)
@@ -209,6 +212,7 @@ func TestAClaimWithNoRetentionFails(t *testing.T) {
 // A retention annotation that does not parse, or asks to keep zero
 // snapshots, fails the item with a message naming the annotation.
 func TestAnUnparseableRetentionFails(t *testing.T) {
+	t.Parallel()
 	for annotation, value := range map[string]string{
 		backupv1alpha1.AnnotationRetainWeekly: "four",
 		backupv1alpha1.AnnotationRetainDaily:  "0",
@@ -228,6 +232,7 @@ func TestAnUnparseableRetentionFails(t *testing.T) {
 // A run that names a claim not marked backup.wlz.li/enabled fails at once
 // with reason Invalid.
 func TestAClaimNotMarkedEnabledIsRefused(t *testing.T) {
+	t.Parallel()
 	unmarked := claim()
 	unmarked.Annotations = nil
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }), unmarked)
@@ -246,6 +251,7 @@ func TestAClaimNotMarkedEnabledIsRefused(t *testing.T) {
 // Invalid with the refusal's message. It never plans the run again into
 // Queued.
 func TestARefusedRunWhoseReleaseFailedEndsInvalid(t *testing.T) {
+	t.Parallel()
 	unmarked := claim()
 	unmarked.Annotations = nil
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) {
@@ -295,6 +301,7 @@ func TestARefusedRunWhoseReleaseFailedEndsInvalid(t *testing.T) {
 // place. The message names that run. Writing a second tag would leave the
 // first run waiting for a backup that is never taken.
 func TestABusySourceMakesTheRunWait(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository(), busySource(TriggerFor(otherRunUID)), otherRun())
 	step(t, r)
@@ -320,6 +327,7 @@ func TestABusySourceMakesTheRunWait(t *testing.T) {
 // with the app still running. If it stopped the app first, the app would stay
 // down until the other backup ends.
 func TestAQuiescedRunWaitsForABusySourceBeforeItStopsTheApp(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false),
 		busySource(TriggerFor(otherRunUID)), otherRun())
@@ -387,6 +395,7 @@ func deadTags() map[string]deadTag {
 // source is left alone: VolSync is still retrying that sync with the clone it
 // cut for it, and a new tag would be completed by that older backup.
 func TestADeadTriggerFailsTheItemAtOnce(t *testing.T) {
+	t.Parallel()
 	for name, tc := range deadTags() {
 		t.Run(name, func(t *testing.T) {
 			objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
@@ -442,6 +451,7 @@ func cacheClaim() []client.Object {
 // tag no run waits for fails its item, and the other claim is backed up as
 // usual: its source gets the run's trigger, and the run records its snapshot.
 func TestADeadTriggerOnOneClaimLeavesTheOtherBackedUp(t *testing.T) {
+	t.Parallel()
 	dead := busySource(TriggerFor("0d1e2f3a-0000-4000-8000-000000000009"))
 	dead.Name, dead.Spec.SourcePVC = cacheN, cacheN
 	objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -484,6 +494,7 @@ func TestADeadTriggerOnOneClaimLeavesTheOtherBackedUp(t *testing.T) {
 // A ReplicationSource of the claim's name that the controller did not write
 // is left alone, and the item fails saying so.
 func TestASourceSomethingElseWroteIsLeftAlone(t *testing.T) {
+	t.Parallel()
 	foreign := &volsyncv1alpha1.ReplicationSource{ObjectMeta: metav1.ObjectMeta{Name: claimN, Namespace: ns}}
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository(), foreign)
@@ -551,6 +562,7 @@ func writeOtherTag(ctx context.Context, cl client.Client) error {
 // completed by the other run's sync, with a clone cut before this run's
 // quiesce.
 func TestTwoRunsDoNotOverwriteEachOthersTrigger(t *testing.T) {
+	t.Parallel()
 	for name, race := range map[string]interceptor.Funcs{
 		// The other run writes just before this run's client reads the
 		// source for its write, after any check through the Reader.
@@ -670,6 +682,7 @@ func neverWriteSyncing(t *testing.T, c client.Client) client.Client {
 // source keeps its spec, even when the claim's retention changed since. With
 // another live run's tag, the run waits with SourceBusy.
 func TestTheControllerNeverWritesASourceVolSyncIsSyncing(t *testing.T) {
+	t.Parallel()
 	syncing := func(tag string) *volsyncv1alpha1.ReplicationSource {
 		source := idleSource()
 		source.Spec.Trigger.Manual = tag
@@ -741,6 +754,7 @@ func TestTheControllerNeverWritesASourceVolSyncIsSyncing(t *testing.T) {
 // A database run creates a CloudNativePG Backup with method plugin, and
 // succeeds once the Backup completes.
 func TestADatabaseRunTakesABaseBackup(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
 	step(t, r)
 	step(t, r)
@@ -769,6 +783,7 @@ func TestADatabaseRunTakesABaseBackup(t *testing.T) {
 // A hibernated Cluster gets no Backup. Its item is Skipped and the run still
 // succeeds.
 func TestAHibernatedDatabaseIsSkipped(t *testing.T) {
+	t.Parallel()
 	sleeping := cluster(func(u *unstructured.Unstructured) {
 		annotations := u.GetAnnotations()
 		annotations[cnpg.HibernationAnnotation] = "on"
@@ -792,6 +807,7 @@ func TestAHibernatedDatabaseIsSkipped(t *testing.T) {
 // item waits with reason SourceBusy and creates no Backup while the first
 // run's Backup runs. It starts once the first run has finished.
 func TestTwoRunsOfOneClusterBackItUpOneAfterTheOther(t *testing.T) {
+	t.Parallel()
 	// The first eight characters of a run's UID name its Backup (see
 	// cnpg.BackupName), so this UID differs from runUID there.
 	const secondUID = types.UID("7c1d9e4b-0000-4000-8000-000000000003")
@@ -865,6 +881,7 @@ func admitAll(t *testing.T, c client.Client) {
 // app again as soon as the clone exists, before the upload finishes, and
 // deletes the Workload when it succeeds.
 func TestANamespaceRunQuiescesAroundTheClones(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false), localQueueObject())
 
@@ -965,6 +982,7 @@ func quiescedRunToUpload(t *testing.T) (*BackupRunReconciler, client.Client) {
 // last pod stopping and that moment, so a restore can recover the database to
 // the snapshot's time and the two agree.
 func TestAQuiescedRunMovesTheSnapshotToItsRestartMoment(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedRunToUpload(t)
 	step(t, r)
 
@@ -987,6 +1005,7 @@ func TestAQuiescedRunMovesTheSnapshotToItsRestartMoment(t *testing.T) {
 // host. The run finishes once the rewrite goes through, so it never reports
 // success for a snapshot left untagged.
 func TestAQuiescedRunWaitsForTheRepositoryLock(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedRunToUpload(t)
 	fake := r.Retimer.(*retimer)
 	fake.err = &restic.LockedError{Hostname: "volsync-dst-restore-1a2b", Time: frozen.Add(-time.Minute)}
@@ -1014,6 +1033,7 @@ func TestAQuiescedRunWaitsForTheRepositoryLock(t *testing.T) {
 // is then moved to the restart moment and tagged quiesced like the other's,
 // so a synced restore finds both volumes at one moment.
 func TestAVolumeDoneBeforeTheRestartIsStillMovedToIt(t *testing.T) {
+	t.Parallel()
 	objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment()}, cacheClaim()...)
 	r, c := backupReconciler(t, objects...)
@@ -1065,6 +1085,7 @@ func TestAVolumeDoneBeforeTheRestartIsStillMovedToIt(t *testing.T) {
 // A Kustomization someone else suspended is left out of the run's
 // suspendedKustomizations, so the run does not resume it afterwards.
 func TestAKustomizationAlreadySuspendedIsNotResumed(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(true))
 	step(t, r) // plan
@@ -1080,6 +1101,7 @@ func TestAKustomizationAlreadySuspendedIsNotResumed(t *testing.T) {
 // A run that times out while the app is stopped starts the app again and
 // fails.
 func TestATimedOutRunRestartsTheApp(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	step(t, r)
@@ -1107,6 +1129,7 @@ func TestATimedOutRunRestartsTheApp(t *testing.T) {
 // gets its replicas back, and the database item stays Pending with the error
 // in its message. A later pass whose create goes through starts the Backup.
 func TestADatabaseThatCannotStartDoesNotHoldTheApp(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false))
 	webhook := `failed calling webhook "vbackup.cnpg.io": failed to call webhook: Post "https://cnpg-webhook-service.cnpg-system.svc:443/validate-postgresql-cnpg-io-v1-backup": dial tcp 10.96.12.7:443: connect: connection refused`
@@ -1200,6 +1223,7 @@ func cloneAt(t *testing.T, c client.Client, created time.Time) *corev1.Persisten
 // first pass recorded, so the run still gives the app its 2 replicas back and
 // resumes the Kustomization once the clone is cut.
 func TestAQuiesceRetriedAfterALostStatusWriteStillRestartsTheApp(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	step(t, r) // plan
@@ -1236,6 +1260,7 @@ func TestAQuiesceRetriedAfterALostStatusWriteStillRestartsTheApp(t *testing.T) {
 // pass chose, so the snapshot is moved to a time before the app wrote
 // anything.
 func TestARestartRetriedAfterALostStatusWriteKeepsItsMoment(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	step(t, r) // plan
@@ -1273,6 +1298,7 @@ func TestARestartRetriedAfterALostStatusWriteKeepsItsMoment(t *testing.T) {
 // same whole-second time, so it matches restartedAt as later passes and a
 // synced restore read it back.
 func TestARestartMomentIsKeptInWholeSeconds(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	r.Now = func() time.Time { return frozen.Add(500 * time.Millisecond) }
@@ -1307,6 +1333,7 @@ func TestARestartMomentIsKeptInWholeSeconds(t *testing.T) {
 // the new clone would start the app before the new clone is cut, and the
 // snapshot would still be tagged quiesced.
 func TestALeftoverCloneDoesNotRestartTheApp(t *testing.T) {
+	t.Parallel()
 	for name, leave := range map[string]func(t *testing.T, c client.Client){
 		"terminating": func(t *testing.T, c client.Client) {
 			clone := cloneAt(t, c, frozen.Add(-time.Hour))
@@ -1362,6 +1389,7 @@ func failMover(t *testing.T, c client.Client, started time.Time) {
 // Job, and deleting the source would kill that mover mid-backup and leave
 // restic's lock in the repository, which stops every later forget.
 func TestAFailedMoverFailsTheItem(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
 	step(t, r) // plan
@@ -1393,6 +1421,7 @@ func TestAFailedMoverFailsTheItem(t *testing.T) {
 // A source whose tag VolSync reports completed while its latest mover
 // failed fails the item with the mover's logs and reason MoverFailed.
 func TestACompletedTagWithAFailedMoverFailsTheItem(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
 	step(t, r) // plan
@@ -1422,6 +1451,7 @@ func TestACompletedTagWithAFailedMoverFailsTheItem(t *testing.T) {
 // before the backup and a lock a killed mover left behind is cleared once it
 // is stale.
 func TestASourceIsTriggeredWithAnUnlock(t *testing.T) {
+	t.Parallel()
 	for name, existing := range map[string][]client.Object{"a new source": nil, "an idle source": {idleSource()}} {
 		t.Run(name, func(t *testing.T) {
 			objects := append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
@@ -1442,6 +1472,7 @@ func TestASourceIsTriggeredWithAnUnlock(t *testing.T) {
 // A Failed result from a sync that started before this run is not this
 // run's, so the item keeps waiting for its own sync.
 func TestAFailedResultFromAnEarlierSyncIsIgnored(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
 	step(t, r) // plan
@@ -1460,6 +1491,7 @@ func TestAFailedResultFromAnEarlierSyncIsIgnored(t *testing.T) {
 // has killed its containers, so it writes nothing, but it stays in the API
 // in phase Failed until something deletes it.
 func TestAnEvictedPodDoesNotHoldTheRun(t *testing.T) {
+	t.Parallel()
 	evicted := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "notes-7c4d", Namespace: ns, Labels: map[string]string{"app": appN}},
 		Status:     corev1.PodStatus{Phase: corev1.PodFailed, Reason: "Evicted"},
@@ -1508,6 +1540,7 @@ func failOnce(c client.Client, fail func(object any) bool) client.Reader {
 // plans the run. Ending the run Invalid would lose a scheduled tick to a
 // moment when the API server was busy.
 func TestAFailedReadWhilePlanningIsRetried(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository())
 	r.Reader = failOnce(c, func(object any) bool { _, ok := object.(*corev1.PersistentVolumeClaimList); return ok })
@@ -1527,6 +1560,7 @@ func TestAFailedReadWhilePlanningIsRetried(t *testing.T) {
 // A failed read while a run starts a volume's backup leaves the item Pending
 // with the error in its message, and the next pass starts it.
 func TestAFailedReadWhileStartingAnItemIsRetried(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
 	step(t, r) // plan
@@ -1559,6 +1593,7 @@ func TestAFailedReadWhileStartingAnItemIsRetried(t *testing.T) {
 // another run's backup, the Ready condition names both, so neither cause is
 // hidden behind the other.
 func TestReadyNamesARetryAndABusySourceTogether(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), cluster(), otherRun())
 	step(t, r) // plan
@@ -1589,6 +1624,7 @@ func TestReadyNamesARetryAndABusySourceTogether(t *testing.T) {
 // volumes. The API server's discovery serves no version of Cluster there,
 // which means there are no Clusters.
 func TestANamespaceRunWithoutCloudNativePGBacksUpTheVolumes(t *testing.T) {
+	t.Parallel()
 	r, c, _ := servedBackupReconciler(t, []string{cnpg.ClusterGVK.Group}, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository())
 	step(t, r)
@@ -1604,6 +1640,7 @@ func TestANamespaceRunWithoutCloudNativePGBacksUpTheVolumes(t *testing.T) {
 // labels are only labels, and anyone who can edit the Deployment could point
 // them at another team's Kustomization.
 func TestAKustomizationThatDoesNotListTheWorkloadIsNotSuspended(t *testing.T) {
+	t.Parallel()
 	app := deployment()
 	app.Labels = map[string]string{quiesce.FluxNameLabel: "billing", quiesce.FluxNamespaceLabel: "billing"}
 	billing := &unstructured.Unstructured{Object: map[string]any{
@@ -1652,6 +1689,7 @@ func syncStarted(t *testing.T, c client.Client, started time.Time) {
 // cut when the sync started, and restic stamps a retry's snapshot with the
 // retry's own time, so that snapshot holds data older than its time.
 func TestAFailedItemNamesTheDataALaterSnapshotHolds(t *testing.T) {
+	t.Parallel()
 	started := frozen.Add(10 * time.Second)
 	at := started.UTC().Format(time.RFC3339)
 	cut := "a snapshot this sync saves later holds the data of " + at

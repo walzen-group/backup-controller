@@ -48,6 +48,7 @@ func laggingCache(c client.Client, stale client.Object) client.Client {
 // the cached copy) and for the one release does when the run ends (the
 // cached copy holds the app, or owes its restart).
 func TestAStaleCachedBackupRunNeverRestartsTheApp(t *testing.T) {
+	t.Parallel()
 	running := func(b *backupv1alpha1.BackupRun) {
 		b.Finalizers = []string{Finalizer}
 		b.Status.StartedAt = atFrozen(-time.Minute)
@@ -110,6 +111,7 @@ func TestAStaleCachedBackupRunNeverRestartsTheApp(t *testing.T) {
 // the restart is the one while the run waits for its Cluster, or the one
 // finish or finalize does.
 func TestAStaleCachedRestoreRunNeverRestartsTheApp(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		mutate func(*backupv1alpha1.RestoreRun)
@@ -171,6 +173,7 @@ func TestAStaleCachedRestoreRunNeverRestartsTheApp(t *testing.T) {
 // conflicts with the stored run. A stored run that is newer and still owes
 // the stop, with the plan and no status.quiescedAt, is stopped as before.
 func TestAStaleCachedBackupRunNeverStopsTheAppAgain(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		store   func(*backupv1alpha1.BackupRun)

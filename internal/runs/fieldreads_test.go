@@ -37,6 +37,7 @@ func quiesceRun(t *testing.T, r *BackupRunReconciler) {
 // reading it as "not listed" would stop the app with Flux still free to
 // scale it back up mid-backup.
 func TestAKustomizationWithoutItsInventoryIsRefused(t *testing.T) {
+	t.Parallel()
 	k := kustomization(false)
 	unstructured.RemoveNestedField(k.Object, "status")
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -55,6 +56,7 @@ func TestAKustomizationWithoutItsInventoryIsRefused(t *testing.T) {
 // An inventory entry whose id is not "<namespace>_<name>_<group>_<kind>" is
 // refused the same way.
 func TestAnInventoryEntryThatDoesNotParseIsRefused(t *testing.T) {
+	t.Parallel()
 	k := kustomization(false)
 	_ = unstructured.SetNestedSlice(k.Object, []any{map[string]any{"id": "notes/notes/apps/Deployment", "v": "v1"}}, "status", "inventory", "entries")
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
@@ -107,6 +109,7 @@ func kustomizationCRDWithoutSuspend(t *testing.T) []string {
 // Kustomization back from the patch and never stops the app behind a
 // Kustomization that is still reconciling.
 func TestASuspendTheAPIServerDropsIsAnError(t *testing.T) {
+	t.Parallel()
 	c := newClientWithCRDs(t, kustomizationCRDWithoutSuspend(t), backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	r := &BackupRunReconciler{Client: c, Reader: c, Snapshots: snapshots{sunday, monday}, Retimer: &retimer{}, Now: frozenNow}
@@ -131,6 +134,7 @@ func TestASuspendTheAPIServerDropsIsAnError(t *testing.T) {
 // it fails, naming Kueue and its Workload, and gives the quota back. Its
 // items record the reason TimedOut.
 func TestAQueuedRunThatKueueNeverAdmitsFails(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository(), localQueueObject())
 	step(t, r) // plan
@@ -166,6 +170,7 @@ func TestAQueuedRunThatKueueNeverAdmitsFails(t *testing.T) {
 // which makes the item Succeeded and clears its message. A run that reaches
 // its timeout in such a phase names it in the item's message.
 func TestABackupInAPhaseTheControllerDoesNotKnowWaitsNamingIt(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
 	step(t, r)
 	step(t, r)
@@ -212,6 +217,7 @@ func setBackupPhase(t *testing.T, c client.Client, phase string) {
 // "completed" are terminal (internal/controller/backup_controller.go:155-158).
 // Thus the item waits and does not fail.
 func TestAnInvalidBackupDefinitionKeepsTheItemWaiting(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Database = pgN }), cluster())
 	step(t, r)
 	step(t, r)

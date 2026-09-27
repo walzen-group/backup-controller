@@ -76,6 +76,7 @@ func ownSourceTag(t *testing.T, c client.Client) string {
 // SourceBusy, names the restore, and writes no trigger: its clone would cut
 // a half-restored volume, and its forget would fail on the restore's lock.
 func TestABackupWaitsWhileARestoreOfTheClaimRuns(t *testing.T) {
+	t.Parallel()
 	restore, job := restoring(t)
 	expectBackupWaitsForRestore(t, restore, job)
 }
@@ -85,6 +86,7 @@ func TestABackupWaitsWhileARestoreOfTheClaimRuns(t *testing.T) {
 // trigger: its forget needs the exclusive lock, which fails while the
 // restore holds its read lock.
 func TestABackupWaitsWhileARestoreFromItsRepositoryRuns(t *testing.T) {
+	t.Parallel()
 	restore, job := restoringInto(t, "other-data")
 	expectBackupWaitsForRestore(t, restore, job)
 }
@@ -152,6 +154,7 @@ func startOtherBackup(t *testing.T, c client.Client) {
 // checks themselves; see
 // TestARestoreSelectsItsSnapshotOnlyOnceABackupOfItsRepositoryHasFinished.)
 func TestARestoreWaitsWhileABackupRuns(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
 		claim(), volumeRestore(), repository())
@@ -176,6 +179,7 @@ func TestARestoreWaitsWhileABackupRuns(t *testing.T) {
 // it and names it. That holds when one starts well before the other, and when
 // both are reconciled in turn from the start, as in one pass of the manager.
 func TestABackupAndARestoreStartedTogetherNeverDeadlock(t *testing.T) {
+	t.Parallel()
 	orders := map[string][]string{
 		"backup long before":     {"b", "b", "b", "r", "r", "b", "r"},
 		"restore long before":    {"r", "r", "b", "b", "b", "r", "b"},
@@ -227,6 +231,7 @@ func TestABackupAndARestoreStartedTogetherNeverDeadlock(t *testing.T) {
 // no longer exists, does not hold a backup, and a source whose trigger a
 // finished or deleted BackupRun completed does not hold a restore.
 func TestAFinishedOrDeletedRunDoesNotBlock(t *testing.T) {
+	t.Parallel()
 	finishedRestore, job := restoring(t)
 	finishedRestore.Status.Phase = backupv1alpha1.RunPhaseSucceeded
 	finishedRestore.Status.Items[0].Phase = backupv1alpha1.ItemSucceeded
@@ -279,6 +284,7 @@ func frozenNow() time.Time { return frozen }
 // after the checks waits, creates neither the claim nor the restore Job, and
 // goes on once the backup has finished.
 func TestAnIntoRestoreWaitsWhileItsRepositoryIsBackedUp(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil, restoreRun(fromRepository), repository())
 	restoreStep(t, r) // plan
 	startOtherBackup(t, c)
@@ -319,6 +325,7 @@ func TestAnIntoRestoreWaitsWhileItsRepositoryIsBackedUp(t *testing.T) {
 // claim and its repository while its restore Job writes: a backup of the
 // claim waits while it runs.
 func TestABackupWaitsWhileAnIntoRestoreFromTheClaimRuns(t *testing.T) {
+	t.Parallel()
 	c := newClient(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" }, asOf("2026-09-21T04:00:00Z")),
 		claim(), volume(), volumeRestore(), repository())
@@ -384,6 +391,7 @@ func suspendedCondition(job *batchv1.Job) {
 // pods have all ended, or are gone, holds nothing, even while it is still
 // there: a run records the item's end before it stops and deletes the Job.
 func TestWhichRestoreJobsHoldABackup(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []restoreJobCase{
 		{name: "running", item: backupv1alpha1.ItemRunning, pod: corev1.PodRunning, holds: true},
 		{name: "not started", item: backupv1alpha1.ItemRunning, holds: true},
@@ -460,6 +468,7 @@ func deleteKept(t *testing.T, c client.Client, name string) {
 // A restore Job holds only the claim it writes and the repository it reads,
 // and only a Job the controller labelled as its own restore Job counts.
 func TestARestoreJobHoldsOnlyItsClaimAndRepository(t *testing.T) {
+	t.Parallel()
 	run, job := restoring(t)
 	c := newClient(t, run, job)
 	for _, tc := range []struct {
@@ -493,6 +502,7 @@ func TestARestoreJobHoldsOnlyItsClaimAndRepository(t *testing.T) {
 // restore Job, and its message says how the retrying sync ends
 // and when the source may be deleted.
 func TestARestoreWaitsWhileVolSyncRetriesTheSyncOfAFinishedBackup(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, nil,
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim = claimN }, asOf("2026-09-21T04:00:00Z")),
 		claim(), volumeRestore(), repository())

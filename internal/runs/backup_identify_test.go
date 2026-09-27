@@ -110,6 +110,7 @@ func listTwice(t *testing.T, r *BackupRunReconciler) {
 // A sync whose mover logs VolSync did not keep still yields its snapshot:
 // the run finds it in the repository by the window of the sync.
 func TestABackupFindsItsSnapshotWithoutLogs(t *testing.T) {
+	t.Parallel()
 	r, c := volumeRunOver(t, snapshots{sunday, monday})
 	completeSync(t, c, monday.Time.Add(2*time.Second), 3*time.Second)
 	step(t, r)
@@ -128,6 +129,7 @@ func TestABackupFindsItsSnapshotWithoutLogs(t *testing.T) {
 // so the tie goes to the higher ID. The three snapshots in the window that
 // another host wrote, or that hold other paths, are no candidates at all.
 func TestTheNewestSnapshotInTheWindowWins(t *testing.T) {
+	t.Parallel()
 	r, c := volumeRunOver(t, sameTimeRepository(t))
 	completeSync(t, c, sameTimeAt(10, 3, 1), 3*time.Minute+5*time.Second)
 	step(t, r)
@@ -151,6 +153,7 @@ func TestTheNewestSnapshotInTheWindowWins(t *testing.T) {
 // still reports Successful. Once a second listing, relistAfter later, also
 // shows no snapshot, the item succeeds with Empty set.
 func TestNoSnapshotInTheWindowIsAnEmptyClaim(t *testing.T) {
+	t.Parallel()
 	r, c := volumeRunOver(t, snapshots{sunday, monday})
 	completeSync(t, c, frozen.Add(time.Minute), 20*time.Second)
 	listTwice(t, r)
@@ -187,6 +190,7 @@ func (l *laggingListing) Snapshots(ctx context.Context, secret *corev1.Secret) (
 // and records when it listed, and a pass at least pollInterval later lists
 // again. That pass finds the snapshot, and the item records it.
 func TestALaggingListingIsNoEmptyClaim(t *testing.T) {
+	t.Parallel()
 	list := &laggingListing{older: snapshots{sunday}, newer: snapshots{sunday, monday}, lag: 1}
 	r, c := volumeRunOver(t, list)
 	completeSync(t, c, monday.Time.Add(2*time.Second), 3*time.Second)
@@ -210,6 +214,7 @@ func TestALaggingListingIsNoEmptyClaim(t *testing.T) {
 // make the claim empty. A pass sooner than that lists again but decides
 // nothing.
 func TestASecondEmptyListingMakesTheClaimEmpty(t *testing.T) {
+	t.Parallel()
 	r, c := volumeRunOver(t, snapshots{sunday, monday})
 	completeSync(t, c, frozen.Add(time.Minute), 20*time.Second)
 	step(t, r)
@@ -241,6 +246,7 @@ func TestASecondEmptyListingMakesTheClaimEmpty(t *testing.T) {
 // the stored time, which is at least pollInterval after the real listing,
 // makes the claim empty.
 func TestAListingTimeInWholeSecondsStillWaitsAPollInterval(t *testing.T) {
+	t.Parallel()
 	r, c := volumeRunOver(t, snapshots{sunday, monday})
 	completeSync(t, c, frozen.Add(time.Minute), 20*time.Second)
 	firstListing := frozen.Add(500 * time.Millisecond)
@@ -270,6 +276,7 @@ func TestAListingTimeInWholeSecondsStillWaitsAPollInterval(t *testing.T) {
 // paths than /data, are no mover's: a sync with only those in its window
 // took no snapshot.
 func TestASnapshotOfAnotherHostOrPathIsIgnored(t *testing.T) {
+	t.Parallel()
 	r, c := volumeRunOver(t, sameTimeRepository(t))
 	completeSync(t, c, sameTimeAt(10, 3, 1), 2*time.Minute+10*time.Second)
 	listTwice(t, r)
@@ -283,6 +290,7 @@ func TestASnapshotOfAnotherHostOrPathIsIgnored(t *testing.T) {
 // A retimed copy keeps the mover's host and path, but its original says a
 // rewrite wrote it: it is never the snapshot a sync wrote.
 func TestARetimedCopyIsNotTheMoversSnapshot(t *testing.T) {
+	t.Parallel()
 	r, c := volumeRunOver(t, sameTimeRepository(t))
 	completeSync(t, c, sameTimeAt(9, 0, 2), 3*time.Second)
 	listTwice(t, r)
@@ -297,6 +305,7 @@ func TestARetimedCopyIsNotTheMoversSnapshot(t *testing.T) {
 // that ran for a long time still finds the snapshot restic stamped when the
 // backup began.
 func TestIdentifyUsesLastSyncDuration(t *testing.T) {
+	t.Parallel()
 	r, c := volumeRunOver(t, snapshots{sunday, monday})
 	completeSync(t, c, monday.Time.Add(40*time.Minute), 40*time.Minute+time.Second)
 	step(t, r)
@@ -312,6 +321,7 @@ func TestIdentifyUsesLastSyncDuration(t *testing.T) {
 // fraction of its second. A snapshot on either edge is the sync's, and one
 // just past an edge is not.
 func TestIdentifyWindowAllowsSkew(t *testing.T) {
+	t.Parallel()
 	ended := time.Date(2026, 9, 24, 12, 0, 10, 0, time.UTC)
 	for name, tc := range map[string]struct {
 		at    time.Time
@@ -343,6 +353,7 @@ func TestIdentifyWindowAllowsSkew(t *testing.T) {
 // A snapshot another BackupRun of the claim already recorded is that run's,
 // so it is no candidate even inside the window.
 func TestASnapshotAnotherRunRecordedIsNotACandidate(t *testing.T) {
+	t.Parallel()
 	other := otherRun()
 	other.Status.Phase = backupv1alpha1.RunPhaseSucceeded
 	other.Status.Items[0].Phase = backupv1alpha1.ItemSucceeded
@@ -361,6 +372,7 @@ func TestASnapshotAnotherRunRecordedIsNotACandidate(t *testing.T) {
 // gives no window, and a run without one can't tell a snapshot from an
 // empty claim. The item fails with reason NoMoverSnapshot.
 func TestASyncWithoutItsTimesFailsTheItem(t *testing.T) {
+	t.Parallel()
 	for name, drop := range map[string]func(*volsyncv1alpha1.ReplicationSourceStatus){
 		"lastSyncTime":     func(s *volsyncv1alpha1.ReplicationSourceStatus) { s.LastSyncTime = nil },
 		"lastSyncDuration": func(s *volsyncv1alpha1.ReplicationSourceStatus) { s.LastSyncDuration = nil },
@@ -391,6 +403,7 @@ func TestASyncWithoutItsTimesFailsTheItem(t *testing.T) {
 // then retimes it by the full ID it recorded, so a pass that crashed after
 // the retime finds the item's snapshot by its original ID.
 func TestAQuiescedRunRetimesByTheRecordedFullID(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedRunToUpload(t)
 
 	item := readBackupRun(t, c).Status.Items[0]

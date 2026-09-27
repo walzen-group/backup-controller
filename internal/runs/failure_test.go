@@ -17,6 +17,7 @@ import (
 // a wait and a plain error fail no item. The run-level list takes the run
 // refusals and nothing else.
 func TestAnErrorFailsAnItemOnlyWhenItIsOnTheList(t *testing.T) {
+	t.Parallel()
 	refused := refuse(backupv1alpha1.ItemReasonClaimMissing, "the claim %s no longer exists", claimN)
 	jobFailed := &restorejob.FailureError{Condition: batchv1.JobCondition{Type: batchv1.JobFailed, Reason: "BackoffLimitExceeded"}}
 	badSpec := &restorejob.SpecError{Field: "SnapshotID", Problem: "is not a full ID"}
@@ -59,6 +60,7 @@ func TestAnErrorFailsAnItemOnlyWhenItIsOnTheList(t *testing.T) {
 // wrapped refusal keeps its wrapper's text, and a refusal marked twice says
 // it once. Any other error, and nil, passes through unchanged.
 func TestASparedRefusalSaysWhatTheRunLeftAlone(t *testing.T) {
+	t.Parallel()
 	refused := refuse(backupv1alpha1.ItemReasonClaimDeleting, "claim %s is being deleted", claimN)
 
 	written := nothingWrittenTo(claimN, refused)

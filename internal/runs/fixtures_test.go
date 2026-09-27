@@ -142,14 +142,14 @@ func newClientWithCRDs(t *testing.T, crdFiles []string, objects ...client.Object
 		Clock: func() time.Time { return now },
 		CRDs:  crdFiles,
 	})
-	serverClocks[c] = &now
-	t.Cleanup(func() { delete(serverClocks, c) })
+	serverClocks.Store(c, &now)
+	t.Cleanup(func() { serverClocks.Delete(c) })
 	return c
 }
 
 // serverClocks holds the API server clock of each client newClient built
 // that a test has not finished with. The clock starts at frozen.
-var serverClocks = map[client.Client]*time.Time{}
+var serverClocks sync.Map // client.Client -> *time.Time
 
 // atServerTime sets the API server clock of c, a client newClient built, to
 // at, so the objects created until the returned function runs get at as their
@@ -157,10 +157,11 @@ var serverClocks = map[client.Client]*time.Time{}
 // was.
 func atServerTime(t *testing.T, c client.Client, at time.Time) func() {
 	t.Helper()
-	now, ok := serverClocks[c]
+	clock, ok := serverClocks.Load(c)
 	if !ok {
 		t.Fatal("the client was not built by newClient")
 	}
+	now := clock.(*time.Time)
 	was := *now
 	*now = at
 	return func() { *now = was }

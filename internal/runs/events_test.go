@@ -26,6 +26,7 @@ func recorded(recorder *events.FakeRecorder) []string {
 // finds nothing to back up records a Warning event on the run that says why.
 // kubectl describe and a UI's event list show the run's events.
 func TestARefusedRunRecordsAWarningWithTheReason(t *testing.T) {
+	t.Parallel()
 	r, _ := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }))
 	recorder := events.NewFakeRecorder(10)
 	r.Recorder = recorder
@@ -43,6 +44,7 @@ func TestARefusedRunRecordsAWarningWithTheReason(t *testing.T) {
 // condition's reason records one event, and that a reconcile which leaves the
 // reason as it was records none.
 func TestARunRecordsOneEventPerReason(t *testing.T) {
+	t.Parallel()
 	r, _ := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository())
 	recorder := events.NewFakeRecorder(10)
@@ -67,6 +69,7 @@ func TestARunRecordsOneEventPerReason(t *testing.T) {
 // events.k8s.io/v1 accepts to at most maxNote bytes, on a character boundary,
 // so the API server accepts the event.
 func TestALongNoteIsCutToTheAPILimit(t *testing.T) {
+	t.Parallel()
 	note := strings.Repeat("ä", maxNote)
 	cut := fitNote(note)
 	if len(cut) > maxNote {

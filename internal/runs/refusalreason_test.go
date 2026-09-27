@@ -128,6 +128,7 @@ func restoreItemAfter(t *testing.T, run *backupv1alpha1.RestoreRun, between func
 // clustersRestoredElsewhere. An item fails with its own reason, even when
 // another item failed with another reason in the same pass.
 func TestARefusedItemRecordsItsReason(t *testing.T) {
+	t.Parallel()
 	quiescing := backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true })
 	unbound := claim()
 	unbound.Spec.VolumeName, unbound.Status.Phase = "", corev1.ClaimPending

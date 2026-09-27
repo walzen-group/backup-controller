@@ -55,6 +55,7 @@ func replicasAt(t *testing.T, r *BackupRunReconciler, c client.Client, after tim
 // volume item with a message that names the limit and the missing clone,
 // records restartedAt and gives the app its replicas back.
 func TestTheAppComesBackAtTheQuiesceLimitWhenNoCloneIsCut(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
 
 	if replicas := replicasAt(t, r, c, 10*time.Minute-time.Second); replicas != 0 {
@@ -85,6 +86,7 @@ func TestTheAppComesBackAtTheQuiesceLimitWhenNoCloneIsCut(t *testing.T) {
 // A namespace's backup.wlz.li/max-quiesce of 30m keeps the app down past the
 // default ten minutes while the clone is not cut, and gives it back at 30.
 func TestANamespaceQuiesceLimitReplacesTheDefault(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedVolumeRun(t, annotatedNamespace(map[string]string{backupv1alpha1.AnnotationMaxQuiesce: "30m"}))
 
 	if replicas := replicasAt(t, r, c, 10*time.Minute); replicas != 0 {
@@ -101,6 +103,7 @@ func TestANamespaceQuiesceLimitReplacesTheDefault(t *testing.T) {
 // A backup.wlz.li/max-quiesce that isn't a Go duration fails the run before
 // it stops anything, with a message that names the annotation.
 func TestAQuiesceLimitThatDoesNotParseFailsTheRun(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		annotatedNamespace(map[string]string{backupv1alpha1.AnnotationMaxQuiesce: "ten minutes"}),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
@@ -130,6 +133,7 @@ func TestAQuiesceLimitThatDoesNotParseFailsTheRun(t *testing.T) {
 // message that names the limit and the Forbidden error, and gives the app its
 // replicas back.
 func TestASourceThatCannotBeWrittenReleasesTheAppAtTheLimit(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		annotatedNamespace(nil), claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false))
 	forbidden := func(obj client.Object) error {
@@ -190,6 +194,7 @@ func TestASourceThatCannotBeWrittenReleasesTheAppAtTheLimit(t *testing.T) {
 // waits for the pod; the pass at the limit fails the volume item, which
 // never started, and gives the app its replicas back.
 func TestAPodThatNeverStopsReleasesTheAppAtTheLimit(t *testing.T) {
+	t.Parallel()
 	stuck := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "notes-5d9f", Namespace: ns, Labels: map[string]string{"app": appN}},
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
@@ -232,6 +237,7 @@ func TestAPodThatNeverStopsReleasesTheAppAtTheLimit(t *testing.T) {
 // time the run had read when the Deployment's scale-up reached the API
 // server, so a moment taken after the restart would show.
 func TestALostWriteAtTheLimitKeepsTheRestartAfterTheMoment(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
 	healthy := r.Client
 
@@ -284,6 +290,7 @@ func TestALostWriteAtTheLimitKeepsTheRestartAfterTheMoment(t *testing.T) {
 // limit, and that release is best effort: a Lease left behind is taken over
 // once its item is done.
 func TestALeaseReleaseThatKeepsFailingDoesNotHoldTheAppPastTheLimit(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
 	r.Reader = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {

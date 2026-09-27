@@ -29,6 +29,7 @@ func leaseCount(t *testing.T, c client.Client) int {
 // or ReplicationSource, and stops no workload. A reconciler without the flag
 // then plans it.
 func TestANewBackupRunWaitsWhilePaused(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), cluster(), deployment(), kustomization(false), localQueueObject())
 	r.Paused = true
@@ -64,6 +65,7 @@ func TestANewBackupRunWaitsWhilePaused(t *testing.T) {
 // A BackupRun that has stopped its app runs to its end while the controller
 // runs with --pause, and gives the app back.
 func TestABackupRunInProgressFinishesWhilePaused(t *testing.T) {
+	t.Parallel()
 	r, c := quiescedVolumeRun(t, annotatedNamespace(nil))
 	r.Paused = true
 
@@ -87,6 +89,7 @@ func TestABackupRunInProgressFinishesWhilePaused(t *testing.T) {
 // A new RestoreRun waits while the controller runs with --pause: no restore
 // Job, no stopped app, no Lease. A reconciler without the flag then plans it.
 func TestANewRestoreRunWaitsWhilePaused(t *testing.T) {
+	t.Parallel()
 	r, c := restoreReconciler(t, prober{saturday}, quiescedRestore(),
 		claim(), volumeRestore(), repository(), deployment(), kustomization(false))
 	r.Paused = true
@@ -122,6 +125,7 @@ func TestANewRestoreRunWaitsWhilePaused(t *testing.T) {
 // goes on to Running once Kueue admits it, also while the controller runs
 // with --pause.
 func TestAQueuedBackupRunWithItsWorkloadGoesOnWhilePaused(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.All = true }),
 		claim(), volume(), volumeRestore(), repository(), deployment(), kustomization(false), localQueueObject())
 	step(t, r) // plan
@@ -141,6 +145,7 @@ func TestAQueuedBackupRunWithItsWorkloadGoesOnWhilePaused(t *testing.T) {
 // runs with --pause. Without the flag it creates one run, for the newest
 // tick it missed.
 func TestTheSchedulerCreatesNoRunWhilePaused(t *testing.T) {
+	t.Parallel()
 	created := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 9, 24, 5, 30, 0, 0, time.UTC)
 	s, c, _ := scheduler(t, now, scheduledNamespace("0 5 * * *", created), claim())
@@ -163,6 +168,7 @@ func TestTheSchedulerCreatesNoRunWhilePaused(t *testing.T) {
 // moment the controller first worked on the run after the pause, so the run
 // waits Queued, and it fails only when its timeout has passed since then.
 func TestABackupRunPausedPastItsTimeoutWaitsForAdmissionAfterThePause(t *testing.T) {
+	t.Parallel()
 	r, c := backupReconciler(t, backupRun(func(b *backupv1alpha1.BackupRun) {
 		b.Spec.Source = claimN
 		b.CreationTimestamp = metav1.NewTime(frozen)

@@ -29,6 +29,7 @@ func checkClusterUnsupported(t *testing.T, message string) {
 // it deletes anything: the bootstrap webhook would not see the Cluster's
 // creation, and the Cluster would start as an empty database.
 func TestADatabaseRestoreDeletesNoClusterTheWebhookCannotSee(t *testing.T) {
+	t.Parallel()
 	c := newClientWithCRDs(t, crdsServedAtNext(t),
 		restoreRun(func(r *backupv1alpha1.RestoreRun) { r.Spec.Database = pgN }, asOf("2026-09-22T00:00:00Z")),
 		atNext(cluster()), atNext(objectStore()), storeSecret())
@@ -54,6 +55,7 @@ func TestADatabaseRestoreDeletesNoClusterTheWebhookCannotSee(t *testing.T) {
 // suspended: the Cluster item fails, and the volume item, still Pending, is
 // Skipped with the app left running.
 func TestAPlannedNamespaceRestoreStopsNothingWhileTheWebhookCannotSee(t *testing.T) {
+	t.Parallel()
 	c := newClientWithCRDs(t, crdsServedAtNext(t), restoreRun(quiescedInPlace, asOf("2026-09-22T00:00:00Z")),
 		claim(), volumeRestore(), repository(), atNext(cluster()), atNext(objectStore()), storeSecret(),
 		deployment(), kustomization(false))
@@ -92,6 +94,7 @@ func TestAPlannedNamespaceRestoreStopsNothingWhileTheWebhookCannotSee(t *testing
 // from. Before, the run ended with reason Failed, because only the pass
 // that failed the item counted.
 func TestABlindClusterFailedEarlierStillEndsClusterVersionUnsupported(t *testing.T) {
+	t.Parallel()
 	run, job := restoringOnJob(t)
 	run.Spec.Claim, run.Spec.All = "", true
 	run.Status.Items = append(run.Status.Items,

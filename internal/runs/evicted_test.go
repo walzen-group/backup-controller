@@ -58,6 +58,7 @@ func runningQuiescedRun(t *testing.T) (*BackupRunReconciler, client.Client) {
 // clears, gives the app back, deletes the Workload so Kueue frees the quota,
 // and ends Failed with reason Evicted on the run and on each unfinished item.
 func TestAnEvictedRunGivesTheAppBackAndEnds(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name       string
 		conditions []map[string]any
@@ -103,6 +104,7 @@ func TestAnEvictedRunGivesTheAppBackAndEnds(t *testing.T) {
 // A Running run whose Workload the controller cannot read goes on with its
 // pass, so the max-quiesce limit and the timeout still give the app back.
 func TestARunWhoseWorkloadReadFailsGoesOn(t *testing.T) {
+	t.Parallel()
 	r, c := runningQuiescedRun(t)
 	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {

@@ -50,6 +50,7 @@ func checkVersionGoneRetried(t *testing.T, what string, c client.Reader) {
 // served.Client, so a read at a version the API server no longer serves is
 // retried, never taken for a missing object.
 func TestBackupRunSetupWrapsTheClientForGoneVersions(t *testing.T) {
+	t.Parallel()
 	gone := destinationGone(newClient(t))
 	r := &BackupRunReconciler{Client: gone, Reader: gone}
 	if err := r.SetupWithManager(testManager(t)); err != nil {
