@@ -110,8 +110,7 @@ that changes the cluster.
 
 The third row is the project. Record the numbers beside the same measurement on
 a volume that still uses the snapshot path. Then the documentation of the
-infrastructure repository can state a measured magnitude. Without the numbers,
-it can state only a mechanism.
+infrastructure repository can state a magnitude in place of a mechanism.
 
 The mover pod in the last row now runs in the controller's namespace. Kueue
 sees it only when that namespace has two things. The namespace must carry the
