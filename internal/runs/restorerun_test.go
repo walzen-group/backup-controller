@@ -838,7 +838,7 @@ func TestARestoreRetriesAFailedReadBeforeAVolumeStarts(t *testing.T) {
 	}
 }
 
-// brokenLister is a restic.Lister whose every listing fails with err, the
+// brokenLister is a SnapshotLister whose every listing fails with err, the
 // way restic fails against a repository whose password is wrong.
 type brokenLister struct{ err error }
 

@@ -45,12 +45,12 @@ type BackupRunReconciler struct {
 	// Snapshots lists the snapshots in a restic repository. The run uses it to
 	// find the snapshot a volume's sync wrote, with the time restic stamped
 	// on it.
-	Snapshots restic.Lister
+	Snapshots SnapshotLister
 
 	// Retimer rewrites a snapshot with a new time and a tag. A quiesced run
 	// uses it to move each volume's snapshot to the moment the run started the
 	// workloads again, and to tag it quiesced.
-	Retimer restic.Retimer
+	Retimer SnapshotRetimer
 
 	// Recorder writes an event on the run each time its Ready reason changes.
 	Recorder events.EventRecorder

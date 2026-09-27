@@ -206,24 +206,9 @@ func (s *S3Store) Remove(ctx context.Context, name string) error {
 	return nil
 }
 
-// Lister lists the snapshots in the repository that a VolSync repository Secret
-// names. S3Lister is the implementation the controller runs with. The
-// controllers take the interface so that their tests can run without an
-// object store.
-type Lister interface {
-	Snapshots(ctx context.Context, secret *corev1.Secret) ([]Snapshot, error)
-}
-
-// Retimer changes the time of one snapshot and adds a tag to it, in the
-// repository that a VolSync repository Secret names. See Repository.Retime.
-// S3Lister is the implementation the controller runs with. The controllers
-// take the interface so that their tests can run without an object store.
-type Retimer interface {
-	Retime(ctx context.Context, secret *corev1.Secret, id string, at time.Time, tag string) (Snapshot, error)
-}
-
-// S3Lister is the Lister and Retimer the controller runs with. Each call opens
-// the repository that a VolSync repository Secret names, in its S3 bucket.
+// S3Lister lists and retimes the snapshots of a restic repository for the
+// controller. Each call opens the repository that a VolSync repository Secret
+// names, in its S3 bucket.
 type S3Lister struct{}
 
 // open reads the Location from a VolSync repository Secret, connects to its

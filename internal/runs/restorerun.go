@@ -56,11 +56,11 @@ type RestoreRunReconciler struct {
 
 	// Snapshots lists the snapshots in a restic repository. plan uses it to
 	// check that each volume has a snapshot the run's moment reaches.
-	Snapshots restic.Lister
+	Snapshots SnapshotLister
 
 	// Prober lists a database's base backups in its object store. plan uses it
 	// to check that each database has a base backup the run's moment reaches.
-	Prober bootstrap.Prober
+	Prober BaseBackupLister
 
 	// Recorder writes an event on the run each time its Ready reason changes.
 	Recorder events.EventRecorder

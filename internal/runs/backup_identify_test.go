@@ -85,7 +85,7 @@ func completeSync(t *testing.T, c client.Client, ended time.Time, took time.Dura
 // volumeRunOver returns a BackupRun of the test claim, driven until its
 // source carries the run's trigger, whose reconciler lists the given
 // snapshots. objects are added to the client beside the run's own.
-func volumeRunOver(t *testing.T, list restic.Lister, objects ...client.Object) (*BackupRunReconciler, client.Client) {
+func volumeRunOver(t *testing.T, list SnapshotLister, objects ...client.Object) (*BackupRunReconciler, client.Client) {
 	t.Helper()
 	objects = append([]client.Object{backupRun(func(b *backupv1alpha1.BackupRun) { b.Spec.Source = claimN }),
 		claim(), volume(), volumeRestore(), repository()}, objects...)
@@ -164,7 +164,7 @@ func TestNoSnapshotInTheWindowIsAnEmptyClaim(t *testing.T) {
 	}
 }
 
-// laggingListing is a restic.Lister whose listing lags the repository by a
+// laggingListing is a SnapshotLister whose listing lags the repository by a
 // given number of calls, as an S3 listing can after a write: the first lag
 // calls return the older list, and every later call returns the newer one.
 type laggingListing struct {

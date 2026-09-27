@@ -44,7 +44,7 @@ var restoreShapes = []struct {
 	{"into from a claim", func(r *backupv1alpha1.RestoreRun) { r.Spec.Claim, r.Spec.Into = claimN, "scratch" }, "scratch"},
 }
 
-// repositoryCopy is a restic.Lister over a copy of a recorded restic
+// repositoryCopy is a SnapshotLister over a copy of a recorded restic
 // repository in a test's temporary directory. A test changes the copy the
 // way a backup's mover or the controller's retime changes the real one, and
 // the run lists what is there at each pass.

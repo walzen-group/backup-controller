@@ -168,7 +168,7 @@ func atServerTime(t *testing.T, c client.Client, at time.Time) func() {
 	return func() { *now = was }
 }
 
-// snapshots is a restic.Lister that returns a fixed list of snapshots.
+// snapshots is a SnapshotLister that returns a fixed list of snapshots.
 type snapshots []restic.Snapshot
 
 // Snapshots returns the fixed list, whatever repository it is asked about.
@@ -190,7 +190,7 @@ type retimeCall struct {
 	tag string
 }
 
-// retimer is a restic.Retimer that records each call. It answers with the
+// retimer is a SnapshotRetimer that records each call. It answers with the
 // snapshot rewritten under an ID that starts with c0ffee00, or with the error
 // in err while err is set.
 type retimer struct {
