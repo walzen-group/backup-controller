@@ -101,9 +101,6 @@ const DefaultBudget = 10 * time.Second
 //   - An update goes to keepRecovery, on a dry run too.
 //   - Any operation other than create or update is allowed unchanged.
 //   - A dry-run create is allowed unchanged without reading anything.
-//   - A create is refused when the entries of the archiving plugin in
-//     spec.plugins do not have the one shape that Archiver and the plugin
-//     read the same way (see archiverShape).
 //   - A create is allowed unchanged when the Cluster has no archiving plugin
 //     (see Archiver).
 //   - A create is refused when the ObjectStore can't be resolved, when
@@ -216,11 +213,6 @@ func (d *Decider) create(ctx context.Context, c creation) admission.Response {
 	}
 
 	c.method = declaredBootstrap(c.cluster)
-
-	if err := archiverShape(c.cluster); err != nil {
-		c.logger.Info("refusing the Cluster", "reason", "unrecognised archiver entry", "error", err.Error())
-		return admission.Denied(fmt.Sprintf("The webhook cannot tell where this Cluster archives: %v. Correct the %s entry in spec.plugins and create the Cluster again.", err, PluginName))
-	}
 
 	var found bool
 	c.store, c.serverName, found = Archiver(c.cluster)

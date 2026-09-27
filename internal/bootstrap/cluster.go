@@ -1,7 +1,6 @@
 package bootstrap
 
 import (
-	"fmt"
 	"sort"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -88,77 +87,4 @@ func Archiver(cluster *unstructured.Unstructured) (store, serverName string, fou
 		return store, serverName, true
 	}
 	return "", "", false
-}
-
-// archiverShape checks that the entries of the Barman Cloud plugin in a
-// Cluster's spec.plugins have the one shape that Archiver and the plugin read
-// the same way.
-//
-// Parameters:
-//   - cluster is the Cluster of the create.
-//
-// It returns nil when no entry has the name PluginName, when the one entry
-// with that name is not a WAL archiver, and when the one archiver entry is
-// enabled, names a store in barmanObjectName and gives no empty serverName.
-// It returns an error that names the problem in every other case.
-//
-// plugin-barman-cloud v0.15.0 reads barmanObjectName from the last entry
-// with the plugin name, and serverName from the last enabled entry that has
-// the parameter, also when the value is empty
-// (internal/cnpgi/operator/config/config.go:149-161 and :289-301). Archiver
-// reads the first archiver entry and uses the Cluster name for an empty
-// serverName. With two entries, an empty serverName, a disabled archiver or
-// an archiver without a store, the two can disagree about the archive. The
-// webhook then refuses the create, because a decision about the wrong
-// archive can start an empty database beside a full archive.
-func archiverShape(cluster *unstructured.Unstructured) error {
-	plugins, _, err := unstructured.NestedSlice(cluster.Object, "spec", "plugins")
-	if err != nil {
-		return fmt.Errorf("spec.plugins is not a list: %w", err)
-	}
-	var entries []map[string]any
-	for _, entry := range plugins {
-		plugin, ok := entry.(map[string]any)
-		if ok && plugin["name"] == PluginName {
-			entries = append(entries, plugin)
-		}
-	}
-	switch len(entries) {
-	case 0:
-		return nil
-	case 1:
-	default:
-		return fmt.Errorf("spec.plugins has %d entries for %s; the webhook reads only one", len(entries), PluginName)
-	}
-	return archiverEntryShape(entries[0])
-}
-
-// archiverEntryShape checks the one entry of the Barman Cloud plugin in
-// spec.plugins. See archiverShape for the rules and the returned error.
-func archiverEntryShape(plugin map[string]any) error {
-	isArchiver, _, err := unstructured.NestedBool(plugin, "isWALArchiver")
-	if err != nil {
-		return fmt.Errorf("the %s entry in spec.plugins has an isWALArchiver that is not true or false: %w", PluginName, err)
-	}
-	enabled, found, err := unstructured.NestedBool(plugin, "enabled")
-	if err != nil {
-		return fmt.Errorf("the %s entry in spec.plugins has an enabled that is not true or false: %w", PluginName, err)
-	}
-	if !isArchiver {
-		return nil
-	}
-	if found && !enabled {
-		return fmt.Errorf("the %s entry in spec.plugins is the WAL archiver and has enabled set to false", PluginName)
-	}
-	parameters, _, err := unstructured.NestedStringMap(plugin, "parameters")
-	if err != nil {
-		return fmt.Errorf("the %s entry in spec.plugins has parameters that are not strings: %w", PluginName, err)
-	}
-	if parameters["barmanObjectName"] == "" {
-		return fmt.Errorf("the %s entry in spec.plugins is the WAL archiver and has no barmanObjectName parameter", PluginName)
-	}
-	if serverName, set := parameters["serverName"]; set && serverName == "" {
-		return fmt.Errorf("the %s entry in spec.plugins has an empty serverName parameter; remove it to use the Cluster name", PluginName)
-	}
-	return nil
 }
