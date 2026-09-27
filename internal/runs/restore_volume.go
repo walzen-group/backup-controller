@@ -253,18 +253,8 @@ func (r *RestoreRunReconciler) recordJobEnd(ctx context.Context, run *backupv1al
 // it created that claim, on the source claim when there is one, so the
 // in-place rule would take the run's own new claim for a replaced one.
 func (r *RestoreRunReconciler) claimLostError(ctx context.Context, run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem) error {
-	var lost string
-	var err error
 	if run.Spec.Into != "" {
-		lost, err = r.claimLost(ctx, run)
-	} else {
-		lost, err = r.inPlaceClaimLost(ctx, run, item.Name)
+		return r.claimLost(ctx, run)
 	}
-	switch {
-	case err != nil:
-		return err
-	case lost != "":
-		return refuse(backupv1alpha1.ItemReasonClaimLost, "%s", lost)
-	}
-	return nil
+	return r.inPlaceClaimLost(ctx, run, item.Name)
 }

@@ -30,16 +30,26 @@ func (r *RestoreRunReconciler) jobs() restorejob.API {
 	return restorejob.NewAPI(r.Reader, r.Client)
 }
 
-// jobName returns the name of the restore Job of one item of a run:
-// restore-, the run's full UID, a dash and the item's position in
-// status.items. The name is at most 48 characters, so it needs no
-// shortening, and a run finds its Job again by it after a restart.
+// jobName returns the name of the restore Job of one item of a run.
+//
+// Parameters:
+//   - uid is the run's UID, which binds the name to the run.
+//   - index is the item's position in status.items, which tells the run's
+//     Jobs apart.
+//
+// The name is restore-, the run's full UID, a dash and the position. It is
+// at most 48 characters, so it needs no shortening, and a run finds its Job
+// again by it after a restart.
 func jobName(uid types.UID, index int) string {
 	return fmt.Sprintf("restore-%s-%d", uid, index)
 }
 
 // jobRef returns the Ref an item recorded for its restore Job, which Stop
 // decides on.
+//
+// Parameters:
+//   - run is the RestoreRun, whose namespace holds the Job.
+//   - item is the volume item, which records the Job's name and UID.
 func jobRef(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem) restorejob.Ref {
 	return restorejob.Ref{Namespace: run.Namespace, Name: item.Job, UID: item.JobUID}
 }
@@ -109,12 +119,10 @@ func (r *RestoreRunReconciler) recheckJobSnapshot(ctx context.Context, run *back
 		return refuse(backupv1alpha1.ItemReasonRestoreJobRefused,
 			"the item records no full snapshot ID (snapshot %q), so the run has no snapshot to restore by ID", item.Snapshot)
 	}
-	snapshots, missing, err := r.listRepository(ctx, run, secretName)
+	snapshots, err := r.repositorySnapshots(ctx, run, secretName)
 	switch {
 	case err != nil:
 		return err
-	case missing != "":
-		return refuse(backupv1alpha1.ItemReasonRepositorySecretMissing, "%s", missing)
 	case slices.ContainsFunc(snapshots, func(s restic.Snapshot) bool { return s.ID == item.SnapshotID }):
 		return nil
 	}

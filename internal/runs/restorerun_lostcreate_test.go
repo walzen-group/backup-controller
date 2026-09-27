@@ -27,7 +27,7 @@ import (
 // ended (rule X2). That holds when a pass ran between the lost write and the
 // end, which took the Job over, and when the end came on the very next pass,
 // which finds the Job under the item's name.
-func TestALostDestinationCreateIsStoppedAtTheEnd(t *testing.T) {
+func TestALostJobCreateIsStoppedAtTheEnd(t *testing.T) {
 	for name, tc := range map[string]struct {
 		passBetween bool
 		timeout     bool

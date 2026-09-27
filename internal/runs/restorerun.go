@@ -799,25 +799,47 @@ func recordSnapshot(item *backupv1alpha1.RestoreItem, snapshot restic.Snapshot) 
 	}
 }
 
+// repositorySnapshots lists every snapshot in a run's restic repository,
+// oldest first.
+//
+// Parameters:
+//   - run is the RestoreRun; the Secret is read in its namespace.
+//   - secretName names the repository Secret.
+//
+// It returns the snapshots. It returns a *refusalError with reason
+// RepositorySecretMissing when the Secret doesn't exist, and a plain error
+// when the Secret can't be read for another reason or listing the
+// repository fails.
+func (r *RestoreRunReconciler) repositorySnapshots(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string) ([]restic.Snapshot, error) {
+	secret := &corev1.Secret{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: secretName}, secret); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("read repository Secret %s: %w", secretName, err)
+		}
+		return nil, refuse(backupv1alpha1.ItemReasonRepositorySecretMissing, "no repository Secret %s in this namespace", secretName)
+	}
+	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
+	if err != nil {
+		return nil, fmt.Errorf("list the snapshots in %s: %w", secretName, err)
+	}
+	return snapshots, nil
+}
+
 // listRepository returns every snapshot in the restic repository whose
-// Secret, in the run's namespace, is named secretName, oldest first.
+// Secret, in the run's namespace, is named secretName, oldest first, for
+// the checks that still take a reason as a string (see
+// repositorySnapshots).
 //
 // It returns a reason, and no error, when the Secret doesn't exist. It
 // returns an error when the Secret can't be read for another reason and when
 // listing the repository fails.
 func (r *RestoreRunReconciler) listRepository(ctx context.Context, run *backupv1alpha1.RestoreRun, secretName string) ([]restic.Snapshot, string, error) {
-	secret := &corev1.Secret{}
-	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: secretName}, secret); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return nil, "", fmt.Errorf("read repository Secret %s: %w", secretName, err)
-		}
-		return nil, fmt.Sprintf("no repository Secret %s in this namespace", secretName), nil
+	snapshots, err := r.repositorySnapshots(ctx, run, secretName)
+	var refused *refusalError
+	if errors.As(err, &refused) {
+		return nil, refused.Error(), nil
 	}
-	snapshots, err := r.Snapshots.Snapshots(ctx, secret)
-	if err != nil {
-		return nil, "", fmt.Errorf("list the snapshots in %s: %w", secretName, err)
-	}
-	return snapshots, "", nil
+	return snapshots, "", err
 }
 
 // recheckSnapshot lists the repository again right before an into restore
@@ -1203,14 +1225,20 @@ func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1al
 	return settings, nothingWrittenTo(claimName, err)
 }
 
-// inPlaceClaimLost returns a message when the claim an in-place item
-// restored is gone, is being deleted, or is not the claim the run checked
-// and took its Lease on, and "" while that claim is there.
+// inPlaceClaimLost checks that the claim an in-place item restored is
+// still the claim the run checked and took its Lease on.
 //
 // Parameters:
 //   - run is the RestoreRun. Its claim Leases are the ones labelled with its
 //     UID.
 //   - claimName names the claim, which is also the item's name.
+//
+// It returns nil while that claim is there, and a *refusalError with reason
+// ClaimLost when the claim is gone, is being deleted, or is another claim.
+// A run that holds no claim Lease for the item can't tell which claim the
+// mover wrote into, and gets that refusal too, since the item must not
+// succeed without that evidence. A failed read of the claim or the Leases
+// comes back as a plain error, and the caller leaves the item as it was.
 //
 // The claim the run checked is the one it took its claim Lease on right
 // before it created the item's restore Job: the Lease is named after that
@@ -1221,18 +1249,13 @@ func (r *RestoreRunReconciler) startRefusal(ctx context.Context, run *backupv1al
 // written into the new claim, and the message asks for that claim's data to
 // be checked.
 //
-// A run that holds no claim Lease for the item can't tell which claim the
-// mover wrote into, and gets a message too, since the item must not succeed
-// without that evidence. A failed read of the claim or the Leases comes back
-// as an error, and the caller leaves the item as it was.
-//
 // A claim deleted while its mover's pod mounts it stays, Terminating, until
 // the pod is gone (pvc-protection), so the mover can complete into a claim
 // that is about to go.
-func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) (string, error) {
+func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName string) error {
 	leases := &coordinationv1.LeaseList{}
 	if err := r.Reader.List(ctx, leases, client.InNamespace(run.Namespace), client.MatchingLabels{labelLeaseHolderUID: string(run.UID)}); err != nil {
-		return "", fmt.Errorf("list the Leases of RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
+		return fmt.Errorf("list the Leases of RestoreRun %s/%s: %w", run.Namespace, run.Name, err)
 	}
 	prefix := claimLeaseName("")
 	var leased []string
@@ -1242,26 +1265,26 @@ func (r *RestoreRunReconciler) inPlaceClaimLost(ctx context.Context, run *backup
 		}
 	}
 	if len(leased) == 0 {
-		return fmt.Sprintf("the run holds no claim Lease for claim %s, so it can't tell whether the mover wrote into the claim that is there now. "+
-			"Check the claim's data, and create a new RestoreRun to restore it", claimName), nil
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "the run holds no claim Lease for claim %s, so it can't tell whether the mover wrote into the claim that is there now. "+
+			"Check the claim's data, and create a new RestoreRun to restore it", claimName)
 	}
 
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: claimName}, claim); err != nil {
 		if apierrors.IsNotFound(err) {
-			return fmt.Sprintf("claim %s was deleted while the mover wrote into it, and the restored data went with it", claimName), nil
+			return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted while the mover wrote into it, and the restored data went with it", claimName)
 		}
-		return "", fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
+		return fmt.Errorf("get claim %s/%s: %w", run.Namespace, claimName, err)
 	}
 	if claim.DeletionTimestamp != nil {
-		return fmt.Sprintf("claim %s was deleted while the mover wrote into it, and the restored data goes with it once the claim is released", claimName), nil
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted while the mover wrote into it, and the restored data goes with it once the claim is released", claimName)
 	}
 	if !slices.Contains(leased, string(claim.UID)) {
-		return fmt.Sprintf("claim %[1]s was replaced while the mover wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
+		return refuse(backupv1alpha1.ItemReasonClaimLost, "claim %[1]s was replaced while the mover wrote into it: the claim there now (UID %[2]s) is not the one the run checked "+
 			"and took its Lease on (UID %[3]s). The mover mounts claim %[1]s by name, so it may have written into it; check its data, "+
-			"and create a new RestoreRun to restore it", claimName, claim.UID, strings.Join(leased, ", ")), nil
+			"and create a new RestoreRun to restore it", claimName, claim.UID, strings.Join(leased, ", "))
 	}
-	return "", nil
+	return nil
 }
 
 // restoreDatabase moves one database item a step further: it deletes the
@@ -1673,36 +1696,37 @@ func replacedDestination(name string) string { //nolint:unused // deleted in res
 	return fmt.Sprintf("ReplicationDestination %s was replaced by one that does not carry this run's trigger; the run leaves it alone", name)
 }
 
-// claimLost reports whether the claim an into restore writes into is still
-// the run's own.
+// claimLost checks that the claim an into restore writes into is still the
+// run's own.
 //
 // Parameters:
 //   - run is the RestoreRun. spec.into names the claim, and the claim is the
 //     run's own when the run is its controller (see notCreatedByRun).
 //
-// It returns a message for the item when the claim is gone, is being
-// deleted, or is controlled by something other than the run, and "" while
-// the run's own claim is there. A failed read that is not NotFound comes
-// back as an error, and the caller leaves the item as it was.
+// It returns nil while the run's own claim is there, and a *refusalError
+// with reason ClaimLost when the claim is gone, is being deleted, or is
+// controlled by something other than the run. A failed read that is not
+// NotFound comes back as a plain error, and the caller leaves the item as it
+// was.
 //
 // An into restore checks it on every pass once its restore Job exists (see
 // claimLostError), so a Job that finished never counts as a restore into a
 // claim that is no longer the run's. inPlaceClaimLost does the same for an
 // in-place item.
-func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha1.RestoreRun) (string, error) {
-	lost := fmt.Sprintf("claim %s was deleted (or replaced) while the mover wrote into it", run.Spec.Into)
+func (r *RestoreRunReconciler) claimLost(ctx context.Context, run *backupv1alpha1.RestoreRun) error {
+	lost := refuse(backupv1alpha1.ItemReasonClaimLost, "claim %s was deleted (or replaced) while the mover wrote into it", run.Spec.Into)
 	claim := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Into}
 	if err := r.Reader.Get(ctx, key, claim); err != nil {
 		if apierrors.IsNotFound(err) {
-			return lost, nil
+			return lost
 		}
-		return "", fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
+		return fmt.Errorf("get PersistentVolumeClaim %s: %w", key, err)
 	}
 	if claim.DeletionTimestamp != nil || !metav1.IsControlledBy(claim, run) {
-		return lost, nil
+		return lost
 	}
-	return "", nil
+	return nil
 }
 
 // abort ends a run early as Failed. It fails every item that has not
