@@ -50,7 +50,8 @@ func (c *Callbacks) jobKey(claimUID types.UID) types.NamespacedName {
 //
 // Parameters:
 //   - r is the claim's restore.
-//   - job is the claim's Job as Populate just read it, not being deleted.
+//   - job is the claim's Job as Populate just read it, not being deleted,
+//     and built for the prime claim the library passes now.
 //
 // It returns what failJob returns for a failed Job, which is always an
 // error. For a running Job it returns an error from recording or resuming
@@ -259,8 +260,9 @@ func (c *Callbacks) createJob(ctx context.Context, r restore, snapshot restic.Sn
 //   - r is the claim's restore.
 //
 // It returns what startJob returns when the claim has no Job, an error
-// wrapping errJobBeingDeleted while the Job is being deleted, and what
-// followJob returns otherwise.
+// wrapping errJobBeingDeleted while the Job is being deleted, what
+// stopEarlierJob returns for a Job built for an earlier prime claim, and
+// what followJob returns otherwise.
 func (c *Callbacks) populate(ctx context.Context, r restore) error {
 	key := c.jobKey(r.claim.UID)
 	job, err := c.operations.GetJob(ctx, key)
@@ -271,6 +273,8 @@ func (c *Callbacks) populate(ctx context.Context, r restore) error {
 		return fmt.Errorf("read restore Job %s: %w", key, err)
 	case job.DeletionTimestamp != nil:
 		return claimError(r.claim, errJobBeingDeleted)
+	case !ownedByPrime(job, r.prime):
+		return c.stopEarlierJob(ctx, r, job)
 	default:
 		return c.followJob(ctx, r, job)
 	}

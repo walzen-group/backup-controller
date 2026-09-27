@@ -112,6 +112,9 @@ func New(operations Operations, namespace, image string, snapshots SnapshotListe
 //     error.
 //   - A Job being deleted: it returns an error and creates nothing, until
 //     the Job is gone.
+//   - A Job built for an earlier prime claim, by its owner reference: it
+//     stops the Job and returns an error, so a new Job for the prime of now
+//     is created once the old one is gone (see stopEarlierJob).
 //   - A failed Job: it marks the claim Failed with reason RestoreFailed and
 //     the Job's failure, then stops the Job, and returns an error (see
 //     failJob).
@@ -145,8 +148,12 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 //   - params are what the library passes for the claim, as for Populate.
 //     The library calls Complete only in a sync whose Populate returned nil.
 //
-// It returns true when the claim's restore Job has Complete=True, the one
-// sign that restic restored the Job's snapshot. With no Job, it returns true
+// It returns true when the claim's restore Job was built for the prime claim
+// the library passes now, by its owner reference, and has Complete=True, the
+// one sign that restic restored the Job's snapshot into that prime's volume.
+// A Job of an earlier prime claim, one the library has since created again
+// under the same name, filled a volume that went with that prime, so it
+// counts for nothing and Populate replaces it. With no Job, it returns true
 // only when the repository holds no snapshot at all and nothing pins the
 // claim, which is how a first deploy binds its empty volume (see choose). It
 // returns false for any other Job and in any other case, and an error when
@@ -165,7 +172,7 @@ func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.Popu
 	case err != nil:
 		return false, fmt.Errorf("read restore Job %s: %w", key, err)
 	default:
-		return restorejob.Read(job, nil).State == restorejob.Succeeded, nil
+		return ownedByPrime(job, params.PvcPrime) && restorejob.Read(job, nil).State == restorejob.Succeeded, nil
 	}
 }
 
