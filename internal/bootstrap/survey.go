@@ -258,18 +258,23 @@ type infoResult struct {
 // It returns how many files were read, a missing one included. It returns
 // the first GET or parse error, unless visit stopped the reading. When ctx
 // ends before every file was read, it returns an *OutOfTimeError carrying
-// the counts and the last read that failed for another reason. When it
-// returns, every worker has stopped.
+// the counts and the last read that failed for another reason.
+//
+// When visit stops the reading, readInfos hands out no more IDs, and waits
+// for the GETs already in flight to finish under ctx. It does not cancel
+// them: a cancelled GET can still reach the store after readInfos returned.
+// Thus, when readInfos returns, every worker has stopped and no GET of it
+// is on its way to the store, unless ctx ended.
 func readInfos(ctx context.Context, client *minio.Client, at Location, ids []string, visit func(BaseBackup) bool) (int, error) {
-	ctx, cancel := context.WithCancel(ctx)
+	feed, stopFeed := context.WithCancel(ctx)
 	results := make(chan infoResult, len(ids))
 	var workers sync.WaitGroup
 	defer func() {
-		cancel()
+		stopFeed()
 		workers.Wait()
 	}()
 
-	jobs := feedIDs(ctx, ids)
+	jobs := feedIDs(feed, ids)
 	for range min(surveyParallel, len(ids)) {
 		workers.Add(1)
 		go func() {

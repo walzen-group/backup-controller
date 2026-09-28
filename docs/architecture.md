@@ -132,7 +132,7 @@ has the source lines.
 
 | Method | Caller | Reads |
 | --- | --- | --- |
-| Survey | the webhook | lists `<prefix>/base/` with the `/` delimiter, one entry per backup directory. Then it reads the `backup.info` files newest first, with eight GETs in flight. It stops at the first DONE backup. If there is a target, it stops at the first DONE backup that finished by the target. When `base/` holds no directory, it lists one key under `<prefix>/` to learn whether the prefix is empty |
+| Survey | the webhook | lists `<prefix>/base/` with the `/` delimiter, one entry per backup directory. Then it reads the `backup.info` files newest first, with eight GETs in flight. It stops at the first DONE backup. If there is a target, it stops at the first DONE backup that finished by the target. When it stops, it starts no more GETs and waits for the GETs in flight to finish, so that no GET of it reaches the store after it returned. When `base/` holds no directory, it lists one key under `<prefix>/` to learn whether the prefix is empty |
 | BaseBackups | the RestoreRun checks | the same listing and parallel reads without the early stop. It keeps every backup whose `status` is `DONE` and orders them by `end_time` |
 
 Both methods count a directory with no `backup.info` as not DONE, as barman

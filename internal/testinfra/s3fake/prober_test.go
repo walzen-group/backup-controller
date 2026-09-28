@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -47,32 +46,26 @@ func TestProberRequestsMatchRecordedTranscripts(t *testing.T) {
 				if err := store.Upload(srv, "recorded", name); err != nil {
 					t.Fatal(err)
 				}
-				// Survey and BaseBackups each talk to their own logging
-				// server in front of the fake. A GET that Survey cancelled
-				// can reach the server after Survey returned, and then it
-				// stays in Survey's log.
-				var mu sync.Mutex
-				surveySent, baseSent := []string{}, []string{}
-				logTo := func(sent *[]string) string {
-					logged := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						mu.Lock()
-						*sent = append(*sent, requestLine(t, r.Method, r.URL.EscapedPath(), r.URL.RawQuery))
-						mu.Unlock()
-						srv.ServeHTTP(w, r)
-					}))
-					t.Cleanup(logged.Close)
-					return logged.URL
-				}
+				var (
+					mu   sync.Mutex
+					sent []string
+				)
+				logged := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					mu.Lock()
+					sent = append(sent, requestLine(t, r.Method, r.URL.EscapedPath(), r.URL.RawQuery))
+					mu.Unlock()
+					srv.ServeHTTP(w, r)
+				}))
+				t.Cleanup(logged.Close)
+
 				at := bootstrap.Location{
-					Bucket: "recorded", Prefix: name + "/" + server,
+					Endpoint: logged.URL, Bucket: "recorded", Prefix: name + "/" + server,
 					AccessKey: srv.AccessKey, SecretKey: srv.SecretKey,
 				}
 				ctx := context.Background()
-				at.Endpoint = logTo(&surveySent)
 				if _, err := (bootstrap.S3Prober{}).Survey(ctx, at, nil); err != nil {
 					t.Fatalf("Survey: %v", err)
 				}
-				at.Endpoint = logTo(&baseSent)
 				if _, err := (bootstrap.S3Prober{}).BaseBackups(ctx, at); err != nil {
 					t.Fatalf("BaseBackups: %v", err)
 				}
@@ -83,8 +76,7 @@ func TestProberRequestsMatchRecordedTranscripts(t *testing.T) {
 				}
 				mu.Lock()
 				defer mu.Unlock()
-				sent := infoRuns(append(slices.Clone(surveySent), baseSent...))
-				want = infoRuns(want)
+				sent, want = infoRuns(sent), infoRuns(want)
 				for i := range max(len(sent), len(want)) {
 					var got, rec string
 					if i < len(sent) {
