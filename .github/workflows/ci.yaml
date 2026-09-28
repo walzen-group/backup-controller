@@ -140,7 +140,9 @@ jobs:
       - name: helm template
         run: |
           mkdir -p .tmp
-          nix develop -c helm template backup-controller chart/ > .tmp/ci-chart-render.yaml
+          # restoreImage has no default: the installer passes VolSync's mover
+          # image. The render uses the one the kind test cluster runs.
+          nix develop -c helm template backup-controller chart/ --set restoreImage=quay.io/backube/volsync:0.16.0 > .tmp/ci-chart-render.yaml
 
       # Schema validation of both renders with no cluster available.
       # `kubectl apply --dry-run=client` cannot run here at all: kubectl v1.37
