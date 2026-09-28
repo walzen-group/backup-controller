@@ -6,7 +6,7 @@
 | --- | --- |
 | VolSync with restic | the backup movers of the claims |
 | CloudNativePG with the barman-cloud plugin | the databases, their base backups and WAL archives |
-| Kueue, with a ClusterQueue that covers backup-controller.wlz.li/run | admission of every run; docs/operations.md shows the quota |
+| Kueue, with a ClusterQueue that covers backup-controller.wlz.li/run | admission of every run and every populator restore; docs/operations.md shows the quota |
 | cert-manager | the certificate of the controller's webhook |
 | An S3 service | the restic repositories and the barman archives |
 | Flux, optional | the controller suspends an app's Kustomization while the app is paused, and waits for Flux to create a deleted Cluster again |
@@ -60,8 +60,11 @@ is ready before any Cluster is created:
 
 The controller writes the ReplicationSources and the CloudNativePG Backups; no
 manifest declares them. The controller namespace also needs a LocalQueue
-named after the queue label in the VolumeRestores' moverPodLabels, so Kueue
-admits the populator's restore Jobs.
+pointing at the same ClusterQueue, through which the populator's restores
+wait for admission. Don't name that LocalQueue default: Kueue gives every
+Job in a namespace with a LocalQueue called default that queue's label, so
+Kueue would queue the populator's restore Jobs a second time, and they would
+wait for quota the ClusterQueue does not cover.
 
 ## Permissions
 

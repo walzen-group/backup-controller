@@ -59,7 +59,7 @@ flowchart TD
 ### Before anything changes
 
 Until Kueue admits the run, the controller only reads the claims, the
-Clusters and the listed workloads. Once admitted, the run takes its Leases,
+Clusters and the listed workloads. Once admitted, the run acquires its Leases,
 so no other run works on its claims, repositories or Clusters, and then
 selects the backup of every item and records it on the item: the snapshot ID of each volume, and
 the base backup of each database. If any item has no backup in reach, the run

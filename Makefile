@@ -9,7 +9,7 @@ CONTROLLER_GEN := $(NIX) controller-gen
 # copy, because kustomize and helm both read a directory of their own. Every
 # generated file is copied, so a new kind needs no edit here.
 
-.PHONY: build test vet lint check generate manifests verify kind-up kind-deploy e2e
+.PHONY: build test vet lint check generate manifests verify kind-up kind-deploy e2e e2e-affected
 
 ## build: compile every package.
 build:
@@ -61,3 +61,8 @@ kind-deploy:
 ## e2e: run every end-to-end scenario against the controller deployed in the kind cluster.
 e2e:
 	go test -tags e2e -count=1 -timeout 120m -v -parallel 4 ./test/e2e/
+
+## e2e-affected: run only the scenarios the change since BASE (the newest version tag) touches; see hack/kind/README.md.
+e2e-affected:
+	@run="$$(hack/kind/affected.sh $(BASE))"; \
+	if [ -n "$$run" ]; then go test -tags e2e -count=1 -timeout 120m -v -parallel 4 ./test/e2e/ -run "$$run"; fi

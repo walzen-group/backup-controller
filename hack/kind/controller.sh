@@ -79,6 +79,18 @@ deploy() {
   log "image $image"
   crds
   render "$image" | k apply --server-side -f -
+  # The populator's restores wait for Kueue through a LocalQueue in the
+  # controller namespace, as on prod, where the backup-controller unit
+  # creates it.
+  k apply --server-side -f - <<YAML
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: backups
+  namespace: $ns
+spec:
+  clusterQueue: backup
+YAML
   wait_ca
   k -n "$ns" rollout status deployment/backup-controller --timeout=300s
   log "running $image"

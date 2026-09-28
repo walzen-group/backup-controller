@@ -7,6 +7,7 @@ import (
 	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/admission"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/lease"
 	"github.com/walzen-group/backup-controller/internal/restic"
@@ -210,16 +211,16 @@ func (r *BackupRunReconciler) items(ctx context.Context, run *backupv1alpha1.Bac
 // run to Running and records status.startedAt, from which the run's timeout
 // counts.
 //
-// The run goes through Kueue as one Workload that asks for one RunResource,
+// The run goes through Kueue as one Workload that asks for one admission.RunResource,
 // so the ClusterQueue's quota bounds how many runs work at once. Once Kueue
 // admits it, admit marks the Workload PodsReady, so that Kueue's
 // waitForPodsReady does not evict it. While the Workload waits, or while the
-// namespace has no LocalQueue (see localQueue), the run stays Queued and admit
+// namespace has no LocalQueue (see admission.LocalQueue), the run stays Queued and admit
 // requeues after pollInterval. A backup.wlz.li/timeout on the namespace that
 // does not parse fails the run here, before it pauses or starts anything.
 func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.BackupRun) (ctrl.Result, error) {
-	queue, err := localQueue(ctx, r.Reader, run.Namespace)
-	var missing noQueueError
+	queue, err := admission.LocalQueue(ctx, r.Reader, run.Namespace)
+	var missing admission.NoQueueError
 	if errors.As(err, &missing) {
 		if setQueued(&run.Status.Conditions, run.Generation, missing.Error()) {
 			return ctrl.Result{RequeueAfter: pollInterval}, r.writeStatus(ctx, run)
@@ -229,7 +230,7 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	workload, err := ensureWorkload(ctx, r.Client, run, backupRunKind, queue)
+	workload, err := admission.EnsureWorkload(ctx, r.Reader, r.Client, run.Namespace, admission.Name(backupRunKind.Kind, run.UID), queue, *metav1.NewControllerRef(run, backupRunKind))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -240,10 +241,10 @@ func (r *BackupRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Bac
 			return ctrl.Result{}, err
 		}
 	}
-	if !admitted(workload) {
+	if !admission.Admitted(workload) {
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
 	}
-	if err := markPodsReady(ctx, r.Client, workload, metav1.NewTime(r.Now())); err != nil {
+	if err := admission.MarkPodsReady(ctx, r.Client, workload, metav1.NewTime(r.Now())); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -379,8 +380,8 @@ func (r *BackupRunReconciler) endIfEvicted(ctx context.Context, run *backupv1alp
 	if run.Status.Workload == "" {
 		return false, nil
 	}
-	workload, err := getWorkload(ctx, r.Reader, run.Namespace, run.Status.Workload)
-	if err != nil || workload == nil || !evicted(workload) {
+	workload, err := admission.Get(ctx, r.Reader, run.Namespace, run.Status.Workload)
+	if err != nil || workload == nil || !admission.Evicted(workload) {
 		return false, nil
 	}
 	return true, r.abort(ctx, run, backupv1alpha1.ReasonEvicted, "Kueue evicted the run's Workload")
@@ -882,7 +883,7 @@ func (r *BackupRunReconciler) release(ctx context.Context, run *backupv1alpha1.B
 	if err := releaseAll(ctx, r.Leases, run.Namespace, r.holder(run), run.Status.Leases); err != nil {
 		return err
 	}
-	return deleteWorkload(ctx, r.Client, run.Namespace, backupRunKind.Kind, run.UID)
+	return admission.Delete(ctx, r.Client, run.Namespace, backupRunKind.Kind, run.UID)
 }
 
 // finalize puts back what a run changed when the run is deleted before it

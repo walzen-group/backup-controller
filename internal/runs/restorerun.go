@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/walzen-group/backup-controller/internal/admission"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/lease"
@@ -240,8 +241,8 @@ func (r *RestoreRunReconciler) items(ctx context.Context, run *backupv1alpha1.Re
 // counts. It works as BackupRunReconciler.admit does: a namespace with no
 // LocalQueue keeps the run Queued.
 func (r *RestoreRunReconciler) admit(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
-	queue, err := localQueue(ctx, r.Reader, run.Namespace)
-	var missing noQueueError
+	queue, err := admission.LocalQueue(ctx, r.Reader, run.Namespace)
+	var missing admission.NoQueueError
 	if errors.As(err, &missing) {
 		if setQueued(&run.Status.Conditions, run.Generation, missing.Error()) {
 			return ctrl.Result{RequeueAfter: pollInterval}, r.writeStatus(ctx, run)
@@ -251,7 +252,7 @@ func (r *RestoreRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Re
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	workload, err := ensureWorkload(ctx, r.Client, run, restoreRunKind, queue)
+	workload, err := admission.EnsureWorkload(ctx, r.Reader, r.Client, run.Namespace, admission.Name(restoreRunKind.Kind, run.UID), queue, *metav1.NewControllerRef(run, restoreRunKind))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -262,10 +263,10 @@ func (r *RestoreRunReconciler) admit(ctx context.Context, run *backupv1alpha1.Re
 			return ctrl.Result{}, err
 		}
 	}
-	if !admitted(workload) {
+	if !admission.Admitted(workload) {
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
 	}
-	if err := markPodsReady(ctx, r.Client, workload, metav1.NewTime(r.Now())); err != nil {
+	if err := admission.MarkPodsReady(ctx, r.Client, workload, metav1.NewTime(r.Now())); err != nil {
 		return ctrl.Result{}, err
 	}
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
@@ -425,8 +426,8 @@ func (r *RestoreRunReconciler) endIfEvicted(ctx context.Context, run *backupv1al
 	if run.Status.Workload == "" {
 		return false, nil
 	}
-	workload, err := getWorkload(ctx, r.Reader, run.Namespace, run.Status.Workload)
-	if err != nil || workload == nil || !evicted(workload) {
+	workload, err := admission.Get(ctx, r.Reader, run.Namespace, run.Status.Workload)
+	if err != nil || workload == nil || !admission.Evicted(workload) {
 		return false, nil
 	}
 	return true, r.abort(ctx, run, backupv1alpha1.ReasonEvicted, "Kueue evicted the run's Workload")
@@ -628,7 +629,7 @@ func (r *RestoreRunReconciler) release(ctx context.Context, run *backupv1alpha1.
 	if err := releaseAll(ctx, r.Leases, run.Namespace, r.holder(run), run.Status.Leases); err != nil {
 		return err
 	}
-	return deleteWorkload(ctx, r.Client, run.Namespace, restoreRunKind.Kind, run.UID)
+	return admission.Delete(ctx, r.Client, run.Namespace, restoreRunKind.Kind, run.UID)
 }
 
 // finalize puts back what a run changed when the run is deleted before it

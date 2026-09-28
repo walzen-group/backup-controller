@@ -88,10 +88,22 @@ type loadSample struct {
 
 // sampleLoad reads one loadSample.
 //
-// It counts the admitted Workloads in all namespaces, and reads the memory of
-// the controller's container from the kubelet's summary of its node. It
-// returns an error when either read fails.
+// It counts the admitted Workloads in all namespaces (see admittedWorkloads),
+// and reads the memory of the controller's container from the kubelet's
+// summary of its node. It returns an error when either read fails.
 func sampleLoad(t *testing.T) (loadSample, error) {
+	admitted, err := admittedWorkloads(t)
+	if err != nil {
+		return loadSample{}, err
+	}
+	memory, err := controllerMemory(t)
+	return loadSample{admitted: admitted, memory: memory}, err
+}
+
+// admittedWorkloads returns how many Kueue Workloads in all namespaces are
+// admitted and not finished: the runs and populator restores that hold a
+// slot of the queue right now. It returns an error when the list fails.
+func admittedWorkloads(t *testing.T) (int, error) {
 	var workloads struct {
 		Items []struct {
 			Status struct {
@@ -101,12 +113,12 @@ func sampleLoad(t *testing.T) (loadSample, error) {
 	}
 	out, err := run(t.Context(), "", "get", "workloads.kueue.x-k8s.io", "-A", "-o", "json")
 	if err != nil {
-		return loadSample{}, err
+		return 0, err
 	}
 	if err := jsonInto(out, &workloads); err != nil {
-		return loadSample{}, err
+		return 0, err
 	}
-	var s loadSample
+	count := 0
 	for _, w := range workloads.Items {
 		admitted, finished := false, false
 		for _, c := range w.Status.Conditions {
@@ -114,11 +126,10 @@ func sampleLoad(t *testing.T) (loadSample, error) {
 			finished = finished || (c.Type == "Finished" && c.Status == "True")
 		}
 		if admitted && !finished {
-			s.admitted++
+			count++
 		}
 	}
-	s.memory, err = controllerMemory(t)
-	return s, err
+	return count, nil
 }
 
 // controllerMemory returns the working set of the controller's container, in

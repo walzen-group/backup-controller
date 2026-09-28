@@ -15,16 +15,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
+	"github.com/walzen-group/backup-controller/internal/admission"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	"golang.org/x/time/rate"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -79,6 +83,7 @@ func main() {
 	}
 	callbacks := populator.New(populator.Config{
 		Operations: operations,
+		Client:     operations.client,
 		Reader:     operations.client,
 		Namespace:  *namespace,
 		Image:      *restoreImg,
@@ -117,6 +122,7 @@ func main() {
 			PopulateCompleteFn: callbacks.Complete,
 			PopulateCleanupFn:  callbacks.Cleanup,
 		},
+		Workqueue: populatorQueue(),
 	})
 
 	klog.Info("stopping backup-controller")
@@ -145,6 +151,7 @@ func newClientOperations(kubeconfig string) (*clientOperations, error) {
 		"core":          corev1.AddToScheme,
 		"batch":         batchv1.AddToScheme,
 		"backup.wlz.li": backupv1alpha1.AddToScheme,
+		"kueue":         admission.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {
 			return nil, fmt.Errorf("register the %s types: %w", name, err)
@@ -157,4 +164,18 @@ func newClientOperations(kubeconfig string) (*clientOperations, error) {
 	}
 	klog.Infof("starting backup-controller: watching %s VolumeRestore", backupv1alpha1.GroupVersion.String())
 	return &clientOperations{client: kubeClient}, nil
+}
+
+// populatorQueue returns the work queue of the populator library.
+//
+// The library calls Populate again after an error and Complete again while a
+// restore Job runs, each after the queue's backoff. The library's default
+// backoff doubles up to 1000 seconds, so a claim waiting for Kueue or for its
+// Job would be looked at only every 16 minutes. This queue doubles from one
+// second up to 30 seconds, and allows 10 retries a second overall.
+func populatorQueue() workqueue.TypedRateLimitingInterface[any] {
+	return workqueue.NewTypedRateLimitingQueue(workqueue.NewTypedMaxOfRateLimiter(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[any](time.Second, 30*time.Second),
+		&workqueue.TypedBucketRateLimiter[any]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+	))
 }

@@ -58,12 +58,12 @@ func (w *replicaWatch) end() []int {
 	return append([]int(nil), w.seen...)
 }
 
-// TestAPausedBackupPausesTheAppAndTagsTheSnapshot backs up a namespace with
+// TestABackupPausesTheMarkedAppAndTagsTheSnapshot backs up a namespace with
 // all: true. The run scales the annotated Deployment to 0 while it copies,
 // and back to its replica count afterwards. The new snapshot holds the
 // app's file, carries the paused tag, and its time is the moment the run
 // resumed the app.
-func TestAPausedBackupPausesTheAppAndTagsTheSnapshot(t *testing.T) {
+func TestABackupPausesTheMarkedAppAndTagsTheSnapshot(t *testing.T) {
 	t.Parallel()
 	a := newApp(t, "paused")
 	a.publish(volumeManifests())

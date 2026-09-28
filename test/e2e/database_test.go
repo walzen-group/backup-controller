@@ -296,13 +296,13 @@ func TestADeletedClusterComesBackWithItsData(t *testing.T) {
 	}
 }
 
-// TestAPausedRestoreOfAnIdleAppMatchesThePausedBackup backs up the whole
+// TestASyncedRestoreOfAnIdleAppMatchesTheBackupThatPausedIt backs up the whole
 // namespace with the app paused, then leaves the app and the database idle,
 // and restores the namespace with syncDatabaseToVolume. The claim holds the
 // file and the database the rows from the paused backup, the restore
 // finishes, and the app runs again. This is the restore that looped on the
 // canary.
-func TestAPausedRestoreOfAnIdleAppMatchesThePausedBackup(t *testing.T) {
+func TestASyncedRestoreOfAnIdleAppMatchesTheBackupThatPausedIt(t *testing.T) {
 	t.Parallel()
 	a := newApp(t, "synced")
 	a.setUpDatabase("paused state")

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
+	"github.com/walzen-group/backup-controller/internal/admission"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/restorejob"
@@ -33,6 +34,15 @@ import (
 // --pause, so the library calls Populate again later.
 var errPaused = errors.New("the controller runs with --pause")
 
+// errQueued is the error Populate returns while the restore waits for Kueue
+// to admit it, so the library calls Populate again later.
+var errQueued = errors.New("the restore waits for the backup queue")
+
+// queueLabel is the label with which Kueue's own Job integration would queue
+// a Job. The populator admits its restores itself, so it takes the label off
+// the restore Job, where a VolumeRestore's moverPodLabels may still carry it.
+const queueLabel = "kueue.x-k8s.io/queue-name"
+
 // Operations are the Kubernetes API calls the callbacks make. The binary
 // implements them with a client (clientOperations in cmd/backup-controller).
 type Operations interface {
@@ -49,6 +59,9 @@ type Operations interface {
 type Config struct {
 	// Operations makes the Kubernetes API calls.
 	Operations Operations
+	// Client creates, reads and deletes the Kueue Workloads through which
+	// each restore waits for admission (see internal/admission).
+	Client client.Client
 	// Reader reads the VolumeRestores and repository Secrets of a namespace,
 	// to find the namespace's paused moment (see internal/synced).
 	Reader client.Reader
@@ -89,9 +102,10 @@ func New(config Config) *Callbacks {
 //
 // It returns nil when the restore Job runs, or when the claim binds empty
 // because its repository holds no snapshot. It returns an error while the
-// controller is paused, when no snapshot reaches the claim's pin, and when
-// an API call or a snapshot listing fails. After an error, the library
-// calls Populate again.
+// controller is paused, while the restore waits for Kueue to admit it (see
+// admit), when no snapshot reaches the claim's pin, and when an API call or
+// a snapshot listing fails. After an error, the library calls Populate
+// again.
 //
 // When the claim's restore Job exists, Populate returns at once. Else it
 // uses the snapshot that the claim's Restoring entry records, or it selects
@@ -116,10 +130,16 @@ func (c *Callbacks) Populate(ctx context.Context, params populatormachinery.Popu
 	if c.config.Paused {
 		return c.waitPaused(ctx, vr, claim)
 	}
+	if err := c.admit(ctx, vr, claim, params.PvcPrime); err != nil {
+		return err
+	}
 	status, ok := decided(vr, claim.UID)
 	if !ok {
 		if status, err = c.decide(ctx, vr, claim); err != nil {
-			return err
+			// No Job will run for this attempt, such as when no snapshot
+			// reaches the claim's pin or S3 can't be read. The slot goes
+			// back, and the next attempt asks the queue again.
+			return errors.Join(err, c.release(ctx, claim))
 		}
 	}
 	if status.SnapshotID == "" {
@@ -146,6 +166,77 @@ func (c *Callbacks) waitPaused(ctx context.Context, vr *backupv1alpha1.VolumeRes
 		return err
 	}
 	return fmt.Errorf("claim %s/%s waits: %w", claim.Namespace, claim.Name, errPaused)
+}
+
+// admit waits for Kueue to admit the restore of one claim, before the
+// populator reads the repository or starts a Job.
+//
+// Parameters:
+//   - vr is the claim's VolumeRestore. While the restore waits, its Ready
+//     condition gets reason Queued.
+//   - claim is the claim to fill. The Workload is named after its UID.
+//   - prime is the prime claim in the controller namespace, which owns the
+//     Workload, so the garbage collector deletes the Workload with it.
+//
+// The restore asks for one admission.RunResource, like a BackupRun or a
+// RestoreRun, through the LocalQueue of the controller namespace, so one
+// ClusterQueue quota bounds all of that work together. Once Kueue admits the
+// Workload, admit marks it PodsReady, so Kueue's waitForPodsReady does not
+// evict it. A Workload that Kueue evicted anyway is deleted, and the restore
+// asks again.
+//
+// It returns nil once the restore is admitted. It returns an error that
+// wraps errQueued while it waits, and any other error when an API call
+// fails.
+func (c *Callbacks) admit(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim, prime *corev1.PersistentVolumeClaim) error {
+	queue, err := admission.LocalQueue(ctx, c.config.Reader, c.config.Namespace)
+	var missing admission.NoQueueError
+	if errors.As(err, &missing) {
+		return c.queued(ctx, vr, claim, missing.Error())
+	}
+	if err != nil {
+		return err
+	}
+	owner := metav1.OwnerReference{APIVersion: "v1", Kind: "PersistentVolumeClaim", Name: prime.Name, UID: prime.UID}
+	workload, err := admission.EnsureWorkload(ctx, c.config.Reader, c.config.Client, c.config.Namespace, workloadName(claim.UID), queue, owner)
+	if err != nil {
+		return err
+	}
+	if admission.Evicted(workload) {
+		if err := c.release(ctx, claim); err != nil {
+			return err
+		}
+		return c.queued(ctx, vr, claim, "Kueue evicted the restore before it started; it asks the backup queue again")
+	}
+	if !admission.Admitted(workload) {
+		return c.queued(ctx, vr, claim, fmt.Sprintf("the restore of claim %s/%s waits for the backup queue to admit it", claim.Namespace, claim.Name))
+	}
+	return admission.MarkPodsReady(ctx, c.config.Client, workload, metav1.Now())
+}
+
+// queued reports a restore that waits for Kueue.
+//
+// Parameters:
+//   - vr is the claim's VolumeRestore. Its Ready condition gets reason
+//     Queued and the message.
+//   - claim is the claim that waits.
+//   - message says what the restore waits for.
+//
+// It returns an error that wraps errQueued, so the library calls Populate
+// again, or an error when the status write fails.
+func (c *Callbacks) queued(ctx context.Context, vr *backupv1alpha1.VolumeRestore, claim *corev1.PersistentVolumeClaim, message string) error {
+	before := vr.Status.DeepCopy()
+	backupv1alpha1.SetReady(&vr.Status.Conditions, vr.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonQueued, message)
+	if err := c.write(ctx, vr, before); err != nil {
+		return err
+	}
+	return fmt.Errorf("claim %s/%s waits: %w", claim.Namespace, claim.Name, errQueued)
+}
+
+// release deletes the Workload of a claim's restore, which gives its slot
+// back to the queue. A Workload that is already gone counts as released.
+func (c *Callbacks) release(ctx context.Context, claim *corev1.PersistentVolumeClaim) error {
+	return admission.Delete(ctx, c.config.Client, c.config.Namespace, populatorKind, claim.UID)
 }
 
 // decide selects the snapshot that fills a claim and records it.
@@ -298,10 +389,7 @@ func (c *Callbacks) start(ctx context.Context, vr *backupv1alpha1.VolumeRestore,
 		RepositorySecret: internalvolsync.SecretCopyName(claim.UID),
 		SnapshotID:       snapshotID,
 		SecurityContext:  vr.Spec.MoverSecurityContext,
-		// The VolumeRestore's moverPodLabels carry the Kueue queue label,
-		// so Kueue admits the populator's restores through the queue, as
-		// no run admits them.
-		Labels: vr.Spec.MoverLabels(),
+		Labels:           jobLabels(vr),
 		// A label value cannot hold a slash, so the label holds the claim's
 		// namespace. The Job's name holds the claim's UID.
 		Owner: claim.Namespace,
@@ -366,15 +454,21 @@ func (c *Callbacks) Complete(ctx context.Context, params populatormachinery.Popu
 			return false, err
 		}
 		status, ok := decided(vr, claim.UID)
-		return ok && status.SnapshotID == "", nil
+		if ok && status.SnapshotID == "" {
+			return true, c.release(ctx, claim)
+		}
+		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("get restore Job %s/%s: %w", c.config.Namespace, name, err)
 	}
 	switch restorejob.Result(job) {
 	case restorejob.Succeeded:
-		return true, nil
+		return true, c.release(ctx, claim)
 	case restorejob.Failed:
+		if err := c.release(ctx, claim); err != nil {
+			return false, err
+		}
 		return false, c.failed(ctx, params)
 	default:
 		return false, nil
@@ -412,11 +506,15 @@ func (c *Callbacks) failed(ctx context.Context, params populatormachinery.Popula
 //   - params are what the library passes: the claim and the VolumeRestore.
 //     The prime claim can be gone.
 //
-// It returns an error when a delete or the status write fails.
+// It returns an error when a delete or the status write fails, and while the
+// pod of the deleted restore Job is still stopping, so the library calls
+// Cleanup again.
 //
-// It deletes the restore Job and the repository Secret copy, and skips any
-// that are already gone. The claim's entry gets phase Restored and keeps its
-// snapshot, which the bootstrap webhook reads. Then settle sets Ready.
+// It deletes the restore Job, waits until its pod is gone, and then gives
+// the restore's queue slot back (see release). It deletes the repository
+// Secret copy, and skips anything already gone. The claim's entry gets phase
+// Restored and keeps its snapshot, which the bootstrap webhook reads. Then
+// settle sets Ready.
 //
 // The library calls Cleanup on every resync for the life of the claim, so it
 // writes the status only when something changed.
@@ -427,6 +525,20 @@ func (c *Callbacks) Cleanup(ctx context.Context, params populatormachinery.Popul
 	claim := params.Pvc
 	if err := c.config.Operations.DeleteJob(ctx, c.config.Namespace, jobName(claim.UID)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete restore Job: %w", err)
+	}
+	// A deleted Job's pod runs until its grace period ends, and the slot
+	// goes back only once restic has stopped.
+	pods := &corev1.PodList{}
+	if err := c.config.Reader.List(ctx, pods, client.InNamespace(c.config.Namespace), client.MatchingLabels{batchv1.JobNameLabel: jobName(claim.UID)}); err != nil {
+		return fmt.Errorf("list the pods of restore Job %s: %w", jobName(claim.UID), err)
+	}
+	for _, pod := range pods.Items {
+		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+			return fmt.Errorf("pod %s of restore Job %s is still stopping", pod.Name, jobName(claim.UID))
+		}
+	}
+	if err := c.release(ctx, claim); err != nil {
+		return err
 	}
 	if err := c.config.Operations.DeleteSecret(ctx, c.config.Namespace, internalvolsync.SecretCopyName(claim.UID)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete copied repository Secret: %w", err)
@@ -469,6 +581,28 @@ func (c *Callbacks) write(ctx context.Context, vr *backupv1alpha1.VolumeRestore,
 //   - uid is the claim's UID, which makes the name unique.
 func jobName(uid types.UID) string {
 	return "restore-" + string(uid)
+}
+
+// populatorKind names the populator's Workloads, such as populator-<UID>
+// (see admission.Name).
+const populatorKind = "populator"
+
+// workloadName returns the name of the Workload through which a claim's
+// restore waits for Kueue.
+//
+// Parameters:
+//   - uid is the UID of the claim being filled.
+func workloadName(uid types.UID) string {
+	return admission.Name(populatorKind, uid)
+}
+
+// jobLabels returns the labels of a claim's restore Job: the VolumeRestore's
+// moverPodLabels without Kueue's queue label, since the populator admits the
+// restore itself (see admit).
+func jobLabels(vr *backupv1alpha1.VolumeRestore) map[string]string {
+	labels := vr.Spec.MoverLabels()
+	delete(labels, queueLabel)
+	return labels
 }
 
 // validateParams checks that the params carry what Populate and Complete

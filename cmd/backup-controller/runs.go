@@ -10,6 +10,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
+	"github.com/walzen-group/backup-controller/internal/admission"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
 	"github.com/walzen-group/backup-controller/internal/restic"
@@ -22,7 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	webhookadmission "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 // configureLogging sends controller-runtime's log output to klog.
@@ -87,6 +88,7 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 		"apps":          appsv1.AddToScheme,
 		"volsync":       volsyncv1alpha1.AddToScheme,
 		"backup.wlz.li": backupv1alpha1.AddToScheme,
+		"kueue":         admission.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {
 			return fmt.Errorf("register the %s types: %w", name, err)
@@ -123,7 +125,7 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 		}
 		manager.GetWebhookServer().Register(
 			bootstrap.WebhookPath,
-			&admission.Webhook{Handler: decider},
+			&webhookadmission.Webhook{Handler: decider},
 		)
 		klog.Infof("serving the bootstrap webhook on :%d%s", hook.Port, bootstrap.WebhookPath)
 	}

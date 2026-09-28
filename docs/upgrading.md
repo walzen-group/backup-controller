@@ -1,12 +1,12 @@
 # Upgrading
 
-This doc covers the upgrade from v0.10.1 to v1.0.0. v1.0.0 keeps
-the three kinds and most of their fields, renames the pause fields, and needs
-a quota in the Kueue ClusterQueue.
+This doc covers the upgrade from v0.10.1 to v1.0.1. v1.0.1 keeps
+the three kinds and most of their fields, renames the pause fields, and sends
+all its restic work through one Kueue queue.
 
 ## What changes
 
-| v0.10.1 | v1.0.0 |
+| v0.10.1 | v1.0.1 |
 | --- | --- |
 | Workload annotation backup.wlz.li/quiesce: "true" | backup.wlz.li/pause-during-backup: "true" |
 | RestoreRun spec.quiesce | spec.pauseDuringRestore |
@@ -29,21 +29,30 @@ true, apply the unit, and wait until no run is working.
 
 Expected result: the listing in that procedure prints nothing.
 
-## Step 2: Give the ClusterQueue the run quota
+## Step 2: Check the queue
 
-Add backup-controller.wlz.li/run to the ClusterQueue that the namespaces'
-LocalQueues point at, with a nominalQuota of 5. docs/operations.md shows the
-ClusterQueue.
+Every BackupRun, RestoreRun and populator restore asks Kueue for one
+backup-controller.wlz.li/run. The ClusterQueue behind the namespaces'
+LocalQueues, and behind the LocalQueue in backup-system, needs a quota for
+it; docs/operations.md shows the ClusterQueue.
 
 ```
-kubectl get clusterqueue backup -o jsonpath='{.spec.resourceGroups[*].coveredResources}'
+kubectl get clusterqueue backups -o jsonpath='{.spec.resourceGroups[*].coveredResources}'
 ```
 
-Expected result: the list contains backup-controller.wlz.li/run.
+Expected result: the list contains backup-controller.wlz.li/run. A missing
+quota leaves every run and every populator restore waiting.
 
-Every run's Workload asks for one backup-controller.wlz.li/run, and Kueue never
-admits a Workload that asks for a resource its ClusterQueue does not cover. A
-missing quota leaves every run Queued.
+```
+kubectl -n backup-system get localqueue -o jsonpath='{.items[*].spec.clusterQueue}'
+```
+
+Expected result: backups, the same ClusterQueue as the namespaces use.
+
+The pods quota that v0.10.1 needed on that ClusterQueue can go. The
+controller admits the populator's restores itself and removes the Kueue queue
+label from their Jobs, so a queue label in a VolumeRestore's moverPodLabels
+no longer does anything.
 
 ## Step 3: Rename the pause annotations and fields
 
@@ -67,11 +76,11 @@ names quiesce.
 
 | Setting | Value |
 | --- | --- |
-| Image | v1.0.0 |
+| Image | v1.0.1 |
 | --restore-image | VolSync's mover image, as the unit passes it today |
 | Memory limit | 512Mi |
-| CRDs | apply config/crd of v1.0.0 |
-| ClusterRole | deploy/rbac.yaml of v1.0.0, which adds coordination.k8s.io leases (get, create, update, delete) and batch jobs (get, create, delete) and update on backupruns/finalizers and restoreruns/finalizers, and drops replicationdestinations |
+| CRDs | apply config/crd of v1.0.1 |
+| ClusterRole | deploy/rbac.yaml of v1.0.1, which adds coordination.k8s.io leases (get, create, update, delete) and batch jobs (get, create, delete) and update on backupruns/finalizers and restoreruns/finalizers, and drops replicationdestinations |
 
 The controller stops at startup when --restore-image is empty.
 

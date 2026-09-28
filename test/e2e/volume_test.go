@@ -284,3 +284,42 @@ func TestAFailedPopulatorRestoreRunsAgainOnceItsJobIsDeleted(t *testing.T) {
 	kubectl(t, "", "-n", controllerNamespace, "delete", "job", "restore-"+string(claim.Metadata.UID), "--wait=true", "--timeout=2m")
 	a.waitNote("the app to read the file from the claim filled on the second try", "kept")
 }
+
+// TestAPopulatorRestoreWaitsForTheQueue fills a recreated claim while the
+// controller namespace has no LocalQueue. The populator asks Kueue before it
+// does any work, so the claim stays Pending, the VolumeRestore reports reason
+// Queued, and no restore Job exists. Once the LocalQueue is back, the
+// restore is admitted and the claim holds the backed-up file. It changes the
+// controller namespace's LocalQueue, so it does not run in parallel with
+// other scenarios.
+func TestAPopulatorRestoreWaitsForTheQueue(t *testing.T) {
+	a := newApp(t, "populator-queue")
+	a.publish(volumeManifests())
+	a.write("queued fill")
+	backedUp := a.backup("base", "source: data")
+	mustSucceed(t, "BackupRun", "base", backedUp.Status.Phase, backedUp.Status.Conditions, a.describe)
+
+	queue := fmt.Sprintf("apiVersion: kueue.x-k8s.io/v1beta2\nkind: LocalQueue\nmetadata:\n  name: backups\n  namespace: %s\nspec:\n  clusterQueue: backup\n", controllerNamespace)
+	kubectl(t, "", "-n", controllerNamespace, "delete", "localqueue", "backups", "--wait=true")
+	t.Cleanup(func() { apply(t, queue) })
+
+	kubectl(t, "", "-n", a.ns, "delete", "deployment", "app", "--wait=true", "--timeout=2m")
+	kubectl(t, "", "-n", a.ns, "delete", "pvc", "data", "--wait=true", "--timeout=3m")
+	a.reconcile()
+	waitFor(t, "the VolumeRestore to report that the restore waits for the queue", 5*time.Minute, func() (bool, string) {
+		var vr backupv1alpha1.VolumeRestore
+		if err := getJSON(a.ns, "volumerestore", "data", &vr); err != nil {
+			return false, err.Error()
+		}
+		return readyReason(vr.Status.Conditions) == backupv1alpha1.ReasonQueued, readyReason(vr.Status.Conditions)
+	}, a.describe)
+	for end := time.Now().Add(time.Minute); time.Now().Before(end); time.Sleep(5 * time.Second) {
+		jobs := kubectl(t, "", "-n", controllerNamespace, "get", "jobs", "-l", "backup.wlz.li/restore="+a.ns, "-o", "name")
+		if strings.TrimSpace(jobs) != "" {
+			t.Fatalf("the populator started %s without admission\n%s", jobs, a.describe())
+		}
+	}
+
+	apply(t, queue)
+	a.waitNote("the app to read the file once the queue admitted the restore", "queued fill")
+}

@@ -21,44 +21,56 @@ volume restore would fail later. It needs a memory limit of 512Mi.
 
 ## Load
 
-Every BackupRun and RestoreRun first creates a Kueue Workload in its
-namespace's LocalQueue, and the Workload asks for one
-backup-controller.wlz.li/run. The ClusterQueue behind the LocalQueues has to
-cover that resource:
+One Kueue queue bounds all restic work the controller starts. Each of these
+first creates a Kueue Workload that asks for one backup-controller.wlz.li/run,
+and does nothing until Kueue admits it:
+
+| Work | Workload in | Holds the slot until |
+| --- | --- | --- |
+| BackupRun | its namespace's LocalQueue | the run ends |
+| RestoreRun | its namespace's LocalQueue | the run ends |
+| Populator restore of a new claim | the LocalQueue of the controller namespace | its restore Job ends |
+
+All these LocalQueues point at one ClusterQueue, which covers that resource:
 
 ```yaml
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
-  name: backup
+  name: backups
 spec:
   namespaceSelector: {}
   resourceGroups:
-    - coveredResources: [cpu, memory, backup-controller.wlz.li/run]
+    - coveredResources: [backup-controller.wlz.li/run]
       flavors:
         - name: default
           resources:
-            - {name: cpu, nominalQuota: "16"}
-            - {name: memory, nominalQuota: 32Gi}
             - {name: backup-controller.wlz.li/run, nominalQuota: 5}
 ```
 
-With a quota of 5, at most five runs work at once, however many namespaces
-reach their schedule in the same minute. A run that waits for admission shows
-reason Queued and does no work: it reads no repository, pauses no app and
-starts no mover. A run's timeout counts from admission, so time in the queue
-does not count against it.
+With a quota of 5, at most five runs and populator restores work at once,
+however many namespaces reach their schedule in the same minute or are
+rebuilt together. Work that waits for admission does nothing: a run shows
+reason Queued and reads no repository, pauses no app and starts no mover; a
+populator restore sets its VolumeRestore to reason Queued and reads no
+repository. A run's timeout counts from admission, so time in the queue does
+not count against it.
+
+The ClusterQueue needs no pods quota. The runs' Workloads have no real pods,
+and the populator's restore Jobs start only once their Workload is admitted,
+so Kueue does not queue those Jobs a second time: the controller removes the
+Kueue queue label from them.
 
 Inside the controller, opening a restic repository is the expensive step:
 restic derives each repository's key with scrypt, up to 60 MiB and 500 ms per
 key. The controller keeps each repository's key after the first open, and
-runs one scrypt at a time, so the populator and the webhook, which run
-outside the queue, stay bounded too.
+runs one scrypt at a time, so the webhook, which answers the API server
+outside the queue, stays bounded too.
 
-A run in a namespace without a LocalQueue stays Queued, and its Ready message
-says that the namespace has no Kueue LocalQueue. It starts once the
-LocalQueue exists. A cluster that serves no Kueue keeps every run Queued the
-same way, so no run works outside the quota.
+Work in a namespace without a LocalQueue waits, and its Ready message says
+that the namespace has no Kueue LocalQueue. It starts once the LocalQueue
+exists. A cluster that serves no Kueue keeps all work waiting the same way,
+so nothing works outside the quota.
 
 ## Leases
 

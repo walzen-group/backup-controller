@@ -5,6 +5,7 @@ package e2e
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -80,4 +81,105 @@ func TestARunWithoutALocalQueueWaitsForOne(t *testing.T) {
 	if run.Status.StartedAt == nil || run.Status.StartedAt.Before(&queue.Metadata.CreationTimestamp) {
 		t.Fatalf("the run started at %v, before the LocalQueue existed at %v\n%s", run.Status.StartedAt, queue.Metadata.CreationTimestamp, a.describe())
 	}
+}
+
+// watchAdmitted counts the admitted Workloads every three seconds (see
+// admittedWorkloads) until the returned function is called, which returns
+// the highest count seen.
+func watchAdmitted(t *testing.T) func() int {
+	var mu sync.Mutex
+	most := 0
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if n, err := admittedWorkloads(t); err == nil {
+				mu.Lock()
+				most = max(most, n)
+				mu.Unlock()
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(3 * time.Second):
+			}
+		}
+	}()
+	return func() int {
+		close(stop)
+		<-done
+		mu.Lock()
+		defer mu.Unlock()
+		return most
+	}
+}
+
+// TestTenNamespacesShareOneQueue checks that the ClusterQueue's quota of five
+// bounds runs and populator restores alike. Ten namespaces reach their
+// schedule at one tick: at most five BackupRuns are admitted at once, and all
+// succeed. Then all ten claims are deleted and applied again at once, as a
+// rebuild does, and the populator fills each from its backup: at most five
+// restores are admitted at once, and every claim holds its file. The app
+// writes nothing after the rebuild, so the file comes from the backup. It
+// uses the whole quota, so it does not run in parallel with other scenarios.
+func TestTenNamespacesShareOneQueue(t *testing.T) {
+	const namespaces, quota = 10, 5
+	apps := make([]*app, namespaces)
+	for i := range apps {
+		apps[i] = newApp(t, fmt.Sprintf("share-%02d", i))
+		kubectl(t, volumeManifests(), "-n", apps[i].ns, "apply", "-f", "-")
+	}
+	for _, a := range apps {
+		a.write("file of " + a.ns)
+	}
+	most := watchAdmitted(t)
+
+	tick := time.Now().UTC().Add(2 * time.Minute).Truncate(time.Minute)
+	schedule := fmt.Sprintf("CRON_TZ=UTC %d %d * * *", tick.Minute(), tick.Hour())
+	for _, a := range apps {
+		kubectl(t, "", "annotate", "--overwrite", "namespace", a.ns, backupv1alpha1.AnnotationSchedule+"="+schedule)
+	}
+	for _, a := range apps {
+		waitFor(t, "the scheduled BackupRun of "+a.ns+" to end", 20*time.Minute, func() (bool, string) {
+			var runs struct {
+				Items []backupv1alpha1.BackupRun `json:"items"`
+			}
+			out, err := run(t.Context(), "", "-n", a.ns, "get", "backupruns", "-o", "json")
+			if err != nil || jsonInto(out, &runs) != nil || len(runs.Items) == 0 {
+				return false, "no run yet"
+			}
+			r := runs.Items[0]
+			if r.Status.Phase.Finished() && r.Status.Phase != backupv1alpha1.RunPhaseSucceeded {
+				t.Fatalf("the scheduled run of %s ended %s: %s", a.ns, r.Status.Phase, ready(r.Status.Conditions))
+			}
+			return r.Status.Phase.Finished(), string(r.Status.Phase)
+		}, a.describe)
+	}
+	backups := most()
+	if backups > quota {
+		t.Errorf("%d BackupRuns were admitted at once, want at most %d", backups, quota)
+	}
+
+	most = watchAdmitted(t)
+	for _, a := range apps {
+		kubectl(t, "", "-n", a.ns, "delete", "deployment", "app", "--wait=false")
+		kubectl(t, "", "-n", a.ns, "delete", "pvc", "data", "--wait=false")
+	}
+	for _, a := range apps {
+		waitFor(t, "the claim of "+a.ns+" to be gone", 5*time.Minute, func() (bool, string) {
+			var claim struct{}
+			return getJSON(a.ns, "pvc", "data", &claim) != nil, "still there"
+		}, a.describe)
+	}
+	for _, a := range apps {
+		kubectl(t, volumeManifests(), "-n", a.ns, "apply", "-f", "-")
+	}
+	for _, a := range apps {
+		a.waitNote("the app of "+a.ns+" to read its file from the filled claim", "file of "+a.ns)
+	}
+	fills := most()
+	if fills > quota {
+		t.Errorf("%d populator restores were admitted at once, want at most %d", fills, quota)
+	}
+	t.Logf("at most %d BackupRuns and %d populator restores were admitted at once", backups, fills)
 }

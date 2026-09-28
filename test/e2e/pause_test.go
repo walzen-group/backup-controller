@@ -46,7 +46,7 @@ func setControllerArgs(t *testing.T, args []string) {
 	kubectl(t, "", "-n", controllerNamespace, "rollout", "status", "deployment/backup-controller", "--timeout=3m")
 }
 
-// TestAPausedControllerFinishesStartedRunsAndStartsNoNewOne pauses the
+// TestTheControllerWithPauseFinishesStartedRunsAndStartsNoNewOne pauses the
 // controller with --pause, as an admin does before an upgrade, while a
 // database restore is in the middle of its work: it has deleted the Cluster
 // and waits for Flux to create it again. That run finishes during the pause
@@ -54,7 +54,7 @@ func setControllerArgs(t *testing.T, args []string) {
 // reason ControllerPaused and changes nothing. Once the controller runs
 // without --pause, the waiting run goes through admission and backs up the
 // database: its item records the base backup.
-func TestAPausedControllerFinishesStartedRunsAndStartsNoNewOne(t *testing.T) {
+func TestTheControllerWithPauseFinishesStartedRunsAndStartsNoNewOne(t *testing.T) {
 	a := newApp(t, "controller-pause")
 	a.setUpDatabase("before the pause")
 	base := a.backup("base", "database: db")

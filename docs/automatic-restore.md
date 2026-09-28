@@ -85,8 +85,11 @@ flowchart TD
     B --> P{Controller runs with --pause?}
     P -- yes --> W1[VolumeRestore Ready False, reason ControllerPaused; retried later]
     P -- no --> C{Restore Job of this claim exists?}
+    C -- no --> Q{Kueue admitted the restore's Workload?}
+    Q -- no --> WQ[VolumeRestore Ready False, reason Queued; retried within 30 seconds]
+    Q -- yes --> S
     C -- yes --> J
-    C -- no --> S[Select the snapshot]
+    S[Select the snapshot]
     S -- pin with no snapshot at or before it --> F1[Claim entry Failed; Ready False, reason NoBackupInReach]
     S -- repository holds no snapshot --> E[Record the entry without a snapshot; the claim binds empty]
     S --> R[Record the snapshot on the VolumeRestore's entry for the claim]
@@ -109,11 +112,15 @@ A failed restore is not tried again on its own, since the cause, such as a
 wrong password or a forbidden security context, needs a fix first.
 docs/operations.md gives the steps.
 
+Before it reads the repository, the populator asks Kueue for one
+backup-controller.wlz.li/run through the LocalQueue of the controller
+namespace, the same quota the BackupRuns and RestoreRuns use
+(docs/operations.md). A rebuild of many namespaces therefore fills a few
+claims at a time, and the slot goes back once the restore Job ends.
+
 The restore Job runs in the controller namespace with a copy of the repository
 Secret, and uses the image from --restore-image. The VolumeRestore's
-moverPodLabels go onto the Job, and with the Kueue queue label among them
-Kueue admits the populator's restores through the queue, so a rebuilt
-namespace fills its claims a few at a time.
+moverPodLabels go onto the Job, except Kueue's queue label.
 
 The VolumeRestore keeps one entry per claim in status.claims, with the
 snapshot ID and time, and the phase Restoring, Restored or Failed. The entry

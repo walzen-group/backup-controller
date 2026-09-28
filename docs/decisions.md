@@ -43,7 +43,7 @@ then has to fall back to an older base backup, or to a clock time. With the
 pause held, the base backup that completes during the pause holds exactly the
 paused moment, and the snapshots name it in a base-backup tag.
 
-## Admit every run before it does any work
+## Admit every run and populator restore before it does any work
 
 A run creates its Kueue Workload first and reads no repository, pauses no app
 and starts no mover before Kueue admits it. When a schedule tick creates 70
@@ -51,7 +51,11 @@ BackupRuns at once and each run works before admission, the controller opens
 70 restic repositories at once, each with a scrypt key derivation of up to
 60 MiB, and exceeds its 512 MiB memory limit. With admission first, the
 ClusterQueue quota of five backup-controller.wlz.li/run bounds the work,
-the memory and the load on the cluster.
+the memory and the load on the cluster. The populator's restores take a slot
+of the same quota. When they went through Kueue as plain Jobs with a pods
+quota, the runs' Workloads counted as pods too, and five long backups held
+every slot a rebuild's restores needed; one quota for all restic work leaves
+one number to size.
 
 ## Let runs take turns through Leases
 

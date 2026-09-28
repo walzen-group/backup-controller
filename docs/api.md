@@ -109,12 +109,12 @@ Set exactly one of source, database and all.
 | repository | the Secret with RESTIC_REPOSITORY, RESTIC_PASSWORD and the S3 keys, in this namespace |
 | restoreAsOf | the populator fills new claims from the newest snapshot at or before this time |
 | cacheStorageClassName, cacheCapacity | the class and size of the backup mover's cache claim and clone |
-| moverPodLabels | labels on the populator's restore Jobs, such as the Kueue queue label |
+| moverPodLabels | labels on the populator's restore Jobs; Kueue's queue label is left off, since the controller admits the restore itself |
 | moverSecurityContext | the pod security context of the backup mover and the restore Jobs |
 
 | Status field | Holds |
 | --- | --- |
-| conditions | Ready: True with reason Restored, or False with Restoring, RestoreFailed, NoBackupInReach or ControllerPaused |
+| conditions | Ready: True with reason Restored, or False with Queued, Restoring, RestoreFailed, NoBackupInReach or ControllerPaused |
 | claims | per claim: name, UID, phase (Restoring, Restored, Failed), startedAt, and the snapshot it is filled from |
 
 ## Ready reasons

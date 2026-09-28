@@ -46,6 +46,93 @@ A failed scenario prints the runs, Clusters, claims, pods and events of its
 namespace and the end of the controller's log. Each scenario deletes its
 namespace when it ends.
 
+## Run the scenarios a change touches
+
+The whole suite runs for about 40 minutes and the load scenario for about
+15, so a change runs only the scenarios that exercise the code it changes,
+plus the scenarios it adds or edits.
+
+```
+make e2e-affected
+```
+
+The target compares the working tree with the newest version tag (set BASE=
+for another base), and hack/kind/affected.sh picks the scenarios from the table
+below:
+
+| Change | Scenarios |
+| --- | --- |
+| a function in a Go file, with a row for file:function | that row |
+| any other change in a Go file | every row whose path the file starts with |
+| only the import block of a Go file | none; the functions that use the import changed too |
+| a Test function in test/e2e | that Test function |
+| a helper in test/e2e | the Test functions that call it, directly or through other helpers |
+| docs/, Markdown, or a row that reads none | none |
+| a path no row matches | the smoke row, with a warning |
+
+TestSeventyNamespacesBackUpAtOneTick measures the controller's memory under
+load. Only the rows that change what the controller holds in memory or how
+much work it does at once name it, and a changed test helper never selects
+it; a change to logic alone never runs it.
+
+<!-- affected:start -->
+| Path | Scenarios |
+| --- | --- |
+| smoke | TestABackupPausesTheMarkedAppAndTagsTheSnapshot, TestAClaimRestoresInPlace, TestThePopulatorFillsARecreatedClaim, TestTheWebhookRefusesASecondClusterOnOneArchive |
+| .github/ | none |
+| .golangci.yaml | none |
+| Makefile | none |
+| flake.nix | none |
+| flake.lock | none |
+| nix/ | none |
+| Dockerfile | smoke |
+| .dockerignore | smoke |
+| cmd/backup-controller/ | smoke |
+| cmd/backup-controller/main.go:populatorQueue | TestAPopulatorRestoreWaitsForTheQueue |
+| deploy/ | smoke |
+| chart/ | smoke |
+| config/crd/ | smoke |
+| go.mod | smoke |
+| go.sum | smoke |
+| hack/kind/ | smoke |
+| internal/api/ | smoke |
+| internal/admission/ | TestTenNamespacesShareOneQueue, TestARunWithoutALocalQueueWaitsForOne, TestARestoredDatabaseHoldsWhatWasArchived |
+| internal/lease/ | TestOneOfManyRunsTakesALease, TestABackupAndARestoreOfOneClaimTakeTurns, TestTwoRestoresOfOneClusterDoNotFight |
+| internal/runs/leases.go | TestABackupAndARestoreOfOneClaimTakeTurns, TestTwoRestoresOfOneClusterDoNotFight |
+| internal/runs/queued.go | TestARunWithoutALocalQueueWaitsForOne |
+| internal/runs/backuprun.go:Reconcile | TestTheControllerWithPauseFinishesStartedRunsAndStartsNoNewOne, TestABackupPausesTheMarkedAppAndTagsTheSnapshot |
+| internal/runs/backuprun.go:admit | TestARunWithoutALocalQueueWaitsForOne, TestTenNamespacesShareOneQueue |
+| internal/runs/backuprun.go:endIfEvicted | TestABackupPausesTheMarkedAppAndTagsTheSnapshot |
+| internal/runs/backuprun.go:release | TestABackupPausesTheMarkedAppAndTagsTheSnapshot |
+| internal/runs/restorerun.go:Reconcile | TestTheControllerWithPauseFinishesStartedRunsAndStartsNoNewOne, TestARestoredDatabaseHoldsWhatWasArchived |
+| internal/runs/restorerun.go:admit | TestARestoredDatabaseHoldsWhatWasArchived |
+| internal/runs/restorerun.go:endIfEvicted | TestARestoredDatabaseHoldsWhatWasArchived |
+| internal/runs/restorerun.go:release | TestARestoredDatabaseHoldsWhatWasArchived, TestAClaimRestoresInPlace |
+| internal/runs/backuprun.go | TestABackupPausesTheMarkedAppAndTagsTheSnapshot, TestAKilledControllerFinishesThePausedBackup, TestARunPastItsTimeoutGivesTheAppBack, TestARebuildAfterAFailedDatabaseBackupComesBackToTheLastPausedMoment |
+| internal/runs/pause.go | TestABackupPausesTheMarkedAppAndTagsTheSnapshot, TestAClaimRestoresInPlace |
+| internal/runs/sources.go | TestABackupPausesTheMarkedAppAndTagsTheSnapshot, TestAFailedBackupResumesTheApp |
+| internal/runs/trigger.go | TestABackupPausesTheMarkedAppAndTagsTheSnapshot |
+| internal/runs/schedule.go | TestTenNamespacesShareOneQueue |
+| internal/runs/namespace_settings.go | TestAnInvalidTimeoutDuringAPauseGivesTheAppBack |
+| internal/runs/cnpg.go | TestARestoredDatabaseHoldsWhatWasArchived, TestARebuildBringsAHibernatedDatabaseBackWithItsLastRows |
+| internal/runs/restorerun.go | TestAClaimRestoresInPlace, TestARestoredDatabaseHoldsWhatWasArchived, TestTwoRestoresOfOneClusterDoNotFight, TestAKilledControllerFinishesTheDatabaseRestore |
+| internal/runs/restore_items.go | TestAClaimRestoresInPlace, TestASnapshotRestoresIntoANewClaim, TestADatabaseRestoreKeepsTheAppPausedUntilTheOldClusterIsGone |
+| internal/runs/restore_select.go | TestADatabaseRestoreToAMomentLandsOnTheBaseBackupBeforeIt, TestASyncedRestoreBringsTheFileAndTheRowsBackToThePausedMoment, TestASyncedRestoreOfAnIdleAppMatchesTheBackupThatPausedIt |
+| internal/runs/ | TestABackupPausesTheMarkedAppAndTagsTheSnapshot, TestAClaimRestoresInPlace |
+| internal/bootstrap/instance.go | TestADeletedClusterComesBackWithItsData, TestADatabaseRestoreKeepsTheAppPausedUntilTheOldClusterIsGone |
+| internal/bootstrap/ | TestTheWebhookRefusesASecondClusterOnOneArchive, TestTheWebhookRefusesAnEmptyDatabaseOverAnArchiveWithoutABackup, TestAnOptedOutClusterStartsEmptyOnlyOverAnEmptyArchive, TestADeletedClusterComesBackWithItsData, TestARebuiltNamespaceComesBackToThePausedMoment, TestAClusterDeletedAfterARebuildKeepsTheRowsWrittenSince, TestARebuildWithTheClaimsFilledFirstComesBackToThePausedMoment |
+| internal/synced/ | TestARebuiltNamespaceComesBackToThePausedMoment, TestARebuildComesBackToTheNewestBackupWhenARepositoryIsStale |
+| internal/populator/ | TestThePopulatorFillsARecreatedClaim, TestAFailedPopulatorRestoreRunsAgainOnceItsJobIsDeleted, TestAPopulatorRestoreWaitsForTheQueue |
+| internal/restorejob/ | TestAClaimRestoresInPlace, TestThePopulatorFillsARecreatedClaim |
+| internal/volsync/ | TestThePopulatorFillsARecreatedClaim |
+| internal/restic/ | TestABackupPausesTheMarkedAppAndTagsTheSnapshot, TestAClaimRestoresInPlace, TestThePopulatorFillsARecreatedClaim |
+| internal/restic/keycache.go | TestSeventyNamespacesBackUpAtOneTick |
+| internal/restic/repository.go:snapshotFiles | TestSeventyNamespacesBackUpAtOneTick, TestABackupPausesTheMarkedAppAndTagsTheSnapshot |
+| internal/restic/s3.go:open | TestSeventyNamespacesBackUpAtOneTick, TestABackupPausesTheMarkedAppAndTagsTheSnapshot |
+| test/e2e/harness_test.go | smoke |
+| test/e2e/app_test.go | smoke |
+<!-- affected:end -->
+
 ## What the cluster holds
 
 | Component | Version | Why |
