@@ -35,6 +35,15 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@v14
 
+      # The same Go build cache as the check job in ci.yaml. A tag reads the
+      # cache that a run on master saved.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum', 'flake.lock') }}
+
       # These are the four Go commands of the check job in ci.yaml, word for
       # word: a tag that does not pass CI does not become a release. If either
       # side changes, change both.
@@ -42,7 +51,7 @@ jobs:
         run: nix develop -c go vet ./...
 
       - name: go test
-        run: nix develop -c go test ./... -race
+        run: nix develop -c go test -count=1 ./... -race
 
       - name: golangci-lint
         run: nix develop -c golangci-lint run
