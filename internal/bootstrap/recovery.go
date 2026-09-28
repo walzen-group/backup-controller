@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -184,19 +185,14 @@ func setExternalCluster(cluster *unstructured.Unstructured, store, serverName st
 	if err != nil {
 		return fmt.Errorf("read the external clusters: %w", err)
 	}
-	replaced := false
-	for i, existing := range external {
-		item, ok := existing.(map[string]any)
-		if !ok {
-			continue
-		}
-		if name, _, _ := unstructured.NestedString(item, "name"); name == RecoverySource {
-			external[i] = entry
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
+	i := slices.IndexFunc(external, func(existing any) bool {
+		item, _ := existing.(map[string]any)
+		name, _, _ := unstructured.NestedString(item, "name")
+		return name == RecoverySource
+	})
+	if i >= 0 {
+		external[i] = entry
+	} else {
 		external = append(external, entry)
 	}
 	if err := unstructured.SetNestedSlice(cluster.Object, external, "spec", "externalClusters"); err != nil {
