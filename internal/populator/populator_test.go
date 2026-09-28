@@ -467,22 +467,31 @@ func mapKeys[T any](values map[string]T) []string {
 	return keys
 }
 
-// TestCleanupRetiresTheClaimAndReportsRestored checks that Cleanup removes the
-// entry of the last claim being filled and sets Ready to True with reason
-// Restored. It runs without a prime claim: the library deletes the prime
-// claim after it calls PopulateCleanupFn, so every pass after the one that
-// finished the restore arrives without it, and Cleanup, which exists to remove
-// things, must succeed then too. Rejecting those passes once made one restored
-// claim fail its sync several times a second for as long as it existed.
+// TestCleanupRetiresTheClaimAndReportsRestored checks that Cleanup of the last
+// claim being filled deletes the Secret copy, removes the claim's entry, sets
+// Ready to True with reason Restored, and then removes the populator's
+// finalizer, so a VolumeRestore deleted mid-restore goes once its claim is
+// cleaned up.
+//
+// It runs without a prime claim: the library deletes the prime claim after it
+// calls PopulateCleanupFn, so every pass after the one that finished the
+// restore arrives without it, and Cleanup, which exists to remove things,
+// must succeed then too. Rejecting those passes once made one restored claim
+// fail its sync several times a second for as long as it existed.
 func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
 	ops := restoringOperations(t)
-	params := paramsWithClaims(backupv1alpha1.ClaimRestoreStatus{
-		Name: "notes", UID: types.UID("claim-123"), Phase: backupv1alpha1.RestorePhaseRestoring,
+	params := paramsWith(func(vr *backupv1alpha1.VolumeRestore) {
+		vr.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		vr.Finalizers = []string{Finalizer}
+		vr.Status.Claims = []backupv1alpha1.ClaimRestoreStatus{{Name: "notes", UID: "claim-123", Phase: backupv1alpha1.RestorePhaseRestoring}}
 	})
 	params.PvcPrime = nil
 
 	if err := newCallbacks(ops, monday).Cleanup(context.Background(), params); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
+	}
+	if len(ops.deletedSec) != 1 {
+		t.Errorf("deleted Secrets = %v, want the copy", ops.deletedSec)
 	}
 	if len(ops.statuses) != 1 {
 		t.Fatalf("status writes = %d, want 1", len(ops.statuses))
@@ -494,6 +503,9 @@ func TestCleanupRetiresTheClaimAndReportsRestored(t *testing.T) {
 	condition := findCondition(status.Status.Conditions, backupv1alpha1.ConditionReady)
 	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != backupv1alpha1.ReasonRestored {
 		t.Fatalf("Ready condition = %#v, want True/Restored", condition)
+	}
+	if len(ops.updates) != 1 || slices.Contains(ops.updates[0].Finalizers, Finalizer) {
+		t.Fatalf("VolumeRestore updates = %v, want one that removes %s", ops.updates, Finalizer)
 	}
 }
 
@@ -561,29 +573,6 @@ func TestPopulateStartsNothingForADeletedVolumeRestore(t *testing.T) {
 	}
 	if len(ops.createdSec) != 0 || ops.job(t, "claim-123") != nil {
 		t.Fatalf("created Secrets %v and Job %v, want none", ops.createdSec, ops.job(t, "claim-123"))
-	}
-}
-
-// TestCleanupReleasesTheVolumeRestoreOnceNoClaimIsLeft checks that Cleanup of
-// the last claim deletes the Secret copy, retires the claim, and then removes
-// the populator's finalizer, so a VolumeRestore deleted mid-restore goes once
-// its claim is cleaned up.
-func TestCleanupReleasesTheVolumeRestoreOnceNoClaimIsLeft(t *testing.T) {
-	ops := restoringOperations(t)
-	deleted := paramsWith(func(vr *backupv1alpha1.VolumeRestore) {
-		vr.DeletionTimestamp = &metav1.Time{Time: time.Now()}
-		vr.Finalizers = []string{Finalizer}
-		vr.Status.Claims = []backupv1alpha1.ClaimRestoreStatus{{Name: "notes", UID: "claim-123", Phase: backupv1alpha1.RestorePhaseRestoring}}
-	})
-
-	if err := newCallbacks(ops, monday).Cleanup(context.Background(), deleted); err != nil {
-		t.Fatalf("Cleanup() error = %v", err)
-	}
-	if len(ops.deletedSec) != 1 {
-		t.Errorf("deleted Secrets = %v, want the copy", ops.deletedSec)
-	}
-	if len(ops.updates) != 1 || slices.Contains(ops.updates[0].Finalizers, Finalizer) {
-		t.Fatalf("VolumeRestore updates = %v, want one that removes %s", ops.updates, Finalizer)
 	}
 }
 
