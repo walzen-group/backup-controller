@@ -215,7 +215,8 @@ func TestAClaimWhoseVolumeRestoreExistsIsLeftToTheLibrary(t *testing.T) {
 // A pod of a restore Job that a person deleted with its pods orphaned still
 // holds the cleanup: the reconciler finds it by the claim's label and waits
 // until it has ended, as Populate and Cleanup do. An unscheduled pod that is
-// not being deleted could still be bound to a node, so it holds too.
+// not being deleted could still be bound to a node, so it holds too. A pod of
+// another claim's restore, still running, holds nothing.
 func TestAPodOfADeletedJobHoldsTheCleanup(t *testing.T) {
 	for name, pod := range map[string]*corev1.Pod{
 		"running":     restorePod(t, "gone-job-uid", "restore-x7k2p", "node-a", corev1.PodRunning),
@@ -223,7 +224,10 @@ func TestAPodOfADeletedJobHoldsTheCleanup(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			pod.OwnerReferences = nil
-			c := newOrphanClient(t, append(leftovers(t)[:2], stuckClaim(), pod)...)
+			other := restorePod(t, "other-job-uid", "restore-other-abcde", "node-a", corev1.PodRunning)
+			other.Labels[restorejob.LabelRestoreClaim] = "another-claim-uid"
+			other.OwnerReferences = nil
+			c := newOrphanClient(t, append(leftovers(t)[:2], stuckClaim(), pod, other)...)
 			r, recorder := newOrphanReconciler(c, c)
 
 			res, err := reconcileClaim(t, r)
@@ -239,19 +243,6 @@ func TestAPodOfADeletedJobHoldsTheCleanup(t *testing.T) {
 			assertLeftovers(t, c, false)
 		})
 	}
-}
-
-// A pod of another claim's restore does not hold this claim.
-func TestAnotherClaimsRestorePodDoesNotBlock(t *testing.T) {
-	other := restorePod(t, "other-job-uid", "restore-other-abcde", "node-a", corev1.PodRunning)
-	other.Labels[restorejob.LabelRestoreClaim] = "another-claim-uid"
-	other.OwnerReferences = nil
-	c := newOrphanClient(t, append(leftovers(t), stuckClaim(), other)...)
-	r, _ := newOrphanReconciler(c, c)
-	if _, err := reconcileClaim(t, r); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	assertLeftovers(t, c, false)
 }
 
 // Claims the library would never clean up, or would clean up itself, are
