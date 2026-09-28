@@ -88,16 +88,6 @@ func noDoneBackup(at Location, serverName string, backups int) string {
 	)
 }
 
-// oldest returns the end of a refusal message that names the oldest base
-// backup and when it finished, or says there is none. It expects the list
-// oldest first, as BaseBackups returns it.
-func oldest(backups []BaseBackup) string {
-	if len(backups) == 0 {
-		return "; it holds no completed base backup"
-	}
-	return fmt.Sprintf("; the oldest, %s, finished at %s", backups[0].ID, backups[0].End.UTC().Format(time.RFC3339))
-}
-
 // recordedBackup returns the time of the last completed backup that the
 // status of an ObjectStore records for one server name.
 //
@@ -131,7 +121,9 @@ func recordedBackup(store *unstructured.Unstructured, serverName string) string 
 // withoutBaseBackup call it before they let the Cluster start empty.
 //
 // It returns the refusal and true when the status records a backup. It
-// returns false when the status records none.
+// returns false when the status records none. The refusal names the prefix,
+// the ObjectStore, the server name and the recorded backup time, and gives
+// the command that removes a stale entry from the status.
 //
 // The two sources disagree when the listing reads another place than the
 // plugin writes to, for example through another endpoint or other
@@ -143,17 +135,10 @@ func contradicted(c creation) (admission.Response, bool) {
 		return admission.Response{}, false
 	}
 	c.logger.Info("refusing the Cluster", "reason", "the listing found no WAL and no complete base backup, and the ObjectStore status records a backup", "prefix", c.at.ServerPrefix(), "lastSuccessfulBackupTime", c.recorded)
-	return admission.Denied(recordedButEmpty(c)), true
-}
-
-// recordedButEmpty words the refusal of contradicted. It names the prefix, the
-// ObjectStore, the server name and the recorded backup time, and gives the
-// command that removes a stale entry from the status.
-func recordedButEmpty(c creation) string {
 	pointer := strings.NewReplacer("~", "~0", "/", "~1").Replace(c.serverName)
-	return fmt.Sprintf(
+	return admission.Denied(fmt.Sprintf(
 		"The listing of s3://%s/%s found no WAL under wals/ and no complete base backup. The status of ObjectStore %s/%s records a completed backup for serverName %q (status.serverRecoveryWindow, lastSuccessfulBackupTime %s). The webhook does not start an empty database while the two disagree. Make sure that the destinationPath, endpointURL and credentials of the ObjectStore reach the bucket that holds the backups. If you deleted that archive on purpose, delete the old entry from the status with this command, then create the Cluster again: kubectl -n %s patch objectstores.barmancloud.cnpg.io %s --subresource=status --type=json -p '[{\"op\":\"remove\",\"path\":\"/status/serverRecoveryWindow/%s\"}]'",
 		c.at.Bucket, c.at.ServerPrefix(), c.req.Namespace, c.store, c.serverName, c.recorded,
 		c.req.Namespace, c.store, pointer,
-	)
+	)), true
 }

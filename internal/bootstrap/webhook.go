@@ -372,8 +372,8 @@ func (d *Decider) recover(ctx context.Context, c creation, run *backupv1alpha1.R
 	// no backup matched, so the webhook refuses it here with the reason.
 	if archive.Found == nil && archive.Oldest != nil && target != nil {
 		return admission.Denied(fmt.Sprintf(
-			"%s asks for %s, and no base backup in %s/%s finished by then%s.",
-			source, target.Format(time.RFC3339), c.at.Bucket, c.at.BasePrefix(), oldest([]BaseBackup{*archive.Oldest}),
+			"%s asks for %s, and no base backup in %s/%s finished by then; the oldest, %s, finished at %s.",
+			source, target.Format(time.RFC3339), c.at.Bucket, c.at.BasePrefix(), archive.Oldest.ID, archive.Oldest.End.UTC().Format(time.RFC3339),
 		))
 	}
 	if archive.Found == nil {

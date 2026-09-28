@@ -71,11 +71,11 @@ func archiveHolder(
 		if err != nil {
 			return "", err
 		}
-		theirs, found, err := archiveOf(other, theirStore, serverName)
+		holds, err := archivesAt(other, theirStore, serverName, at)
 		if err != nil {
 			return "", err
 		}
-		if found && theirs.sameArchive(at) {
+		if holds {
 			return fmt.Sprintf("%s/%s", other.GetNamespace(), other.GetName()), nil
 		}
 	}
@@ -107,31 +107,34 @@ func (x *storeIndex) get(ctx context.Context, key types.NamespacedName) (*unstru
 	return x.stores[key], nil
 }
 
-// archiveOf finds where another Cluster archives, for archiveHolder.
+// archivesAt reports whether another Cluster archives to a Location, for
+// archiveHolder.
 //
 // Parameters:
 //   - other is the other Cluster, which the error names.
 //   - store is the ObjectStore that other names, from the list of
 //     objectStores, or nil when the list does not hold it.
 //   - serverName is the server name of other, as Archiver returns it.
+//   - at is where the admitted Cluster would archive.
 //
-// It returns the Location and true. It returns false when store is nil or
-// names no s3:// destination, since other then archives nowhere. It returns
-// an error when the destination of store cannot be read.
-func archiveOf(other, store *unstructured.Unstructured, serverName string) (Location, bool, error) {
+// It returns true when other archives to the bucket and prefix of at (see
+// sameArchive). It returns false when store is nil or names no s3://
+// destination, since other then archives nowhere. It returns an error when
+// the destination of store cannot be read.
+func archivesAt(other, store *unstructured.Unstructured, serverName string, at Location) (bool, error) {
 	if store == nil {
 		// Not in the list is what NotFound means for a single read.
-		return Location{}, false, nil
+		return false, nil
 	}
 	theirs, err := storeLocation(store, serverName)
 	var noDestination *destinationError
 	if errors.As(err, &noDestination) {
-		return Location{}, false, nil
+		return false, nil
 	}
 	if err != nil {
-		return Location{}, false, fmt.Errorf("find where %s/%s archives: %w", other.GetNamespace(), other.GetName(), err)
+		return false, fmt.Errorf("find where %s/%s archives: %w", other.GetNamespace(), other.GetName(), err)
 	}
-	return theirs, true, nil
+	return theirs.sameArchive(at), nil
 }
 
 // sharedArchive refuses the create of a Cluster whose archive another
