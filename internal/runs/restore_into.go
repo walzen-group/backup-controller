@@ -129,12 +129,8 @@ func (r *RestoreRunReconciler) planIntoNewClaim(ctx context.Context, run *backup
 		Kind: backupv1alpha1.ItemKindClaim, Name: run.Spec.Into, Phase: backupv1alpha1.ItemRunning,
 	}
 	recordSnapshot(&item, snapshot)
-	now := metav1.NewTime(r.Now())
-	run.Status.Phase = backupv1alpha1.RunPhaseRunning
-	run.Status.StartedAt = &now
 	run.Status.Items = []backupv1alpha1.RestoreItem{item}
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, runningMessage(run))
-	return after(time.Second, r.writeStatus(ctx, run))
+	return r.begin(ctx, run)
 }
 
 // intoTimedOut returns the message of an into restore that ran past its

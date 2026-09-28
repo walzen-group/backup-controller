@@ -126,10 +126,18 @@ func (r *RestoreRunReconciler) plan(ctx context.Context, run *backupv1alpha1.Res
 		run.Status.SyncedTo = &metav1.Time{Time: *synced}
 	}
 
+	return r.begin(ctx, run)
+}
+
+// begin moves a run whose checks passed to Running: it sets
+// status.startedAt, which spec.timeout counts from, and the Ready message
+// of runningMessage, writes the status, and requeues the run after a
+// second.
+func (r *RestoreRunReconciler) begin(ctx context.Context, run *backupv1alpha1.RestoreRun) (ctrl.Result, error) {
 	now := metav1.NewTime(r.Now())
 	run.Status.Phase = backupv1alpha1.RunPhaseRunning
 	run.Status.StartedAt = &now
-	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, "restoring")
+	backupv1alpha1.SetReady(&run.Status.Conditions, run.Generation, metav1.ConditionFalse, backupv1alpha1.ReasonRunning, runningMessage(run))
 	return after(time.Second, r.writeStatus(ctx, run))
 }
 
