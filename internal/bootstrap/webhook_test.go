@@ -737,7 +737,9 @@ func recovered(t *testing.T) *unstructured.Unstructured {
 
 // TestAnUpdateDropsInitdbFromARecoveredCluster checks that an update adding
 // initdb back to a Cluster this webhook recovered gets a patch that removes
-// initdb and keeps the recovery, on a dry run and on a real request.
+// initdb and keeps the recovery, on a dry run and on a real request, and
+// that an update of a Cluster this webhook did not recover is allowed
+// without a patch.
 //
 // Flux applies the Cluster from git on every reconcile, and git still holds
 // initdb. Server-side apply keeps the recovery the webhook wrote and adds initdb
@@ -765,18 +767,10 @@ func TestAnUpdateDropsInitdbFromARecoveredCluster(t *testing.T) {
 			t.Errorf("dry run %v: recovery source = %q, want %q", dryRun, source, RecoverySource)
 		}
 	}
-}
 
-// TestAnUpdateOfAnInitdbClusterIsLeftAlone checks that an update of a Cluster
-// this webhook didn't recover is allowed without a patch.
-func TestAnUpdateOfAnInitdbClusterIsLeftAlone(t *testing.T) {
 	response := update(t, cluster(t, nil), cluster(t, nil), true)
-
-	if !response.Allowed {
-		t.Fatalf("the update was refused: %v", response.Result)
-	}
-	if len(response.Patches) != 0 {
-		t.Fatalf("an initdb cluster was rewritten: %v", response.Patches)
+	if !response.Allowed || len(response.Patches) != 0 {
+		t.Fatalf("an update of a Cluster this webhook did not recover = %v, patches %v; want it allowed unchanged", response.Result, response.Patches)
 	}
 }
 
