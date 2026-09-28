@@ -1,0 +1,106 @@
+# RustFS, the S3 service of the test cluster, as prod stores its backups on
+# RustFS. The data lives on a local-path claim, so it survives a restart of
+# the pod. The Job creates the two buckets: volsync for the restic
+# repositories and postgres for the barman archives.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: s3
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: s3
+stringData:
+  AWS_ACCESS_KEY_ID: test-access-key
+  AWS_SECRET_ACCESS_KEY: test-secret-key-0123456789
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rustfs-data
+  namespace: s3
+spec:
+  storageClassName: standard
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 5Gi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs
+  namespace: s3
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: rustfs}
+  template:
+    metadata:
+      labels: {app: rustfs}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}
+      containers:
+        - name: rustfs
+          image: RUSTFS_IMAGE
+          env:
+            - {name: RUSTFS_VOLUMES, value: /data}
+            - {name: RUSTFS_ADDRESS, value: "0.0.0.0:9000"}
+            - {name: RUSTFS_CONSOLE_ENABLE, value: "false"}
+            - name: RUSTFS_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: s3-credentials, key: AWS_ACCESS_KEY_ID}}
+            - name: RUSTFS_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: s3-credentials, key: AWS_SECRET_ACCESS_KEY}}
+          ports:
+            - {name: s3, containerPort: 9000}
+          readinessProbe:
+            tcpSocket: {port: s3}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 1Gi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: logs, mountPath: /logs}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: rustfs-data}
+        - name: logs
+          emptyDir: {sizeLimit: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs
+  namespace: s3
+spec:
+  selector: {app: rustfs}
+  ports:
+    - {name: s3, port: 9000, targetPort: s3}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: buckets
+  namespace: s3
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: aws
+          image: AWS_CLI_IMAGE
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              for b in volsync postgres; do
+                aws s3api head-bucket --bucket "$b" 2>/dev/null || aws s3api create-bucket --bucket "$b"
+              done
+          envFrom:
+            - secretRef: {name: s3-credentials}
+          env:
+            - {name: AWS_ENDPOINT_URL, value: "http://rustfs.s3.svc:9000"}
+            - {name: AWS_DEFAULT_REGION, value: us-east-1}

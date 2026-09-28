@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -12,35 +12,59 @@ import (
 )
 
 // clientOperations implements populator.Operations with a real Kubernetes
-// client. The populator callbacks reach the API server only through that
-// interface, which lets their tests run against a fake. Each method is a thin
-// call on the client and returns the client's error unchanged.
+// client. The populator callbacks make their writes through that interface.
+// Each method is a thin call on the client and returns the client's error
+// unchanged.
 type clientOperations struct {
 	client client.Client
 }
 
-// GetReplicationDestination reads the named ReplicationDestination.
-func (o *clientOperations) GetReplicationDestination(ctx context.Context, namespace, name string) (*volsyncv1alpha1.ReplicationDestination, error) {
-	destination := new(volsyncv1alpha1.ReplicationDestination)
-	if err := o.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, destination); err != nil {
+// GetJob reads one Job.
+//
+// Parameters:
+//   - namespace and name identify the Job.
+//
+// It returns the Job, or the client's error, which is NotFound when there is
+// no such Job.
+func (o *clientOperations) GetJob(ctx context.Context, namespace, name string) (*batchv1.Job, error) {
+	job := new(batchv1.Job)
+	if err := o.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, job); err != nil {
 		return nil, err
 	}
-	return destination, nil
+	return job, nil
 }
 
-// CreateReplicationDestination creates the ReplicationDestination it is given.
-func (o *clientOperations) CreateReplicationDestination(ctx context.Context, rd *volsyncv1alpha1.ReplicationDestination) error {
-	return o.client.Create(ctx, rd)
+// CreateJob creates one Job.
+//
+// Parameters:
+//   - job is the Job to create, with its namespace and name set.
+//
+// It returns the client's error, which is AlreadyExists when a Job of that
+// name exists.
+func (o *clientOperations) CreateJob(ctx context.Context, job *batchv1.Job) error {
+	return o.client.Create(ctx, job)
 }
 
-// DeleteReplicationDestination deletes the named ReplicationDestination.
-func (o *clientOperations) DeleteReplicationDestination(ctx context.Context, namespace, name string) error {
-	return o.client.Delete(ctx, &volsyncv1alpha1.ReplicationDestination{
-		ObjectMeta: objectMeta(namespace, name),
-	})
+// DeleteJob deletes one Job and, in the background, its pods.
+//
+// Parameters:
+//   - namespace and name identify the Job.
+//
+// It returns the client's error, which is NotFound when there is no such
+// Job. Without background propagation, the API server would leave the
+// Job's pods behind.
+func (o *clientOperations) DeleteJob(ctx context.Context, namespace, name string) error {
+	return o.client.Delete(ctx, &batchv1.Job{ObjectMeta: objectMeta(namespace, name)},
+		client.PropagationPolicy(metav1.DeletePropagationBackground))
 }
 
-// GetSecret reads the named Secret.
+// GetSecret reads one Secret.
+//
+// Parameters:
+//   - namespace and name identify the Secret.
+//
+// It returns the Secret, or the client's error, which is NotFound when there
+// is no such Secret.
 func (o *clientOperations) GetSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
 	secret := new(corev1.Secret)
 	if err := o.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, secret); err != nil {
@@ -49,25 +73,45 @@ func (o *clientOperations) GetSecret(ctx context.Context, namespace, name string
 	return secret, nil
 }
 
-// CreateSecret creates the Secret it is given.
+// CreateSecret creates one Secret.
+//
+// Parameters:
+//   - secret is the Secret to create, with its namespace and name set.
+//
+// It returns the client's error, which is AlreadyExists when a Secret of
+// that name exists.
 func (o *clientOperations) CreateSecret(ctx context.Context, secret *corev1.Secret) error {
 	return o.client.Create(ctx, secret)
 }
 
-// DeleteSecret deletes the named Secret.
+// DeleteSecret deletes one Secret.
+//
+// Parameters:
+//   - namespace and name identify the Secret.
+//
+// It returns the client's error, which is NotFound when there is no such
+// Secret.
 func (o *clientOperations) DeleteSecret(ctx context.Context, namespace, name string) error {
 	return o.client.Delete(ctx, &corev1.Secret{ObjectMeta: objectMeta(namespace, name)})
 }
 
-// SetStatus writes the VolumeRestore's status subresource. The callbacks pass
-// an object decoded from the data source the library cached, so it already
-// carries the resource version the update needs.
+// SetStatus writes the status subresource of one VolumeRestore.
+//
+// Parameters:
+//   - vr is the VolumeRestore with the new status. The callbacks decode it
+//     from the object the library cached, so it has the resource version
+//     that the update needs. An update from an old copy fails with Conflict.
+//
+// It returns the client's error.
 func (o *clientOperations) SetStatus(ctx context.Context, vr *backupv1alpha1.VolumeRestore) error {
 	return o.client.Status().Update(ctx, vr)
 }
 
-// objectMeta returns object metadata holding only a namespace and a name,
-// which is all a delete needs.
+// objectMeta returns object metadata with only a namespace and a name, which
+// is all that a delete needs.
+//
+// Parameters:
+//   - namespace and name identify the object.
 func objectMeta(namespace, name string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{Namespace: namespace, Name: name}
 }

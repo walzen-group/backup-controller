@@ -63,11 +63,23 @@ func volumeRestoreFor(ctx context.Context, c client.Reader, claim *corev1.Persis
 	vr := &backupv1alpha1.VolumeRestore{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: claim.Namespace, Name: name}, vr); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, fmt.Errorf("claim %s has no VolumeRestore %s to name its repository", claim.Name, name)
+			return nil, &missingVolumeRestoreError{claim: claim.Name, name: name}
 		}
 		return nil, fmt.Errorf("get VolumeRestore %s/%s: %w", claim.Namespace, name, err)
 	}
 	return vr, nil
+}
+
+// missingVolumeRestoreError is the error of volumeRestoreFor for a claim
+// whose VolumeRestore does not exist.
+type missingVolumeRestoreError struct {
+	// claim is the claim's name, and name the VolumeRestore it needs.
+	claim, name string
+}
+
+// Error names the claim and the VolumeRestore it needs.
+func (e *missingVolumeRestoreError) Error() string {
+	return fmt.Sprintf("claim %s has no VolumeRestore %s to name its repository", e.claim, e.name)
 }
 
 // volumeAffinity returns a node affinity that places a pod on the node that
@@ -253,7 +265,13 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 					// for its cache, whose reclaim policy is Delete.
 					StorageClassName: vr.Spec.CacheStorageClassName,
 				},
-				Repository:            vr.Spec.Repository,
+				Repository: vr.Spec.Repository,
+				// A new value makes VolSync run restic unlock before the
+				// backup (volsync v0.16.0 mover/restic/mover.go:670). restic
+				// then removes only locks it considers stale, such as the
+				// lock of a mover that was killed, so a stale lock never
+				// blocks the backups of a repository for good.
+				Unlock:                tag,
 				PruneIntervalDays:     &pruneInterval,
 				Retain:                retain,
 				CacheCapacity:         vr.Spec.CacheCapacity,

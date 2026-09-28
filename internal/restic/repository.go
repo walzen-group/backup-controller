@@ -2,7 +2,7 @@
 // a snapshot with a new time.
 //
 // The controller needs three things from a repository: which snapshots it
-// holds, when each was taken, and, after a quiesced backup, a snapshot moved to
+// holds, when each was taken, and, after a paused backup, a snapshot moved to
 // the time the run started the workloads again. Before a RestoreRun overwrites
 // anything, it checks that some snapshot reaches the point in time it asks
 // for, and it refuses the restore when none does. A BackupRun reports the time
@@ -21,9 +21,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // Store reads and writes the files of one repository. In the cluster it's an
@@ -97,21 +100,11 @@ func Open(ctx context.Context, store Store, password string) (*Repository, error
 	if len(names) == 0 {
 		return nil, ErrNoRepository
 	}
-	for _, name := range names {
-		raw, err := store.Get(ctx, path.Join("keys", name))
-		if err != nil {
-			return nil, fmt.Errorf("read key file %s: %w", name, err)
-		}
-		master, err := masterKey(password, raw)
-		if errors.Is(err, errWrongKey) {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("key file %s: %w", name, err)
-		}
-		return &Repository{store: store, master: master}, nil
+	master, err := openKeys(ctx, store, password, names)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("no key file opens with this password")
+	return &Repository{store: store, master: master}, nil
 }
 
 // snapshotJSON holds the fields of a snapshot document that this package reads.
@@ -144,29 +137,42 @@ func (r *Repository) Snapshots(ctx context.Context) ([]Snapshot, error) {
 	return snapshots, nil
 }
 
+// snapshotReads is how many snapshot documents snapshotFiles reads from the
+// store at once. Each read is one small GET, so a repository with many
+// snapshots is listed in a fraction of the time a sequential read needs,
+// which keeps the webhook well inside its timeout.
+const snapshotReads = 8
+
 // snapshotFiles reads, decrypts and decodes every snapshot document under
 // snapshots/, and returns them sorted by time with the oldest first. It skips
-// files whose names aren't storage IDs.
+// files whose names aren't storage IDs. It reads up to snapshotReads
+// documents at once, and returns the first error.
 func (r *Repository) snapshotFiles(ctx context.Context) ([]snapshotFile, error) {
 	names, err := r.store.List(ctx, "snapshots")
 	if err != nil {
 		return nil, fmt.Errorf("list the snapshots: %w", err)
 	}
+	names = slices.DeleteFunc(names, func(name string) bool { return !isID(name) })
 
-	files := make([]snapshotFile, 0, len(names))
-	for _, name := range names {
-		if !isID(name) {
-			continue
-		}
-		document, err := r.load(ctx, path.Join("snapshots", name))
-		if err != nil {
-			return nil, fmt.Errorf("snapshot %s: %w", name, err)
-		}
-		f, err := parseSnapshot(name, document)
-		if err != nil {
-			return nil, fmt.Errorf("decode snapshot %s: %w", name, err)
-		}
-		files = append(files, f)
+	files := make([]snapshotFile, len(names))
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(snapshotReads)
+	for i, name := range names {
+		group.Go(func() error {
+			document, err := r.load(groupCtx, path.Join("snapshots", name))
+			if err != nil {
+				return fmt.Errorf("snapshot %s: %w", name, err)
+			}
+			f, err := parseSnapshot(name, document)
+			if err != nil {
+				return fmt.Errorf("decode snapshot %s: %w", name, err)
+			}
+			files[i] = f
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
 	}
 
 	sort.Slice(files, func(i, j int) bool { return files[i].snapshot.Time.Before(files[j].snapshot.Time) })
@@ -301,4 +307,77 @@ func (d DirStore) Put(_ context.Context, name string, data []byte) error {
 // Remove deletes one file.
 func (d DirStore) Remove(_ context.Context, name string) error {
 	return os.Remove(filepath.Join(string(d), name))
+}
+
+// SyncedSnapshot finds the snapshot that one VolSync sync wrote.
+//
+// Parameters:
+//   - snapshots are the repository's snapshots, in any order.
+//   - end is the sync's end, from the ReplicationSource's status.lastSyncTime.
+//   - took is the sync's length, from status.lastSyncDuration.
+//
+// VolSync records both only when a sync completes, and the mover starts
+// restic inside that sync, so restic stamps the snapshot with a time between
+// the sync's start and its end. SyncedSnapshot returns the newest snapshot in
+// that window and true. A mover that VolSync ran again within one sync can
+// leave two snapshots in the window; both hold the same clone, and the newest
+// is the one the successful mover saved. It returns false when the window
+// holds no snapshot: the volume held no files, and VolSync's mover skipped
+// the backup.
+func SyncedSnapshot(snapshots []Snapshot, end time.Time, took time.Duration) (Snapshot, bool) {
+	// restic writes whole seconds of precision and more; the status holds
+	// whole seconds. One second on each side keeps the window from cutting
+	// off a snapshot at its edge.
+	start := end.Add(-took).Add(-time.Second)
+	end = end.Add(time.Second)
+	var found Snapshot
+	ok := false
+	for _, s := range snapshots {
+		if s.Time.Before(start) || s.Time.After(end) {
+			continue
+		}
+		if !ok || s.Time.After(found.Time) {
+			found, ok = s, true
+		}
+	}
+	return found, ok
+}
+
+// BaseBackupTag is the tag a BackupRun adds to each snapshot it moves to its
+// resume moment, for one base backup that completed while the app was
+// paused. It is "base-backup/<cluster>=<backup ID>", such as
+// "base-backup/db=20260928T093012".
+func BaseBackupTag(cluster, backupID string) string {
+	return baseBackupTagPrefix + cluster + "=" + backupID
+}
+
+// baseBackupTagPrefix starts every BaseBackupTag.
+const baseBackupTagPrefix = "base-backup/"
+
+// HibernatedTag is the tag a BackupRun adds to each snapshot it moves to its
+// resume moment, for one Cluster that was hibernated during the run and so
+// got no base backup. It is "hibernated/<cluster>", such as
+// "hibernated/db". A hibernated database writes nothing, so the end of its
+// archive holds its state at that moment, until it runs again.
+func HibernatedTag(cluster string) string {
+	return "hibernated/" + cluster
+}
+
+// PausedBaseBackup returns the base backup ID that a snapshot's
+// BaseBackupTag gives for a Cluster, and true.
+//
+// Parameters:
+//   - snapshot is a snapshot tagged paused.
+//   - cluster is the name of the Cluster.
+//
+// It returns false when the snapshot carries no such tag, for example when
+// the Cluster's Backup completed after the run resumed the app.
+func PausedBaseBackup(snapshot Snapshot, cluster string) (string, bool) {
+	prefix := baseBackupTagPrefix + cluster + "="
+	for _, tag := range snapshot.Tags {
+		if id, ok := strings.CutPrefix(tag, prefix); ok && id != "" {
+			return id, true
+		}
+	}
+	return "", false
 }

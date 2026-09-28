@@ -18,16 +18,16 @@ import (
 // +kubebuilder:validation:XValidation:rule="!has(self.previous) || has(self.claim) || has(self.repository)",message="previous applies to one volume only"
 // +kubebuilder:validation:XValidation:rule="!has(self.into) || has(self.claim) || has(self.repository)",message="into needs claim or repository"
 // +kubebuilder:validation:XValidation:rule="!has(self.syncDatabaseToVolume) || !self.syncDatabaseToVolume || (has(self.all) && self.all)",message="syncDatabaseToVolume needs all"
-// +kubebuilder:validation:XValidation:rule="!has(self.quiesce) || size(self.quiesce) == 0 || !has(self.into)",message="quiesce restores in place; an into restore leaves the app alone"
+// +kubebuilder:validation:XValidation:rule="!has(self.pauseDuringRestore) || size(self.pauseDuringRestore) == 0 || !has(self.into)",message="pauseDuringRestore needs an in-place restore; an into restore leaves the app alone"
 type RestoreRunSpec struct {
 	// Claim is the name of a claim in this namespace. The restore reads from
 	// that claim's repository, and writes into the claim itself unless Into
 	// names a new one.
 	//
-	// The claim's VolumeRestore supplies the repository Secret, the cache
-	// storage class and the mover's pod labels, so none of them is repeated
-	// here. That is the VolumeRestore the claim's dataSourceRef names, or the
-	// one with the claim's own name. To restore from a repository that no
+	// The claim's VolumeRestore supplies the repository Secret and the
+	// restore Job's security context, so neither is repeated here. That is
+	// the VolumeRestore the claim's dataSourceRef names, or the one with the
+	// claim's own name. To restore from a repository that no
 	// claim in this namespace uses, set Repository instead.
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
@@ -45,7 +45,9 @@ type RestoreRunSpec struct {
 	// +kubebuilder:validation:MaxLength=253
 	Repository string `json:"repository,omitempty"`
 
-	// Into is the name of a new claim to create and fill. The source claim
+	// Into is the name of a new claim to create and fill. The run creates it
+	// only when no claim has that name, and writes only into a claim it
+	// created. The claim stays after the run is deleted. The source claim
 	// stays untouched. When omitted, the restore overwrites Claim in place,
 	// and the workload that mounts it has to stop first.
 	// +optional
@@ -73,10 +75,11 @@ type RestoreRunSpec struct {
 	All bool `json:"all,omitempty"`
 
 	// RestoreAsOf is the moment to restore to, as an RFC 3339 time. A volume
-	// restores the newest snapshot taken at or before it, and a database
-	// replays WAL up to exactly that moment. When it is omitted and Previous
-	// is unset, a volume restores its newest snapshot and a database replays
-	// to the end of its WAL archive.
+	// restores the newest snapshot taken at or before it. A database recovers
+	// to the end of the newest base backup that finished at or before it, so
+	// the database is never ahead of that moment. When it is omitted, a
+	// volume restores its newest snapshot and a database recovers to the end
+	// of its WAL archive.
 	// +optional
 	// +kubebuilder:validation:Format="date-time"
 	RestoreAsOf *string `json:"restoreAsOf,omitempty"`
@@ -89,37 +92,40 @@ type RestoreRunSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	Previous *int32 `json:"previous,omitempty"`
 
-	// SyncDatabaseToVolume recovers the databases to the moment of the
-	// volumes' snapshots, and RestoreAsOf then selects the snapshots only. It
-	// needs All. The run considers only snapshots tagged quiesced, which a
-	// BackupRun writes when it stopped the workloads. Such a snapshot carries
-	// the moment the run gave the workloads back, and neither the volumes nor
-	// the databases were written between the stop and that moment. Every
-	// volume has to select a snapshot of the same moment.
+	// SyncDatabaseToVolume brings the volumes and the databases back to one
+	// moment, and RestoreAsOf then selects the snapshots only. It needs All.
+	// The run considers only snapshots tagged paused, which a BackupRun with
+	// all: true writes when it paused the app, and every volume has to select
+	// a snapshot of the same moment. Each database recovers to the end of the
+	// base backup that the BackupRun took while the app was paused, which the
+	// snapshots name in a base-backup tag. When the tag is missing or the
+	// store no longer holds that backup, the database recovers to the end of
+	// the newest base backup that finished before the moment.
 	// +optional
 	SyncDatabaseToVolume bool `json:"syncDatabaseToVolume,omitempty"`
 
-	// Quiesce lists the workloads in this namespace to stop before anything
-	// is restored. For each one, the run suspends the Flux Kustomization that
-	// applies it and scales it to zero. The run gives the workloads back once
-	// every volume is restored and every database deleted, down to the old
-	// Cluster's last instance pod and PVC. It gives them back at that point
-	// because a database comes back only when its owner creates it again, and
-	// a suspended Kustomization creates nothing. When omitted, the run waits
-	// for whatever mounts a claim to stop on its own.
+	// PauseDuringRestore lists the workloads in this namespace to stop before
+	// anything is restored. For each one, the run suspends the Flux
+	// Kustomization that applies it and scales it to zero. The run gives the
+	// workloads back once every volume is restored and every database deleted,
+	// down to the old Cluster's last instance pod and PVC. It gives them back
+	// at that point because a database comes back only when its owner creates
+	// it again, and a suspended Kustomization creates nothing. When omitted,
+	// the run waits for whatever mounts a claim to stop on its own.
 	// +optional
 	// +kubebuilder:validation:MaxItems=32
-	Quiesce []WorkloadRef `json:"quiesce,omitempty"`
+	PauseDuringRestore []WorkloadRef `json:"pauseDuringRestore,omitempty"`
 
-	// Timeout is how long the run waits for its movers and recovered databases
-	// before it gives up. The clock starts when the run passes its checks.
+	// Timeout is how long the run may work before it gives up, resumes what
+	// it paused and ends Failed with reason TimedOut. The clock starts when
+	// Kueue admits the run.
 	// +optional
 	// +kubebuilder:default="4h"
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
-	// MoverSecurityContext is copied onto the ReplicationDestination. Set it
-	// for an app whose files belong to a user the mover has to run as. When
-	// omitted, the one on the claim's VolumeRestore applies.
+	// MoverSecurityContext is the pod security context of the run's restore
+	// Jobs. Set it for an app whose files belong to a user restic has to run
+	// as. When omitted, the one on the claim's VolumeRestore applies.
 	// +optional
 	MoverSecurityContext *corev1.PodSecurityContext `json:"moverSecurityContext,omitempty"`
 
@@ -137,29 +143,25 @@ type RestoreRunStatus struct {
 	// +optional
 	Phase RunPhase `json:"phase,omitempty"`
 
-	// Target is the name of the claim an into restore creates and fills.
-	// +optional
-	Target string `json:"target,omitempty"`
-
 	// SyncedTo is the moment a syncDatabaseToVolume run restores everything
-	// to. It is the time on the volumes' quiesced snapshots, and the
+	// to. It is the time on the volumes' paused snapshots, and the
 	// databases recover to it as well.
 	// +optional
 	SyncedTo *metav1.Time `json:"syncedTo,omitempty"`
 
-	// QuiescedAt is when the run stopped the workloads that spec.quiesce
-	// lists.
+	// PausedAt is when the run stopped the workloads that
+	// spec.pauseDuringRestore lists.
 	// +optional
-	QuiescedAt *metav1.Time `json:"quiescedAt,omitempty"`
+	PausedAt *metav1.Time `json:"pausedAt,omitempty"`
 
-	// RestartedAt is when the run gave those workloads their replicas back.
+	// ResumedAt is when the run gave those workloads their replicas back.
 	// +optional
-	RestartedAt *metav1.Time `json:"restartedAt,omitempty"`
+	ResumedAt *metav1.Time `json:"resumedAt,omitempty"`
 
-	// Quiesced lists the workloads this run scaled to zero, each with the
+	// Paused lists the workloads this run scaled to zero, each with the
 	// replica count the run restores when it starts them again.
 	// +optional
-	Quiesced []QuiescedWorkload `json:"quiesced,omitempty"`
+	Paused []PausedWorkload `json:"paused,omitempty"`
 
 	// SuspendedKustomizations lists the Flux Kustomizations this run
 	// suspended, as namespace/name. The run resumes these and no others.
@@ -173,6 +175,25 @@ type RestoreRunStatus struct {
 	// CompletedAt is when the run reached a terminal phase.
 	// +optional
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+
+	// Workload is the name of the Kueue Workload through which the run
+	// waits for admission.
+	// +optional
+	Workload string `json:"workload,omitempty"`
+
+	// SelectedAt is when the run, once admitted, selected the snapshot of
+	// each volume and the base backup of each database. Nothing in the
+	// cluster changed before this moment.
+	// +optional
+	SelectedAt *metav1.Time `json:"selectedAt,omitempty"`
+
+	// Leases names the coordination.k8s.io Leases in the run's namespace that
+	// the run takes before it acts: one for each claim, restic repository and
+	// Cluster it restores, and backup-pause when it pauses workloads. The run
+	// records a name here before it takes the Lease, and deletes every Lease
+	// it still holds when it finishes.
+	// +optional
+	Leases []string `json:"leases,omitempty"`
 
 	// Items has one entry for each claim and each database the run restores.
 	// An into restore has a single entry, for the claim it creates.
@@ -206,18 +227,41 @@ type RestoreItem struct {
 	// Message says why the item failed or was skipped.
 	// +optional
 	Message string `json:"message,omitempty"`
-	// Destination is the name of the ReplicationDestination restoring a
-	// volume. It is cleared once the restore ends and the destination is
-	// deleted.
+	// Job is the name of the restore Job that writes a volume's snapshot into
+	// the claim. The run records it before it creates the Job, and deletes
+	// the Job once the item ends.
 	// +optional
-	Destination string `json:"destination,omitempty"`
+	Job string `json:"job,omitempty"`
 	// Snapshot is the short ID of the restic snapshot a volume restores.
 	// +optional
 	Snapshot string `json:"snapshot,omitempty"`
+	// SnapshotID is the full ID of that snapshot. The restore Job restores
+	// exactly this snapshot.
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
+	// SnapshotTime is the time of that snapshot.
+	// +optional
+	SnapshotTime *metav1.Time `json:"snapshotTime,omitempty"`
+	// CreatedClaim is true when the run created the claim of an into
+	// restore. The run writes only into a claim it created.
+	// +optional
+	CreatedClaim bool `json:"createdClaim,omitempty"`
 	// BaseBackup is the ID of the barman base backup a database's recovery
 	// starts from.
 	// +optional
 	BaseBackup string `json:"baseBackup,omitempty"`
+	// StopAtBaseBackup is true when the recovery ends at the end of
+	// BaseBackup (recoveryTarget backupID with targetImmediate), and false
+	// when it replays the whole WAL archive. A restore to a moment and a
+	// synced restore stop at a base backup, so the database is never ahead
+	// of the moment, and Postgres always reaches the target.
+	// +optional
+	StopAtBaseBackup bool `json:"stopAtBaseBackup,omitempty"`
+	// ClusterUID is the UID of the Cluster the run deletes, recorded before
+	// the delete. A Cluster of that name with this UID is the old one; one
+	// with another UID was created again.
+	// +optional
+	ClusterUID string `json:"clusterUID,omitempty"`
 }
 
 // +kubebuilder:object:root=true

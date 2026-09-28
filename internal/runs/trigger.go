@@ -9,8 +9,6 @@
 package runs
 
 import (
-	"regexp"
-	"strings"
 	"time"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
@@ -24,8 +22,8 @@ import (
 const FieldOwner = client.FieldOwner("backup-controller")
 
 // Finalizer keeps a deleted run in place until the controller has put back
-// whatever the run changed: a stopped workload, a suspended Kustomization, or
-// a ReplicationDestination it created.
+// whatever the run changed: a paused workload, a suspended Kustomization, a
+// restore Job it created, or a Lease it holds.
 const Finalizer = "backup.wlz.li/run-cleanup"
 
 // pollInterval is how long a waiting run waits before it checks again. The
@@ -81,28 +79,4 @@ func lastManual(source *volsyncv1alpha1.ReplicationSource) string {
 // for the next run.
 func busy(source *volsyncv1alpha1.ReplicationSource) bool {
 	return manualTag(source) != "" && manualTag(source) != lastManual(source)
-}
-
-// savedSnapshot matches the line restic prints after a backup, such as
-// "snapshot da4d7eb4 saved", and captures the snapshot ID. VolSync keeps that
-// line in the mover's status logs.
-var savedSnapshot = regexp.MustCompile(`snapshot ([0-9a-f]{8,64}) saved`)
-
-// emptyDirectory is the line VolSync's mover prints when the volume holds no
-// files. The mover then runs no backup, and the repository gains no snapshot.
-const emptyDirectory = "Directory is empty skipping backup"
-
-// moverOutcome reads the logs of a finished mover from the source's
-// status.latestMoverStatus. It returns the ID of the snapshot the mover
-// saved, as restic printed it, or true in empty when the mover found the
-// volume empty. When the logs show neither, it returns an empty ID and false.
-func moverOutcome(source *volsyncv1alpha1.ReplicationSource) (snapshot string, empty bool) {
-	if source.Status == nil || source.Status.LatestMoverStatus == nil {
-		return "", false
-	}
-	logs := source.Status.LatestMoverStatus.Logs
-	if match := savedSnapshot.FindStringSubmatch(logs); match != nil {
-		return match[1], false
-	}
-	return "", strings.Contains(logs, emptyDirectory)
 }

@@ -7,10 +7,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// VolumeRestoreSpec names the restic repository a claim is restored from, and
-// says how the mover that runs the restore should be set up. Each field is
-// passed to the field of the same name on the ReplicationDestination the
-// controller creates.
+// VolumeRestoreSpec names the restic repository a claim is restored from and
+// backed up to, and says how the pods that move its data are set up: the
+// backup mover of the claim's ReplicationSource and the controller's restore
+// Job.
 type VolumeRestoreSpec struct {
 	// Repository is the name of the Secret in this namespace that holds the
 	// restic repository URL, its password and the object store keys. It is
@@ -30,22 +30,24 @@ type VolumeRestoreSpec struct {
 	// +kubebuilder:validation:Format="date-time"
 	RestoreAsOf *string `json:"restoreAsOf,omitempty"`
 
-	// CacheStorageClassName is the storage class for the claim that holds the
-	// restic mover's metadata cache. When omitted, the cluster's default class
-	// provisions it. If that class has reclaimPolicy Retain, every restore
-	// leaves a volume behind, so name a class whose reclaimPolicy is Delete.
+	// CacheStorageClassName is the storage class of the backup mover's
+	// restic cache claim and of the clone VolSync cuts for a backup. When
+	// omitted, the cluster's default class provisions them. If that class has
+	// reclaimPolicy Retain, every backup leaves volumes behind, so name a class
+	// whose reclaimPolicy is Delete.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	CacheStorageClassName *string `json:"cacheStorageClassName,omitempty"`
 
-	// CacheCapacity is the size of the cache claim. When omitted, VolSync
-	// picks its own default.
+	// CacheCapacity is the size of the backup mover's cache claim. When
+	// omitted, VolSync picks its own default.
 	// +optional
 	CacheCapacity *resource.Quantity `json:"cacheCapacity,omitempty"`
 
-	// MoverPodLabels are added to the mover pod, so that the cluster's backup
-	// queue admits the restore the same way it admits every other mover. Keys
+	// MoverPodLabels are added to the restore Job that fills a new claim, so
+	// that the cluster's backup queue admits that restore; a restore of a
+	// rebuilt namespace then fills its claims a few at a time. Keys
 	// and values must be valid label syntax. The map holds at most 8 entries,
 	// because the API server installs the label syntax rules only for a map
 	// whose maximum size is declared.
@@ -55,8 +57,8 @@ type VolumeRestoreSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k].matches('^([a-zA-Z0-9]([-a-zA-Z0-9_.]*[a-zA-Z0-9])?)?$'))",message="moverPodLabels values must be a valid label value"
 	MoverPodLabels map[string]MoverPodLabelValue `json:"moverPodLabels,omitempty"`
 
-	// MoverSecurityContext is copied onto the ReplicationDestination
-	// unchanged.
+	// MoverSecurityContext is the pod security context of the backup mover
+	// and of the restore Jobs of this repository's claims.
 	// +optional
 	MoverSecurityContext *corev1.PodSecurityContext `json:"moverSecurityContext,omitempty"`
 }
@@ -71,8 +73,8 @@ type VolumeRestoreSpec struct {
 // +kubebuilder:validation:MaxLength=63
 type MoverPodLabelValue string
 
-// MoverLabels returns MoverPodLabels as the plain string map a
-// ReplicationDestination takes. It returns nil when no labels are set.
+// MoverLabels returns MoverPodLabels as the plain string map a restore Job
+// takes. It returns nil when no labels are set.
 func (s VolumeRestoreSpec) MoverLabels() map[string]string {
 	if s.MoverPodLabels == nil {
 		return nil
@@ -93,8 +95,8 @@ type VolumeRestoreStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// Claims has one entry for each claim currently being populated from this
-	// object.
+	// Claims has one entry for each claim this object filled or fills: which
+	// snapshot, and how far the restore got.
 	// +optional
 	Claims []ClaimRestoreStatus `json:"claims,omitempty"`
 }
@@ -115,6 +117,22 @@ type ClaimRestoreStatus struct {
 	// StartedAt is when this object first reported the claim.
 	// +optional
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+
+	// Snapshot is the short ID of the restic snapshot the claim is filled
+	// from, or empty when the repository held no snapshot and the claim
+	// binds empty.
+	// +optional
+	Snapshot string `json:"snapshot,omitempty"`
+
+	// SnapshotID is the full ID of that snapshot.
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
+
+	// SnapshotTime is the time of that snapshot. The bootstrap webhook reads
+	// it to learn whether the claim was filled from the namespace's paused
+	// moment (see Automatic synced restore in the docs).
+	// +optional
+	SnapshotTime *metav1.Time `json:"snapshotTime,omitempty"`
 }
 
 // RestorePhase is the state of one claim's restore.
@@ -124,9 +142,14 @@ const (
 	// RestorePhaseRestoring is a claim whose volume is being filled.
 	RestorePhaseRestoring RestorePhase = "Restoring"
 
-	// RestorePhaseFailed is a claim whose restore failed: its mover reported
-	// a failure, or no snapshot reaches its restore-as-of time.
+	// RestorePhaseFailed is a claim whose restore failed: its restore Job
+	// failed, or no snapshot reaches its restore-as-of time.
 	RestorePhaseFailed RestorePhase = "Failed"
+
+	// RestorePhaseRestored is a claim whose volume was filled. The entry
+	// stays while the claim exists, so it records which snapshot filled the
+	// claim.
+	RestorePhaseRestored RestorePhase = "Restored"
 )
 
 // +kubebuilder:object:root=true

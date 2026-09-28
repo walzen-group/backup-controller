@@ -79,10 +79,10 @@ spec:
                   that claim's repository, and writes into the claim itself unless Into
                   names a new one.
 
-                  The claim's VolumeRestore supplies the repository Secret, the cache
-                  storage class and the mover's pod labels, so none of them is repeated
-                  here. That is the VolumeRestore the claim's dataSourceRef names, or the
-                  one with the claim's own name. To restore from a repository that no
+                  The claim's VolumeRestore supplies the repository Secret and the
+                  restore Job's security context, so neither is repeated here. That is
+                  the VolumeRestore the claim's dataSourceRef names, or the one with the
+                  claim's own name. To restore from a repository that no
                   claim in this namespace uses, set Repository instead.
                 maxLength: 253
                 type: string
@@ -95,7 +95,9 @@ spec:
                 type: string
               into:
                 description: |-
-                  Into is the name of a new claim to create and fill. The source claim
+                  Into is the name of a new claim to create and fill. The run creates it
+                  only when no claim has that name, and writes only into a claim it
+                  created. The claim stays after the run is deleted. The source claim
                   stays untouched. When omitted, the restore overwrites Claim in place,
                   and the workload that mounts it has to stop first.
                 maxLength: 253
@@ -113,9 +115,9 @@ spec:
                 x-kubernetes-int-or-string: true
               moverSecurityContext:
                 description: |-
-                  MoverSecurityContext is copied onto the ReplicationDestination. Set it
-                  for an app whose files belong to a user the mover has to run as. When
-                  omitted, the one on the claim's VolumeRestore applies.
+                  MoverSecurityContext is the pod security context of the run's restore
+                  Jobs. Set it for an app whose files belong to a user restic has to run
+                  as. When omitted, the one on the claim's VolumeRestore applies.
                 properties:
                   appArmorProfile:
                     description: |-
@@ -346,25 +348,16 @@ spec:
                         type: string
                     type: object
                 type: object
-              previous:
+              pauseDuringRestore:
                 description: |-
-                  Previous is the number of snapshots to step back from the one the run
-                  would otherwise select. That is the newest snapshot at or before
-                  RestoreAsOf, or the newest snapshot when RestoreAsOf is omitted. It
-                  applies to a single volume only.
-                format: int32
-                minimum: 0
-                type: integer
-              quiesce:
-                description: |-
-                  Quiesce lists the workloads in this namespace to stop before anything
-                  is restored. For each one, the run suspends the Flux Kustomization that
-                  applies it and scales it to zero. The run gives the workloads back once
-                  every volume is restored and every database deleted, down to the old
-                  Cluster's last instance pod and PVC. It gives them back at that point
-                  because a database comes back only when its owner creates it again, and
-                  a suspended Kustomization creates nothing. When omitted, the run waits
-                  for whatever mounts a claim to stop on its own.
+                  PauseDuringRestore lists the workloads in this namespace to stop before
+                  anything is restored. For each one, the run suspends the Flux
+                  Kustomization that applies it and scales it to zero. The run gives the
+                  workloads back once every volume is restored and every database deleted,
+                  down to the old Cluster's last instance pod and PVC. It gives them back
+                  at that point because a database comes back only when its owner creates
+                  it again, and a suspended Kustomization creates nothing. When omitted,
+                  the run waits for whatever mounts a claim to stop on its own.
                 items:
                   description: WorkloadRef names a Deployment or a StatefulSet in
                     the run's namespace.
@@ -385,6 +378,15 @@ spec:
                   type: object
                 maxItems: 32
                 type: array
+              previous:
+                description: |-
+                  Previous is the number of snapshots to step back from the one the run
+                  would otherwise select. That is the newest snapshot at or before
+                  RestoreAsOf, or the newest snapshot when RestoreAsOf is omitted. It
+                  applies to a single volume only.
+                format: int32
+                minimum: 0
+                type: integer
               repository:
                 description: |-
                   Repository is the name of a restic repository Secret in this namespace
@@ -400,27 +402,31 @@ spec:
               restoreAsOf:
                 description: |-
                   RestoreAsOf is the moment to restore to, as an RFC 3339 time. A volume
-                  restores the newest snapshot taken at or before it, and a database
-                  replays WAL up to exactly that moment. When it is omitted and Previous
-                  is unset, a volume restores its newest snapshot and a database replays
-                  to the end of its WAL archive.
+                  restores the newest snapshot taken at or before it. A database recovers
+                  to the end of the newest base backup that finished at or before it, so
+                  the database is never ahead of that moment. When it is omitted, a
+                  volume restores its newest snapshot and a database recovers to the end
+                  of its WAL archive.
                 format: date-time
                 type: string
               syncDatabaseToVolume:
                 description: |-
-                  SyncDatabaseToVolume recovers the databases to the moment of the
-                  volumes' snapshots, and RestoreAsOf then selects the snapshots only. It
-                  needs All. The run considers only snapshots tagged quiesced, which a
-                  BackupRun writes when it stopped the workloads. Such a snapshot carries
-                  the moment the run gave the workloads back, and neither the volumes nor
-                  the databases were written between the stop and that moment. Every
-                  volume has to select a snapshot of the same moment.
+                  SyncDatabaseToVolume brings the volumes and the databases back to one
+                  moment, and RestoreAsOf then selects the snapshots only. It needs All.
+                  The run considers only snapshots tagged paused, which a BackupRun with
+                  all: true writes when it paused the app, and every volume has to select
+                  a snapshot of the same moment. Each database recovers to the end of the
+                  base backup that the BackupRun took while the app was paused, which the
+                  snapshots name in a base-backup tag. When the tag is missing or the
+                  store no longer holds that backup, the database recovers to the end of
+                  the newest base backup that finished before the moment.
                 type: boolean
               timeout:
                 default: 4h
                 description: |-
-                  Timeout is how long the run waits for its movers and recovered databases
-                  before it gives up. The clock starts when the run passes its checks.
+                  Timeout is how long the run may work before it gives up, resumes what
+                  it paused and ends Failed with reason TimedOut. The clock starts when
+                  Kueue admits the run.
                 type: string
               ttlSecondsAfterFinished:
                 description: |-
@@ -442,8 +448,10 @@ spec:
             - message: syncDatabaseToVolume needs all
               rule: '!has(self.syncDatabaseToVolume) || !self.syncDatabaseToVolume
                 || (has(self.all) && self.all)'
-            - message: quiesce restores in place; an into restore leaves the app alone
-              rule: '!has(self.quiesce) || size(self.quiesce) == 0 || !has(self.into)'
+            - message: pauseDuringRestore needs an in-place restore; an into restore
+                leaves the app alone
+              rule: '!has(self.pauseDuringRestore) || size(self.pauseDuringRestore)
+                == 0 || !has(self.into)'
           status:
             description: RestoreRunStatus reports how far the restore got.
             properties:
@@ -523,11 +531,22 @@ spec:
                         BaseBackup is the ID of the barman base backup a database's recovery
                         starts from.
                       type: string
-                    destination:
+                    clusterUID:
                       description: |-
-                        Destination is the name of the ReplicationDestination restoring a
-                        volume. It is cleared once the restore ends and the destination is
-                        deleted.
+                        ClusterUID is the UID of the Cluster the run deletes, recorded before
+                        the delete. A Cluster of that name with this UID is the old one; one
+                        with another UID was created again.
+                      type: string
+                    createdClaim:
+                      description: |-
+                        CreatedClaim is true when the run created the claim of an into
+                        restore. The run writes only into a claim it created.
+                      type: boolean
+                    job:
+                      description: |-
+                        Job is the name of the restore Job that writes a volume's snapshot into
+                        the claim. The run records it before it creates the Job, and deletes
+                        the Job once the item ends.
                       type: string
                     kind:
                       description: Kind is PersistentVolumeClaim for a volume and
@@ -546,22 +565,45 @@ spec:
                       description: Snapshot is the short ID of the restic snapshot
                         a volume restores.
                       type: string
+                    snapshotID:
+                      description: |-
+                        SnapshotID is the full ID of that snapshot. The restore Job restores
+                        exactly this snapshot.
+                      type: string
+                    snapshotTime:
+                      description: SnapshotTime is the time of that snapshot.
+                      format: date-time
+                      type: string
+                    stopAtBaseBackup:
+                      description: |-
+                        StopAtBaseBackup is true when the recovery ends at the end of
+                        BaseBackup (recoveryTarget backupID with targetImmediate), and false
+                        when it replays the whole WAL archive. A restore to a moment and a
+                        synced restore stop at a base backup, so the database is never ahead
+                        of the moment, and Postgres always reaches the target.
+                      type: boolean
                   required:
                   - kind
                   - name
                   - phase
                   type: object
                 type: array
-              phase:
-                description: Phase is the run's state. It is the Phase column `kubectl
-                  get` prints.
-                type: string
-              quiesced:
+              leases:
                 description: |-
-                  Quiesced lists the workloads this run scaled to zero, each with the
+                  Leases names the coordination.k8s.io Leases in the run's namespace that
+                  the run takes before it acts: one for each claim, restic repository and
+                  Cluster it restores, and backup-pause when it pauses workloads. The run
+                  records a name here before it takes the Lease, and deletes every Lease
+                  it still holds when it finishes.
+                items:
+                  type: string
+                type: array
+              paused:
+                description: |-
+                  Paused lists the workloads this run scaled to zero, each with the
                   replica count the run restores when it starts them again.
                 items:
-                  description: QuiescedWorkload is one workload a run scaled to zero.
+                  description: PausedWorkload is one workload a run scaled to zero.
                   properties:
                     kind:
                       description: Kind is Deployment or StatefulSet.
@@ -571,25 +613,43 @@ spec:
                       type: string
                     replicas:
                       description: |-
-                        Replicas is the replica count the workload had before the run stopped
-                        it.
+                        Replicas is the replica count the workload had before the run paused
+                        it. The run records it before it scales the workload to 0.
                       format: int32
                       type: integer
+                    resumed:
+                      description: |-
+                        Resumed is true once the run has given the workload its replicas back.
+                        The run records the resume moment first and marks each workload once it
+                        is scaled back, so a pass that stops in between scales back only the
+                        workloads not marked yet.
+                      type: boolean
                   required:
                   - kind
                   - name
                   - replicas
                   type: object
                 type: array
-              quiescedAt:
+              pausedAt:
                 description: |-
-                  QuiescedAt is when the run stopped the workloads that spec.quiesce
-                  lists.
+                  PausedAt is when the run stopped the workloads that
+                  spec.pauseDuringRestore lists.
                 format: date-time
                 type: string
-              restartedAt:
-                description: RestartedAt is when the run gave those workloads their
+              phase:
+                description: Phase is the run's state. It is the Phase column `kubectl
+                  get` prints.
+                type: string
+              resumedAt:
+                description: ResumedAt is when the run gave those workloads their
                   replicas back.
+                format: date-time
+                type: string
+              selectedAt:
+                description: |-
+                  SelectedAt is when the run, once admitted, selected the snapshot of
+                  each volume and the base backup of each database. Nothing in the
+                  cluster changed before this moment.
                 format: date-time
                 type: string
               startedAt:
@@ -607,13 +667,14 @@ spec:
               syncedTo:
                 description: |-
                   SyncedTo is the moment a syncDatabaseToVolume run restores everything
-                  to. It is the time on the volumes' quiesced snapshots, and the
+                  to. It is the time on the volumes' paused snapshots, and the
                   databases recover to it as well.
                 format: date-time
                 type: string
-              target:
-                description: Target is the name of the claim an into restore creates
-                  and fills.
+              workload:
+                description: |-
+                  Workload is the name of the Kueue Workload through which the run
+                  waits for admission.
                 type: string
             type: object
         type: object

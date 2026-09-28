@@ -20,7 +20,7 @@ import (
 // no annotation, so a Flux component can write the key from a substitution
 // that defaults to "".
 const (
-	defaultTimeout           = 6 * time.Hour
+	defaultTimeout           = time.Hour
 	defaultPruneIntervalDays = int32(1)
 )
 

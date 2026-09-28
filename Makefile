@@ -9,7 +9,7 @@ CONTROLLER_GEN := $(NIX) controller-gen
 # copy, because kustomize and helm both read a directory of their own. Every
 # generated file is copied, so a new kind needs no edit here.
 
-.PHONY: build test vet lint check generate manifests verify
+.PHONY: build test vet lint check generate manifests verify kind-up kind-deploy e2e
 
 ## build: compile every package.
 build:
@@ -49,3 +49,15 @@ verify:
 	diff -ru config/crd .tmp/crd
 	diff -ru --exclude=kustomization.yaml config/crd deploy/crds
 	diff -ru config/crd chart/crds
+
+## kind-up: install the test stack into the kind cluster of Docker Desktop (hack/kind/README.md).
+kind-up:
+	hack/kind/up.sh
+
+## kind-deploy: build the controller from this tree and deploy it into the kind cluster.
+kind-deploy:
+	hack/kind/controller.sh deploy
+
+## e2e: run every end-to-end scenario against the controller deployed in the kind cluster.
+e2e:
+	go test -tags e2e -count=1 -timeout 120m -v -parallel 4 ./test/e2e/

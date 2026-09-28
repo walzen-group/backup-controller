@@ -39,7 +39,7 @@ type workload struct {
 	// object is the workload as read from the API server.
 	object client.Object
 
-	// replicas is the count to give back when the run restarts the workload.
+	// replicas is the count to give back when the run resumes the workload.
 	// An unset spec.replicas counts as 1, which is the Kubernetes default.
 	replicas int32
 
@@ -48,13 +48,16 @@ type workload struct {
 	selector *metav1.LabelSelector
 }
 
-// quiesceTargets lists the Deployments and StatefulSets in a namespace that
-// carry the annotation backup.wlz.li/quiesce: "true". A BackupRun stops these
-// while VolSync clones the volumes. The list is sorted by kind, then by name.
+// pauseTargets lists the Deployments and StatefulSets in a namespace that carry
+// the annotation backup.wlz.li/pause-during-backup: "true". A BackupRun stops
+// these while VolSync clones the volumes. The list is sorted by kind, then by
+// name.
 //
 // It returns an error when either list call fails.
-func quiesceTargets(ctx context.Context, c client.Reader, namespace string) ([]workload, error) {
-	marked := func(o metav1.Object) bool { return o.GetAnnotations()[backupv1alpha1.AnnotationQuiesce] == "true" }
+func pauseTargets(ctx context.Context, c client.Reader, namespace string) ([]workload, error) {
+	marked := func(o metav1.Object) bool {
+		return o.GetAnnotations()[backupv1alpha1.AnnotationPauseDuringBackup] == "true"
+	}
 	replicas := func(r *int32) int32 {
 		if r == nil {
 			return 1
@@ -89,19 +92,19 @@ func quiesceTargets(ctx context.Context, c client.Reader, namespace string) ([]w
 	return targets, nil
 }
 
-// namedTargets reads the workloads that a RestoreRun's spec.quiesce lists, in
-// the order the list gives them.
+// namedTargets reads the workloads that a RestoreRun's spec.pauseDuringRestore
+// lists, in the order the list gives them.
 //
 // Parameters:
 //   - namespace is the RestoreRun's namespace. Each workload is looked up there.
-//   - refs is the run's spec.quiesce.
+//   - refs is the run's spec.pauseDuringRestore.
 //
-// It returns a *quiesceSpecError when an entry has a kind other than
-// Deployment or StatefulSet, or names a workload the namespace doesn't hold.
-// The error names the entry. Any other failed read comes back wrapped as it
-// is, and the caller retries it. A RestoreRun calls this while it plans,
-// before it stops anything, so a mistake in spec.quiesce fails the run with
-// nothing changed.
+// It returns a *pauseSpecError when an entry has a kind other than Deployment
+// or StatefulSet, or names a workload the namespace doesn't hold. The error
+// names the entry. Any other failed read comes back wrapped as it is, and the
+// caller retries it. A RestoreRun calls this while it plans, before it stops
+// anything, so a mistake in spec.pauseDuringRestore fails the run with nothing
+// changed.
 func namedTargets(ctx context.Context, c client.Reader, namespace string, refs []backupv1alpha1.WorkloadRef) ([]workload, error) {
 	replicas := func(r *int32) int32 {
 		if r == nil {
@@ -126,59 +129,55 @@ func namedTargets(ctx context.Context, c client.Reader, namespace string, refs [
 			}
 			targets = append(targets, workload{kind: ref.Kind, object: s, replicas: replicas(s.Spec.Replicas), selector: s.Spec.Selector})
 		default:
-			return nil, &quiesceSpecError{fmt.Sprintf("spec.quiesce lists %s %s; only a Deployment or a StatefulSet can be stopped", ref.Kind, ref.Name)}
+			return nil, &pauseSpecError{fmt.Sprintf("spec.pauseDuringRestore lists %s %s; only a Deployment or a StatefulSet can be stopped", ref.Kind, ref.Name)}
 		}
 	}
 	return targets, nil
 }
 
-// quiesceSpecError is an entry in a RestoreRun's spec.quiesce that the run
-// can't act on: a kind it can't stop, or a workload the namespace doesn't
+// pauseSpecError is an entry in a RestoreRun's spec.pauseDuringRestore that the
+// run can't act on: a kind it can't stop, or a workload the namespace doesn't
 // hold. Reading again won't change it, so the run ends. A failed read of the
 // API server is returned as a plain error, and the run retries it.
-type quiesceSpecError struct{ message string }
+type pauseSpecError struct{ message string }
 
-func (e *quiesceSpecError) Error() string { return e.message }
+func (e *pauseSpecError) Error() string { return e.message }
 
-// isQuiesceSpecError reports whether err, or an error it wraps, is a
-// *quiesceSpecError.
-func isQuiesceSpecError(err error) bool {
-	var bad *quiesceSpecError
+// isPauseSpecError reports whether err, or an error it wraps, is a
+// *pauseSpecError.
+func isPauseSpecError(err error) bool {
+	var bad *pauseSpecError
 	return errors.As(err, &bad)
 }
 
-// missingWorkload turns the error from reading a spec.quiesce entry into the
-// error the RestoreRun reports. A NotFound error becomes a *quiesceSpecError
-// saying the namespace holds no such workload. Any other error is wrapped as
-// it is.
+// missingWorkload turns the error from reading a spec.pauseDuringRestore entry
+// into the error the RestoreRun reports. A NotFound error becomes a
+// *pauseSpecError saying the namespace holds no such workload. Any other error
+// is wrapped as it is.
 func missingWorkload(ref backupv1alpha1.WorkloadRef, err error) error {
 	if apierrors.IsNotFound(err) {
-		return &quiesceSpecError{fmt.Sprintf("spec.quiesce lists %s %s, which this namespace does not hold", ref.Kind, ref.Name)}
+		return &pauseSpecError{fmt.Sprintf("spec.pauseDuringRestore lists %s %s, which this namespace does not hold", ref.Kind, ref.Name)}
 	}
 	return fmt.Errorf("get %s %s: %w", ref.Kind, ref.Name, err)
 }
 
-// stopWorkloads scales the target workloads to zero. It first suspends the
-// Flux Kustomizations that apply them, so that Flux can't scale them back up.
+// pausePlan works out what pausing the target workloads changes, without
+// changing anything, so the run can record it before it acts.
 //
 // Parameters:
-//   - c writes the patches.
 //   - reader reads each Kustomization's current spec.suspend.
-//   - targets are the workloads to stop, from quiesceTargets or namedTargets.
+//   - targets are the workloads to pause, from pauseTargets or namedTargets.
 //
-// It returns the workloads it scaled down, with their replica counts, and the
-// Kustomizations it suspended as "namespace/name" keys. The caller records
-// both in the run's status, and restartWorkloads later reverses exactly those
-// changes. On an error it still returns what it changed up to that point, so
-// the caller can put that back.
-//
-// A target without the kustomize-controller labels, or whose Kustomization
-// no longer exists, is scaled down with nothing suspended. A Kustomization
-// that was already suspended is left out of the returned list, because the
-// run didn't suspend it and must not resume it. A Kustomization that applies
-// several targets is suspended once.
-func stopWorkloads(ctx context.Context, c client.Client, reader client.Reader, targets []workload) ([]backupv1alpha1.QuiescedWorkload, []string, error) {
-	var suspended []string
+// It returns each workload with the replica count it has now, and the Flux
+// Kustomizations to suspend as "namespace/name" keys, so Flux can't scale the
+// workloads back up. A target without the kustomize-controller labels, or
+// whose Kustomization no longer exists, gets nothing suspended. A
+// Kustomization that is already suspended is left out, because the run did
+// not suspend it and must not resume it. A Kustomization that applies several
+// targets is listed once. It returns an error when a Kustomization can't be
+// read.
+func pausePlan(ctx context.Context, reader client.Reader, targets []workload) ([]backupv1alpha1.PausedWorkload, []string, error) {
+	var suspend []string
 	seen := map[string]bool{}
 	for _, t := range targets {
 		name := t.object.GetLabels()[fluxNameLabel]
@@ -198,25 +197,68 @@ func stopWorkloads(ctx context.Context, c client.Client, reader client.Reader, t
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return nil, suspended, fmt.Errorf("get Kustomization %s: %w", key, err)
+			return nil, nil, fmt.Errorf("get Kustomization %s: %w", key, err)
 		}
 		if already, _, _ := unstructured.NestedBool(kustomization.Object, "spec", "suspend"); already {
 			continue
 		}
-		if err := setSuspend(ctx, c, namespace, name, true); err != nil {
-			return nil, suspended, err
-		}
-		suspended = append(suspended, key)
+		suspend = append(suspend, key)
 	}
 
-	var stopped []backupv1alpha1.QuiescedWorkload
+	paused := make([]backupv1alpha1.PausedWorkload, 0, len(targets))
 	for _, t := range targets {
-		if err := scale(ctx, c, t.object, 0); err != nil {
-			return stopped, suspended, err
-		}
-		stopped = append(stopped, backupv1alpha1.QuiescedWorkload{Kind: t.kind, Name: t.object.GetName(), Replicas: t.replicas})
+		paused = append(paused, backupv1alpha1.PausedWorkload{Kind: t.kind, Name: t.object.GetName(), Replicas: t.replicas})
 	}
-	return stopped, suspended, nil
+	return paused, suspend, nil
+}
+
+// applyPause suspends the Kustomizations and scales the workloads to zero
+// that the run recorded from pausePlan.
+//
+// Parameters:
+//   - namespace is the run's namespace, which holds the workloads.
+//   - paused is the run's status.paused.
+//   - suspend is the run's status.suspendedKustomizations.
+//
+// It suspends first, so Flux can't scale a workload back up. Every patch sets
+// a fixed value, so a pass that repeats applyPause after a crash changes
+// nothing that is already paused. A workload or Kustomization that is gone is
+// skipped. It returns the first other error.
+func applyPause(ctx context.Context, c client.Client, namespace string, paused []backupv1alpha1.PausedWorkload, suspend []string) error {
+	for _, key := range suspend {
+		ns, name, _ := strings.Cut(key, "/")
+		if err := setSuspend(ctx, c, ns, name, true); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	for _, w := range paused {
+		object, ok := workloadObject(namespace, w)
+		if !ok {
+			continue
+		}
+		if err := scale(ctx, c, object, 0); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// workloadObject returns an empty object of a paused workload's kind with its
+// namespace and name set, for a patch. It returns false for a kind other than
+// Deployment and StatefulSet.
+func workloadObject(namespace string, w backupv1alpha1.PausedWorkload) (client.Object, bool) {
+	var object client.Object
+	switch w.Kind {
+	case "Deployment":
+		object = &appsv1.Deployment{}
+	case "StatefulSet":
+		object = &appsv1.StatefulSet{}
+	default:
+		return nil, false
+	}
+	object.SetNamespace(namespace)
+	object.SetName(w.Name)
+	return object, true
 }
 
 // podsGone reports whether every pod of the target workloads has gone. A
@@ -243,34 +285,33 @@ func podsGone(ctx context.Context, c client.Reader, namespace string, targets []
 	return true, "", nil
 }
 
-// restartWorkloads gives each stopped workload its replica count back, then
+// resumeWorkloads gives each paused workload its replica count back, then
 // resumes the Kustomizations the run suspended.
 //
 // Parameters:
-//   - namespace is the run's namespace, which holds the stopped workloads.
-//   - stopped is the run's status.quiesced, as stopWorkloads returned it.
-//   - suspended is the run's status.suspendedKustomizations, as
-//     "namespace/name" keys.
+//   - namespace is the run's namespace, which holds the paused workloads.
+//   - paused is the run's status.paused. resumeWorkloads marks each workload
+//     Resumed once it is scaled back, and skips a workload already marked,
+//     so it never scales a workload again that its owner scaled since.
+//   - suspended is the run's status.suspendedKustomizations.
 //
-// A workload or Kustomization that has been deleted since is skipped, so a
-// second call after a partial failure is safe. It returns the first other
-// error it meets.
-func restartWorkloads(ctx context.Context, c client.Client, namespace string, stopped []backupv1alpha1.QuiescedWorkload, suspended []string) error {
-	for _, w := range stopped {
-		var object client.Object
-		switch w.Kind {
-		case "Deployment":
-			object = &appsv1.Deployment{}
-		case "StatefulSet":
-			object = &appsv1.StatefulSet{}
-		default:
+// The caller records status.resumedAt before it calls resumeWorkloads, and
+// writes the marks afterwards. A workload or Kustomization that has been
+// deleted since is skipped, so a second call after a partial failure is safe.
+// It returns the first other error.
+func resumeWorkloads(ctx context.Context, c client.Client, namespace string, paused []backupv1alpha1.PausedWorkload, suspended []string) error {
+	for i := range paused {
+		w := &paused[i]
+		if w.Resumed {
 			continue
 		}
-		object.SetNamespace(namespace)
-		object.SetName(w.Name)
-		if err := scale(ctx, c, object, w.Replicas); err != nil && !apierrors.IsNotFound(err) {
-			return err
+		object, ok := workloadObject(namespace, *w)
+		if ok {
+			if err := scale(ctx, c, object, w.Replicas); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
 		}
+		w.Resumed = true
 	}
 	for _, key := range suspended {
 		ns, name, _ := strings.Cut(key, "/")
@@ -302,4 +343,30 @@ func setSuspend(ctx context.Context, c client.Client, namespace, name string, su
 		return fmt.Errorf("set suspend %t on Kustomization %s/%s: %w", suspend, namespace, name, err)
 	}
 	return nil
+}
+
+// pausedPodsGone reports whether every pod of the workloads a run paused is
+// gone, so nothing writes to their volumes any more.
+//
+// Parameters:
+//   - namespace is the run's namespace.
+//   - paused is the run's status.paused.
+//
+// It reads each workload for its pod selector and lists the pods that match.
+// A workload deleted since the pause has no pods to wait for. It returns
+// false and the name of a pod that is still there, or an error when a read
+// fails.
+func pausedPodsGone(ctx context.Context, c client.Reader, namespace string, paused []backupv1alpha1.PausedWorkload) (bool, string, error) {
+	var targets []workload
+	for _, w := range paused {
+		found, err := namedTargets(ctx, c, namespace, []backupv1alpha1.WorkloadRef{{Kind: w.Kind, Name: w.Name}})
+		if isPauseSpecError(err) {
+			continue
+		}
+		if err != nil {
+			return false, "", err
+		}
+		targets = append(targets, found...)
+	}
+	return podsGone(ctx, c, namespace, targets)
 }

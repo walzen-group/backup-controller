@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -18,37 +19,79 @@ import (
 // Location it's given.
 type S3Prober struct{}
 
-// HasBaseBackup reports whether the location holds at least one object under
-// its base prefix. The webhook calls it to decide between recovering a new
-// Cluster and leaving it on initdb.
+// ArchiveEmpty reports whether nothing is stored under the location's
+// archive prefix. It lists at most one key, so it answers in one request
+// however large the archive is.
 //
-// The at argument is the database's Location, as ResolveLocation returns it.
+// Parameters:
+//   - at is the database's Location.
 //
-// It asks the store for one object and stops. barman writes a directory per
-// backup, so anything below <server>/base/ answers the question, and a store
-// holding years of backups is as quick to check as an empty one. It returns an
-// error when the client can't be built from the location or the listing
-// fails.
-func (p S3Prober) HasBaseBackup(ctx context.Context, at Location) (bool, error) {
+// It returns true when the listing holds no key, and an error when the
+// client can't be built or the listing fails.
+func (p S3Prober) ArchiveEmpty(ctx context.Context, at Location) (bool, error) {
 	client, err := p.client(at)
 	if err != nil {
 		return false, err
 	}
-
-	// MaxKeys makes the server stop after one object. Breaking out of the
-	// channel early would leak the goroutine the SDK starts for the listing.
 	listing := client.ListObjects(ctx, at.Bucket, minio.ListObjectsOptions{
-		Prefix:  at.BasePrefix(),
-		MaxKeys: 1,
+		Prefix:    at.ArchivePrefix(),
+		Recursive: true,
+		MaxKeys:   1,
 	})
 	object, ok := <-listing
 	if !ok {
-		return false, nil
+		return true, nil
 	}
 	if object.Err != nil {
-		return false, fmt.Errorf("list %s/%s: %w", at.Bucket, at.BasePrefix(), object.Err)
+		return false, fmt.Errorf("list %s/%s: %w", at.Bucket, at.ArchivePrefix(), object.Err)
 	}
-	return true, nil
+	return false, nil
+}
+
+// WALSince reports whether barman wrote a WAL file or a timeline history
+// file for the database after a moment.
+//
+// Parameters:
+//   - at is the database's Location.
+//   - since is the moment. A file written later shows that a database
+//     archived into the location after it.
+//
+// barman-cloud keeps each WAL file under wals/ in a directory named after its
+// timeline and log, and each history file directly under wals/. Those names
+// sort by time, and a later timeline sorts after an earlier one, so the last
+// directory holds the newest WAL. WALSince lists wals/ one level deep and then
+// that last directory, two listings however long the archive is. It returns
+// an error when the client can't be built or a listing fails.
+func (p S3Prober) WALSince(ctx context.Context, at Location, since time.Time) (bool, error) {
+	client, err := p.client(at)
+	if err != nil {
+		return false, err
+	}
+	last := ""
+	for object := range client.ListObjects(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: at.WALPrefix()}) {
+		if object.Err != nil {
+			return false, fmt.Errorf("list %s/%s: %w", at.Bucket, at.WALPrefix(), object.Err)
+		}
+		if strings.HasSuffix(object.Key, "/") {
+			last = max(last, object.Key)
+			continue
+		}
+		if object.LastModified.After(since) {
+			return true, nil
+		}
+	}
+	if last == "" {
+		return false, nil
+	}
+	for object := range client.ListObjects(ctx, at.Bucket, minio.ListObjectsOptions{Prefix: last, Recursive: true}) {
+		if object.Err != nil {
+			return false, fmt.Errorf("list %s/%s: %w", at.Bucket, last, object.Err)
+		}
+		if object.LastModified.After(since) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // client builds a minio client for the location's endpoint and credentials.

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -75,16 +76,32 @@ func (l Location) BasePrefix() string {
 	return strings.TrimPrefix(l.Prefix+"/base/", "/")
 }
 
+// WALPrefix returns the key prefix under which barman writes the database's
+// WAL files and timeline history files.
+func (l Location) WALPrefix() string {
+	return l.ArchivePrefix() + "wals/"
+}
+
+// ArchivePrefix returns the key prefix of everything barman writes for the
+// database, WAL and base backups: Prefix followed by "/". The trailing slash
+// keeps a database named db from matching one named db-old.
+func (l Location) ArchivePrefix() string {
+	return strings.TrimPrefix(l.Prefix+"/", "/")
+}
+
 // Prober asks an object store which base backups exist at a Location.
 // S3Prober is the real one. The interface exists so the webhook and the
 // RestoreRun controller can be tested without an object store.
 type Prober interface {
-	// HasBaseBackup reports whether anything is stored under the
-	// location's base prefix.
-	HasBaseBackup(ctx context.Context, at Location) (bool, error)
+	// ArchiveEmpty reports whether nothing at all is stored for the
+	// database at the location: no WAL file and no base backup directory.
+	ArchiveEmpty(ctx context.Context, at Location) (bool, error)
 	// BaseBackups lists the location's completed base backups, oldest
 	// first.
 	BaseBackups(ctx context.Context, at Location) ([]BaseBackup, error)
+	// WALSince reports whether the location holds a WAL file written after
+	// the given time, which shows that a database archived there since.
+	WALSince(ctx context.Context, at Location, since time.Time) (bool, error)
 }
 
 // ResolveLocation works out where one database's backups live and how to
@@ -115,19 +132,7 @@ func ResolveLocation(
 	c client.Reader,
 	namespace, objectStore, serverName string,
 ) (Location, error) {
-	store := &unstructured.Unstructured{}
-	store.SetGroupVersionKind(ObjectStoreGVK)
-	key := types.NamespacedName{Namespace: namespace, Name: objectStore}
-	if err := c.Get(ctx, key, store); err != nil {
-		return Location{}, fmt.Errorf("read ObjectStore %s/%s: %w", namespace, objectStore, err)
-	}
-
-	destination, _, err := unstructured.NestedString(store.Object, "spec", "configuration", "destinationPath")
-	if err != nil || destination == "" {
-		return Location{}, fmt.Errorf("ObjectStore %s/%s has no spec.configuration.destinationPath", namespace, objectStore)
-	}
-
-	bucket, prefix, err := splitDestination(destination)
+	store, bucket, prefix, err := archivePath(ctx, c, namespace, objectStore, serverName)
 	if err != nil {
 		return Location{}, err
 	}
@@ -151,11 +156,43 @@ func ResolveLocation(
 	return Location{
 		Endpoint:  endpoint,
 		Bucket:    bucket,
-		Prefix:    strings.Trim(prefix+"/"+serverName, "/"),
+		Prefix:    prefix,
 		AccessKey: accessKey,
 		SecretKey: secretKey,
 		CABundle:  bundle,
 	}, nil
+}
+
+// archivePath reads where a database archives from its ObjectStore alone,
+// without the credentials.
+//
+// Parameters:
+//   - c reads the ObjectStore.
+//   - namespace is the Cluster's namespace, which holds the ObjectStore.
+//   - objectStore and serverName come from the Cluster's archiving plugin
+//     (see Archiver).
+//
+// It returns the ObjectStore, the bucket, and the archive's prefix inside
+// the bucket: the destinationPath's prefix joined with serverName, without
+// slashes at either end. It returns an error when the ObjectStore can't be
+// read, carrying the API server's error so a caller can tell NotFound apart,
+// and when destinationPath is missing or isn't an s3:// URL with a bucket.
+func archivePath(ctx context.Context, c client.Reader, namespace, objectStore, serverName string) (*unstructured.Unstructured, string, string, error) {
+	store := &unstructured.Unstructured{}
+	store.SetGroupVersionKind(ObjectStoreGVK)
+	key := types.NamespacedName{Namespace: namespace, Name: objectStore}
+	if err := c.Get(ctx, key, store); err != nil {
+		return nil, "", "", fmt.Errorf("read ObjectStore %s/%s: %w", namespace, objectStore, err)
+	}
+	destination, _, err := unstructured.NestedString(store.Object, "spec", "configuration", "destinationPath")
+	if err != nil || destination == "" {
+		return nil, "", "", fmt.Errorf("ObjectStore %s/%s has no spec.configuration.destinationPath", namespace, objectStore)
+	}
+	bucket, prefix, err := splitDestination(destination)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return store, bucket, strings.Trim(prefix+"/"+serverName, "/"), nil
 }
 
 // endpointCA reads the PEM bundle that the ObjectStore's

@@ -169,7 +169,7 @@ func TestCRDValidation(t *testing.T) {
 // TestRunsNameExactlyOneScope checks the CEL rules on BackupRun and RestoreRun
 // specs. A run names one volume, one database, or the whole namespace, and
 // never two of them. The RestoreRun cases also cover the rules for previous,
-// into, syncDatabaseToVolume and quiesce.
+// into, syncDatabaseToVolume and pauseDuringRestore.
 func TestRunsNameExactlyOneScope(t *testing.T) {
 	previous := int32(1)
 	backups := []struct {
@@ -208,10 +208,10 @@ func TestRunsNameExactlyOneScope(t *testing.T) {
 		{"into with database", RestoreRunSpec{Database: "notes-pg", Into: "copy"}, true},
 		{"sync with all", RestoreRunSpec{All: true, SyncDatabaseToVolume: true}, false},
 		{"sync with a database", RestoreRunSpec{Database: "notes-pg", SyncDatabaseToVolume: true}, true},
-		{"quiesce with all", RestoreRunSpec{All: true, Quiesce: []WorkloadRef{{Kind: "Deployment", Name: "notes"}}}, false},
-		{"quiesce with a claim", RestoreRunSpec{Claim: "notes-data", Quiesce: []WorkloadRef{{Kind: "StatefulSet", Name: "notes"}}}, false},
-		{"quiesce with into", RestoreRunSpec{Claim: "notes-data", Into: "copy", Quiesce: []WorkloadRef{{Kind: "Deployment", Name: "notes"}}}, true},
-		{"quiesce of a CronJob", RestoreRunSpec{All: true, Quiesce: []WorkloadRef{{Kind: "CronJob", Name: "notes"}}}, true},
+		{"pauseDuringRestore with all", RestoreRunSpec{All: true, PauseDuringRestore: []WorkloadRef{{Kind: "Deployment", Name: "notes"}}}, false},
+		{"pauseDuringRestore with a claim", RestoreRunSpec{Claim: "notes-data", PauseDuringRestore: []WorkloadRef{{Kind: "StatefulSet", Name: "notes"}}}, false},
+		{"pauseDuringRestore with into", RestoreRunSpec{Claim: "notes-data", Into: "copy", PauseDuringRestore: []WorkloadRef{{Kind: "Deployment", Name: "notes"}}}, true},
+		{"pauseDuringRestore of a CronJob", RestoreRunSpec{All: true, PauseDuringRestore: []WorkloadRef{{Kind: "CronJob", Name: "notes"}}}, true},
 	}
 	for i, tc := range restores {
 		t.Run("RestoreRun "+tc.name, func(t *testing.T) {

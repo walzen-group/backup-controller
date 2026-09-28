@@ -28,7 +28,7 @@ var (
 
 	restorePinned = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "backup_controller_restore_pinned",
-		Help: "1 for each claim or Cluster carrying backup.wlz.li/restore-as-of, which pins every later automatic restore of it to one moment.",
+		Help: "1 for each claim carrying backup.wlz.li/restore-as-of, which pins every later automatic restore of the claim to one moment.",
 	}, []string{"namespace", "kind", "name"})
 )
 

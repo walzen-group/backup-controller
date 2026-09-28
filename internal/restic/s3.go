@@ -213,7 +213,7 @@ type Lister interface {
 // S3Lister is the implementation the controller runs with. The controllers
 // take the interface so that their tests can run without an object store.
 type Retimer interface {
-	Retime(ctx context.Context, secret *corev1.Secret, short string, at time.Time, tag string) (Snapshot, error)
+	Retime(ctx context.Context, secret *corev1.Secret, id string, at time.Time, tag string, extra ...string) (Snapshot, error)
 }
 
 // S3Lister is the Lister and Retimer the controller runs with. Each call opens
@@ -221,7 +221,9 @@ type Retimer interface {
 type S3Lister struct{}
 
 // open reads the Location from a VolSync repository Secret, connects to its
-// bucket, and opens the repository with the Secret's password.
+// bucket, and opens the repository with the Secret's password. It derives
+// the repository's key at most once for the life of the process (see
+// OpenCached).
 func (S3Lister) open(ctx context.Context, secret *corev1.Secret) (*Repository, error) {
 	at, err := FromSecret(secret)
 	if err != nil {
@@ -231,7 +233,8 @@ func (S3Lister) open(ctx context.Context, secret *corev1.Secret) (*Repository, e
 	if err != nil {
 		return nil, err
 	}
-	return Open(ctx, store, at.Password)
+	location := fmt.Sprintf("%t %s/%s/%s", at.Secure, at.Endpoint, at.Bucket, at.Prefix)
+	return OpenCached(ctx, store, location, at.Password)
 }
 
 // Snapshots opens the repository that the Secret names and returns its
@@ -252,10 +255,10 @@ func (l S3Lister) Snapshots(ctx context.Context, secret *corev1.Secret) ([]Snaps
 // Retime opens the repository that the Secret names and calls
 // Repository.Retime on it with the other arguments. Repository.Retime
 // describes what they mean.
-func (l S3Lister) Retime(ctx context.Context, secret *corev1.Secret, short string, at time.Time, tag string) (Snapshot, error) {
+func (l S3Lister) Retime(ctx context.Context, secret *corev1.Secret, id string, at time.Time, tag string, extra ...string) (Snapshot, error) {
 	repo, err := l.open(ctx, secret)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return repo.Retime(ctx, short, at, tag)
+	return repo.Retime(ctx, id, at, tag, extra...)
 }

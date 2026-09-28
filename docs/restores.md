@@ -1,319 +1,178 @@
 # Restores
 
-Three operations bring data back, and they differ in what they discard. This
-page owns that distinction; [api.md](api.md) describes VolumeRestore and
-RestoreRun field by field and [architecture.md](architecture.md) has the object
-flow.
+A RestoreRun puts volumes and databases back to an earlier state. It restores
+a claim in place, fills a new claim from a repository, recovers a
+CloudNativePG Cluster, or does all of these for a whole namespace.
 
-## Know this first
+A namespace that is rebuilt, or a Cluster that is created again, comes back
+without a RestoreRun; automatic restores cover that case
+(docs/automatic-restore.md).
 
-A volume populator acts once, at the moment a claim is created. A VolumeRestore
-is a standing declaration that says where a new volume's contents come from, and
-it does nothing at all to a claim that already exists.
+## Kinds of RestoreRun
 
-So "restore" splits into two unrelated mechanisms, and reaching for the wrong one
-is how data is lost:
+| Spec | Restores |
+| --- | --- |
+| claim: data | the claim data in place, from its own repository |
+| claim: data, into: copy | a new claim copy from the repository of data; data stays untouched |
+| repository: SECRET, into: copy, intoSize: 1Gi | a new claim copy from the repository the Secret names |
+| database: db | the Cluster db |
+| all: true | every claim and every Cluster marked backup.wlz.li/enabled: "true" |
+| all: true, syncDatabaseToVolume: true | every claim and every Cluster, to one paused moment |
+
+Every kind accepts these fields:
+
+| Field | Effect |
+| --- | --- |
+| restoreAsOf | an RFC 3339 time; the restore goes back to the newest backup at or before it |
+| previous | steps back that many snapshots from the one otherwise selected, for a single claim |
+| pauseDuringRestore | a list of kind and name, each a Deployment or StatefulSet to pause while the run restores |
+| timeout | how long the run may work after Kueue admits it; 4 hours when omitted |
+| moverSecurityContext | the pod security context of the restore Jobs; else the one of the claim's VolumeRestore |
+| ttlSecondsAfterFinished | deletes the run that many seconds after it finished; kept for good when omitted |
+
+pauseDuringRestore lists workloads by name. The annotation
+backup.wlz.li/pause-during-backup has no effect on a RestoreRun.
+
+## One RestoreRun from start to end
 
 ```mermaid
 flowchart TD
-    Q{"Does the claim<br/>already exist?"}
-    Q -- "no, it is being created" --> P["its VolumeRestore fills it<br/>the populator + VolSync"]
-    Q -- "yes, and the app is using it" --> D["a RestoreRun overwrites it<br/>a ReplicationDestination, copyMethod Direct"]
-
-    P --> P1["the volume holds the<br/>newest backup"]
-    D --> D1["the volume holds the<br/>snapshot you chose"]
+    A[RestoreRun created] --> B[Check the spec and list the items, with API reads only]
+    B -- invalid spec --> F1[Failed, reason Invalid; nothing changed]
+    B --> C[Queued: Kueue Workload asks for one backup-controller.wlz.li/run]
+    C -- Kueue admits it --> D[Running: the timeout counts from here]
+    D --> E{Take the Leases of every item}
+    E -- another run holds one --> W1[Wait with reason Busy] --> E
+    E --> S[Select the snapshot of each volume and where each database recovers to]
+    S -- an item has no backup in reach --> F2[Failed, reason NoBackupInReach; nothing changed]
+    S --> P[Record the pause, then pause what pauseDuringRestore lists]
+    P --> G[Wait until the paused pods are gone]
+    G --> V[Restore each volume with a restore Job]
+    V -- a pod still mounts the claim --> W2[Wait with reason ClaimInUse] --> V
+    V -- a Job failed --> F3[Item Failed; databases not started are Skipped]
+    V -- every volume restored --> DB[Restore each database, see below]
+    DB --> R[Resume the paused workloads once every old Cluster is gone]
+    R --> OK[Succeeded; Jobs, Leases and Workload removed]
+    D -. timeout or Kueue eviction at any step .-> F4[Failed, reason TimedOut or Evicted; the app is resumed first]
 ```
 
-Both paths go through this controller. The left one acts on its own when a
-claim is created; the right one runs only when someone submits a RestoreRun.
+### Before anything changes
 
-## Choosing
+Until Kueue admits the run, the controller only reads the claims, the
+Clusters and the listed workloads. Once admitted, the run takes its Leases,
+so no other run works on its claims, repositories or Clusters, and then
+selects the backup of every item and records it on the item: the snapshot ID of each volume, and
+the base backup of each database. If any item has no backup in reach, the run
+ends Failed with reason NoBackupInReach and names each item and why. At that
+point the run has paused, deleted and overwritten nothing.
+
+Nothing selects again later. The restore Job restores the recorded snapshot ID,
+and the webhook recovers the recorded base backup.
+
+### Volumes
+
+For each volume the run starts a restore Job with the image from the
+controller's --restore-image flag, VolSync's mover image. The Job runs
+`restic restore SNAPSHOTID --target /data --delete` with the claim mounted at
+/data, so afterwards the claim holds exactly the snapshot. The Job's result is
+its Kubernetes condition, Complete or Failed; no log is read.
+
+| Kind | Before the Job starts |
+| --- | --- |
+| In place | No pod may mount the claim. List the workload in pauseDuringRestore, or the run waits with reason ClaimInUse and names the pod. |
+| Into a new claim | The run creates the claim when no claim has that name. A claim of that name that the run did not create fails the item: the run never writes into it. The new claim stays after the run is deleted. |
+
+A restore Job that is deleted before it finished fails its item, and the
+message says the claim may hold part of the snapshot.
+
+### Selecting the snapshot
+
+| Spec | Snapshot |
+| --- | --- |
+| nothing | the newest snapshot |
+| restoreAsOf T | the newest snapshot at or before T |
+| previous N | N snapshots before the one otherwise selected |
+| syncDatabaseToVolume | only snapshots tagged paused; every volume must select a snapshot of the same time, else NoBackupInReach |
+
+## Databases
+
+A Cluster can only recover when it is created, so the run deletes the Cluster
+and the Cluster's owner (its Flux Kustomization, or the terragrunt unit)
+creates it again. The controller's webhook then writes the recovery into the
+new Cluster.
 
 ```mermaid
 flowchart TD
-    S{"What do you want?"}
-
-    S -- "the volume rebuilt from<br/>the newest backup" --> A["Delete the claim"]
-    S -- "an older snapshot, and<br/>keep the live volume" --> B["A RestoreRun<br/>with into:"]
-    S -- "an older snapshot written<br/>into the volume you have" --> C["A RestoreRun<br/>naming the claim"]
-
-    A --> A1["Discards everything the<br/>volume holds now"]
-    B --> B1["Discards nothing.<br/>Two volumes, side by side"]
-    C --> C1["Discards the volume's<br/>current contents"]
-
-    A1 --> W["Back up on demand first"]
-    C1 --> W
+    A[Record the Cluster's UID and phase Deleted in the item] --> B[Delete the Cluster with that UID as a precondition]
+    B --> C{Old pods and claims of the Cluster gone?}
+    C -- no --> W1[Wait with reason WaitingForShutdown] --> C
+    C -- yes --> R[Resume the paused workloads, so Flux applies again]
+    R --> W2[Wait with reason WaitingForRecreate]
+    W2 --> N[Flux creates the Cluster]
+    N --> H[Webhook reads the item and writes the recovery; annotation backup.wlz.li/restore-run]
+    H --> I[Item Recovering]
+    I -- Cluster reports Cluster in healthy state --> OK[Item Succeeded]
+    N -- created without the run's recovery --> F1[Item Failed]
+    I -- Cluster deleted again --> F2[Item Failed]
 ```
 
-| To do this | Create | Stop the workload | What is discarded |
-| --- | --- | --- | --- |
-| rebuild from the newest backup | nothing, delete the claim | yes, to release the claim | the volume's current contents |
-| read an older snapshot beside the live volume | a RestoreRun with `into:` | no | nothing |
-| write an older snapshot into the existing volume | a RestoreRun naming the claim | yes, the mover mounts the claim | the volume's current contents |
+The item records the Cluster's UID before the delete. The delete carries that
+UID as a precondition, so it never reaches a Cluster created since. A Cluster
+that comes back without the annotation backup.wlz.li/restore-run naming the
+run did not get the run's recovery, and the item fails.
 
-The middle row is the one to reach for when the question is whether an older
-backup is any better, because it answers that without betting the current data on
-the answer. Any number of `into:` runs can exist at once, each with its own
-point in time and its own claim.
+### What Postgres recovers to
 
-## Which claim shapes each one works on
-
-A claim is one of two shapes, and only the first mechanism cares which:
-
-| Claim | How it gets its volume |
-| --- | --- |
-| dynamic, `dataSourceRef` names a VolumeRestore | the class provisions it, and backup-controller fills it at creation |
-| fixed name, `volumeName` names a PersistentVolume | it binds that volume the moment it exists |
+The recovery never goes ahead of the run's moment, and Postgres always reaches
+the target it gets. No recovery gets a clock time as its target: Postgres
+refuses to finish a recovery to a time when no transaction was committed after
+that time, and CloudNativePG then retries the recovery forever.
 
 ```mermaid
-flowchart LR
-    subgraph dyn["dynamic claim"]
-        d1["rebuild by deleting it"]
-        d2["read a second volume"]
-        d3["overwrite in place"]
-    end
-
-    subgraph fixed["fixed-name claim"]
-        f1["deleting it rebinds the<br/>same volume, no restore"]
-        f2["read a second volume"]
-        f3["overwrite in place"]
-    end
+flowchart TD
+    A[Run admitted: select the base backup of each Cluster] --> Z{Store holds a completed base backup?}
+    Z -- no --> F[Run Failed, reason NoBackupInReach; nothing changed]
+    Z -- yes --> S{syncDatabaseToVolume?}
+    S -- yes --> T{The paused snapshots name a base backup of this Cluster, and the store holds it?}
+    T -- yes --> R1[Stop at the end of that base backup: the paused moment]
+    T -- no --> HB{Tagged hibernated, and no WAL after the paused moment?}
+    HB -- yes --> R3
+    HB -- no --> B1{A base backup finished at or before the paused moment?}
+    S -- no --> AS{restoreAsOf set?}
+    AS -- yes --> B2{A base backup finished at or before restoreAsOf?}
+    AS -- no --> R3[No target: replay the whole WAL archive]
+    B1 -- yes --> R2[Stop at the end of the newest such base backup]
+    B2 -- yes --> R2
+    B1 -- no --> F
+    B2 -- no --> F
 ```
 
-A fixed-name claim is never populated, because it is bound before anything could
-fill it. Delete it and recreate it and it rebinds the same dataset with the same
-contents, so restic reaches that volume only through an in-place RestoreRun.
-That makes the in-place restore the only way back for a fixed-name volume, and
-one of two ways back for a dynamic one. The runs find a fixed-name claim's
-repository through the VolumeRestore carrying the claim's own name.
+The run records the selection on the item (baseBackup, stopAtBaseBackup)
+before it deletes the Cluster, and the webhook writes the recorded target:
 
-The in-place restore itself is indifferent to the shape. Its
-ReplicationDestination names `destinationPVC` and writes into whatever claim
-that is, without knowing how the claim was provisioned.
+| Run | recoveryTarget the webhook writes | The database holds |
+| --- | --- | --- |
+| neither restoreAsOf nor syncDatabaseToVolume | none | everything in the WAL archive |
+| restoreAsOf T | backupID of the newest base backup that finished at or before T, targetImmediate: true | the state at the end of that base backup |
+| syncDatabaseToVolume | backupID from the snapshots' tag base-backup/CLUSTER=ID, targetImmediate: true | the state at the paused moment |
+| syncDatabaseToVolume, the snapshots tag the Cluster hibernated and no WAL came after the paused moment | none | its state at the paused moment, which the whole archive holds |
+| syncDatabaseToVolume, tag missing or backup gone | backupID of the newest base backup that finished at or before the paused moment, targetImmediate: true | a state at or before the paused moment |
 
-## Why an in-place restore needs the workload stopped
+A restore to a moment therefore lands on a base backup. A BackupRun writes one
+base backup of each enabled Cluster on every run, so the schedule sets how
+close to a chosen time a database can come back.
 
-The mover mounts the claim and writes into it. ReadWriteOnce restricts a claim to
-one node rather than to one pod, and the mover and the app both land on the node
-holding the volume, so Kubernetes permits both to mount it at once. Two writers
-on one filesystem is how the volume being restored is corrupted.
+## When a restore fails
 
-Stopping the workload is what prevents it, and a RestoreRun does not do the
-stopping: it waits in phase Waiting, reason ClaimInUse, until no pod mounts the
-claim. Who stops the workload depends on what deployed it. In the walzen
-infrastructure repository a Flux app is suspended and scaled down by hand, and a
-terragrunt unit is applied with its workload at zero; that repository's
-docs/cluster/backups/ has both procedures.
+| What happened | Run | Changed before it failed |
+| --- | --- | --- |
+| Invalid spec, such as syncDatabaseToVolume without all | Failed, Invalid | nothing |
+| No backup in reach for an item | Failed, NoBackupInReach | nothing |
+| A restore Job failed | Failed, item message points at `kubectl logs job/NAME` | the claims restored so far, including a partial one |
+| The Cluster came back without the run's recovery | Failed | the old Cluster was deleted |
+| Timeout or eviction | Failed, TimedOut or Evicted | the app is resumed |
 
-## Back up before you discard
-
-Two of the three operations discard what the volume holds. Whatever has not
-reached the repository is gone with it, so take a backup on demand first
-whenever the newest writes might matter. Submit a BackupRun naming the claim, or
-`all: true` for everything the namespace marks backup.wlz.li/enabled, and watch
-it the way you would a Job:
-
-```yaml
-apiVersion: backup.wlz.li/v1alpha1
-kind: BackupRun
-metadata:
-  name: before-the-rebuild
-  namespace: canary-namespace-backup
-spec:
-  source: canary-namespace-backup-data
-```
-
-The phase runs Queued, Running and Succeeded, or Failed with the reason on the
-Ready condition. `status.items[].snapshotTime` holds the time restic stamped on
-the snapshot the mover saved, and the object stays as the record. Set
-`ttlSecondsAfterFinished` to have it clean itself up.
-
-The controller writes the claim's ReplicationSource itself and keeps the spent
-manual tag on it between runs, because VolSync syncs a source with no trigger in
-a tight loop. [namespace-backups.md](namespace-backups.md) has the whole
-mechanism, the scheduler and the measured runs.
-
-## Submitting a restore
-
-Both restore shapes are one object. The claim's own VolumeRestore supplies the
-repository, the cache class and the mover's queue label, so a run states only
-which volume and how far back:
-
-```yaml
-apiVersion: backup.wlz.li/v1alpha1
-kind: RestoreRun
-metadata:
-  name: back-to-friday
-  namespace: canary-backup
-spec:
-  claim: canary-backup
-  restoreAsOf: "2026-09-13T00:00:00Z"
-```
-
-That is the in-place restore, and it stops nothing itself. While
-a pod still mounts the claim the run sits in phase Waiting, with the reason
-ClaimInUse and a message naming the pod that holds it. Stop the workload however
-that app is deployed and the restore begins on its own.
-
-Add `into:` for the shape that needs nothing stopped, because it writes a second
-volume and leaves the app's alone:
-
-```yaml
-spec:
-  claim: canary-backup
-  into: canary-backup-friday
-  restoreAsOf: "2026-09-13T00:00:00Z"
-```
-
-The controller writes a VolumeRestore carrying that point in time and a claim
-naming it, so the ordinary populator path fills it. Mount `canary-backup-friday`
-from a throwaway pod and compare. Both objects are owned by the RestoreRun, so
-deleting the run deletes the claim and its dataset with it; keep the run until
-the comparison is done.
-
-Before it creates anything, a run lists the repository's snapshots and fails
-with reason NoBackupInReach when none is at or before `restoreAsOf`. VolSync's
-mover would otherwise print `No eligible snapshots found`, exit 0, and report
-success having written nothing.
-
-`database: <cluster>` restores one database and `all: true` every enabled volume
-and database in the namespace; [namespace-backups.md](namespace-backups.md)
-shows both on the prod canary.
-
-To restore a repository no claim in the namespace owns, name the Secret instead
-of a claim. It has to be a Secret in the run's own namespace: a run that could
-name one anywhere would let whoever may create a run here read any backup in the
-cluster, so copying a Secret into a namespace is the deliberate act that grants
-that.
-
-```yaml
-spec:
-  repository: other-app-restic
-  into: scratch
-```
-
-## Databases restore themselves
-
-Everything above is about volumes. A CloudNativePG database has the same gap
-that a volume used to have, and the controller closes it the same way: by
-deciding at creation time.
-
-`spec.bootstrap` is read once, when CloudNativePG creates a Cluster, and never
-again. So a Cluster created after a cluster rebuild bootstraps with `initdb`,
-comes up empty, and reports healthy while its archive sits untouched in the
-object store. Nobody is told.
-
-The bootstrap webhook watches Clusters being created and looks in the object
-store the Cluster archives through:
-
-| What it finds | What it does |
-| --- | --- |
-| no base backup | nothing; the Cluster bootstraps as written |
-| a base backup | rewrites the Cluster to recover from it, to the end of the archive |
-| a base backup, and a RestoreRun that deleted this Cluster | rewrites it to recover to the run's `restoreAsOf`, and names the run in `backup.wlz.li/restore-run` |
-| a base backup, and `backup.wlz.li/restore-as-of` on the Cluster | rewrites it to recover to that moment |
-| no base backup at or before the moment a run or the annotation asks for | refuses the Cluster, naming the oldest base backup |
-| the Cluster already declares a recovery | nothing, unless a RestoreRun waits for this Cluster; then it refuses it, so two targets cannot race |
-| `backup.wlz.li/bootstrap: initdb` | nothing; an empty database was asked for on purpose |
-
-Neither kustomize nor OpenTofu can make that choice, because both render their
-manifests before anything has spoken to the object store. Admission is the one
-moment when the Cluster is known and the store is reachable.
-
-A rewritten Cluster gets `bootstrap.recovery`, the `externalClusters` entry that
-recovery names, and the annotation `cnpg.io/skipEmptyWalArchiveCheck`. The annotation is needed because
-CloudNativePG refuses to archive into a prefix that already holds WAL, which is
-true of every restore: the prefix a database recovers from is the prefix it
-archives to.
-
-### Updates to a recovered Cluster
-
-A GitOps tool applies the Cluster from its source on every reconcile, and the
-source still holds `initdb`. Server-side apply keeps the `recovery` the webhook
-wrote and adds `initdb` back, and CloudNativePG refuses the result:
-
-```text
-admission webhook "vcluster.cnpg.io" denied the request: Cluster.cluster.cnpg.io
-"canary-backup-aio-flux-pg" is invalid: spec.bootstrap: Forbidden: Only one
-bootstrap method can be specified at a time
-```
-
-A second webhook entry receives updates. When the stored Cluster has a `recovery`
-whose source is `backup-controller`, the handler drops `initdb` from the
-incoming object. It reads nothing, so it also acts on dry-runs, which is where
-Flux first hits the refusal. A Cluster without that recovery source is left as
-the update wrote it.
-
-The update entry is registered with `failurePolicy: Ignore`. An unavailable
-controller then fails only a recovered Cluster's update, with the error above,
-and blocks no update to any other Cluster.
-
-### Refusing a shared archive
-
-Before admitting a Cluster, the webhook checks that no other database already
-archives to the same bucket and prefix, and refuses it if one does:
-
-```text
-other/app-pg already archives to backups/app/app-pg. Two databases writing one
-archive interleave their WAL and leave it unrestorable. Give this Cluster an
-archive of its own, or a serverName that is not "app-pg".
-```
-
-This is the one failure nothing else on the cluster can see. Each Cluster is
-valid on its own; the pair is the problem. The damage is silent and permanent:
-WAL filenames are timeline plus position and nothing else, so the second
-database overwrites the first's segments, and a base backup whose WAL range is
-gone can never reach consistency again.
-
-A Cluster that declares its own recovery is checked like any other: where a
-Cluster archives does not depend on how it bootstraps.
-
-It compares resolved destinations rather than names, because two Clusters can
-reach one prefix through differently named ObjectStores. The Cluster being
-admitted is skipped by namespace and name, so recreating a database is not a
-collision with the record of itself, which is what makes restores work.
-
-A Cluster whose own store cannot be read is skipped rather than counted as a
-holder. Refusing a new database because an unrelated one is misconfigured would
-block work this check has no business blocking.
-
-### Reaching an object store over TLS
-
-The webhook talks to the object store directly, so it has to verify whatever
-certificate that endpoint presents. Neither case is configured on this
-controller and neither is hardcoded:
-
-| The endpoint's certificate | What verifies it |
-| --- | --- |
-| signed by a public authority | the public roots in the image |
-| signed by a private authority | the store's own `endpointCA` |
-
-`endpointCA` is a field on the ObjectStore, a Secret name and key holding a PEM
-bundle, and the Barman Cloud plugin already reads it for exactly this reason.
-So an endpoint that needs a CA is described once, on the store, and the plugin
-and this controller both pick it up. A store that needs none declares none.
-
-### Refuse a Cluster the webhook cannot decide
-
-The creation entry is registered with `failurePolicy: Fail`. When it cannot
-run, or cannot read the object store, the Cluster is refused.
-
-The alternative is worse than it sounds. Allowing the Cluster through would
-create it exactly as written, which is `initdb`, which is an empty database
-beside a full archive, reported as success. That failure arrives during a
-cluster rebuild, when this controller is most likely to be starting up and an
-admin is least likely to be reading Cluster events.
-
-### Starting a database empty
-
-With the webhook installed, deleting a Cluster brings its data back, which
-leaves no way to discard a database. The opt-out is an annotation the webhook
-honours and leaves alone:
-
-```yaml
-metadata:
-  annotations:
-    backup.wlz.li/bootstrap: initdb
-```
-
-Any other value is ignored, so a typo does not silently wipe a database.
+In every case the run resumes what it paused, deletes its restore Jobs, and
+gives its Leases and its Workload back before it ends. A restore Job that
+failed on its own stays for its logs, and goes away with the run. The Jobs
+of a run that timed out or was evicted are deleted, which stops them.

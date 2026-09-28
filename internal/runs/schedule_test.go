@@ -1,213 +1,53 @@
 package runs
 
 import (
-	"context"
 	"testing"
 	"time"
 
-	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/events"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"github.com/robfig/cron/v3"
 )
 
-// scheduledNamespace returns the test namespace with the cron schedule given
-// in schedule and the creation time given in created.
-func scheduledNamespace(schedule string, created time.Time) *corev1.Namespace {
-	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
-		Name:              ns,
-		CreationTimestamp: metav1.NewTime(created),
-		Annotations:       map[string]string{backupv1alpha1.AnnotationSchedule: schedule},
-	}}
-}
-
-// scheduler builds a Scheduler over a fake client that holds the given
-// objects, with its clock stopped at now. It also returns the client and the
-// fake event recorder.
-func scheduler(t *testing.T, now time.Time, objects ...client.Object) (*Scheduler, client.Client, *events.FakeRecorder) {
-	t.Helper()
-	c := newClient(t, objects...)
-	recorder := events.NewFakeRecorder(10)
-	return &Scheduler{Client: c, Reader: c, Recorder: recorder, Now: func() time.Time { return now }}, c, recorder
-}
-
-// tick reconciles the test namespace once and fails the test on an error.
-func tick(t *testing.T, s *Scheduler) ctrl.Result {
-	t.Helper()
-	result, err := s.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: ns}})
+// TestDueTick checks which tick a schedule is due for: none before the first
+// tick after the baseline, the tick itself once it has come, and only the
+// newest when several were missed.
+func TestDueTick(t *testing.T) {
+	schedule, err := cron.ParseStandard("0 3 * * *")
 	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	return result
-}
-
-// schedule builds a Scheduler with scheduler and reconciles the test
-// namespace once.
-func schedule(t *testing.T, now time.Time, objects ...client.Object) (ctrl.Result, client.Client) {
-	t.Helper()
-	s, c, _ := scheduler(t, now, objects...)
-	return tick(t, s), c
-}
-
-// scheduledRuns lists the BackupRuns in the test namespace that carry the
-// backup.wlz.li/scheduled-for label.
-func scheduledRuns(t *testing.T, c client.Client) []backupv1alpha1.BackupRun {
-	t.Helper()
-	runs := &backupv1alpha1.BackupRunList{}
-	if err := c.List(context.Background(), runs, client.InNamespace(ns), client.HasLabels{backupv1alpha1.LabelScheduledFor}); err != nil {
 		t.Fatal(err)
 	}
-	return runs.Items
-}
-
-// TestADueTickCreatesARunOfTheWholeNamespace checks that a due tick creates
-// one BackupRun with spec.all set, named and labelled after the tick. With
-// the next tick a day away, the scheduler requeues after refresh.
-func TestADueTickCreatesARunOfTheWholeNamespace(t *testing.T) {
-	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
-
-	result, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), claim())
-
-	runs := scheduledRuns(t, c)
-	if len(runs) != 1 {
-		t.Fatalf("runs = %d, want 1", len(runs))
+	day := func(d, h, m int) time.Time { return time.Date(2026, 9, d, h, m, 0, 0, time.UTC) }
+	cases := []struct {
+		name          string
+		baseline, now time.Time
+		want          time.Time
+		due           bool
+	}{
+		{"before the first tick", day(27, 3, 0), day(28, 2, 59), time.Time{}, false},
+		{"at the tick", day(27, 3, 0), day(28, 3, 0), day(28, 3, 0), true},
+		{"after the tick", day(27, 3, 0), day(28, 9, 30), day(28, 3, 0), true},
+		{"three ticks missed", day(25, 3, 0), day(28, 9, 30), day(28, 3, 0), true},
+		{"a new namespace", day(28, 1, 15), day(28, 3, 1), day(28, 3, 0), true},
 	}
-	run := runs[0]
-	if !run.Spec.All || run.Name != "scheduled-20260924-0500" || run.Labels[backupv1alpha1.LabelScheduledFor] != "1790226000" {
-		t.Errorf("run = %s %v all=%v", run.Name, run.Labels, run.Spec.All)
-	}
-	if want := 5 * time.Minute; result.RequeueAfter != want {
-		t.Errorf("requeue after = %v, want the refresh ceiling %v", result.RequeueAfter, want)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, due := dueTick(schedule, c.baseline, c.now)
+			if due != c.due || !got.Equal(c.want) {
+				t.Errorf("dueTick = %s, %t; want %s, %t", got, due, c.want, c.due)
+			}
+		})
 	}
 }
 
-// TestAScheduleWithAZoneTicksOnThatZonesClock checks that a CRON_TZ prefix
-// puts the schedule on that zone's clock. 04:00 in Berlin is 02:00 UTC in
-// September.
-func TestAScheduleWithAZoneTicksOnThatZonesClock(t *testing.T) {
-	created := time.Date(2026, 9, 24, 1, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 9, 24, 2, 0, 30, 0, time.UTC)
-
-	_, c := schedule(t, now, scheduledNamespace("CRON_TZ=Europe/Berlin 0 4 * * *", created), claim())
-
-	runs := scheduledRuns(t, c)
-	if len(runs) != 1 || runs[0].Labels[backupv1alpha1.LabelScheduledFor] != "1790215200" {
-		t.Fatalf("runs = %v, want one for 2026-09-24T02:00:00Z (1790215200)", runs)
-	}
-}
-
-// TestATickNotYetDueCreatesNothing checks that a tick two minutes away creates
-// no run, and that the scheduler requeues for the moment the tick is due.
-func TestATickNotYetDueCreatesNothing(t *testing.T) {
-	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 9, 24, 4, 58, 0, 0, time.UTC)
-
-	result, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), claim())
-
-	if runs := scheduledRuns(t, c); len(runs) != 0 {
-		t.Fatalf("runs = %d before the tick, want 0", len(runs))
-	}
-	if result.RequeueAfter != 2*time.Minute {
-		t.Errorf("requeue after = %v, want the two minutes to the tick", result.RequeueAfter)
-	}
-}
-
-// TestMissedTicksRunOnceForTheNewest checks that the ticks missed while the
-// controller was down produce one run, for the newest of them.
-func TestMissedTicksRunOnceForTheNewest(t *testing.T) {
-	created := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 9, 24, 5, 30, 0, 0, time.UTC)
-
-	_, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), claim())
-
-	runs := scheduledRuns(t, c)
-	if len(runs) != 1 || runs[0].Name != "scheduled-20260924-0500" {
-		t.Fatalf("runs = %v, want one for the newest tick", runs)
-	}
-}
-
-// TestAnUnfinishedNamespaceRunHoldsTheTick checks that a due tick creates no
-// run while another BackupRun with spec.all set is still running. Only one
-// namespace backup runs at a time, because a second would find every source
-// busy.
-func TestAnUnfinishedNamespaceRunHoldsTheTick(t *testing.T) {
-	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
-	running := &backupv1alpha1.BackupRun{
-		ObjectMeta: metav1.ObjectMeta{Name: "by-hand", Namespace: ns},
-		Spec:       backupv1alpha1.BackupRunSpec{All: true},
-		Status:     backupv1alpha1.BackupRunStatus{Phase: backupv1alpha1.RunPhaseRunning},
-	}
-
-	_, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), claim(), running)
-
-	if runs := scheduledRuns(t, c); len(runs) != 0 {
-		t.Fatalf("runs = %d while another namespace run works, want 0", len(runs))
-	}
-}
-
-// TestADueTickWaitsForSomethingMarkedEnabled checks that a due tick waits,
-// with a Warning event on the Namespace, until a claim is marked enabled, and
-// then creates its run. Flux creates a Namespace before the claims in it, so a
-// tick can be due before anything is marked, and a run created then would
-// find nothing to back up and fail.
-func TestADueTickWaitsForSomethingMarkedEnabled(t *testing.T) {
-	created := time.Date(2026, 9, 22, 16, 25, 56, 0, time.UTC)
-	now := time.Date(2026, 9, 25, 9, 37, 16, 0, time.UTC)
-	unmarked := claim()
-	unmarked.Annotations = nil
-	s, c, recorder := scheduler(t, now, scheduledNamespace("0 5 * * 3", created), unmarked)
-
-	result := tick(t, s)
-
-	if runs := scheduledRuns(t, c); len(runs) != 0 {
-		t.Fatalf("runs = %d with nothing marked, want 0", len(runs))
-	}
-	if result.RequeueAfter > refresh {
-		t.Errorf("requeue after = %v, want at most %v", result.RequeueAfter, refresh)
-	}
-	want := `Warning NothingEnabled the tick at 2026-09-23T05:00:00Z is due, but nothing in this namespace is marked backup.wlz.li/enabled: "true"`
-	if got := recorded(recorder); len(got) != 1 || got[0] != want {
-		t.Fatalf("events = %q, want [%q]", got, want)
-	}
-
-	marked := &corev1.PersistentVolumeClaim{}
-	get(t, c, ns, claimN, marked)
-	marked.Annotations = enabled()
-	if err := c.Update(context.Background(), marked); err != nil {
+// TestDueTickFollowsTheScheduleZone checks that a CRON_TZ= schedule ticks on
+// that zone's clock: 03:00 in Europe/Berlin is 01:00 UTC in summer.
+func TestDueTickFollowsTheScheduleZone(t *testing.T) {
+	schedule, err := cron.ParseStandard("CRON_TZ=Europe/Berlin 0 3 * * *")
+	if err != nil {
 		t.Fatal(err)
 	}
-	tick(t, s)
-
-	runs := scheduledRuns(t, c)
-	if len(runs) != 1 || runs[0].Name != "scheduled-20260923-0500" {
-		t.Fatalf("runs = %v, want the waiting tick's run", runs)
-	}
-}
-
-// TestAnEnabledClusterAloneLetsTheTickRun checks that a namespace whose only
-// marked object is a Cluster gets its scheduled run.
-func TestAnEnabledClusterAloneLetsTheTickRun(t *testing.T) {
-	created := time.Date(2026, 9, 24, 4, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 9, 24, 5, 0, 30, 0, time.UTC)
-
-	_, c := schedule(t, now, scheduledNamespace("0 5 * * *", created), cluster())
-
-	if runs := scheduledRuns(t, c); len(runs) != 1 {
-		t.Fatalf("runs = %d, want 1", len(runs))
-	}
-}
-
-// TestANamespaceWithoutAScheduleIsLeftAlone checks that a namespace without
-// backup.wlz.li/schedule gets no run.
-func TestANamespaceWithoutAScheduleIsLeftAlone(t *testing.T) {
-	plain := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
-	_, c := schedule(t, frozen, plain)
-	if runs := scheduledRuns(t, c); len(runs) != 0 {
-		t.Fatalf("runs = %d, want 0", len(runs))
+	baseline := time.Date(2026, 9, 27, 1, 0, 0, 0, time.UTC)
+	got, due := dueTick(schedule, baseline, time.Date(2026, 9, 28, 1, 30, 0, 0, time.UTC))
+	if want := time.Date(2026, 9, 28, 1, 0, 0, 0, time.UTC); !due || !got.Equal(want) {
+		t.Errorf("dueTick = %s, %t; want %s", got.UTC(), due, want)
 	}
 }

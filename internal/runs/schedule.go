@@ -12,7 +12,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -29,9 +28,8 @@ import (
 const scheduledTTL = int32(30 * 24 * 60 * 60)
 
 // refresh is the longest the scheduler waits before it reconciles a namespace
-// again. The scheduler doesn't watch Clusters, so when a Cluster's
-// backup.wlz.li/restore-as-of annotation changes, the
-// backup_controller_restore_pinned series catches up within this time. The
+// again. The scheduler doesn't watch Clusters, so a Cluster newly marked
+// backup.wlz.li/enabled lets a waiting tick run within this time. The
 // exception is a schedule that doesn't parse, which is read again after 10
 // minutes.
 const refresh = 5 * time.Minute
@@ -54,6 +52,11 @@ type Scheduler struct {
 	// Reader reads CloudNativePG Clusters. The manager passes its API reader,
 	// which reads from the API server without the informer cache.
 	Reader client.Reader
+
+	// Paused is true when the controller runs with --pause. The scheduler
+	// then creates no BackupRun. Once the controller runs without --pause, a
+	// namespace gets one run for the newest tick it missed.
+	Paused bool
 
 	// Recorder records the Warning event on a Namespace whose tick is due
 	// while nothing in it carries backup.wlz.li/enabled: "true". When it is
@@ -148,10 +151,10 @@ func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 		}
 	}
 
-	due := schedule.Next(baseline)
-	if !due.After(now) {
-		for next := schedule.Next(due); !next.After(now); next = schedule.Next(next) {
-			due = next
+	if due, ok := dueTick(schedule, baseline, now); ok {
+		if s.Paused {
+			logger.Info("not creating the scheduled backup", "reason", "the controller runs with --pause", "tick", due.UTC().Format(time.RFC3339))
+			return ctrl.Result{RequeueAfter: refresh}, nil
 		}
 		// Only one namespace backup runs at a time. A second one would find
 		// every source busy, and it would hold its workloads down while it
@@ -182,6 +185,29 @@ func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 
 	wait := min(max(schedule.Next(now).Sub(now), time.Second), refresh)
 	return ctrl.Result{RequeueAfter: wait}, nil
+}
+
+// dueTick finds the tick a namespace's schedule is due for.
+//
+// Parameters:
+//   - schedule is the parsed backup.wlz.li/schedule.
+//   - baseline is the newest tick the namespace already has a run for, or
+//     the namespace's creation time when it has none.
+//   - now is the current time.
+//
+// It returns the newest tick after the baseline that is not after now, and
+// true. Ticks missed while the controller was down or paused give one run,
+// for the newest of them. It returns false when no tick after the baseline
+// is due yet.
+func dueTick(schedule cron.Schedule, baseline, now time.Time) (time.Time, bool) {
+	due := schedule.Next(baseline)
+	if due.After(now) {
+		return time.Time{}, false
+	}
+	for next := schedule.Next(due); !next.After(now); next = schedule.Next(next) {
+		due = next
+	}
+	return due, true
 }
 
 // anythingEnabled reports whether a claim or a Cluster in the namespace
@@ -239,11 +265,11 @@ func (s *Scheduler) exportSchedule(namespace *corev1.Namespace, schedule cron.Sc
 	scheduleInterval.WithLabelValues(namespace.Name).Set(schedule.Next(first).Sub(first).Seconds())
 }
 
-// exportPinned sets the restore-pinned series to 1 for each claim and Cluster
-// in the namespace that carries backup.wlz.li/restore-as-of. It first deletes
-// all of the namespace's restore-pinned series, so an object that has lost
-// the annotation loses its series. It returns an error when the claims or the
-// Clusters can't be listed.
+// exportPinned sets the restore-pinned series to 1 for each claim in the
+// namespace that carries backup.wlz.li/restore-as-of, which pins every later
+// automatic restore of the claim to that moment. It first deletes all of the
+// namespace's restore-pinned series, so a claim that has lost the annotation
+// loses its series. It returns an error when the claims can't be listed.
 func (s *Scheduler) exportPinned(ctx context.Context, namespace string) error {
 	restorePinned.DeletePartialMatch(prometheus.Labels{"namespace": namespace})
 
@@ -254,17 +280,6 @@ func (s *Scheduler) exportPinned(ctx context.Context, namespace string) error {
 	for _, claim := range claims.Items {
 		if _, ok := claim.Annotations[backupv1alpha1.AnnotationRestoreAsOf]; ok {
 			restorePinned.WithLabelValues(namespace, "PersistentVolumeClaim", claim.Name).Set(1)
-		}
-	}
-
-	clusters := &unstructured.UnstructuredList{}
-	clusters.SetGroupVersionKind(clusterListGV)
-	if err := s.Reader.List(ctx, clusters, client.InNamespace(namespace)); err != nil {
-		return err
-	}
-	for _, cluster := range clusters.Items {
-		if _, ok := cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreAsOf]; ok {
-			restorePinned.WithLabelValues(namespace, "Cluster", cluster.GetName()).Set(1)
 		}
 	}
 	return nil

@@ -2,11 +2,12 @@
 //
 // It fills PersistentVolumeClaims from restic repositories. It hands the
 // callbacks in internal/populator to lib-volume-populator's provider-function
-// mode, so a VolSync mover fills a claim whose dataSourceRef names a
-// VolumeRestore, and this binary builds no populator pod of its own. It also
-// runs a controller-runtime manager that reconciles BackupRun and RestoreRun,
-// runs the namespace backup scheduler, and serves the bootstrap webhook for
-// CloudNativePG Clusters when a certificate directory is given.
+// mode, so the controller's own restic Job fills a claim whose dataSourceRef
+// refers to a VolumeRestore, and this binary builds no populator pod of its
+// own. It also runs a controller-runtime manager that reconciles BackupRun
+// and RestoreRun, runs the namespace backup scheduler, and serves the
+// bootstrap webhook for CloudNativePG Clusters when a certificate directory
+// is given.
 package main
 
 import (
@@ -15,11 +16,11 @@ import (
 	"fmt"
 	"os"
 
-	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	populatormachinery "github.com/kubernetes-csi/lib-volume-populator/v3/populator-machinery"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -47,13 +48,15 @@ const prefix = "backup.wlz.li"
 func main() {
 	var (
 		kubeconfig  = kubeconfigFlag(flag.CommandLine)
-		namespace   = flag.String("namespace", "backup-system", "namespace the prime claim and the ReplicationDestination live in")
+		namespace   = flag.String("namespace", "backup-system", "namespace the prime claims and the restore Jobs live in")
 		metricsAddr = flag.String("metrics-addr", ":8080", "address the populator library's metrics listener binds")
 		metricsPath = flag.String("metrics-path", "/metrics", "path the metrics listener serves")
 		runsMetrics = flag.String("runs-metrics-addr", ":8081", "address the scheduler's metrics listener binds, at /metrics")
 		webhookCert = flag.String("webhook-cert-dir", "", "directory holding tls.crt and tls.key; empty serves no webhook")
 		webhookPort = flag.Int("webhook-port", 9443, "port the admission webhook listens on")
 		printVer    = flag.Bool("version", false, "print the version and exit")
+		pause       = flag.Bool("pause", false, "start paused, for an upgrade: new runs wait, runs that started work finish, the scheduler creates no run")
+		restoreImg  = flag.String("restore-image", "", "image of the restore Jobs: VolSync's mover image, which holds the restic that wrote the repositories")
 	)
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -62,13 +65,26 @@ func main() {
 		fmt.Println(version)
 		return
 	}
+	// Every volume restore runs a Job with this image. Without it, each
+	// restore would fail only once it starts, so the process stops here.
+	if *restoreImg == "" {
+		klog.Errorf("--restore-image is required: pass VolSync's mover image, which holds the restic that wrote the repositories")
+		os.Exit(2)
+	}
 
 	operations, err := newClientOperations(kubeconfig())
 	if err != nil {
 		klog.Errorf("failed to build the Kubernetes client: %v", err)
 		os.Exit(1)
 	}
-	callbacks := populator.New(operations, *namespace, restic.S3Lister{})
+	callbacks := populator.New(populator.Config{
+		Operations: operations,
+		Reader:     operations.client,
+		Namespace:  *namespace,
+		Image:      *restoreImg,
+		Snapshots:  restic.S3Lister{},
+		Paused:     *pause,
+	})
 
 	// The populator library drives only the one kind it is given, so
 	// BackupRun and RestoreRun are reconciled by a controller-runtime manager
@@ -78,7 +94,7 @@ func main() {
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
-	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook); err != nil {
+	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook, *pause, *restoreImg); err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)
 	}
@@ -106,14 +122,19 @@ func main() {
 	klog.Info("stopping backup-controller")
 }
 
-// newClientOperations builds the cluster operations the populator callbacks
-// run through. They use a client whose scheme knows the core, VolSync and
-// backup.wlz.li types. The kubeconfig argument is the path from the
-// --kubeconfig flag, and an empty path means the in-cluster configuration.
+// newClientOperations builds the cluster operations that the populator
+// callbacks run through.
 //
-// It returns an error when the client configuration can't be built or a
-// scheme fails to register.
-func newClientOperations(kubeconfig string) (populator.Operations, error) {
+// Parameters:
+//   - kubeconfig is the path from the --kubeconfig flag. An empty path means
+//     the in-cluster configuration.
+//
+// It returns the operations, or an error when the client configuration
+// cannot be built or a scheme fails to register.
+//
+// The client reads straight from the API server, with no cache. Its scheme
+// knows the core, batch and backup.wlz.li types.
+func newClientOperations(kubeconfig string) (*clientOperations, error) {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("build client configuration: %w", err)
@@ -122,7 +143,7 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 	scheme := runtime.NewScheme()
 	for name, add := range map[string]func(*runtime.Scheme) error{
 		"core":          corev1.AddToScheme,
-		"volsync":       volsyncv1alpha1.AddToScheme,
+		"batch":         batchv1.AddToScheme,
 		"backup.wlz.li": backupv1alpha1.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {

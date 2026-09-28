@@ -1,150 +1,98 @@
 # backup-controller
 
-A Kubernetes controller that schedules and runs a namespace's backups, and
-brings volumes and CloudNativePG databases back from them, with VolSync and the
-barman-cloud plugin moving every byte.
+A Kubernetes controller that backs up a namespace's volumes and CloudNativePG
+databases on a schedule, and brings them back: on demand with a RestoreRun,
+and on its own when a namespace or a Cluster is created again. VolSync's
+restic mover writes every volume backup and the barman-cloud plugin every
+database backup; the controller decides when each runs, restores volumes with
+restic, and decides where each database recovers to.
 
-It does three jobs in one binary:
-
-| Job | What it acts on | Page |
+| Job | Acts on | Doc |
 | --- | --- | --- |
-| fill a new claim from its restic repository, with no ZFS clone behind it | a claim whose `dataSourceRef` names a VolumeRestore | [docs/overview.md](docs/overview.md) |
-| back up and restore on schedule or on demand | a Namespace's `backup.wlz.li/schedule`, BackupRun, RestoreRun | [docs/namespace-backups.md](docs/namespace-backups.md) |
-| recover a new database from its archive | a CloudNativePG Cluster at creation, through a mutating webhook | [docs/restores.md](docs/restores.md) |
+| Back up a namespace on a schedule or on demand, with the app paused | a Namespace's backup.wlz.li/schedule, a BackupRun | docs/backups.md |
+| Restore claims and databases to the newest backup or to a moment | a RestoreRun | docs/restores.md |
+| Fill a new claim from its repository | a claim whose dataSourceRef names a VolumeRestore | docs/automatic-restore.md |
+| Recover a new Cluster from its archive | a CloudNativePG Cluster at its create, through a mutating webhook | docs/automatic-restore.md |
 
-A namespace names its schedule in `backup.wlz.li/schedule`, and each claim and
-Cluster opts in with `backup.wlz.li/enabled`. At every tick the controller
-creates a BackupRun that Kueue admits as one unit. The run stops the workloads
-marked `backup.wlz.li/quiesce` while the volumes' clones are cut, writes each
-claim's ReplicationSource, and asks CloudNativePG for a base backup of each
-database. A run that stopped workloads moves each volume's snapshot to the
-moment it started them again and tags it `quiesced`. A RestoreRun restores one
-volume, one database or the whole namespace to the newest backup or a chosen
-moment, can stop the workloads it lists while it does, and with
-`syncDatabaseToVolume` recovers the databases to the moment the volumes'
-quiesced snapshot holds.
+## How a namespace is backed up
 
-Status, 2026-09-25: released at v0.7.0, which runs on the walzen prod cluster.
-The canary at the infrastructure repository's
-modules/testing/canary-namespace-backup ran every mode on 2026-09-24: a
-scheduled run, each form of BackupRun and RestoreRun, and automatic restore of
-the volume and the database after the namespace was destroyed. On 2026-09-25 it
-ran the quiesced snapshot rewrite and a synced, quiesced RestoreRun that brought
-the volume and the database back ending on the same tick.
-[docs/namespace-backups.md](docs/namespace-backups.md) quotes those runs.
+A namespace names its schedule in backup.wlz.li/schedule, and each claim and
+Cluster opts in with backup.wlz.li/enabled: "true". At every tick the
+controller creates a BackupRun, and Kueue admits at most five runs at once
+across the cluster. The run pauses the workloads marked
+backup.wlz.li/pause-during-backup, has VolSync back up each claim and
+CloudNativePG write a base backup of each database, and resumes the app once
+every clone is cut and every database backup completed. Each volume snapshot
+then carries the resume time, the tag paused, and the ID of each base backup
+taken during the pause.
 
-## Releases
+## How it restores
 
-| Tag | Change |
-| --- | --- |
-| v0.1.0 | the VolumeRestore populator |
-| v0.1.1 | cacheStorageClassName and cacheCapacity passthroughs |
-| v0.1.2 | pods get, list, watch for the library's pod informer |
-| v0.2.0 | BackupRun and RestoreRun, and a stop to the populator's status write loop |
-| v0.2.1 | a startup panic on a doubled `--kubeconfig` flag |
-| v0.2.2 | an error loop in the populator's cleanup |
-| v0.2.3 | a logger for controller-runtime |
-| v0.2.4 | the selected node carried onto an `into:` scratch claim |
-| v0.3.0 | the bootstrap webhook: a new Cluster recovers from its object store |
-| v0.3.1 | the public CA roots in the image |
-| v0.3.2 | an object store verified through its own `endpointCA` |
-| v0.3.3 | the database and owner carried into a recovery |
-| v0.4.0 | a Cluster refused when another database already archives to its prefix |
-| v0.4.1 | dry-run requests admitted without reading the object store |
-| v0.4.2 | `initdb` dropped from updates to a recovered Cluster |
-| v0.5.0 | namespace backups: the scheduler, BackupRun and RestoreRun with `database` and `all`, quiesce, controller-written ReplicationSources, the restore checks, the metrics |
-| v0.5.1 | a base backup named by its directory |
-| v0.5.2 | retention tiers from the `retain-` annotations |
-| v0.5.3 | the zone database compiled in, so a `CRON_TZ=` schedule loads its zone |
-| v0.5.4 | `backup.wlz.li/timeout` and `backup.wlz.li/prune-interval-days` per namespace, and a six-hour default timeout |
-| v0.5.5 | an event on a run at each new Ready reason, a Warning when it fails |
-| v0.5.6 | a due tick waits until something in the namespace is marked enabled |
-| v0.6.0 | quiesced snapshots moved to the run's `restartedAt` and tagged `quiesced`, and `syncDatabaseToVolume` on a RestoreRun |
-| v0.7.0 | `quiesce` on a RestoreRun: the workloads it lists are stopped while it restores |
-| v0.7.1 | a database restore gives the app back only once the old Cluster's instance pods and PVCs are gone |
-| v0.7.2 | a RestoreRun that can't stop a workload fails at once with reason `Failed`; a retime whose delete failed reuses its copy; an `endpointURL` of `host:port` reads as HTTPS |
+A RestoreRun selects every snapshot and base backup before it changes anything,
+and fails with reason NoBackupInReach when one is missing. It restores each
+volume with a restic Job by snapshot ID, and recovers each database by
+deleting the Cluster and letting its owner create it again. The webhook then
+recovers the new Cluster to the end of a base backup or to the end of its
+archive: targets Postgres always reaches, never ahead of the chosen moment.
+With syncDatabaseToVolume, volumes and databases come back to the same paused
+moment.
 
-The early fixes below explain behaviour that is still in the code.
+When Flux rebuilds a namespace without a RestoreRun, the claims and the
+Clusters come back to the namespace's newest paused moment when every volume
+has one, and to their newest backups otherwise.
 
-v0.1.2 adds `pods: get, list, watch` to the ClusterRole. The populator library
-builds a pod informer whether or not a populator pod is used, and waits for its
-cache to sync before the controller runs at all, so under v0.1.1 the reflector
-failed every few seconds and every claim stayed Pending. Only a cluster showed
-this: the offline check compared deploy/rbac.yaml against the table in
-[docs/packaging.md](docs/packaging.md), and the two agreed with each other.
+## Rules the controller keeps
 
-v0.2.0 stops a write loop: the library has no early return for a claim it has
-already populated, so it calls the cleanup callback on every resync for the life
-of the claim, and the callback was writing VolumeRestore status each time
-without anything having changed.
-
-v0.2.2 stops an error loop that had been there since v0.1.0. The library deletes
-the prime claim after calling the cleanup callback, so every pass after the one
-that finishes a restore arrives without it, and the callback rejected that. The
-library requeues on error, so one restored claim erred several times a second
-for as long as it existed, re-emitting PopulatorFinished as it went. Cleanup
-exists to remove things, and the prime claim being gone is the state it works
-towards.
-
-v0.2.4 carries the source claim's selected node onto the scratch claim a
-RestoreRun creates with `into:`. On a WaitForFirstConsumer class the populator
-library waits for `volume.kubernetes.io/selected-node` before it fills a claim,
-and the scheduler writes that annotation when a pod using the claim is
-scheduled. A scratch claim has no pod, so nothing ever wrote it and the claim
-stayed Pending: observed on the walzen test cluster, eight minutes with no prime
-claim and nothing in the controller's log. Every class on that cluster binds
-WaitForFirstConsumer.
-
-The walzen infrastructure repository installs each release through its
-cluster/backup-controller unit, described in
-[docs/integration.md](docs/integration.md).
-
-## Why it exists
-
-An app whose claim names a VolSync ReplicationDestination in `dataSourceRef`
-comes back filled whenever the claim is recreated, with no procedure for anyone
-to remember. That behaviour is the reason the walzen-group infrastructure
-repository writes every backed-up volume that way.
-
-VolSync's own populator fills the claim by cloning a VolumeSnapshot. On
-zfs-localpv, and on any copy-on-write storage, a volume provisioned from a
-snapshot is a clone that holds its origin open for as long as it exists. Every
-block the app overwrites keeps its previous version in that origin, and nothing
-can release it: `zfs destroy` on the snapshot answers `snapshot has dependent
-clones`. A volume that rewrites itself drifts toward holding twice its own size,
-and a second dataset, the destination's restored copy, stays on the pool for the
-life of the claim.
-
-This controller keeps the behaviour and removes the clone. It fills an ordinary
-empty volume by running a VolSync restore directly into it, then hands that
-volume to the app's claim. No VolumeSnapshot is taken, no clone exists, nothing
-is pinned, and the destination's permanent restored copy is gone.
-
-Scheduling came later, in v0.5.0. VolSync's per-source schedules started every
-mover at the same minute and Kueue admitted them one pod at a time, so a
-namespace's two volumes could be backed up hours apart, and an app could not be
-stopped for its backup at all.
-
-## What it is not
-
-It does not move data. VolSync's mover writes and reads every volume byte, and
-the barman-cloud plugin every database byte. The controller decides when each
-runs, writes the objects that start them, and reads the results.
-
-It does not replace VolSync or the barman-cloud plugin, and it keeps no state of
-its own: every run is an object in the cluster, and the backups are the restic
-repositories and barman archives the two tools already write.
+- It reads no log to decide anything. It finds snapshots in the restic
+  repository, base backups in the S3 archive, and results in the status of
+  VolSync, CloudNativePG and its own Jobs.
+- Two runs never act on the same claim, repository, Cluster or paused app at
+  once; they take turns through coordination.k8s.io Leases.
+- A run records each step in its status before it acts, so a controller that
+  restarts anywhere finishes the run, and a failed or timed-out run resumes the
+  app it paused.
+- Two Clusters never archive into the same bucket and prefix.
+- It uses the API versions the cluster serves for VolSync, CloudNativePG,
+  Kueue and Flux, and fails with a message that names the object and field when
+  something it needs is missing.
 
 ## Documents
 
-| Document | For |
+| Doc | For |
 | --- | --- |
-| [docs/overview.md](docs/overview.md) | the fill problem, the populator mechanism, and what changes for an app |
-| [docs/architecture.md](docs/architecture.md) | the three parts of the binary, every object the controller writes, and what runs where |
-| [docs/api.md](docs/api.md) | VolumeRestore, BackupRun and RestoreRun, field by field |
-| [docs/namespace-backups.md](docs/namespace-backups.md) | the annotations, the scheduler, the runs, quiesce and the metrics, measured on the prod canary |
-| [docs/restores.md](docs/restores.md) | what fills a claim, what overwrites one, how a database restores, and which to reach for |
-| [docs/packaging.md](docs/packaging.md) | the release: image, rendered manifests, Helm chart, RBAC |
-| [docs/integration.md](docs/integration.md) | how the infrastructure repository installs and uses it |
-| [docs/decisions.md](docs/decisions.md) | why this shape rather than the alternatives that were rejected |
-| [docs/implementation-plan.md](docs/implementation-plan.md) | the original build plan for v0.1, kept as a record |
+| docs/backups.md | what gets backed up, the schedule, pausing the app, and how a BackupRun runs |
+| docs/restores.md | every kind of RestoreRun, and what each database recovers to |
+| docs/automatic-restore.md | the populator, and the webhook's decision on a new Cluster |
+| docs/operations.md | flags, load and the queue, Leases, timeouts, pausing for an upgrade, failures and metrics |
+| docs/api.md | every field, annotation and reason |
+| docs/installing.md | what the cluster needs, the release assets, and the permissions |
+| docs/upgrading.md | the upgrade from v0.10.1 |
+| docs/decisions.md | why the controller works this way, and what the alternatives break |
+| hack/kind/README.md | the test cluster and the end-to-end scenarios |
+
+## Why the controller fills claims itself
+
+An app whose claim names a data source in dataSourceRef comes back filled
+whenever the claim is created again, with no procedure for anyone to follow.
+VolSync's own populator fills such a claim by cloning a VolumeSnapshot. On
+zfs-localpv, and on any copy-on-write storage, a volume provisioned from a
+snapshot is a clone that holds its origin open for as long as it exists: every
+block the app overwrites keeps its old version in the origin, and zfs destroy
+on the snapshot answers "snapshot has dependent clones". The controller fills
+an ordinary empty volume with a restic restore instead, then hands that volume
+to the claim, so no snapshot and no clone remain.
+
+## Tests
+
+Every feature has a scenario on a kind cluster with the real VolSync,
+CloudNativePG, barman-cloud plugin, Kueue, Flux and an S3 service; each
+scenario checks the file in the claim or the rows in the database.
+
+```
+make kind-up
+make kind-deploy
+make e2e
+```
+
+hack/kind/README.md describes the test cluster. `make check` runs the unit
+tests, vet, lint and the build.

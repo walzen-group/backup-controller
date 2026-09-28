@@ -22,9 +22,9 @@ const (
 	mondayID = "88dc3648f06c94f727f601cb69653191e7e79602d36965a8e7892388d7875b81"
 )
 
-// quiescedAt is a moment inside a quiesce window, three seconds before the time
+// pausedAt is a moment inside a pause window, three seconds before the time
 // restic stamped on the Monday snapshot.
-var quiescedAt = time.Date(2026, 9, 21, 4, 59, 57, 0, time.UTC)
+var pausedAt = time.Date(2026, 9, 21, 4, 59, 57, 0, time.UTC)
 
 // writableFixture copies the fixture repository into a temporary directory that
 // the test may write to, opens it, and turns off the lock protocol's pause for
@@ -128,22 +128,22 @@ func lockFiles(t *testing.T, store DirStore) []string {
 }
 
 // TestRetimeReplacesTheSnapshotWithOneAtTheNewTime checks that Retime replaces
-// a quiesced backup's snapshot with a new snapshot file. The new file carries
-// the quiesce moment as its time, the quiesced tag, and the old ID in its
+// a paused backup's snapshot with a new snapshot file. The new file carries
+// the pause moment as its time, the paused tag, and the old ID in its
 // original field, as restic rewrite --forget --new-time would write it. The
 // other snapshot stays as it was, and no lock is left behind.
 func TestRetimeReplacesTheSnapshotWithOneAtTheNewTime(t *testing.T) {
 	store, repo := writableFixture(t)
 
-	got, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	got, err := repo.Retime(context.Background(), mondayID[:8], pausedAt, PausedTag)
 	if err != nil {
 		t.Fatalf("retime: %v", err)
 	}
 	if got.ID == mondayID {
 		t.Fatal("the snapshot kept its ID, so nothing was written")
 	}
-	if !got.Time.Equal(quiescedAt) || !slices.Contains(got.Tags, QuiescedTag) || got.Original != mondayID {
-		t.Errorf("retimed = %+v, want time %s, tag %q and original %s", got, quiescedAt, QuiescedTag, mondayID)
+	if !got.Time.Equal(pausedAt) || !slices.Contains(got.Tags, PausedTag) || got.Original != mondayID {
+		t.Errorf("retimed = %+v, want time %s, tag %q and original %s", got, pausedAt, PausedTag, mondayID)
 	}
 
 	snapshots, err := repo.Snapshots(context.Background())
@@ -170,7 +170,7 @@ func TestRetimeKeepsTheSnapshotsOtherFields(t *testing.T) {
 	store, repo := writableFixture(t)
 	before := document(t, store, repo, path.Join("snapshots", mondayID))
 
-	got, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	got, err := repo.Retime(context.Background(), mondayID[:8], pausedAt, PausedTag)
 	if err != nil {
 		t.Fatalf("retime: %v", err)
 	}
@@ -194,11 +194,11 @@ func TestRetimeKeepsTheSnapshotsOtherFields(t *testing.T) {
 func TestRetimeAgainReturnsTheFirstRewrite(t *testing.T) {
 	_, repo := writableFixture(t)
 
-	first, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	first, err := repo.Retime(context.Background(), mondayID[:8], pausedAt, PausedTag)
 	if err != nil {
 		t.Fatalf("first retime: %v", err)
 	}
-	second, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	second, err := repo.Retime(context.Background(), mondayID[:8], pausedAt, PausedTag)
 	if err != nil {
 		t.Fatalf("second retime: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestRetimeBacksOffFromAnotherLock(t *testing.T) {
 	store, repo := writableFixture(t)
 	placeLock(t, store, repo, time.Now().Add(-time.Minute), false, moverHost, 12)
 
-	_, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	_, err := repo.Retime(context.Background(), mondayID[:8], pausedAt, PausedTag)
 	var locked *LockedError
 	if !errors.As(err, &locked) {
 		t.Fatalf("err = %v, want a LockedError", err)
@@ -250,7 +250,7 @@ func TestRetimeIgnoresAStaleLock(t *testing.T) {
 	store, repo := writableFixture(t)
 	placeLock(t, store, repo, time.Now().Add(-31*time.Minute), true, moverHost, 12)
 
-	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err != nil {
+	if _, err := repo.Retime(context.Background(), mondayID[:8], pausedAt, PausedTag); err != nil {
 		t.Fatalf("retime past a stale lock: %v", err)
 	}
 }
@@ -268,7 +268,7 @@ func TestRetimeRemovesALockThisProcessLeftBehind(t *testing.T) {
 	}
 	placeLock(t, store, repo, time.Now().Add(-time.Minute), true, host, os.Getpid())
 
-	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err != nil {
+	if _, err := repo.Retime(context.Background(), mondayID[:8], pausedAt, PausedTag); err != nil {
 		t.Fatalf("retime past this process's own lock: %v", err)
 	}
 	if left := lockFiles(t, store); len(left) != 0 {
@@ -280,7 +280,7 @@ func TestRetimeRemovesALockThisProcessLeftBehind(t *testing.T) {
 // an ID the repository doesn't hold.
 func TestRetimeOfAnUnknownSnapshotSaysSo(t *testing.T) {
 	_, repo := writableFixture(t)
-	if _, err := repo.Retime(context.Background(), "ffffffff", quiescedAt, QuiescedTag); err == nil {
+	if _, err := repo.Retime(context.Background(), "ffffffff", pausedAt, PausedTag); err == nil {
 		t.Fatal("retime of a snapshot the repository does not hold succeeded")
 	}
 }
@@ -313,10 +313,10 @@ func TestRetimeAfterAFailedRemoveWritesNoSecondCopy(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 
-	if _, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag); err == nil {
+	if _, err := repo.Retime(context.Background(), mondayID[:8], pausedAt, PausedTag); err == nil {
 		t.Fatal("first retime succeeded, want the refused delete")
 	}
-	got, err := repo.Retime(context.Background(), mondayID[:8], quiescedAt, QuiescedTag)
+	got, err := repo.Retime(context.Background(), mondayID[:8], pausedAt, PausedTag)
 	if err != nil {
 		t.Fatalf("second retime: %v", err)
 	}

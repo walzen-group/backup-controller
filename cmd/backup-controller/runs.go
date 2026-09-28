@@ -4,6 +4,11 @@ import (
 	"context"
 	"fmt"
 
+	batchv1 "k8s.io/api/batch/v1"
+
+	"github.com/walzen-group/backup-controller/internal/lease"
+	coordinationv1 "k8s.io/api/coordination/v1"
+
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
@@ -58,11 +63,15 @@ type BootstrapWebhook struct {
 //     and nothing else can register metrics into that one.
 //   - hook says where the bootstrap webhook listens. An empty hook.CertDir
 //     serves no webhook.
+//   - paused is the --pause flag: the run controllers start no new run while
+//     it is set, and finish the runs that already started work.
+//   - restoreImage is the --restore-image flag, the image of the restore
+//     Jobs.
 //
 // It returns an error when the client configuration can't be built, a scheme
 // fails to register, or the manager or one of its controllers can't be set
 // up. An error from the running manager is only logged.
-func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook) error {
+func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook, paused bool, restoreImage string) error {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client configuration: %w", err)
@@ -73,6 +82,8 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 	scheme := runtime.NewScheme()
 	for name, add := range map[string]func(*runtime.Scheme) error{
 		"core":          corev1.AddToScheme,
+		"coordination":  coordinationv1.AddToScheme,
+		"batch":         batchv1.AddToScheme,
 		"apps":          appsv1.AddToScheme,
 		"volsync":       volsyncv1alpha1.AddToScheme,
 		"backup.wlz.li": backupv1alpha1.AddToScheme,
@@ -106,8 +117,9 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 		// cluster, and would hold all of them in memory for the life of the
 		// process.
 		decider := &bootstrap.Decider{
-			Client: manager.GetAPIReader(),
-			Prober: bootstrap.S3Prober{},
+			Client:    manager.GetAPIReader(),
+			Prober:    bootstrap.S3Prober{},
+			Snapshots: restic.S3Lister{},
 		}
 		manager.GetWebhookServer().Register(
 			bootstrap.WebhookPath,
@@ -118,15 +130,20 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 
 	reader := manager.GetAPIReader()
 	recorder := manager.GetEventRecorder("backup-controller")
-	backups := &runs.BackupRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Retimer: restic.S3Lister{}, Recorder: recorder}
+	leases := &lease.Leases{Client: manager.GetClient(), Reader: reader, Alive: runs.RunAlive(reader)}
+	if paused {
+		klog.Info("paused: new runs wait, runs in progress finish")
+	}
+	backups := &runs.BackupRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Retimer: restic.S3Lister{}, Leases: leases, Paused: paused, Recorder: recorder}
 	if err := backups.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the BackupRun controller: %w", err)
 	}
-	restores := &runs.RestoreRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Prober: bootstrap.S3Prober{}, Recorder: recorder}
+	restores := &runs.RestoreRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Prober: bootstrap.S3Prober{},
+		Leases: leases, RestoreImage: restoreImage, Paused: paused, Recorder: recorder}
 	if err := restores.SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the RestoreRun controller: %w", err)
 	}
-	if err := (&runs.Scheduler{Client: manager.GetClient(), Reader: reader, Recorder: recorder}).SetupWithManager(manager); err != nil {
+	if err := (&runs.Scheduler{Client: manager.GetClient(), Reader: reader, Paused: paused, Recorder: recorder}).SetupWithManager(manager); err != nil {
 		return fmt.Errorf("register the scheduler: %w", err)
 	}
 

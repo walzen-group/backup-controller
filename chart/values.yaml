@@ -16,11 +16,20 @@ nameOverride: ""
 # Overrides the generated release-qualified name entirely.
 fullnameOverride: ""
 
-# Namespace the controller creates its prime claim and ReplicationDestination
+# Namespace the controller creates its prime claims and restore Jobs
 # in, passed to the container as --namespace. It has to be the namespace the
 # release is installed into, which is backup-system for the install command in
 # the README.
 namespace: backup-system
+
+# Image of the restore Jobs, passed as --restore-image. It has to be VolSync's
+# mover image, whose restic wrote the repositories, such as
+# quay.io/backube/volsync:0.16.0. The controller does not start without it.
+restoreImage: ""
+
+# Starts the controller with --pause, for an upgrade: runs that started work
+# finish, new runs wait, and the scheduler creates no run.
+pause: false
 
 # The admission webhook that chooses how a CloudNativePG Cluster starts. A
 # Cluster whose object store already holds a base backup is recovered from it;
@@ -56,4 +65,4 @@ resources:
     cpu: 10m
     memory: 64Mi
   limits:
-    memory: 128Mi
+    memory: 512Mi

@@ -5,7 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
+
+	"github.com/walzen-group/backup-controller/internal/restic"
+	"github.com/walzen-group/backup-controller/internal/synced"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	"github.com/go-logr/logr"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -63,6 +73,10 @@ type Decider struct {
 	// Prober asks the object store which base backups exist.
 	// cmd/backup-controller passes S3Prober, and the tests pass a stub.
 	Prober Prober
+	// Snapshots lists the snapshots of the namespace's restic repositories,
+	// to find the namespace's paused moment for a Cluster created without a
+	// RestoreRun (see automaticRecovery).
+	Snapshots restic.Lister
 }
 
 // Handle answers one admission request for a Cluster. For a new Cluster whose
@@ -74,22 +88,29 @@ type Decider struct {
 //   - An update goes to keepRecovery, on a dry run too.
 //   - Any operation other than create or update is allowed unchanged.
 //   - A dry-run create is allowed unchanged without reading anything.
-//   - A create is allowed unchanged when the Cluster carries OptOutAnnotation
-//     set to OptOutValue, or when it has no archiving plugin (see Archiver).
+//   - A create is allowed unchanged when the Cluster has no archiving plugin
+//     (see Archiver).
 //   - A create is refused when the ObjectStore can't be resolved, or when
 //     another Cluster anywhere already archives to the same bucket and prefix.
+//   - A Cluster that carries OptOutAnnotation set to OptOutValue starts
+//     empty when nothing is archived under its prefix, and is refused
+//     otherwise (see optedOut).
 //   - A Cluster that declares its own spec.bootstrap.recovery is allowed
 //     unchanged, unless a RestoreRun is waiting for it. Then it's refused.
-//   - A create is refused when a RestoreRun's restoreAsOf or the Cluster's
-//     restore-as-of annotation isn't an RFC 3339 time.
-//   - A create is refused when a RestoreRun or the restore-as-of annotation
-//     asks for a recovery and the store holds no base backup, or no base
-//     backup finished by the requested moment.
-//   - Otherwise, when the store holds a base backup, the response patches the
-//     Cluster to recover from it (see setRecovery). When a RestoreRun waits
-//     for the Cluster, the patch also sets the backup.wlz.li/restore-run
-//     annotation to the run's name. With no base backup and nothing asking
-//     for a recovery, the Cluster is allowed unchanged and starts empty.
+//   - With no completed base backup in the store, the create is decided by
+//     withoutBaseBackup: refused when a RestoreRun waits or when the archive
+//     holds WAL, and allowed unchanged, to start empty, when nothing at all
+//     is archived.
+//   - A create is refused when the RestoreRun's item names a base backup to
+//     stop at that the store no longer holds (see recoveryFor).
+//   - Otherwise the response patches the Cluster to recover from its
+//     archive (see setRecovery). With a RestoreRun, the recovery stops at the
+//     end of the item's base backup when the item says so, and replays the
+//     whole archive otherwise. Without one, it stops at the end of the base
+//     backup of the namespace's paused moment when the whole namespace comes
+//     back from that moment (see automaticRecovery), and replays the whole
+//     archive otherwise. When a RestoreRun waits for the Cluster, the patch also
+//     sets the backup.wlz.li/restore-run annotation to the run's name.
 //
 // Failures to read the store, list Clusters or RestoreRuns, or talk to the
 // object store return an HTTP 500 error response, which the API server treats
@@ -127,9 +148,18 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
-	if cluster.GetAnnotations()[OptOutAnnotation] == OptOutValue {
-		logger.Info("leaving the Cluster to initdb", "reason", "opted out by annotation")
-		return admission.Allowed("opted out")
+	// A Cluster deleted a moment ago leaves its instance pod shutting down
+	// and its PVCs until the garbage collector removes them. A new Cluster of
+	// the same name would meet them, so it waits: Flux tries the create again
+	// on its next reconcile.
+	left, err := InstanceLeft(ctx, d.Client, req.Namespace, req.Name)
+	if err != nil {
+		logger.Error(err, "cannot check for an earlier instance")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	if left != "" {
+		logger.Info("refusing the Cluster", "reason", "an earlier instance is left", "left", left)
+		return admission.Denied(fmt.Sprintf("%s of an earlier Cluster %s/%s still exists. The create is refused until it is gone; Flux applies the Cluster again on its next reconcile.", left, req.Namespace, req.Name))
 	}
 
 	_, declared, _ := unstructured.NestedMap(cluster.Object, "spec", "bootstrap", "recovery")
@@ -167,6 +197,10 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		))
 	}
 
+	if cluster.GetAnnotations()[OptOutAnnotation] == OptOutValue {
+		return d.optedOut(ctx, logger, at)
+	}
+
 	run, err := waitingRun(ctx, d.Client, req.Namespace, req.Name)
 	if err != nil {
 		logger.Error(err, "cannot read the namespace's RestoreRuns")
@@ -188,41 +222,23 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Allowed("already recovering")
 	}
 
-	target, source, err := restoreTarget(cluster, run)
+	backups, err := d.Prober.BaseBackups(ctx, at)
+	if err != nil {
+		logger.Error(err, "cannot list the base backups")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	if len(backups) == 0 {
+		return d.withoutBaseBackup(ctx, logger, at, run)
+	}
+	target, err := recoveryFor(req.Name, run, backups)
 	if err != nil {
 		return admission.Denied(err.Error())
 	}
-
-	has, err := d.Prober.HasBaseBackup(ctx, at)
-	if err != nil {
-		logger.Error(err, "cannot list the object store")
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-	if !has {
-		if run != nil || target != nil {
-			return admission.Denied(fmt.Sprintf(
-				"%s asks for a recovery, and %s/%s holds no base backup to recover from.",
-				source, at.Bucket, at.BasePrefix(),
-			))
-		}
-		logger.Info("leaving the Cluster to initdb", "reason", "no base backup in the store", "prefix", at.BasePrefix())
-		return admission.Allowed("no base backup")
-	}
-
-	// A target before the oldest base backup's end is one Postgres can never
-	// reach. CloudNativePG would keep the Cluster in recovery reporting that
-	// no backup matched, so the webhook refuses it here with the reason.
-	if target != nil {
-		backups, err := d.Prober.BaseBackups(ctx, at)
+	if run == nil {
+		target, err = d.automaticRecovery(ctx, at, req.Namespace, req.Name, backups)
 		if err != nil {
-			logger.Error(err, "cannot list the base backups")
+			logger.Error(err, "cannot work out the namespace's paused moment")
 			return admission.Errored(http.StatusInternalServerError, err)
-		}
-		if _, ok := AtOrBefore(backups, *target); !ok {
-			return admission.Denied(fmt.Sprintf(
-				"%s asks for %s, and no base backup in %s/%s finished by then%s.",
-				source, target.Format(time.RFC3339), at.Bucket, at.BasePrefix(), oldest(backups),
-			))
 		}
 	}
 
@@ -239,7 +255,7 @@ func (d *Decider) Handle(ctx context.Context, req admission.Request) admission.R
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	logger.Info("recovering the Cluster from its object store", "prefix", at.BasePrefix(), "target", target, "for", source)
+	logger.Info("recovering the Cluster from its object store", "prefix", at.BasePrefix(), "baseBackup", target.backupID)
 	return admission.PatchResponseFromRaw(req.Object.Raw, patched)
 }
 
@@ -270,58 +286,245 @@ func waitingRun(ctx context.Context, c client.Reader, namespace, name string) (*
 	return nil, nil
 }
 
-// restoreTarget works out the moment a new Cluster should recover to, and
-// names what asked for it so refusal messages can point there.
+// withoutBaseBackup decides the create of a Cluster whose store holds no
+// completed base backup.
 //
 // Parameters:
-//   - cluster is the Cluster being created. Its backup.wlz.li/restore-as-of
-//     annotation sets the target when no RestoreRun waits for it.
-//   - run is the RestoreRun waiting for the Cluster (see waitingRun), or nil.
+//   - at is the database's Location.
+//   - run is the RestoreRun waiting for the Cluster, or nil.
 //
-// With a waiting RestoreRun, the target is the run's status.syncedTo, or else
-// its spec.restoreAsOf, or else nil, and the source is "RestoreRun <name>".
-// Without one, the target is the annotation's time and the source is
-// "annotation backup.wlz.li/restore-as-of". With neither, the target is nil and
-// the source is "the webhook". A nil target means the recovery replays to the
-// end of the archive. It returns an error when restoreAsOf or the annotation
-// isn't an RFC 3339 time.
-func restoreTarget(cluster *unstructured.Unstructured, run *backupv1alpha1.RestoreRun) (*time.Time, string, error) {
+// A waiting RestoreRun asks for a recovery there is nothing to recover from,
+// so the create is refused. Without a run, the Cluster may start as a new
+// empty database only when nothing at all is stored under its archive
+// prefix. An archive with WAL and no completed base backup refuses the
+// create: there is nothing to recover from, and the barman-cloud plugin
+// refuses to archive a new database into a prefix that holds WAL, so the new
+// database could never be backed up. A failed listing gives an HTTP 500, so
+// the create is tried again.
+func (d *Decider) withoutBaseBackup(ctx context.Context, logger logr.Logger, at Location, run *backupv1alpha1.RestoreRun) admission.Response {
 	if run != nil {
-		source := "RestoreRun " + run.Name
-		if run.Status.SyncedTo != nil {
-			t := run.Status.SyncedTo.UTC()
-			return &t, source, nil
-		}
-		if run.Spec.RestoreAsOf == nil {
-			return nil, source, nil
-		}
-		t, err := time.Parse(time.RFC3339, *run.Spec.RestoreAsOf)
-		if err != nil {
-			return nil, source, fmt.Errorf("%s has an unparsable restoreAsOf %q: %w", source, *run.Spec.RestoreAsOf, err)
-		}
-		return &t, source, nil
+		return admission.Denied(fmt.Sprintf(
+			"RestoreRun %s asks for a recovery, and %s/%s holds no completed base backup to recover from.",
+			run.Name, at.Bucket, at.BasePrefix(),
+		))
 	}
-
-	value, ok := cluster.GetAnnotations()[backupv1alpha1.AnnotationRestoreAsOf]
-	if !ok {
-		return nil, "the webhook", nil
-	}
-	source := "annotation " + backupv1alpha1.AnnotationRestoreAsOf
-	t, err := time.Parse(time.RFC3339, value)
+	empty, err := d.Prober.ArchiveEmpty(ctx, at)
 	if err != nil {
-		return nil, source, fmt.Errorf("%s is %q, which is not an RFC 3339 time", source, value)
+		logger.Error(err, "cannot list the archive")
+		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	return &t, source, nil
+	if !empty {
+		logger.Info("refusing the Cluster", "reason", "WAL and no completed base backup", "prefix", at.ArchivePrefix())
+		return admission.Denied(fmt.Sprintf(
+			"%s/%s holds WAL of an earlier database and no completed base backup. There is nothing to recover from, and a new empty database could never archive into that prefix. Delete everything under %s/%s and create the Cluster again, or give this Cluster another serverName.",
+			at.Bucket, at.ArchivePrefix(), at.Bucket, at.ArchivePrefix(),
+		))
+	}
+	logger.Info("leaving the Cluster to initdb", "reason", "nothing is archived yet", "prefix", at.ArchivePrefix())
+	return admission.Allowed("nothing archived yet")
 }
 
-// oldest returns the end of a refusal message that names the oldest base
-// backup and when it finished, or says there is none. It expects the list
-// oldest first, as BaseBackups returns it.
-func oldest(backups []BaseBackup) string {
-	if len(backups) == 0 {
-		return "; it holds no completed base backup"
+// automaticRecovery works out where a Cluster created without a RestoreRun
+// recovers to, for example when Flux applies a rebuilt namespace or an admin
+// deleted the Cluster.
+//
+// Parameters:
+//   - at is the Cluster's archive Location.
+//   - namespace and name identify the new Cluster.
+//   - backups are the completed base backups in the Cluster's store.
+//
+// When every claim marked backup.wlz.li/enabled comes back from the
+// namespace's paused moment (see synced.Moment and claimsFromMoment), the
+// Cluster recovers to:
+//   - the end of the base backup that the moment's snapshot names for this
+//     Cluster, which the BackupRun took while the app was paused, when the
+//     store still holds it;
+//   - else, when the snapshot carries restic.HibernatedTag for this Cluster
+//     and no WAL reached the archive after the moment, the end of the
+//     archive: the hibernated database has not run since;
+//   - else the end of the newest base backup that finished at or before the
+//     moment, for example when retention pruned the tagged one or the
+//     Cluster was not part of that BackupRun;
+//   - else, when no base backup is that old, the end of the archive. The
+//     Cluster did not exist at the moment, or retention pruned every base
+//     backup that old; in the second case the database comes back ahead of
+//     the volumes, since nothing older is left to recover from.
+//
+// A claim the populator already filled from the moment counts only while no
+// WAL reached the archive after its restore started: a database that wrote
+// since then ran next to the claim, and the claim holds live data.
+//
+// In every other case the claims hold live data or come back with their
+// newest snapshots, and the Cluster recovers to the end of its archive, its
+// newest state. It returns an error when a read fails, and the create is
+// tried again.
+func (d *Decider) automaticRecovery(ctx context.Context, at Location, namespace, name string, backups []BaseBackup) (recoveryTarget, error) {
+	if d.Snapshots == nil {
+		return recoveryTarget{}, nil
 	}
-	return fmt.Sprintf("; the oldest, %s, finished at %s", backups[0].ID, backups[0].End.UTC().Format(time.RFC3339))
+	repositories, err := synced.Repositories(ctx, d.Client, d.Snapshots, namespace)
+	if err != nil {
+		return recoveryTarget{}, err
+	}
+	moment, ok := synced.Moment(repositories)
+	if !ok {
+		return recoveryTarget{}, nil
+	}
+	fromMoment, filled, err := claimsFromMoment(ctx, d.Client, namespace, moment)
+	if err != nil || !fromMoment {
+		return recoveryTarget{}, err
+	}
+	if filled != nil {
+		written, err := d.Prober.WALSince(ctx, at, *filled)
+		if err != nil || written {
+			return recoveryTarget{}, err
+		}
+	}
+	for _, snapshots := range repositories {
+		if snapshot, found := synced.At(snapshots, moment); found {
+			if id, tagged := restic.PausedBaseBackup(snapshot, name); tagged && slices.ContainsFunc(backups, func(b BaseBackup) bool { return b.ID == id }) {
+				return recoveryTarget{backupID: id}, nil
+			}
+			if slices.Contains(snapshot.Tags, restic.HibernatedTag(name)) {
+				// The database was hibernated at the moment. When no WAL
+				// came after the moment, it has not run since, and the end
+				// of its archive is its state at the moment.
+				woken, err := d.Prober.WALSince(ctx, at, moment)
+				if err != nil || !woken {
+					return recoveryTarget{}, err
+				}
+			}
+			break
+		}
+	}
+	if backup, found := AtOrBefore(backups, moment); found {
+		return recoveryTarget{backupID: backup.ID}, nil
+	}
+	return recoveryTarget{}, nil
+}
+
+// claimsFromMoment reports whether every claim of the namespace marked
+// backup.wlz.li/enabled comes back from the paused moment.
+//
+// Parameters:
+//   - namespace is the namespace of the claims.
+//   - moment is the namespace's paused moment.
+//
+// Every such claim has to name a VolumeRestore in its dataSourceRef and have
+// no pin (backup.wlz.li/restore-as-of on the claim or spec.restoreAsOf on the
+// VolumeRestore): a pinned claim is filled from the pin's time. A claim that
+// is not bound yet comes back from the moment, since the populator fills it
+// from the moment's snapshot. A bound claim comes back from the moment only
+// when its VolumeRestore records that the populator filled it with the
+// moment's snapshot; any other bound claim holds data the populator did not
+// write.
+//
+// It returns true and the earliest time at which the restore of a bound
+// claim started, or nil when no claim is bound yet, so the caller can check
+// that no database wrote since. It returns an error when a read fails.
+func claimsFromMoment(ctx context.Context, c client.Reader, namespace string, moment time.Time) (bool, *time.Time, error) {
+	claims := &corev1.PersistentVolumeClaimList{}
+	if err := c.List(ctx, claims, client.InNamespace(namespace)); err != nil {
+		return false, nil, fmt.Errorf("list the claims in %s: %w", namespace, err)
+	}
+	var filled *time.Time
+	for _, claim := range claims.Items {
+		if !backupv1alpha1.Enabled(claim.Annotations) {
+			continue
+		}
+		ref := claim.Spec.DataSourceRef
+		if ref == nil || ref.Kind != "VolumeRestore" || ref.APIGroup == nil || *ref.APIGroup != backupv1alpha1.GroupVersion.Group {
+			return false, nil, nil
+		}
+		if _, pinned := claim.Annotations[backupv1alpha1.AnnotationRestoreAsOf]; pinned {
+			return false, nil, nil
+		}
+		vr := &backupv1alpha1.VolumeRestore{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, vr); err != nil {
+			return false, nil, client.IgnoreNotFound(err)
+		}
+		if vr.Spec.RestoreAsOf != nil {
+			return false, nil, nil
+		}
+		if claim.Status.Phase != corev1.ClaimBound {
+			continue
+		}
+		i := slices.IndexFunc(vr.Status.Claims, func(e backupv1alpha1.ClaimRestoreStatus) bool {
+			return e.UID == claim.UID && e.SnapshotTime != nil && e.SnapshotTime.UTC().Truncate(time.Second).Equal(moment) && e.StartedAt != nil
+		})
+		if i < 0 {
+			return false, nil, nil
+		}
+		if started := vr.Status.Claims[i].StartedAt.Time; filled == nil || started.Before(*filled) {
+			filled = &started
+		}
+	}
+	return true, filled, nil
+}
+
+// optedOut decides the create of a Cluster that carries
+// backup.wlz.li/bootstrap: initdb, which asks for an empty database.
+//
+// Parameters:
+//   - at is the database's Location.
+//
+// The Cluster starts empty only when nothing is archived under its archive
+// prefix. Over an archive that holds anything, the barman-cloud plugin
+// refuses to archive the new database, so it could never be backed up, and
+// the create is refused with the steps to take. A failed listing gives an
+// HTTP 500, so the create is tried again.
+func (d *Decider) optedOut(ctx context.Context, logger logr.Logger, at Location) admission.Response {
+	empty, err := d.Prober.ArchiveEmpty(ctx, at)
+	if err != nil {
+		logger.Error(err, "cannot list the archive")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	if !empty {
+		logger.Info("refusing the Cluster", "reason", "opted out over an archive", "prefix", at.ArchivePrefix())
+		return admission.Denied(fmt.Sprintf(
+			"The Cluster asks for an empty database (%s: %s), and %s/%s holds the archive of an earlier one. The new database could not archive there. Delete everything under %s/%s first, or give this Cluster another serverName.",
+			OptOutAnnotation, OptOutValue, at.Bucket, at.ArchivePrefix(), at.Bucket, at.ArchivePrefix(),
+		))
+	}
+	logger.Info("leaving the Cluster to initdb", "reason", "opted out by annotation, nothing archived yet")
+	return admission.Allowed("opted out")
+}
+
+// recoveryTarget says where the recovery of a new Cluster stops.
+type recoveryTarget struct {
+	// backupID is the base backup the recovery starts from and stops at the
+	// end of, or "" for a recovery that replays the whole WAL archive.
+	backupID string
+}
+
+// recoveryFor works out where the recovery of a new Cluster stops.
+//
+// Parameters:
+//   - name is the Cluster's name.
+//   - run is the RestoreRun waiting for the Cluster, or nil.
+//   - backups are the completed base backups in the Cluster's store.
+//
+// When the run's item for the Cluster has stopAtBaseBackup set, the recovery
+// stops at the end of the item's base backup. It returns an error, which
+// refuses the create, when that base backup is no longer in the store. In
+// every other case the recovery replays the whole archive, which Postgres
+// always completes.
+func recoveryFor(name string, run *backupv1alpha1.RestoreRun, backups []BaseBackup) (recoveryTarget, error) {
+	if run == nil {
+		return recoveryTarget{}, nil
+	}
+	for _, item := range run.Status.Items {
+		if item.Kind != "Cluster" || item.Name != name || !item.StopAtBaseBackup {
+			continue
+		}
+		for _, b := range backups {
+			if b.ID == item.BaseBackup {
+				return recoveryTarget{backupID: b.ID}, nil
+			}
+		}
+		return recoveryTarget{}, fmt.Errorf("RestoreRun %s recovers to the end of base backup %s, which the store no longer holds as a completed base backup. Delete the RestoreRun and create a new one", run.Name, item.BaseBackup)
+	}
+	return recoveryTarget{}, nil
 }
 
 // keepRecovery answers an update of a Cluster. When the old Cluster was
@@ -363,25 +566,28 @@ func keepRecovery(req admission.Request) admission.Response {
 }
 
 // archiveHolder finds an existing Cluster that already archives to the same
-// bucket and prefix as the Cluster being admitted. Two databases archiving to
-// one prefix interleave their WAL and leave the archive unrestorable.
+// bucket and archive prefix as the Cluster being admitted. Two databases
+// archiving to one prefix interleave their WAL and leave the archive
+// unrestorable.
 //
 // Parameters:
 //   - namespace and name identify the Cluster being admitted. A Cluster with
-//     the same namespace and name is skipped, so a recreate of the same
-//     database doesn't collide with its own record.
+//     the same namespace and name is skipped, so the same database created
+//     again, as a restore does, doesn't collide with its own archive.
 //   - at is where the admitted Cluster would archive, from ResolveLocation.
 //
 // It returns the holder as "namespace/name", or an empty string when no
-// Cluster archives there. It returns an error only when the Cluster list
-// fails.
+// Cluster archives there.
 //
-// It lists every Cluster in every namespace and resolves each one's location
-// with ResolveLocation, then compares bucket and prefix. Two Clusters can reach
-// one prefix through differently named ObjectStores, so comparing store names
-// would miss them. A Cluster whose own store can't be resolved is skipped.
-// Refusing a new database because an unrelated one is misconfigured would
-// block work this check has no reason to block.
+// It lists every Cluster in every namespace and reads each one's bucket and
+// prefix from its ObjectStore (see archivePath). The endpoint URL is not
+// compared: two URLs can name one S3 service, and a collision that slips
+// through destroys both archives. The prefix has no trailing slash on either
+// side, and the comparison is exact, so a database named db and one named
+// db-old are two archives. A Cluster whose ObjectStore does not exist
+// archives nowhere and is skipped. Any other failure to read a Cluster's
+// ObjectStore returns an error, which refuses the create with an HTTP 500
+// until the read works, since a skipped Cluster might hold the prefix.
 func archiveHolder(
 	ctx context.Context,
 	c client.Reader,
@@ -403,11 +609,14 @@ func archiveHolder(
 		if !found {
 			continue
 		}
-		theirs, err := ResolveLocation(ctx, c, other.GetNamespace(), store, serverName)
-		if err != nil {
+		_, bucket, prefix, err := archivePath(ctx, c, other.GetNamespace(), store, serverName)
+		if apierrors.IsNotFound(err) {
 			continue
 		}
-		if theirs.Bucket == at.Bucket && theirs.Prefix == at.Prefix {
+		if err != nil {
+			return "", fmt.Errorf("read the archive of Cluster %s/%s: %w", other.GetNamespace(), other.GetName(), err)
+		}
+		if bucket == at.Bucket && prefix == at.Prefix {
 			return fmt.Sprintf("%s/%s", other.GetNamespace(), other.GetName()), nil
 		}
 	}
@@ -461,9 +670,11 @@ func Archiver(cluster *unstructured.Unstructured) (store, serverName string, fou
 //   - cluster is the Cluster being created. It's modified directly.
 //   - store and serverName say where the Cluster archives, as Archiver
 //     returns them. The recovery reads from the same place.
-//   - target is the moment to recover to, written as
-//     recoveryTarget.targetTime. A nil target replays to the end of the
-//     archive.
+//   - target says where the recovery stops. A backup ID gives
+//     recoveryTarget backupID with targetImmediate: the recovery starts from
+//     that base backup and stops at its end. No backup ID gives no
+//     recoveryTarget, and the recovery replays the whole archive. Postgres
+//     reaches both targets, whether or not anything was written after them.
 //
 // It replaces spec.bootstrap.initdb with spec.bootstrap.recovery, carrying
 // over initdb's database, owner and secret. It adds an externalClusters entry
@@ -472,10 +683,14 @@ func Archiver(cluster *unstructured.Unstructured) (store, serverName string, fou
 // "enabled" so the recovered database can archive into the prefix it restored
 // from. It returns an error only when the unstructured object can't be read or
 // written at those paths.
-func setRecovery(cluster *unstructured.Unstructured, store, serverName string, target *time.Time) error {
+func setRecovery(cluster *unstructured.Unstructured, store, serverName string, target recoveryTarget) error {
 	recovery := map[string]any{"source": RecoverySource}
-	if target != nil {
-		recovery["recoveryTarget"] = map[string]any{"targetTime": target.UTC().Format(time.RFC3339)}
+	if target.backupID != "" {
+		// CloudNativePG 1.30 accepts targetImmediate only together with
+		// backupID (internal/webhook/v1/cluster_webhook.go:1485-1494), and the
+		// barman-cloud plugin starts from the backup that backupID names
+		// (barman-cloud v0.6.0 pkg/catalog/catalog.go:143-147).
+		recovery["recoveryTarget"] = map[string]any{"backupID": target.backupID, "targetImmediate": true}
 	}
 
 	// The application database, its owning role and the Secret holding that

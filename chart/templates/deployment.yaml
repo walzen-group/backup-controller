@@ -22,11 +22,15 @@ spec:
       - name: controller
         image: {{ include "backup-controller.image" . }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
-        # The prime claim and the ReplicationDestination live in this
+        # The prime claims and the populator's restore Jobs live in this
         # namespace, which is the library's namespace setting. The metrics
         # listen address and path keep their defaults, :8080 and /metrics.
         args:
         - --namespace={{ .Values.namespace }}
+        - --restore-image={{ required "restoreImage is required: set it to VolSync's mover image" .Values.restoreImage }}
+        {{- if .Values.pause }}
+        - --pause
+        {{- end }}
         {{- if .Values.webhook.enabled }}
         - --webhook-cert-dir=/etc/webhook/tls
         - --webhook-port={{ .Values.webhook.port }}

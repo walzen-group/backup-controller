@@ -63,6 +63,11 @@ rules:
   - apiGroups: ["backup.wlz.li"]
     resources: ["backupruns/status", "restoreruns/status"]
     verbs: ["patch", "update"]
+  # The runs' Workloads and restore Jobs carry the run as their controller
+  # owner, which blocks the run's deletion until they are gone.
+  - apiGroups: ["backup.wlz.li"]
+    resources: ["backupruns/finalizers", "restoreruns/finalizers"]
+    verbs: ["update"]
   # The controller writes each enabled claim's source and triggers it with a
   # manual tag.
   - apiGroups: ["volsync.backube"]
@@ -76,7 +81,7 @@ rules:
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["backups"]
     verbs: ["get", "create"]
-  # Quiesce scales a marked workload to zero and back, and suspends the Flux
+  # Pausing scales a marked workload to zero and back, and suspends the Flux
   # Kustomization that would otherwise put the replicas back mid-run.
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
@@ -89,17 +94,22 @@ rules:
   - apiGroups: ["kueue.x-k8s.io"]
     resources: ["workloads"]
     verbs: ["get", "create", "delete"]
+  # A run takes a Lease for each claim, restic repository, Cluster and set of
+  # paused workloads it acts on, so two runs never act on one of them at once.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "delete"]
+  # A volume restore runs the controller's own restic Job, which restores the
+  # snapshot the run selected by its ID.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "create", "delete"]
   - apiGroups: ["kueue.x-k8s.io"]
     resources: ["workloads/status"]
     verbs: ["update"]
   - apiGroups: ["kueue.x-k8s.io"]
     resources: ["localqueues"]
     verbs: ["list"]
-  # One destination per restore, created and removed by the callbacks and by a
-  # RestoreRun.
-  - apiGroups: ["volsync.backube"]
-    resources: ["replicationdestinations"]
-    verbs: ["get", "list", "watch", "create", "delete"]
   # The repository Secret copy the populator writes for the length of a
   # restore.
   - apiGroups: [""]

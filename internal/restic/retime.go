@@ -12,11 +12,11 @@ import (
 	"time"
 )
 
-// QuiescedTag is the restic tag that a quiesced BackupRun adds to each snapshot
-// it moves to its restartedAt time, the moment it gave the stopped workloads
+// PausedTag is the restic tag that a paused BackupRun adds to each snapshot
+// it moves to its resumedAt time, the moment it gave the stopped workloads
 // their replicas back. A RestoreRun with syncDatabaseToVolume restores a volume
 // only from a snapshot that carries this tag.
-const QuiescedTag = "quiesced"
+const PausedTag = "paused"
 
 // lockCheckDelay and staleLockAge are the two timings restic's lock protocol
 // uses, taken from internal/restic/lock.go in restic 0.18.1. lockCheckDelay is
@@ -73,15 +73,18 @@ func (e *LockedError) Error() string {
 //
 // Parameters:
 //   - ctx cancels the wait for the lock and the calls to the storage backend.
-//   - short is the snapshot's ID, or the start of it. A BackupRun passes the
-//     eight characters a mover logs in "snapshot da4d7eb4 saved", because that
-//     log line is the only place it learns the ID.
+//   - id is the snapshot's full ID, as the BackupRun found it by listing the
+//     repository. The start of an ID works too: Retime then takes the first
+//     snapshot whose ID starts with it.
 //   - at is the time the snapshot should carry. A BackupRun passes its
-//     restartedAt: the volume didn't change between the last pod stopping and
+//     resumedAt: the volume didn't change between the last pod stopping and
 //     that moment, so a database recovered to at matches the files.
-//   - tag is added to the snapshot's tags. A BackupRun passes QuiescedTag, which
+//   - tag is added to the snapshot's tags. A BackupRun passes PausedTag, which
 //     is how a RestoreRun with syncDatabaseToVolume finds the snapshots it can
-//     recover a database alongside.
+//     recover a database alongside. Retime finds a copy an earlier call wrote
+//     by this tag.
+//   - extra are more tags for the copy. A BackupRun passes one BaseBackupTag
+//     for each base backup that completed while the app was paused.
 //
 // It returns the snapshot as written, with its new ID. When another process
 // holds a lock on the repository, it returns a *LockedError and changes
@@ -98,33 +101,38 @@ func (e *LockedError) Error() string {
 // same time as a mover. If the snapshot was already retimed, Retime finds the
 // copy through its original field and returns it. A controller that restarts
 // before it records the new ID gets the same snapshot back.
-func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag string) (Snapshot, error) {
-	if short == "" {
+func (r *Repository) Retime(ctx context.Context, id string, at time.Time, tag string, extra ...string) (Snapshot, error) {
+	if id == "" {
 		return Snapshot{}, errors.New("no snapshot named")
 	}
 	unlock, err := r.lockExclusive(ctx)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	written, err := r.retime(ctx, short, at, tag)
+	written, err := r.retime(ctx, id, at, append([]string{tag}, extra...))
 	if unlockErr := unlock(); unlockErr != nil {
 		return Snapshot{}, errors.Join(err, fmt.Errorf("remove the controller's lock: %w", unlockErr))
 	}
 	return written, err
 }
 
-// retime does the work of Retime once the exclusive lock is held. It takes the
-// same parameters.
+// retime does the work of Retime once the exclusive lock is held.
 //
-// It looks for the snapshot whose ID starts with the prefix in short. If no ID
+// Parameters:
+//   - id is the snapshot's ID or its start, as Retime got it.
+//   - at is the time the copy carries.
+//   - tags are the tags the copy carries. The first one is the tag by which
+//     retime finds a copy an earlier call wrote.
+//
+// It looks for the snapshot whose ID starts with the given ID. If no ID
 // matches, the snapshot may have been rewritten already. retime then looks for
-// a snapshot whose original field starts with that prefix and which carries
-// the tag, and returns it without writing anything. If neither exists, it
+// a snapshot whose original field starts with that ID and which carries the
+// first tag, and returns it without writing anything. If neither exists, it
 // returns an error.
 //
 // To rewrite a snapshot, it copies every field of the old snapshot document,
-// sets the time field to the time in at, and adds the tag to the tags when it
-// isn't there yet. It records the old ID in the original field, unless the old
+// sets the time field to the new time, and adds each tag that isn't there
+// yet. It records the old ID in the original field, unless the old
 // snapshot was itself a rewrite and already has one. It saves the copy under
 // its new ID and then removes the old snapshot file. If that removal fails, the
 // copy stays in the repository and the error names both IDs.
@@ -133,7 +141,8 @@ func (r *Repository) Retime(ctx context.Context, short string, at time.Time, tag
 // that earlier call failed to remove it. retime then removes the old file and
 // returns that copy. Writing the copy again would add a second snapshot under
 // another ID, because every encryption uses a fresh random IV.
-func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag string) (Snapshot, error) {
+func (r *Repository) retime(ctx context.Context, id string, at time.Time, tags []string) (Snapshot, error) {
+	tag := tags[0]
 	files, err := r.snapshotFiles(ctx)
 	if err != nil {
 		return Snapshot{}, err
@@ -141,18 +150,18 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 
 	var old *snapshotFile
 	for i := range files {
-		if strings.HasPrefix(files[i].snapshot.ID, short) {
+		if strings.HasPrefix(files[i].snapshot.ID, id) {
 			old = &files[i]
 			break
 		}
 	}
 	if old == nil {
 		for _, f := range files {
-			if strings.HasPrefix(f.snapshot.Original, short) && slices.Contains(f.snapshot.Tags, tag) {
+			if strings.HasPrefix(f.snapshot.Original, id) && slices.Contains(f.snapshot.Tags, tag) {
 				return f.snapshot, nil
 			}
 		}
-		return Snapshot{}, fmt.Errorf("the repository holds no snapshot %s", short)
+		return Snapshot{}, fmt.Errorf("the repository holds no snapshot %s", id)
 	}
 
 	origin := old.snapshot.Original
@@ -176,11 +185,13 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 	if fields["time"], err = json.Marshal(at); err != nil {
 		return Snapshot{}, err
 	}
-	tags := old.snapshot.Tags
-	if !slices.Contains(tags, tag) {
-		tags = append(slices.Clone(tags), tag)
+	written := slices.Clone(old.snapshot.Tags)
+	for _, t := range tags {
+		if !slices.Contains(written, t) {
+			written = append(written, t)
+		}
 	}
-	if fields["tags"], err = json.Marshal(tags); err != nil {
+	if fields["tags"], err = json.Marshal(written); err != nil {
 		return Snapshot{}, err
 	}
 	if old.snapshot.Original == "" {
@@ -193,18 +204,18 @@ func (r *Repository) retime(ctx context.Context, short string, at time.Time, tag
 	if err != nil {
 		return Snapshot{}, err
 	}
-	id, err := r.save(ctx, "snapshots", document)
+	newID, err := r.save(ctx, "snapshots", document)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	if err := r.store.Remove(ctx, path.Join("snapshots", old.snapshot.ID)); err != nil {
-		return Snapshot{}, fmt.Errorf("remove snapshot %s after writing %s: %w", old.snapshot.ID, id, err)
+		return Snapshot{}, fmt.Errorf("remove snapshot %s after writing %s: %w", old.snapshot.ID, newID, err)
 	}
-	written, err := parseSnapshot(id, document)
+	copied, err := parseSnapshot(newID, document)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return written.snapshot, nil
+	return copied.snapshot, nil
 }
 
 // lockExclusive takes restic's exclusive lock on the repository, with the same

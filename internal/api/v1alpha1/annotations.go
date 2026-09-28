@@ -41,10 +41,10 @@ const (
 	AnnotationRetainYearly  = "backup.wlz.li/retain-yearly"
 	AnnotationRetainWithin  = "backup.wlz.li/retain-within"
 
-	// AnnotationQuiesce, set to "true" on a Deployment or a StatefulSet, makes
-	// a BackupRun with all set scale that workload to zero while it cuts the
-	// clones of the namespace's volumes.
-	AnnotationQuiesce = "backup.wlz.li/quiesce"
+	// AnnotationPauseDuringBackup, set to "true" on a Deployment or a
+	// StatefulSet, makes a BackupRun with all set scale that workload to zero
+	// while it cuts the clones of the namespace's volumes.
+	AnnotationPauseDuringBackup = "backup.wlz.li/pause-during-backup"
 
 	// AnnotationRestoreAsOf, on a claim or a Cluster, is an RFC 3339 time.
 	// Every automatic restore of that object goes back to this moment.

@@ -7,7 +7,6 @@ import (
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/bootstrap"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -33,49 +32,6 @@ const hibernationAnnotation = "cnpg.io/hibernation"
 // healthyPhase is the status.phase CloudNativePG reports for a Cluster that
 // is up.
 const healthyPhase = "Cluster in healthy state"
-
-// clusterLabel is the label CloudNativePG puts on each instance pod and PVC it
-// creates for a Cluster. Its value is the Cluster's name.
-const clusterLabel = "cnpg.io/cluster"
-
-// instanceLeft looks for an instance pod or PVC of a Cluster that is still in
-// the namespace. A RestoreRun calls it after it deletes a Cluster. Until
-// nothing is left, the run waits with reason WaitingForShutdown, and it
-// restarts the workloads it stopped only after that.
-//
-// Parameters:
-//   - c lists the pods and PVCs.
-//   - namespace is the Cluster's namespace.
-//   - name is the Cluster's name, matched against the cnpg.io/cluster label.
-//
-// It returns a description of the first one it finds, such as
-// "pod notes-pg-1" or "PVC notes-pg-1", or an empty string once none is left.
-// A pod in phase Succeeded or Failed doesn't count.
-//
-// An instance pod outlives its deleted Cluster until Postgres has shut down,
-// which takes up to the Cluster's smartShutdownTimeout. Until then the
-// Cluster's Services still reach the pod, and a new Cluster can't take its
-// names.
-func instanceLeft(ctx context.Context, c client.Reader, namespace, name string) (string, error) {
-	selector := client.MatchingLabels{clusterLabel: name}
-	pods := &corev1.PodList{}
-	if err := c.List(ctx, pods, client.InNamespace(namespace), selector); err != nil {
-		return "", fmt.Errorf("list the pods of Cluster %s/%s: %w", namespace, name, err)
-	}
-	for _, pod := range pods.Items {
-		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
-			return "pod " + pod.Name, nil
-		}
-	}
-	claims := &corev1.PersistentVolumeClaimList{}
-	if err := c.List(ctx, claims, client.InNamespace(namespace), selector); err != nil {
-		return "", fmt.Errorf("list the PVCs of Cluster %s/%s: %w", namespace, name, err)
-	}
-	if len(claims.Items) > 0 {
-		return "PVC " + claims.Items[0].Name, nil
-	}
-	return "", nil
-}
 
 // getCluster reads one Cluster. It returns false, with no error, when the
 // Cluster doesn't exist.
@@ -167,26 +123,45 @@ func ensureBackup(ctx context.Context, c client.Client, namespace, cluster strin
 	return backup.GetName(), nil
 }
 
-// backupResult reads the status.phase of the Backup with the given name.
+// backupOutcome is what a CloudNativePG Backup reports about itself.
+type backupOutcome struct {
+	// Done is true once the Backup's phase is completed or failed.
+	// CloudNativePG changes neither phase afterwards.
+	Done bool
+	// Completed is true when the phase is completed.
+	Completed bool
+	// Message is CloudNativePG's error from status.error for a failed Backup.
+	Message string
+	// BackupID is barman's ID of the base backup, from status.backupId, such
+	// as 20260928T093012. CloudNativePG sets it for a completed Backup.
+	BackupID string
+}
+
+// backupResult reads what a CloudNativePG Backup reports.
 //
-// The result done is true once the phase is completed or failed, and ok is
-// true when it completed. For a failed Backup, message holds CloudNativePG's
-// error from status.error. It returns an error when the Backup can't be read.
-func backupResult(ctx context.Context, c client.Reader, namespace, name string) (done, ok bool, message string, err error) {
+// Parameters:
+//   - c reads the Backup from the API server.
+//   - namespace and name identify the Backup.
+//
+// It returns the outcome of the Backup, and an error when the Backup can't be
+// read. A phase other than completed or failed gives an outcome that is not
+// done.
+func backupResult(ctx context.Context, c client.Reader, namespace, name string) (backupOutcome, error) {
 	backup := &unstructured.Unstructured{}
 	backup.SetGroupVersionKind(BackupGVK)
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, backup); err != nil {
-		return false, false, "", fmt.Errorf("get Backup %s/%s: %w", namespace, name, err)
+		return backupOutcome{}, fmt.Errorf("get Backup %s/%s: %w", namespace, name, err)
 	}
 	phase, _, _ := unstructured.NestedString(backup.Object, "status", "phase")
 	switch phase {
 	case "completed":
-		return true, true, "", nil
+		id, _, _ := unstructured.NestedString(backup.Object, "status", "backupId")
+		return backupOutcome{Done: true, Completed: true, BackupID: id}, nil
 	case "failed":
 		message, _, _ := unstructured.NestedString(backup.Object, "status", "error")
-		return true, false, message, nil
+		return backupOutcome{Done: true, Message: message}, nil
 	}
-	return false, false, "", nil
+	return backupOutcome{}, nil
 }
 
 // newTime returns a pointer to a copy of t, so a caller can set a *metav1.Time

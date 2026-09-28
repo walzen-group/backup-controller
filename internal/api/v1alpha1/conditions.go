@@ -50,6 +50,20 @@ const (
 	// same volume to finish.
 	ReasonSourceBusy = "SourceBusy"
 
+	// ReasonBusy is a run that waits for a Lease another run holds: that run
+	// acts on the same claim, restic repository, Cluster or paused workloads.
+	// The Ready message names the Lease and the run that holds it.
+	ReasonBusy = "Busy"
+
+	// ReasonEvicted is a run that Kueue evicted after it admitted the run.
+	// The run resumed what it paused and ended Failed.
+	ReasonEvicted = "Evicted"
+
+	// ReasonControllerPaused is a run that waits because the controller runs
+	// with --pause, as it does during an upgrade. The run has not started
+	// work, and it starts once the controller runs without --pause.
+	ReasonControllerPaused = "ControllerPaused"
+
 	// ReasonNoBackupInReach reports a restore whose moment is older than every
 	// backup of one of its items. A RestoreRun fails with it before it deletes
 	// or overwrites anything. A VolumeRestore reports it for a claim whose
@@ -72,9 +86,9 @@ const (
 
 	// ReasonTimedOut reports a RestoreRun that had not finished by the end of
 	// its spec.timeout, or an into restore whose claim had not bound by then.
-	// The run removes its ReplicationDestinations and gives back any workloads
-	// it stopped before it reports this. A BackupRun that runs out of time
-	// reports ReasonFailed.
+	// The run deletes its restore Jobs, resumes the workloads it paused and
+	// releases its Leases before it reports this. A BackupRun that runs out of
+	// time reports it too.
 	ReasonTimedOut = "TimedOut"
 
 	// ReasonInvalid reports a spec the controller will not act on. The

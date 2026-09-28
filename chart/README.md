@@ -1,20 +1,19 @@
 # backup-controller
 
-A Helm chart for the backup controller: the Deployment that refills a claim from
-a VolSync restic repository and reports the restore as conditions on the
-VolumeRestore. The plain manifests under `deploy/` are the primary install
+A Helm chart for the backup controller, which backs up a namespace's claims
+and CloudNativePG databases and restores them (see the repository's README). The plain manifests under `deploy/` are the primary install
 path, and every release attaches them with the image pinned by digest. This
 chart exists for clusters that install with Helm and want the image reference
 templated. Where this chart and `deploy/` disagree, `deploy/` is right.
 
 ## Requirements
 
-- VolSync, so the `replicationdestinations.volsync.backube` kind the controller
-  creates is servable and a mover writes into the prime claim.
-- A restic repository Secret in the namespace of each claim that restores. The
-  controller copies that Secret into its own namespace for the length of a
-  restore.
-- A cluster-admin for the first install: the chart registers one CRD.
+- VolSync, CloudNativePG with the barman-cloud plugin, Kueue with a
+  ClusterQueue that covers backup-controller.wlz.li/run, and cert-manager
+  (docs/installing.md in the repository).
+- VolSync's mover image for the restoreImage value; the controller restores
+  volumes with the restic inside it.
+- A cluster-admin for the first install: the chart registers three CRDs.
 
 ## Install
 
@@ -29,7 +28,7 @@ templated. Where this chart and `deploy/` disagree, `deploy/` is right.
 2. Install the release into that namespace.
 
    ```
-   helm install backup-controller ./chart -n backup-system
+   helm install backup-controller ./chart -n backup-system --set restoreImage=quay.io/backube/volsync:0.16.0
    ```
 
    Expected result: `STATUS: deployed`.
@@ -44,7 +43,7 @@ templated. Where this chart and `deploy/` disagree, `deploy/` is right.
 
 The chart passes the `namespace` value to the container as `--namespace`, which
 is where the controller creates the prime claim, the repository Secret copy and
-the ReplicationDestination for each restore. The default, `backup-system`,
+the restore Job for each claim the populator fills. The default, `backup-system`,
 matches the install command above. A release installed into a different
 namespace needs `--set namespace=<that namespace>`; a value that names a
 namespace which does not exist fails every restore.
