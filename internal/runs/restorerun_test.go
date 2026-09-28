@@ -382,9 +382,10 @@ func TestATimedOutQuiescedRestoreGivesTheAppBack(t *testing.T) {
 	}
 }
 
-// A restore stops the workloads spec.quiesce lists together with the ones
-// marked backup.wlz.li/quiesce, and gives each back its own count.
-func TestARestoreStopsTheListedAndTheMarkedWorkloads(t *testing.T) {
+// A restore stops only the workloads that spec.quiesce lists, and gives
+// them back. A workload with the annotation backup.wlz.li/quiesce that the
+// list does not contain keeps running: that annotation is for BackupRuns.
+func TestARestoreStopsOnlyTheListedWorkloads(t *testing.T) {
 	t.Parallel()
 	worker := deployment()
 	worker.Name, worker.Annotations, worker.Labels = "notes-worker", nil, nil
@@ -403,11 +404,12 @@ func TestARestoreStopsTheListedAndTheMarkedWorkloads(t *testing.T) {
 
 	restoreStep(t, r) // plan
 	restoreStep(t, r) // quiesce
-	if replicas(appN) != 0 || replicas(worker.Name) != 0 {
-		t.Fatalf("replicas = %d and %d after the run started, want both 0", replicas(appN), replicas(worker.Name))
+	if replicas(worker.Name) != 0 || replicas(appN) != 2 {
+		t.Fatalf("replicas of %s = %d and of %s = %d after the run started, want 0 for the listed one and 2 for the marked one",
+			worker.Name, replicas(worker.Name), appN, replicas(appN))
 	}
-	if got := readRestoreRun(t, c).Status.Quiesced; len(got) != 2 {
-		t.Errorf("quiesced = %+v, want the listed and the marked Deployment", got)
+	if got := readRestoreRun(t, c).Status.Quiesced; len(got) != 1 || got[0].Name != worker.Name {
+		t.Errorf("quiesced = %+v, want only the listed Deployment %s", got, worker.Name)
 	}
 
 	r.Now = func() time.Time { return frozen.Add(5 * time.Hour) }

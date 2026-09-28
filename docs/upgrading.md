@@ -18,14 +18,14 @@ BackupRun, and the populator starts no restore for a new VolumeRestore claim.
 Use the flag to upgrade the controller or a dependency while no run is active.
 
 A v0.7.x controller has no `--pause` flag. Thus, the upgrade from v0.7.x to
-v0.10.1 waits for the active runs to finish
+v0.10.2 waits for the active runs to finish
 ([step 1](#step-1-check-the-preconditions)). Use this section for each upgrade
-after v0.10.1.
+after v0.10.2.
 
 ### Add the pause input to the unit
 
 This is a new input. The backup-controller unit at infra commit 6315b4e does
-not have it. Make these edits one time, in the same change as the v0.10.1
+not have it. Make these edits one time, in the same change as the v0.10.2
 upgrade ([step 2](#step-2-edit-the-infra-units)), with `pause: false`.
 
 1. New: in modules/cluster/backup-controller/opentofu/variables.tf, add:
@@ -83,12 +83,12 @@ upgrade ([step 2](#step-2-edit-the-infra-units)), with `pause: false`.
    that waited then start. A namespace schedule creates one run for the newest
    tick that it missed.
 
-## v0.10.1
+## v0.10.2
 
-This section moves a cluster from v0.7.x directly to v0.10.1. It covers
+This section moves a cluster from v0.7.x directly to v0.10.2. It covers
 v0.7.0, v0.7.1 and v0.7.2, which have the same RBAC, Deployment and webhook
 configuration. Prod runs v0.7.0: infra commit 46dd6a3 applied it. Do not
-install v0.8.x, v0.9.x or v0.10.0 on the way. v0.10.1 replaces them.
+install v0.8.x, v0.9.x, v0.10.0 or v0.10.1 on the way. v0.10.2 replaces them.
 
 Infra commit 6315b4e sets `backup_controller_version` to `v0.8.0`, but prod did
 not apply it. Item 9 of step 2 replaces the version line, whatever value it
@@ -117,7 +117,7 @@ kubectl get backupruns,restoreruns -A -o json | jq -r '.items[] | select(.status
 Expected result: no output. If the listing prints a line, wait for that run to
 finish, and run the listing again.
 
-v0.10.1 restores through a Job of its own. It does not read or delete the
+v0.10.2 restores through a Job of its own. It does not read or delete the
 ReplicationDestinations of v0.7.x. The v0.7.x populator keeps its destinations
 in backup-system. Make sure that no v0.7.x restore of a claim is still active:
 
@@ -141,7 +141,7 @@ This step reads ~/repos/infra at commit 6315b4e. Before you edit, run
 `git status` in ~/repos/infra. Do not change uncommitted edits of other persons
 in the files below. Commit only the files that you changed.
 
-v0.10.1 restores with its own restic Job. This Job must run the same restic
+v0.10.2 restores with its own restic Job. This Job must run the same restic
 image that VolSync backs up with. Thus, the volsync unit declares the image
 one time, and both units read it. The controller refuses to start without
 `--restore-image`. The release manifest does not contain the flag, so the
@@ -241,7 +241,7 @@ backup-controller module appends it.
    the ReplicationDestination kind. Change it to name the restic image.
 
    In environments/test/cluster/backup-controller/inputs.yaml, set
-   `backup_controller_version: "v0.10.1"` (inputs.yaml:5 pins `v0.5.6`). The
+   `backup_controller_version: "v0.10.2"` (inputs.yaml:5 pins `v0.5.6`). The
    module now requires `restore_image` and appends `--restore-image` for every
    release. v0.5.6 exits at start on a flag that it does not know.
 
@@ -297,7 +297,7 @@ backup-controller module appends it.
    `args` line replaces the `args` line above.
 
 9. In environments/prod/cluster/backup-controller/inputs.yaml, set
-   `backup_controller_version: "v0.10.1"`.
+   `backup_controller_version: "v0.10.2"`.
 
 10. Update the READMEs and one comment:
 
@@ -406,9 +406,9 @@ kubectl -n backup-system logs deploy/backup-controller -c controller --previous
 The log line `refusing to start: --restore-image is required` means that the
 unit ran without the edit of step 2 item 8.
 
-v0.10.1 has no code for a run that v0.7.x started
+v0.10.2 has no code for a run that v0.7.x started
 ([decisions.md](decisions.md#upgrade-only-while-no-run-is-active)). Run the
-listing of step 1 again. Expected result: no output, or only runs that v0.10.1
+listing of step 1 again. Expected result: no output, or only runs that v0.10.2
 created after the apply. Delete a run that started before the apply. Then make
 sure that its app runs.
 
@@ -419,7 +419,7 @@ backup. Its webhook listed only `<prefix>/base/` and did not look at `wals/`.
 It also admitted any Cluster with `backup.wlz.li/bootstrap: initdb` as written.
 Such a Cluster runs and serves traffic, but each archive attempt fails from its
 start ([restores.md](restores.md#a-database-that-could-never-archive)).
-v0.10.1 acts only on creates. Thus, it does not repair a Cluster that exists.
+v0.10.2 acts only on creates. Thus, it does not repair a Cluster that exists.
 
 List the Clusters whose archiving fails:
 
@@ -546,10 +546,8 @@ Expected result: the phase column shows Succeeded.
   api.md has the full tables for a [BackupRun](api.md#ready-reasons), a
   [RestoreRun](api.md#ready-reasons-of-a-restorerun), a
   [VolumeRestore](api.md#status) and the [items](api.md#item-reasons).
-- An in-place RestoreRun stops the workloads marked `backup.wlz.li/quiesce`
-  together with the ones its `spec.quiesce` lists. It stops them before any
-  restore Job or Cluster delete, and gives them back at the end. A run with
-  `into:` stops nothing.
+- A RestoreRun stops only the workloads in its spec.quiesce list. The
+  annotation backup.wlz.li/quiesce affects only a BackupRun with all: true.
 - An automatic restore of a whole app, a claim that the populator fills and a
   Cluster that the webhook admits with no RestoreRun, comes back to one
   quiesced moment: the time of the newest quiesced snapshot of each

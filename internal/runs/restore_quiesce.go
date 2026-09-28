@@ -8,10 +8,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-// quiesceFirst stops the workloads of the app before the run restores
-// anything in place: the ones spec.quiesce lists and the ones marked
-// backup.wlz.li/quiesce, which a BackupRun of the namespace stops (see
-// quiesce.NamedAndMarked). A volume restored into its own claim and a
+// quiesceFirst stops the workloads in the run's spec.quiesce list before the
+// run restores anything in place (see quiesce.Named). The annotation
+// backup.wlz.li/quiesce has no effect on a RestoreRun: only a BackupRun
+// with all: true stops the annotated workloads. A volume restored into its own claim and a
 // Cluster that the restore deletes both change the data under the running
 // app. An into restore writes only into a claim it creates, so it stops
 // nothing.
@@ -33,7 +33,7 @@ func (r *RestoreRunReconciler) quiesceFirst(ctx context.Context, run *backupv1al
 	}
 	var targets []quiesce.Workload
 	if len(run.Status.Quiesced) == 0 {
-		targets, err = quiesce.NamedAndMarked(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
+		targets, err = quiesce.Named(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
 		if asRunRefusal(err) {
 			result, err = r.finish(ctx, run, backupv1alpha1.ReasonInvalid, err.Error())
 			return true, result, err

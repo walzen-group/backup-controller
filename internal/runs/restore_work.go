@@ -164,7 +164,7 @@ func (r *RestoreRunReconciler) waitForStoppedPods(ctx context.Context, run *back
 	if !stopped(fieldsOf(run)) || !anyItemIn(run.Status.Items, backupv1alpha1.ItemPending) {
 		return false, ctrl.Result{}, nil
 	}
-	targets, err := quiesce.NamedAndMarked(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
+	targets, err := quiesce.Named(ctx, r.Reader, run.Namespace, run.Spec.Quiesce)
 	if err != nil {
 		if !asRunRefusal(err) {
 			return true, ctrl.Result{}, err

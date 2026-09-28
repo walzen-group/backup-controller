@@ -103,21 +103,19 @@ ReadWriteOncePod limits a claim to one pod. The Job's pod and the app both go
 to the node that holds the volume, so Kubernetes lets both mount it at the same
 time. Two writers on one filesystem corrupt the volume that the run restores.
 
-To stop the workload prevents this. A RestoreRun in place itself stops the
-workloads marked `backup.wlz.li/quiesce`, which a BackupRun with `all` stops,
-and the workloads that its `quiesce` lists, as
+To stop the workload prevents this. A RestoreRun with `quiesce` itself stops
+the workloads in that list, as
 [namespace-backups.md](namespace-backups.md#restore-a-whole-namespace-to-one-moment)
 shows. A pod of one of them can still be terminating. Then the run waits in
 phase Waiting with Ready reason Running and `waiting for pod <pod> to stop
 before anything is restored`. It waits because a pod that shuts down can still
 write.
 
-The run does not stop a workload that has no mark and is not in the list.
-While a pod of such a workload mounts the claim, the run waits in phase
-Waiting, reason ClaimInUse. On every pass, it lists the pods
+Without that list, the run stops nothing. It waits in phase Waiting, reason
+ClaimInUse, until no pod mounts the claim. On every pass, it lists the pods
 directly from the API server. A cached list that did not yet see a new pod
-would report the claim free. For such a workload, the tool that deployed it
-decides who stops it. In the walzen infrastructure repository, you
+would report the claim free. Without the list, the tool that deployed the
+workload decides who stops it. In the walzen infrastructure repository, you
 suspend a Flux app and scale it down by hand. You apply a terragrunt unit with
 its workload at zero. The docs/cluster/backups/ directory of that repository
 has both procedures.
@@ -203,9 +201,8 @@ spec:
   restoreAsOf: "2026-09-13T00:00:00Z"
 ```
 
-That is the in-place restore. The run stops the workloads marked
-`backup.wlz.li/quiesce` and the ones under `quiesce`. While a pod of another
-workload still mounts the claim, the run stays in phase Waiting, with the
+That is the in-place restore. Without `quiesce`, the run itself stops nothing.
+While a pod still mounts the claim, the run stays in phase Waiting, with the
 reason ClaimInUse and a message that names the pod. Stop the workload in the
 way that the app is deployed. The restore then starts on its own.
 
@@ -317,9 +314,9 @@ and the error. It ends with what a person can delete by hand:
 could not stop its restore Job restore-<run uid>-0: <error>. The run retries until it can. Fix the cause, or delete Job restore-<run uid>-0 with its pods yourself (kubectl delete job restore-<run uid>-0 --cascade=foreground) and make sure none of its pods still runs; the run then finishes by itself.
 ```
 
-A run that stopped workloads can report RestartFailed for this step. Its
-message then also names the workloads to scale back once no restore Job of
-the run still writes to its claims. [api.md](api.md#ready-reasons-of-a-restorerun) lists
+A run with `quiesce` can report RestartFailed for this step. Its message then
+also names the workloads to scale back once no restore Job of the run still
+writes to its claims. [api.md](api.md#ready-reasons-of-a-restorerun) lists
 every reason that a RestoreRun reports.
 
 ### Which snapshot a run restores

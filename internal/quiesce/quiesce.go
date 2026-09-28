@@ -7,7 +7,6 @@ package quiesce
 import (
 	"context"
 	"fmt"
-	"slices"
 	"sort"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -169,37 +168,6 @@ func workloadOf(object client.Object) Workload {
 		w.replicas = *replicas
 	}
 	return w
-}
-
-// NamedAndMarked reads the workloads that a RestoreRun in place stops: the
-// ones its spec.quiesce lists (see Named), then the ones marked
-// backup.wlz.li/quiesce that the list does not name (see Targets), which
-// are the ones a BackupRun of the namespace stops.
-//
-// Parameters:
-//   - namespace is the RestoreRun's namespace.
-//   - refs is the run's spec.quiesce.
-//
-// It returns each workload one time. It returns the errors of Named and
-// Targets.
-func NamedAndMarked(ctx context.Context, c client.Reader, namespace string, refs []backupv1alpha1.WorkloadRef) ([]Workload, error) {
-	targets, err := Named(ctx, c, namespace, refs)
-	if err != nil {
-		return nil, err
-	}
-	marked, err := Targets(ctx, c, namespace)
-	if err != nil {
-		return nil, err
-	}
-	for _, m := range marked {
-		named := slices.ContainsFunc(targets, func(t Workload) bool {
-			return t.kind == m.kind && t.object.GetName() == m.object.GetName()
-		})
-		if !named {
-			targets = append(targets, m)
-		}
-	}
-	return targets, nil
 }
 
 // missingWorkload turns the error from reading a spec.quiesce entry into the
