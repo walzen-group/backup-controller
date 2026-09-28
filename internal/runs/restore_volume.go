@@ -328,7 +328,8 @@ func (r *RestoreRunReconciler) resumeJob(ctx context.Context, run *backupv1alpha
 	err = r.jobs().ResumeJob(ctx, job)
 	switch {
 	case apierrors.IsForbidden(err) || apierrors.IsInvalid(err):
-		return refusedResume(item, job, err)
+		return nothingWrittenTo(item.Name, refuse(backupv1alpha1.ItemReasonRestoreJobRefused,
+			"the API server refused to resume restore Job %s, which never ran: %v", job.Name, err))
 	case err != nil:
 		return fmt.Errorf("resume restore Job %s: %w", job.Name, err)
 	}
@@ -362,20 +363,6 @@ func (r *RestoreRunReconciler) storedRunGoesOn(ctx context.Context, run *backupv
 	}
 	s := stored.Status.Items[index]
 	return s.Name == item.Name && s.Phase == backupv1alpha1.ItemRunning && s.Job == item.Job && s.JobUID == item.JobUID, nil
-}
-
-// refusedResume returns the refusal for a resume the API server refused.
-//
-// Parameters:
-//   - item is the volume item, whose claim the message names.
-//   - job is the item's Job, which never ran.
-//   - err is the API server's refusal, which the message quotes.
-//
-// It returns a *refusalError with reason RestoreJobRefused that says
-// nothing was written to the claim.
-func refusedResume(item backupv1alpha1.RestoreItem, job *batchv1.Job, err error) error {
-	return nothingWrittenTo(item.Name, refuse(backupv1alpha1.ItemReasonRestoreJobRefused,
-		"the API server refused to resume restore Job %s, which never ran: %v", job.Name, err))
 }
 
 // jobDeleted returns the refusal for a volume item whose restore Job was

@@ -83,7 +83,9 @@ func (r *RestoreRunReconciler) endEarly(ctx context.Context, run *backupv1alpha1
 		return ctrl.Result{}, err
 	}
 	failRemainingItems(run, message, itemReason)
-	addWaits(run, waits)
+	for i, waiting := range waits {
+		run.Status.Items[i].Message += "; the restore Job's pod was " + waiting.String()
+	}
 	return r.finish(ctx, run, reason, leftDeletedNotes(run.Status.Items, message))
 }
 

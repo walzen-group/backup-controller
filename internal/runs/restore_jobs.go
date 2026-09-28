@@ -44,16 +44,6 @@ func jobName(uid types.UID, index int) string {
 	return fmt.Sprintf("restore-%s-%d", uid, index)
 }
 
-// jobRef returns the Ref an item recorded for its restore Job, which Stop
-// decides on.
-//
-// Parameters:
-//   - run is the RestoreRun, whose namespace holds the Job.
-//   - item is the volume item, which records the Job's name and UID.
-func jobRef(run *backupv1alpha1.RestoreRun, item backupv1alpha1.RestoreItem) restorejob.Ref {
-	return restorejob.Ref{Namespace: run.Namespace, Name: item.Job, UID: item.JobUID}
-}
-
 // lostJob reads the Job that holds the name of an item's restore Job.
 //
 // Parameters:
@@ -276,18 +266,6 @@ func (r *RestoreRunReconciler) settleJob(ctx context.Context, run *backupv1alpha
 	return seen.waiting, nil
 }
 
-// addWaits adds to the message of each item a run failed as it ended early
-// why its restore Job's newest pod was still waiting.
-//
-// Parameters:
-//   - run is the RestoreRun, after failRemainingItems.
-//   - waits are the waiting reasons settleJobs returned, by item position.
-func addWaits(run *backupv1alpha1.RestoreRun, waits map[int]*restorejob.Waiting) {
-	for i, waiting := range waits {
-		run.Status.Items[i].Message += "; the restore Job's pod was " + waiting.String()
-	}
-}
-
 // stopJobs stops the restore Jobs of the volume items a run is done with,
 // and reports those that may still write (rule X2).
 //
@@ -326,7 +304,7 @@ func (r *RestoreRunReconciler) stopJobs(ctx context.Context, run *backupv1alpha1
 		if item.JobUID == "" {
 			continue
 		}
-		state, err := restorejob.Stop(ctx, r.jobs(), jobRef(run, *item))
+		state, err := restorejob.Stop(ctx, r.jobs(), restorejob.Ref{Namespace: run.Namespace, Name: item.Job, UID: item.JobUID})
 		if err != nil {
 			return "", jobReleaseError(item.Job, err)
 		}
