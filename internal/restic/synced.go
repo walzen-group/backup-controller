@@ -2,11 +2,15 @@ package restic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
 
+	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Quiesced reports whether a restore of a synced moment may take a
@@ -121,24 +125,43 @@ type SnapshotLister interface {
 // NamespaceSnapshots lists the snapshots of each repository of a namespace.
 //
 // Parameters:
-//   - names are the repository Secrets that the namespace's VolumeRestores
-//     name. A name that comes twice is read once.
-//   - secret reads a Secret of the namespace by name.
+//   - c lists the namespace's VolumeRestores and reads their repository
+//     Secrets.
+//   - namespace is the namespace.
+//   - own is a repository Secret that counts even when the list of
+//     VolumeRestores does not show its VolumeRestore yet, or "" for none.
 //   - lister lists the snapshots of the repository a Secret names.
 //
-// It returns the snapshots by the name of the Secret, for SyncedMoment. It
-// returns an error when a Secret or a listing can not be read.
-func NamespaceSnapshots(ctx context.Context, names []string, secret func(context.Context, string) (*corev1.Secret, error), lister SnapshotLister) (map[string][]Snapshot, error) {
+// It returns the snapshots by the name of the Secret, for SyncedMoment, and
+// no entry for a namespace with no VolumeRestore and no own. A name that
+// comes twice is read once. It returns an error when the list, a Secret or a
+// listing can not be read, and when lister is nil and there is a repository
+// to read.
+func NamespaceSnapshots(ctx context.Context, c client.Reader, namespace, own string, lister SnapshotLister) (map[string][]Snapshot, error) {
+	restores := &backupv1alpha1.VolumeRestoreList{}
+	if err := c.List(ctx, restores, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list the VolumeRestores in %s: %w", namespace, err)
+	}
+	var names []string
+	if own != "" {
+		names = append(names, own)
+	}
+	for _, vr := range restores.Items {
+		names = append(names, vr.Spec.Repository)
+	}
+	if len(names) > 0 && lister == nil {
+		return nil, errors.New("no lister reads the restic repositories of the VolumeRestores")
+	}
 	repositories := make(map[string][]Snapshot, len(names))
 	for _, name := range names {
 		if _, done := repositories[name]; done {
 			continue
 		}
-		s, err := secret(ctx, name)
-		if err != nil {
+		secret := &corev1.Secret{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, secret); err != nil {
 			return nil, fmt.Errorf("read repository Secret %s: %w", name, err)
 		}
-		all, err := lister.Snapshots(ctx, s)
+		all, err := lister.Snapshots(ctx, secret)
 		if err != nil {
 			return nil, fmt.Errorf("list the snapshots in %s: %w", name, err)
 		}

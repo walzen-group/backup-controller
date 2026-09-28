@@ -9,7 +9,6 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -26,9 +25,9 @@ const syncedSource = "the moment of the quiesced snapshots of the namespace's vo
 //   - pin is the Cluster's backup.wlz.li/restore-as-of, or nil.
 //
 // It reads the repository Secrets that the namespace's VolumeRestores name,
-// lists their snapshots with Snapshots, and returns what
-// restic.SyncedMoment returns for them: the moment and true, false when no
-// repository holds a quiesced snapshot at or before pin, or a
+// lists their snapshots with Snapshots (see restic.NamespaceSnapshots), and
+// returns what restic.SyncedMoment returns for them: the moment and true,
+// false when no repository holds a quiesced snapshot at or before pin, or a
 // *restic.NotSyncedError. A namespace with no VolumeRestore has no moment,
 // and neither has a namespace with a live volume (see liveVolume), which
 // gets no *restic.NotSyncedError either: only the Cluster comes back there,
@@ -37,26 +36,8 @@ const syncedSource = "the moment of the quiesced snapshots of the namespace's vo
 // It returns another error when a read fails, and when Snapshots is nil and
 // the namespace has a VolumeRestore.
 func (d *Decider) syncedTarget(ctx context.Context, namespace string, pin *time.Time) (time.Time, bool, error) {
-	restores := &backupv1alpha1.VolumeRestoreList{}
-	if err := d.Client.List(ctx, restores, client.InNamespace(namespace)); err != nil {
-		return time.Time{}, false, fmt.Errorf("list the VolumeRestores: %w", err)
-	}
-	if len(restores.Items) == 0 {
-		return time.Time{}, false, nil
-	}
-	if d.Snapshots == nil {
-		return time.Time{}, false, errors.New("the webhook has no lister to read the restic repositories of the VolumeRestores")
-	}
-	names := make([]string, 0, len(restores.Items))
-	for _, vr := range restores.Items {
-		names = append(names, vr.Spec.Repository)
-	}
-	secret := func(ctx context.Context, name string) (*corev1.Secret, error) {
-		s := &corev1.Secret{}
-		return s, d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, s)
-	}
-	repositories, err := restic.NamespaceSnapshots(ctx, names, secret, d.Snapshots)
-	if err != nil {
+	repositories, err := restic.NamespaceSnapshots(ctx, d.Client, namespace, "", d.Snapshots)
+	if err != nil || len(repositories) == 0 {
 		return time.Time{}, false, err
 	}
 	moment, found, err := restic.SyncedMoment(repositories, pin)

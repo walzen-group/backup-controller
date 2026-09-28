@@ -10,8 +10,6 @@ import (
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // selection is the snapshot a claim is filled from.
@@ -100,7 +98,7 @@ func (e *noBackupError) Error() string {
 //     RestoreAsOf). vr also names the claim's repository Secret.
 //
 // It reads the snapshots of every repository of the claim's namespace (see
-// namespaceSnapshots), and gives them to restic.SyncedMoment, as the
+// restic.NamespaceSnapshots), and gives them to restic.SyncedMoment, as the
 // bootstrap webhook does for a Cluster of the namespace. When that gives a
 // moment and the claim's repository holds a quiesced snapshot at it, that
 // snapshot fills the claim, so the volume and the database come back to one
@@ -115,7 +113,7 @@ func (c *Callbacks) selectSnapshot(ctx context.Context, vr *backupv1alpha1.Volum
 	if err != nil {
 		return selection{}, err
 	}
-	repositories, err := c.namespaceSnapshots(ctx, claim.Namespace, vr.Spec.Repository)
+	repositories, err := restic.NamespaceSnapshots(ctx, c.operations, claim.Namespace, vr.Spec.Repository, c.snapshots)
 	if err != nil {
 		return selection{}, err
 	}
@@ -134,32 +132,6 @@ func (c *Callbacks) selectSnapshot(ctx context.Context, vr *backupv1alpha1.Volum
 		}
 	}
 	return choose(own, moment)
-}
-
-// namespaceSnapshots lists the snapshots of every repository of a namespace.
-//
-// Parameters:
-//   - namespace is the claim's namespace.
-//   - repository is the claim's own repository Secret. It counts even when
-//     the list of VolumeRestores does not show its VolumeRestore yet.
-//
-// It returns the snapshots by the name of the Secret (see
-// restic.NamespaceSnapshots), and an error when the VolumeRestores, a Secret
-// or a repository can not be read.
-func (c *Callbacks) namespaceSnapshots(ctx context.Context, namespace, repository string) (map[string][]restic.Snapshot, error) {
-	restores := &backupv1alpha1.VolumeRestoreList{}
-	if err := c.operations.List(ctx, restores, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("list the VolumeRestores in %s: %w", namespace, err)
-	}
-	names := []string{repository}
-	for _, vr := range restores.Items {
-		names = append(names, vr.Spec.Repository)
-	}
-	secret := func(ctx context.Context, name string) (*corev1.Secret, error) {
-		s := &corev1.Secret{}
-		return s, c.operations.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, s)
-	}
-	return restic.NamespaceSnapshots(ctx, names, secret, c.snapshots)
 }
 
 // readPin reads the moment a claim's restore goes back to.
