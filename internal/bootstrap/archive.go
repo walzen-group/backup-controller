@@ -147,7 +147,9 @@ func (l Location) ServerPrefix() string {
 //     store's prefix. It also comes from Archiver.
 //
 // It returns a Location whose Prefix joins the destinationPath's prefix and
-// serverName. It returns an error when the ObjectStore can't be read, when its
+// serverName, and the ObjectStore it read, whose status the webhook reads
+// (see recordedBackup). The ObjectStore is nil when the error is not nil. It
+// returns an error when the ObjectStore can't be read, when its
 // spec.configuration.destinationPath is missing or isn't an s3:// URL with a
 // bucket, when a Secret or key named under s3Credentials or endpointCA is
 // missing, or when endpointCA names a Secret with no key. The error says which
@@ -159,23 +161,6 @@ func (l Location) ServerPrefix() string {
 // The webhook refuses such a Cluster with this error, so nobody gets an empty
 // database beside a full archive because a store was misnamed.
 func ResolveLocation(
-	ctx context.Context,
-	c client.Reader,
-	mapper meta.RESTMapper,
-	namespace, objectStore, serverName string,
-) (Location, error) {
-	at, _, err := resolveStore(ctx, c, mapper, namespace, objectStore, serverName)
-	return at, err
-}
-
-// resolveStore is ResolveLocation that also returns the ObjectStore it read.
-// The webhook reads the status of that ObjectStore (see recordedBackup).
-//
-// The arguments, the Location and the errors are those of ResolveLocation.
-// The ObjectStore is nil when the error is not nil. A destinationPath that is
-// missing or isn't an s3:// URL with a bucket gives a *destinationError (see
-// storeLocation).
-func resolveStore(
 	ctx context.Context,
 	c client.Reader,
 	mapper meta.RESTMapper,
@@ -212,7 +197,7 @@ func resolveStore(
 }
 
 // storeLocation works out where one database archives from an ObjectStore
-// already read. resolveStore calls it on the store it fetched, and the webhook's
+// already read. ResolveLocation calls it on the store it fetched, and the webhook's
 // collision check calls it on each store of one cluster-wide list.
 //
 // Parameters:

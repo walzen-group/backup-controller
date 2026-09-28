@@ -249,7 +249,7 @@ func (d *Decider) create(ctx context.Context, c creation) admission.Response {
 	// A lookup that runs discovery ends with the budget too.
 	mapper = boundedMapper{RESTMapper: mapper, ctx: ctx}
 
-	at, objectStore, err := resolveStore(ctx, d.Client, mapper, c.req.Namespace, c.store, c.serverName)
+	at, objectStore, err := ResolveLocation(ctx, d.Client, mapper, c.req.Namespace, c.store, c.serverName)
 	if err != nil {
 		// The store is named and unreadable. Refusing is the failure that gets
 		// noticed; allowing would create an empty database beside a full

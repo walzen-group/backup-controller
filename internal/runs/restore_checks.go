@@ -201,7 +201,7 @@ func (r *RestoreRunReconciler) checkDatabase(ctx context.Context, namespace, nam
 	if !archives {
 		return "", refuse(backupv1alpha1.ItemReasonClusterArchivesNowhere, "the Cluster archives nowhere, so it has no backup to restore")
 	}
-	location, err := bootstrap.ResolveLocation(ctx, r.Reader, r.RESTMapper(), namespace, store, serverName)
+	location, _, err := bootstrap.ResolveLocation(ctx, r.Reader, r.RESTMapper(), namespace, store, serverName)
 	if err != nil {
 		if retryable(err) {
 			return "", err

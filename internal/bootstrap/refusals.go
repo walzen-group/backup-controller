@@ -102,7 +102,7 @@ func oldest(backups []BaseBackup) string {
 // status of an ObjectStore records for one server name.
 //
 // Parameters:
-//   - store is the ObjectStore that resolveStore read.
+//   - store is the ObjectStore that ResolveLocation read.
 //   - serverName is the server name of the Cluster, from Archiver. The plugin
 //     writes the status under this key.
 //
