@@ -21,8 +21,6 @@ import (
 	"github.com/walzen-group/backup-controller/internal/populator"
 	"github.com/walzen-group/backup-controller/internal/restic"
 	"github.com/walzen-group/backup-controller/internal/served"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -151,9 +149,9 @@ func run(options RunOptions, listener metrics, exitOnFailure func(error)) int {
 }
 
 // newClientOperations builds the cluster operations the populator callbacks
-// run through. They use a client whose scheme knows the core, batch and
-// backup.wlz.li types. The kubeconfig argument is the path from the
-// --kubeconfig flag, and an empty path means the in-cluster configuration.
+// run through. They use a client with the run manager's scheme (see
+// runScheme). The kubeconfig argument is the path from the --kubeconfig
+// flag, and an empty path means the in-cluster configuration.
 //
 // It returns an error when the client configuration can't be built or a
 // scheme fails to register.
@@ -163,15 +161,9 @@ func newClientOperations(kubeconfig string) (populator.Operations, error) {
 		return nil, fmt.Errorf("build client configuration: %w", err)
 	}
 
-	scheme := runtime.NewScheme()
-	for name, add := range map[string]func(*runtime.Scheme) error{
-		"core":          corev1.AddToScheme,
-		"batch":         batchv1.AddToScheme,
-		"backup.wlz.li": backupv1alpha1.AddToScheme,
-	} {
-		if err := add(scheme); err != nil {
-			return nil, fmt.Errorf("register the %s types: %w", name, err)
-		}
+	scheme, err := runScheme()
+	if err != nil {
+		return nil, err
 	}
 
 	kubeClient, err := client.New(config, clientOptions(scheme))
