@@ -268,11 +268,7 @@ func parseSnapshot(id string, document []byte) (snapshotFile, error) {
 //
 // It returns an error, which names the step, when a step fails.
 func (r *Repository) openSnapshot(name string, sealed []byte) (snapshotFile, error) {
-	plain, err := r.master.decrypt(sealed)
-	if err != nil {
-		return snapshotFile{}, fmt.Errorf("decrypt: %w", err)
-	}
-	document, err := unpack(plain)
+	document, err := r.open(sealed)
 	if err != nil {
 		return snapshotFile{}, err
 	}
@@ -283,13 +279,18 @@ func (r *Repository) openSnapshot(name string, sealed []byte) (snapshotFile, err
 	return f, nil
 }
 
-// load reads one file of the repository, decrypts it with the master key, and
-// removes its encoding header.
+// load reads one file of the repository and opens it (see open).
 func (r *Repository) load(ctx context.Context, name string) ([]byte, error) {
 	sealed, err := r.store.Get(ctx, name)
 	if err != nil {
 		return nil, err
 	}
+	return r.open(sealed)
+}
+
+// open decrypts one file of the repository with the master key, and removes
+// its encoding header.
+func (r *Repository) open(sealed []byte) ([]byte, error) {
 	plain, err := r.master.decrypt(sealed)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt: %w", err)
