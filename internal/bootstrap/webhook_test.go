@@ -310,20 +310,6 @@ func TestARecreateOfTheSameClusterIsNotACollision(t *testing.T) {
 	}
 }
 
-// TestAnEmptyStoreLeavesTheClusterOnInitdb checks that a Cluster whose store
-// holds no base backup is admitted without a patch, through the real S3Prober
-// against the empty store that barman-cloud 3.20.0 recorded.
-func TestAnEmptyStoreLeavesTheClusterOnInitdb(t *testing.T) {
-	response := decideOn(t, cluster(t, nil), recordedS3(t, barmanstore.MustLoad(t, "empty")))
-
-	if !response.Allowed {
-		t.Fatalf("the cluster was refused: %v", response.Result)
-	}
-	if len(response.Patches) != 0 {
-		t.Fatalf("the cluster was rewritten: %v", response.Patches)
-	}
-}
-
 // TestAStoreWithABackupRecoversTheCluster checks the rewrite of a Cluster
 // whose store holds a base backup: initdb is gone, the recovery reads through
 // one externalClusters entry named RecoverySource with the Cluster's own name

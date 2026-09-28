@@ -128,12 +128,20 @@ func withoutWAL(t *testing.T) barmanstore.Store {
 
 // TestAPrefixWithoutWALStartsEmpty checks that a Cluster, opted out or not,
 // starts with initdb over a prefix that holds a FAILED base backup and other
-// objects but no WAL file. barman-cloud-check-wal-archive passes there, so
-// the new database archives.
+// objects but no WAL file, and over the empty store that barman-cloud 3.20.0
+// recorded. barman-cloud-check-wal-archive passes there, so the new database
+// archives.
 func TestAPrefixWithoutWALStartsEmpty(t *testing.T) {
-	for name, c := range map[string]*unstructured.Unstructured{"initdb": cluster(t, nil), "opted out": optedOut(t)} {
+	for name, tc := range map[string]struct {
+		cluster *unstructured.Unstructured
+		store   barmanstore.Store
+	}{
+		"initdb":              {cluster(t, nil), withoutWAL(t)},
+		"opted out":           {optedOut(t), withoutWAL(t)},
+		"initdb, empty store": {cluster(t, nil), barmanstore.MustLoad(t, "empty")},
+	} {
 		t.Run(name, func(t *testing.T) {
-			response := decideOn(t, c, recordedS3(t, withoutWAL(t)))
+			response := decideOn(t, tc.cluster, recordedS3(t, tc.store))
 			if !response.Allowed {
 				t.Fatalf("the cluster was refused over a prefix without WAL: %v", response.Result)
 			}
