@@ -107,11 +107,7 @@ func (r *BackupRunReconciler) precheckItem(ctx context.Context, run *backupv1alp
 	// A restore of the claim or its repository holds the item the
 	// same way, and startVolume would wait for it with the app down.
 	repository := settings.vr.Spec.Repository
-	restoring, err := otherMover(ctx, r.Reader, run.Namespace, item.Name, repository, restoreMover)
-	if err != nil || restoring.held() {
-		return restoring, err
-	}
-	leased, err := leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, item.Name, repository)
+	leased, err := heldElsewhere(ctx, r.Reader, run, item.Name, repository, restoreMover)
 	if failBackupItem(item, err) {
 		// A repository Secret that is gone fails the item now.
 		return hold{}, nil

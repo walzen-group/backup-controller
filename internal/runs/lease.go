@@ -148,7 +148,7 @@ func acquireLeases(ctx context.Context, c client.Client, reader client.Reader, r
 //
 // Parameters:
 //   - reader reads the claim and the Secret. Callers pass the uncached
-//     Reader, and acquireLeases and leaseHeldElsewhere share this function,
+//     Reader, and acquireLeases and heldElsewhere share this function,
 //     so a pre-check looks at exactly the Leases the run would take later.
 //   - namespace is the run's namespace, which holds both objects.
 //   - claim is the name of the claim. An empty name adds no claim Lease.
@@ -422,19 +422,23 @@ func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Re
 	}
 }
 
-// leaseHeldElsewhere returns a hold that names the run that holds the Lease
-// of the given claim or restic repository. It returns the zero hold when the
-// asking run holds the Leases, when no Lease exists, or when the holder is
-// stale (see holderLive). A pre-check calls it before it stops anything. If
+// heldElsewhere returns a hold that names the run whose mover of the other
+// kind works on the given claim or restic repository (see otherMover), or
+// the run that holds the Lease of either. It returns the zero hold when no
+// such mover exists and the asking run holds the Leases, no Lease exists,
+// or the holder is stale (see holderLive). A pre-check calls it before it stops anything. If
 // the hold is of kind holdSourceBusy, then the run waits with reason
 // SourceBusy and keeps the app running.
 //
 // Parameters:
 //   - reader reads the claim, the Secret and the Leases. Callers pass the
 //     uncached Reader: a Lease a run takes in this instant must be seen.
-//   - run is the asking run; only its UID is read, so its own Lease is free.
-//   - namespace, claim and secret name the claim and the repository Secret,
-//     as acquireLeases takes them.
+//   - run is the asking run; its namespace holds the claim, and its own
+//     Lease is free.
+//   - claim and secret name the claim and the repository Secret, as
+//     acquireLeases takes them.
+//   - other is the kind of mover that holds the asking run back:
+//     backupMover for a RestoreRun, restoreMover for a BackupRun.
 //
 // The Lease names come from leaseNamesFor, the same function acquireLeases
 // resolves them with, so this check can never look at a Lease the run would
@@ -443,7 +447,16 @@ func releaseQuiesceLeases(ctx context.Context, c client.Client, reader client.Re
 // RestoreRun fails the item with it before anything is stopped. Any other
 // failed read comes back as an error, and the caller retries with nothing
 // stopped.
-func leaseHeldElsewhere(ctx context.Context, reader client.Reader, run metav1.Object, namespace, claim, secret string) (hold, error) {
+//
+// The check is advisory. A run that starts its mover between this read and
+// the stop still goes first under the Leases and otherMover, which run right
+// before the mover object is written.
+func heldElsewhere(ctx context.Context, reader client.Reader, run metav1.Object, claim, secret string, other moverKind) (hold, error) {
+	namespace := run.GetNamespace()
+	busy, err := otherMover(ctx, reader, namespace, claim, secret, other)
+	if err != nil || busy.held() {
+		return busy, err
+	}
 	names, err := leaseNamesFor(ctx, reader, namespace, claim, secret)
 	if err != nil {
 		return hold{}, err

@@ -84,7 +84,7 @@ func (r *RestoreRunReconciler) ops() runOps {
 //     items in place.
 //
 // It returns the hold of the first item that a backup holds (see
-// backupHeldElsewhere), and the zero hold when no backup holds an item. A
+// heldElsewhere), and the zero hold when no backup holds an item. A
 // failed read comes back as an error, and the pass retries with nothing
 // stopped.
 //
@@ -109,7 +109,7 @@ func (r *RestoreRunReconciler) precheckItems(ctx context.Context, run *backupv1a
 		if err != nil {
 			return hold{}, err
 		}
-		held, err := r.backupHeldElsewhere(ctx, run, item.Name, settings.Secret)
+		held, err := heldElsewhere(ctx, r.Reader, run, item.Name, settings.Secret, backupMover)
 		if failRestoreItem(item, nothingWrittenTo(item.Name, err)) {
 			continue
 		}
@@ -118,32 +118,4 @@ func (r *RestoreRunReconciler) precheckItems(ctx context.Context, run *backupv1a
 		}
 	}
 	return hold{}, nil
-}
-
-// backupHeldElsewhere returns a hold of kind holdSourceBusy that names the
-// run that holds the claim or its repository. It returns the zero hold when
-// no run holds either. A restore calls it before it stops any workload, so
-// that it waits with the app running where restoreVolume would wait with
-// the app down.
-//
-// Parameters:
-//   - run is the asking run; its namespace and UID are read.
-//   - claimName names the claim the item restores.
-//   - secret names the repository Secret, from the settings startRefusal
-//     read for the item.
-//
-// A repository Secret that does not exist comes back as the refusal that
-// leaseNamesFor gives, and quiesce fails the item with it (see
-// failRestoreItem) before it stops anything. Any other failed read comes
-// back as an error, and the pass retries with nothing stopped.
-//
-// The check is advisory. A run that starts its mover between this read and
-// the stop still goes first under the Leases and otherMover, which run right
-// before the mover object is written.
-func (r *RestoreRunReconciler) backupHeldElsewhere(ctx context.Context, run *backupv1alpha1.RestoreRun, claimName, secret string) (hold, error) {
-	backing, err := otherMover(ctx, r.Reader, run.Namespace, claimName, secret, backupMover)
-	if err != nil || backing.held() {
-		return backing, err
-	}
-	return leaseHeldElsewhere(ctx, r.Reader, run, run.Namespace, claimName, secret)
 }
