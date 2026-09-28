@@ -483,7 +483,9 @@ func TestASyncedRunRecoversToTheVolumesMoment(t *testing.T) {
 
 // TestARunWithoutAMomentRecoversToTheEndOfTheArchive checks that a RestoreRun
 // with no restoreAsOf gets a recovery with no recoveryTarget, and that the
-// Cluster is still annotated with the run's name.
+// Cluster is still annotated with the run's name. Over the recorded empty
+// store the Cluster is refused: a run that asks for a recovery must never get
+// an empty database back.
 func TestARunWithoutAMomentRecoversToTheEndOfTheArchive(t *testing.T) {
 	original := cluster(t, nil)
 	response := decideOn(t, original, recordedS3(t, barmanstore.MustLoad(t, "done-base")), waiting(nil))
@@ -496,11 +498,16 @@ func TestARunWithoutAMomentRecoversToTheEndOfTheArchive(t *testing.T) {
 	if annotations[backupv1alpha1.AnnotationRestoreRun] != "back-to-monday" {
 		t.Error("the recovered Cluster does not name the run")
 	}
+
+	if decideOn(t, cluster(t, nil), recordedS3(t, barmanstore.MustLoad(t, "empty")), waiting(nil)).Allowed {
+		t.Fatal("a Cluster a RestoreRun waits for was admitted to initdb")
+	}
 }
 
 // TestADeclaredRecoveryIsRefusedWhileARunWaits checks that a Cluster declaring
-// its own recovery is refused while a RestoreRun waits for it, and that the
-// refusal names the run.
+// its own point-in-time recovery is refused while a RestoreRun waits for it,
+// with a refusal that names the run, and is admitted without a patch when no
+// RestoreRun waits.
 func TestADeclaredRecoveryIsRefusedWhileARunWaits(t *testing.T) {
 	response := decide(t, declaredRecovery(t), stubProber{has: true}, waiting(nil))
 
@@ -509,6 +516,11 @@ func TestADeclaredRecoveryIsRefusedWhileARunWaits(t *testing.T) {
 	}
 	if !strings.Contains(response.Result.Message, "back-to-monday") {
 		t.Errorf("the refusal does not name the run: %q", response.Result.Message)
+	}
+
+	response = decide(t, declaredRecovery(t), stubProber{has: true})
+	if !response.Allowed || len(response.Patches) != 0 {
+		t.Fatalf("a declared recovery with no run waiting = %v, patches %v; want it allowed unchanged", response.Result, response.Patches)
 	}
 }
 
@@ -555,42 +567,6 @@ func TestATargetBeforeEveryBaseBackupIsRefused(t *testing.T) {
 	}
 	if strings.Contains(response.Result.Message, oldestFailed) {
 		t.Errorf("the refusal names the failed backup %s: %q", oldestFailed, response.Result.Message)
-	}
-}
-
-// TestARunIsRefusedWhenTheStoreHoldsNoBaseBackup checks that a Cluster a
-// RestoreRun waits for is refused when its store holds no base backup. A run
-// that asks for a recovery must never get an empty database back. The store
-// is the recorded empty store.
-func TestARunIsRefusedWhenTheStoreHoldsNoBaseBackup(t *testing.T) {
-	response := decideOn(t, cluster(t, nil), recordedS3(t, barmanstore.MustLoad(t, "empty")), waiting(nil))
-
-	if response.Allowed {
-		t.Fatal("a Cluster a RestoreRun waits for was admitted to initdb")
-	}
-}
-
-// TestADeclaredRecoveryIsLeftAlone checks that a Cluster declaring its own
-// point-in-time recovery is admitted without a patch when no RestoreRun waits
-// for it.
-func TestADeclaredRecoveryIsLeftAlone(t *testing.T) {
-	c := cluster(t, func(object map[string]any) {
-		spec, _ := object["spec"].(map[string]any)
-		spec["bootstrap"] = map[string]any{
-			"recovery": map[string]any{
-				"source":         "objectstore",
-				"recoveryTarget": map[string]any{"targetTime": "2026-09-15T07:33:00Z"},
-			},
-		}
-	})
-
-	response := decide(t, c, stubProber{has: true})
-
-	if !response.Allowed {
-		t.Fatalf("the cluster was refused: %v", response.Result)
-	}
-	if len(response.Patches) != 0 {
-		t.Fatalf("a point-in-time restore was rewritten: %v", response.Patches)
 	}
 }
 
