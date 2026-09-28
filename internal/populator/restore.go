@@ -402,25 +402,6 @@ func (c *Callbacks) mayResume(ctx context.Context, r restore, prime *corev1.Pers
 	return ref != nil && ref.Namespace == prime.Namespace && ref.Name == prime.Name && ref.UID == prime.UID, nil
 }
 
-// jobRefusedError is a restore Job create or resume that the API server
-// refused with 403 Forbidden or 422 Invalid, such as an admission policy
-// that refuses the Job's pod security context. The same request fails the
-// same way until the VolumeRestore or the cluster changes.
-type jobRefusedError struct {
-	// err is the failed call's error, with the API server's answer.
-	err error
-}
-
-// Error returns the failed call's error.
-func (e *jobRefusedError) Error() string {
-	return e.err.Error()
-}
-
-// Unwrap returns the failed call's error.
-func (e *jobRefusedError) Unwrap() error {
-	return e.err
-}
-
 // uidField is the path of an object's UID in the API server's field errors.
 var uidField = field.NewPath("metadata", "uid").String()
 
@@ -460,17 +441,18 @@ func jobReplaced(err error) bool {
 //
 // It returns err unchanged unless the API server refused the call with 403
 // Forbidden or 422 Invalid, which apierrors reads from the typed status of
-// the error. For a refusal it marks the claim Failed with reason
-// RestoreJobRefused and the API server's answer, and returns a
-// *jobRefusedError, or the error of that status write. Either way the
-// library requeues the claim and the next sync tries the call again.
+// the error, such as an admission policy that refuses the Job's pod security
+// context. The same request fails the same way until the VolumeRestore or the
+// cluster changes. For a refusal it marks the claim Failed with reason
+// RestoreJobRefused and the API server's answer, and returns err with the
+// claim's name, or the error of that status write. Either way the library
+// requeues the claim and the next sync tries the call again.
 func (c *Callbacks) jobCallError(ctx context.Context, r restore, err error) error {
 	if !apierrors.IsForbidden(err) && !apierrors.IsInvalid(err) {
 		return err
 	}
-	refusal := &jobRefusedError{err: err}
-	if err := c.markFailed(ctx, r.vr, r.claim, backupv1alpha1.ReasonRestoreJobRefused, refusal); err != nil {
-		return err
+	if markErr := c.markFailed(ctx, r.vr, r.claim, backupv1alpha1.ReasonRestoreJobRefused, err); markErr != nil {
+		return markErr
 	}
-	return claimError(r.claim, refusal)
+	return claimError(r.claim, err)
 }
