@@ -235,6 +235,8 @@ lock in the repository.
 | --- | --- |
 | backup_controller_namespace_last_success_timestamp_seconds | when the namespace's newest run with all: true succeeded, else when the namespace was created |
 | backup_controller_namespace_schedule_interval_seconds | seconds between two ticks of the schedule |
+| backup_controller_namespace_next_run_timestamp_seconds | the schedule's first tick after now |
+| backup_controller_namespace_schedule_info | 1, with the schedule annotation as written in the schedule label, as in `schedule="0 3 * * 0"` |
 | backup_controller_namespace_schedule_invalid | 1 while the schedule annotation does not parse |
 | backup_controller_restore_pinned | 1 for each claim with backup.wlz.li/restore-as-of |
 

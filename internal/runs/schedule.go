@@ -122,10 +122,12 @@ func (s *Scheduler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 		scheduleLabels(req.Name).deleteAll()
 		return ctrl.Result{RequeueAfter: refresh}, nil
 	}
+	exportScheduleInfo(req.Name, spec)
 	schedule, err := cron.ParseStandard(spec)
 	if err != nil {
 		logger.Error(err, "cannot parse the backup schedule", "schedule", spec)
 		scheduleInvalid.WithLabelValues(req.Name).Set(1)
+		nextRun.DeleteLabelValues(req.Name)
 		return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
 	}
 	scheduleInvalid.WithLabelValues(req.Name).Set(0)
@@ -243,15 +245,24 @@ func (s *Scheduler) create(ctx context.Context, namespace string, tick time.Time
 	return nil
 }
 
-// exportSchedule sets the namespace's last-success and schedule-interval
-// series.
+// exportScheduleInfo sets the namespace's schedule-info series, labelled with
+// the annotation as written, so a schedule that doesn't parse shows up too. It
+// first deletes the namespace's schedule-info series, so an edited schedule
+// leaves no series behind with the old string.
+func exportScheduleInfo(namespace, spec string) {
+	scheduleInfo.DeletePartialMatch(prometheus.Labels{"namespace": namespace})
+	scheduleInfo.WithLabelValues(namespace, spec).Set(1)
+}
+
+// exportSchedule sets the namespace's last-success, schedule-interval and
+// next-run series.
 //
 // The last success is the newest completion time among the namespace's
 // succeeded BackupRuns with spec.all set. A namespace that has never finished
 // such a backup reports its creation time, so the overdue alert measures from
 // when the namespace first asked for backups, and a namespace created a
-// minute ago doesn't fire it. The interval is the time between the next two
-// ticks after now.
+// minute ago doesn't fire it. The next run is the first tick after now, and
+// the interval is the time from that tick to the one after it.
 func (s *Scheduler) exportSchedule(namespace *corev1.Namespace, schedule cron.Schedule, runs []backupv1alpha1.BackupRun, now time.Time) {
 	last := namespace.CreationTimestamp.Time
 	for _, run := range runs {
@@ -262,6 +273,7 @@ func (s *Scheduler) exportSchedule(namespace *corev1.Namespace, schedule cron.Sc
 	lastSuccess.WithLabelValues(namespace.Name).Set(float64(last.Unix()))
 
 	first := schedule.Next(now)
+	nextRun.WithLabelValues(namespace.Name).Set(float64(first.Unix()))
 	scheduleInterval.WithLabelValues(namespace.Name).Set(schedule.Next(first).Sub(first).Seconds())
 }
 
@@ -289,11 +301,13 @@ func (s *Scheduler) exportPinned(ctx context.Context, namespace string) error {
 // namespace's schedule series.
 type scheduleLabels string
 
-// deleteAll deletes the namespace's last-success, schedule-interval and
-// schedule-invalid series.
+// deleteAll deletes the namespace's last-success, schedule-interval,
+// schedule-info, next-run and schedule-invalid series.
 func (n scheduleLabels) deleteAll() {
 	lastSuccess.DeleteLabelValues(string(n))
 	scheduleInterval.DeleteLabelValues(string(n))
+	scheduleInfo.DeletePartialMatch(prometheus.Labels{"namespace": string(n)})
+	nextRun.DeleteLabelValues(string(n))
 	scheduleInvalid.DeleteLabelValues(string(n))
 }
 
