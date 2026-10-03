@@ -61,6 +61,7 @@ func main() {
 		printVer    = flag.Bool("version", false, "print the version and exit")
 		pause       = flag.Bool("pause", false, "start paused, for an upgrade: new runs wait, runs that started work finish, the scheduler creates no run")
 		restoreImg  = flag.String("restore-image", "", "image of the restore Jobs: VolSync's mover image, which holds the restic that wrote the repositories")
+		leaderElect = flag.Bool("leader-elect", false, "take the Lease backup-controller in --namespace before running any controller, so several replicas can run")
 	)
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -93,16 +94,24 @@ func main() {
 
 	// The populator library drives only the one kind it is given, so
 	// BackupRun and RestoreRun are reconciled by a controller-runtime manager
-	// that this binary starts itself. The deferred cancel stops that manager
-	// once the library returns, which is the only shutdown signal this process
+	// that this binary starts itself. Cancelling runs stops that manager once
+	// the library returns, which is the only shutdown signal this process
 	// gets.
 	runs, stopRuns := context.WithCancel(context.Background())
 	defer stopRuns()
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
-	if err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook, *pause, *restoreImg); err != nil {
+	election := Election{Enabled: *leaderElect, Namespace: *namespace}
+	elected, stopped, err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook, election, *pause, *restoreImg)
+	if err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)
 	}
+
+	// The populator library has no leader election of its own, so it starts
+	// only once the manager holds the Lease. A replica waiting here serves the
+	// webhook and nothing else. SIGTERM ends it with Go's default handling,
+	// since the library's handler is installed only once it starts.
+	<-elected
 
 	// The library registers its own handler for SIGTERM and interrupt, and it
 	// closes the stop channel itself. This binary installs no second handler,
@@ -125,7 +134,11 @@ func main() {
 		Workqueue: populatorQueue(),
 	})
 
+	// Waiting for the manager lets it release the Lease, so the other replica
+	// takes over now and not when the Lease expires.
 	klog.Info("stopping backup-controller")
+	stopRuns()
+	<-stopped
 }
 
 // newClientOperations builds the cluster operations that the populator

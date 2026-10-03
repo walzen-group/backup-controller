@@ -58,6 +58,7 @@ var grants = []grant{
 	{"apps", "deployments", []string{"get", "list", "patch"}, "pausing scales a marked Deployment to zero and back"},
 	{"apps", "statefulsets", []string{"get", "list", "patch"}, "pausing scales a marked StatefulSet to zero and back"},
 	{"kustomize.toolkit.fluxcd.io", "kustomizations", []string{"get", "patch"}, "pausing suspends the Kustomization that would put the replicas back"},
+	{"coordination.k8s.io", "leases", []string{"get", "create", "update"}, "--leader-elect takes and renews the Lease backup-controller, and runs take a Lease per object they act on"},
 	{"kueue.x-k8s.io", "workloads", []string{"get", "create", "delete"}, "the Workload that admits a run"},
 	{"kueue.x-k8s.io", "workloads/status", []string{"update"}, "the PodsReady condition on that Workload"},
 	{"kueue.x-k8s.io", "localqueues", []string{"list"}, "the queue a namespace's runs are admitted through"},

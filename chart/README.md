@@ -39,7 +39,8 @@ templated. Where this chart and `deploy/` disagree, `deploy/` is right.
    kubectl -n backup-system get deployment backup-controller
    ```
 
-   Expected result: `READY` reads 1/1.
+   Expected result: `READY` reads 2/2. One pod holds the Lease
+   backup-controller and runs the controllers; both answer the webhook.
 
 The chart passes the `namespace` value to the container as `--namespace`, which
 is where the controller creates the prime claim, the repository Secret copy and

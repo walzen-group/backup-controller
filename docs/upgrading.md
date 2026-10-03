@@ -1,10 +1,35 @@
 # Upgrading
 
-This doc covers the upgrade from v0.10.1 to v1.0.1. v1.0.1 keeps
-the three kinds and most of their fields, renames the pause fields, and sends
-all its restic work through one Kueue queue.
+This doc covers the upgrade from v1.1.0 to v1.2.0, which runs two replicas,
+and the upgrade from v0.10.1 to v1.0.1, which keeps the three kinds and most of
+their fields, renames the pause fields, and sends all its restic work through
+one Kueue queue.
 
-## What changes
+## From v1.1.0 to v1.2.0
+
+v1.2.0 runs two replicas with --leader-elect (docs/operations.md, Replicas).
+The rollout starts the new pods while the v1.1.0 pod still runs, and the
+v1.1.0 pod never acquires the Lease, so for a moment two processes would drive the same
+runs. Upgrade through the pause, so no run is working while both are up:
+
+1. Follow "Pause the controller for an upgrade" in docs/operations.md through
+   its Step 2: set pause: true, apply, and wait until the listing prints
+   nothing.
+2. Move the release to v1.2.0 with pause still true, and apply. The CRDs and
+   the ClusterRole are unchanged.
+3. Check that both pods run and one holds the Lease:
+
+   ```
+   kubectl -n backup-system get pods -l app.kubernetes.io/name=backup-controller
+   kubectl -n backup-system get lease backup-controller -o jsonpath='{.spec.holderIdentity}'
+   ```
+
+   Expected result: two Running pods, and a holder naming one of them.
+4. Set pause: false and apply.
+
+## From v0.10.1 to v1.0.1
+
+### What changes
 
 | v0.10.1 | v1.0.1 |
 | --- | --- |
@@ -22,14 +47,14 @@ Snapshots tagged quiesced by v0.10.1 do not count as paused snapshots. The
 first scheduled backup after the upgrade writes a paused snapshot of each
 namespace whose app is marked for pausing.
 
-## Step 1: Pause the controller
+### Step 1: Pause the controller
 
 Follow "Pause the controller for an upgrade" in docs/operations.md: set pause:
 true, apply the unit, and wait until no run is working.
 
 Expected result: the listing in that procedure prints nothing.
 
-## Step 2: Check the queue
+### Step 2: Check the queue
 
 Every BackupRun, RestoreRun and populator restore asks Kueue for one
 backup-controller.wlz.li/run. The ClusterQueue behind the namespaces'
@@ -54,7 +79,7 @@ controller admits the populator's restores itself and removes the Kueue queue
 label from their Jobs, so a queue label in a VolumeRestore's moverPodLabels
 no longer does anything.
 
-## Step 3: Rename the pause annotations and fields
+### Step 3: Rename the pause annotations and fields
 
 In the app manifests, replace:
 
@@ -72,7 +97,7 @@ grep -rn 'quiesce\|backup.wlz.li/restore-as-of' <infra repo>
 Expected result: only claims carry backup.wlz.li/restore-as-of, and nothing
 names quiesce.
 
-## Step 4: Update the controller unit
+### Step 4: Update the controller unit
 
 | Setting | Value |
 | --- | --- |
@@ -84,7 +109,7 @@ names quiesce.
 
 The controller stops at startup when --restore-image is empty.
 
-## Step 5: Apply and check
+### Step 5: Apply and check
 
 Apply the unit with pause still true.
 
@@ -94,7 +119,7 @@ kubectl -n backup-system logs deploy/backup-controller | grep 'paused:'
 
 Expected result: `paused: new runs wait, runs in progress finish`.
 
-## Step 6: End the pause
+### Step 6: End the pause
 
 Set pause: false and apply the unit. Each namespace schedule creates one run
 for the newest tick it missed.

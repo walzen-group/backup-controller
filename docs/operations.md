@@ -1,8 +1,8 @@
 # Operations
 
 This doc covers running the controller: how it limits its own load, how two
-runs keep out of each other's way, how to pause it for an upgrade, and what to
-do when a run fails or hangs.
+runs keep out of each other's way, how two replicas share the work, how to
+pause it for an upgrade, and what to do when a run fails or hangs.
 
 ## Controller flags
 
@@ -10,6 +10,7 @@ do when a run fails or hangs.
 | --- | --- | --- |
 | --restore-image | none, required | image of the restore Jobs; pass VolSync's mover image, whose restic wrote the repositories |
 | --pause | false | new runs wait, runs that started work finish, the scheduler creates no run, the populator starts no restore |
+| --leader-elect | false | the process runs its controllers only while it holds the Lease backup-controller in --namespace; deploy/ and the chart pass it |
 | --namespace | backup-system | where the populator's prime claims and restore Jobs live |
 | --webhook-cert-dir | none | directory with tls.crt and tls.key; empty serves no webhook |
 | --webhook-port | 9443 | port of the admission webhook |
@@ -112,6 +113,40 @@ when it ends.
 So a backup and a restore of one claim take turns, two restores of one
 Cluster take turns, and a crashed or deleted run never blocks an object for
 good.
+
+## Replicas
+
+deploy/ and the chart run two replicas with --leader-elect. Both serve the
+admission webhook. Only the replica holding the Lease backup-controller in the
+controller's namespace runs the BackupRun and RestoreRun controllers, the
+scheduler and the populator:
+
+| | Leader | Standby |
+| --- | --- | --- |
+| bootstrap webhook | answers | answers |
+| BackupRun, RestoreRun, scheduler | run | wait for the Lease |
+| populator, and its listener on :8080 | runs | not started |
+| listener on :8081 | serves the schedule series | serves no schedule series |
+
+The run Leases above tell runs apart by the run's identity, which says nothing
+about the process. Two processes reconciling one run would both count as its
+holder, so two replicas started without --leader-elect would both drive every
+run. With the flag, only one process reconciles at a time.
+
+| Event | What happens |
+| --- | --- |
+| the leader's pod is deleted or rolled | it stops the populator, then the manager releases the Lease, and the standby acquires it within a few seconds |
+| the leader's node fails | the standby acquires the Lease once it expires, 15 seconds after the last renewal |
+| the leader cannot renew the Lease | its manager stops and the process exits, so its populator never runs beside the new leader's |
+
+Every state a run needs is in the API: its status, the run Leases, the
+scheduled-for label on each scheduled BackupRun. A new leader reads all of it
+on its first reconcile. Its only cold start is the restic key cache, so it runs
+scrypt once for each repository it opens.
+
+The webhook rejects a CloudNativePG Cluster create when no replica answers, by
+design (deploy/webhook.yaml has the reason). With two replicas on different
+nodes, one node failing leaves the webhook answering.
 
 ## Timeouts
 
