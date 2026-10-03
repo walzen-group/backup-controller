@@ -36,12 +36,14 @@ build() {
 restore_image=quay.io/backube/volsync:0.16.0
 
 # render prints the deploy/ manifests without the CRDs, with the release image
-# replaced by the image in $1, and --restore-image added to the controller's
-# arguments. It reads only local files.
+# replaced by the image in $1, the Deployment's replicas set to $2 (2 when
+# empty), and --restore-image added to the controller's arguments. It reads
+# only local files.
 render() {
   kubectl kustomize "$root/deploy" |
     yq 'select(.kind != "CustomResourceDefinition")' |
     RESTORE_IMAGE="$restore_image" yq '(select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--restore-image=" + strenv(RESTORE_IMAGE)]' |
+    REPLICAS="${2:-2}" yq '(select(.kind == "Deployment") | .spec.replicas) = env(REPLICAS)' |
     sed -e "s|image: ${release_image}[:@].*|image: $1|"
 }
 
@@ -74,11 +76,15 @@ wait_ca() {
 # deploy builds the image, applies everything, and waits until the controller
 # runs the new image and the webhook has its CA.
 deploy() {
-  local image
+  local image nodes replicas
   image="$(build)"
   log "image $image"
   crds
-  render "$image" | k apply --server-side -f -
+  # Each replica needs a node of its own, so a one-node cluster runs one.
+  nodes="$(k get nodes --no-headers | wc -l)"
+  replicas=$((nodes < 2 ? nodes : 2))
+  log "$replicas replica(s) on $nodes node(s)"
+  render "$image" "$replicas" | k apply --server-side -f -
   # The populator's restores wait for Kueue through a LocalQueue in the
   # controller namespace, as on prod, where the backup-controller unit
   # creates it.

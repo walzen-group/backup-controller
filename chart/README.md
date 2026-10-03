@@ -94,6 +94,7 @@ kubectl delete -f chart/crds/
 | image.pullPolicy | IfNotPresent | Pull policy for the controller container |
 | nameOverride / fullnameOverride | "" | Name parts used by the object names |
 | namespace | backup-system | Namespace the controller creates its prime claim and destination in, passed as --namespace |
+| replicas | 2 | Pods of the controller, each on its own node; one holds the Lease and runs the controllers, all answer the webhook |
 | rbac.create | true | Create the ClusterRole and ClusterRoleBinding for the controller |
 | serviceAccount.create | true | Create the ServiceAccount |
 | serviceAccount.name | "" (the fullname) | Use this ServiceAccount name, created or pre-existing |

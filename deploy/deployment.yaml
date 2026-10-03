@@ -21,19 +21,17 @@ spec:
         app.kubernetes.io/name: backup-controller
         app.kubernetes.io/instance: backup-controller
     spec:
-      # Preferred, so a one-node cluster still runs both. The scheduler's
-      # default spread allows both pods on one node, and losing that node
-      # would leave the webhook unanswered.
+      # Every replica on its own node. The scheduler's default spread allows
+      # two on one node, and losing that node would leave the webhook
+      # unanswered. A replica beyond the node count stays Pending.
       affinity:
         podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              topologyKey: kubernetes.io/hostname
-              labelSelector:
-                matchLabels:
-                  app.kubernetes.io/name: backup-controller
-                  app.kubernetes.io/instance: backup-controller
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: backup-controller
+                app.kubernetes.io/instance: backup-controller
       # The client reads the API server address and CA from the mounted
       # token, so the pod keeps the default automount and asks for no other
       # projected credential.

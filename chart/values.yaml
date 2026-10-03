@@ -27,6 +27,11 @@ namespace: backup-system
 # quay.io/backube/volsync:0.16.0. The controller does not start without it.
 restoreImage: ""
 
+# Pods of the controller. One holds the Lease backup-controller and runs the
+# controllers; every pod answers the webhook. Each pod needs a node of its own,
+# so a count above the node count leaves the rest Pending.
+replicas: 2
+
 # Starts the controller with --pause, for an upgrade: runs that started work
 # finish, new runs wait, and the scheduler creates no run.
 pause: false

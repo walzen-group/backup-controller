@@ -1,6 +1,7 @@
 package main
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -46,7 +47,8 @@ func TestTheManagerRunsAloneWithoutTheFlag(t *testing.T) {
 }
 
 // TestTheDeploymentRunsTwoElectedReplicas checks that deploy/ and the chart
-// both run two replicas and pass --leader-elect. Two replicas without the flag
+// both run two replicas by default and pass --leader-elect, and that the
+// chart reads the count from its replicas value. Two replicas without the flag
 // would both drive the same run, and the flag without a second replica leaves
 // the webhook unanswered whenever the one pod is gone.
 func TestTheDeploymentRunsTwoElectedReplicas(t *testing.T) {
@@ -79,9 +81,49 @@ func TestTheDeploymentRunsTwoElectedReplicas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the chart's deployment: %v", err)
 	}
-	for _, want := range []string{"replicas: 2", "- --leader-elect"} {
+	for _, want := range []string{"replicas: {{ .Values.replicas }}", "- --leader-elect", "requiredDuringSchedulingIgnoredDuringExecution"} {
 		if !strings.Contains(string(chart), want) {
 			t.Errorf("the chart's deployment has no %q", want)
 		}
+	}
+	values, err := os.ReadFile(filepath.Join("..", "..", "chart", "values.yaml"))
+	if err != nil {
+		t.Fatalf("read the chart's values: %v", err)
+	}
+	if !strings.Contains(string(values), "\nreplicas: 2\n") {
+		t.Errorf("the chart's values.yaml sets no replicas: 2")
+	}
+}
+
+// TestNoTwoReplicasShareANode checks that deploy/ requires every replica on its
+// own node. Two replicas on one node both go when that node fails, and the
+// webhook then refuses every CloudNativePG Cluster create.
+func TestNoTwoReplicasShareANode(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deployment.yaml"))
+	if err != nil {
+		t.Fatalf("read deploy/deployment.yaml: %v", err)
+	}
+	deployment := &appsv1.Deployment{}
+	if err := yaml.Unmarshal(content, deployment); err != nil {
+		t.Fatalf("parse deploy/deployment.yaml: %v", err)
+	}
+
+	affinity := deployment.Spec.Template.Spec.Affinity
+	if affinity == nil || affinity.PodAntiAffinity == nil {
+		t.Fatalf("deploy/deployment.yaml has no pod anti-affinity")
+	}
+	required := affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if len(required) != 1 {
+		t.Fatalf("deploy/deployment.yaml has %d required anti-affinity terms, want 1", len(required))
+	}
+	term := required[0]
+	if term.TopologyKey != "kubernetes.io/hostname" {
+		t.Errorf("the required term spreads over %q, want kubernetes.io/hostname", term.TopologyKey)
+	}
+	if term.LabelSelector == nil || !maps.Equal(term.LabelSelector.MatchLabels, deployment.Spec.Selector.MatchLabels) {
+		t.Errorf("the required term selects %v, want the Deployment's own pods %v", term.LabelSelector, deployment.Spec.Selector.MatchLabels)
+	}
+	if preferred := affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution; len(preferred) != 0 {
+		t.Errorf("deploy/deployment.yaml keeps %d preferred anti-affinity terms beside the required one", len(preferred))
 	}
 }

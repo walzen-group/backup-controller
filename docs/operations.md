@@ -116,10 +116,10 @@ good.
 
 ## Replicas
 
-deploy/ and the chart run two replicas with --leader-elect. Both serve the
-admission webhook. Only the replica holding the Lease backup-controller in the
-controller's namespace runs the BackupRun and RestoreRun controllers, the
-scheduler and the populator:
+deploy/ and the chart run two replicas with --leader-elect. Every replica
+serves the admission webhook. Only the replica holding the Lease
+backup-controller in the controller's namespace runs the BackupRun and
+RestoreRun controllers, the scheduler and the populator:
 
 | | Leader | Standby |
 | --- | --- | --- |
@@ -145,8 +145,23 @@ on its first reconcile. Its only cold start is the restic key cache, so it runs
 scrypt once for each repository it opens.
 
 The webhook rejects a CloudNativePG Cluster create when no replica answers, by
-design (deploy/webhook.yaml has the reason). With two replicas on different
-nodes, one node failing leaves the webhook answering.
+design (deploy/webhook.yaml has the reason). A required anti-affinity on
+kubernetes.io/hostname puts every replica on its own node, so one node failing
+leaves the webhook answering.
+
+The chart sets the count with its replicas value. An install from deploy/ or
+the release asset sets spec.replicas on the Deployment. Each replica needs a
+node of its own, so a count above the number of schedulable nodes leaves the
+rest Pending:
+
+```
+kubectl -n backup-system get pods -l app.kubernetes.io/name=backup-controller
+```
+
+A Pending pod there reads `didn't match pod anti-affinity rules` in its
+events. Lower the count or add a node. One replica also works: it acquires the
+Lease and runs everything, and the webhook is unanswered while that pod is
+gone.
 
 ## Timeouts
 

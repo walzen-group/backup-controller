@@ -5,10 +5,10 @@ metadata:
   labels:
     {{- include "backup-controller.labels" . | nindent 4 }}
 spec:
-  # Two replicas behind the Lease backup-controller: one runs the controllers,
-  # both answer the webhook, so creating a CloudNativePG Cluster keeps working
-  # while one pod is gone.
-  replicas: 2
+  # Replicas behind the Lease backup-controller: one runs the controllers, all
+  # answer the webhook, so creating a CloudNativePG Cluster keeps working while
+  # one pod is gone.
+  replicas: {{ .Values.replicas }}
   selector:
     matchLabels:
       {{- include "backup-controller.selectorLabels" . | nindent 6 }}
@@ -17,18 +17,16 @@ spec:
       labels:
         {{- include "backup-controller.selectorLabels" . | nindent 8 }}
     spec:
-      # Preferred, so a one-node cluster still runs both. The scheduler's
-      # default spread allows both pods on one node, and losing that node
-      # would leave the webhook unanswered.
+      # Every replica on its own node. The scheduler's default spread allows
+      # two on one node, and losing that node would leave the webhook
+      # unanswered. A replica beyond the node count stays Pending.
       affinity:
         podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              topologyKey: kubernetes.io/hostname
-              labelSelector:
-                matchLabels:
-                  {{- include "backup-controller.selectorLabels" . | nindent 18 }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                {{- include "backup-controller.selectorLabels" . | nindent 16 }}
       # The client reads the API server address and CA from the mounted token,
       # so the pod keeps the default automount and asks for no other projected
       # credential.
