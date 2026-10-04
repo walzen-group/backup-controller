@@ -98,4 +98,4 @@ kubectl delete -f chart/crds/
 | rbac.create | true | Create the ClusterRole and ClusterRoleBinding for the controller |
 | serviceAccount.create | true | Create the ServiceAccount |
 | serviceAccount.name | "" (the fullname) | Use this ServiceAccount name, created or pre-existing |
-| resources | 10m/64Mi requests, 128Mi memory limit | CPU limit is deliberately absent; see values.yaml |
+| resources | 10m/128Mi requests, 512Mi memory limit | CPU limit is deliberately absent; see values.yaml |
