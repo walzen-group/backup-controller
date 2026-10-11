@@ -25,6 +25,7 @@ waits for them to be established, then the Namespace, then the rest.
 | backup-controller-X.Y.Z.yaml | the whole install |
 | crds-X.Y.Z.yaml | the CRDs alone |
 | backup-controller-X.Y.Z.tgz, and oci://ghcr.io/walzen-group/backup-controller | the Helm chart |
+| kubectl-backup-X.Y.Z-OS-ARCH | the kubectl plugin for linux and darwin on amd64 and arm64; docs/cli.md |
 
 The Deployment needs two settings from the installer: --restore-image with
 VolSync's mover image, and --pause while an upgrade runs (docs/operations.md).

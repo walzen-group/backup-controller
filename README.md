@@ -64,6 +64,7 @@ has one, and to their newest backups otherwise.
 | docs/restores.md | every kind of RestoreRun, and what each database recovers to |
 | docs/automatic-restore.md | the populator, and the webhook's decision on a new Cluster |
 | docs/operations.md | flags, load and the queue, Leases, timeouts, pausing for an upgrade, failures and metrics |
+| docs/cli.md | the kubectl plugin: `kubectl backup run` and `kubectl backup restore` |
 | docs/api.md | every field, annotation and reason |
 | docs/installing.md | what the cluster needs, the release assets, and the permissions |
 | docs/upgrading.md | the upgrade from v0.10.1 |

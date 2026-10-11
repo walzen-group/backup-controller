@@ -2,7 +2,8 @@
 
 A RestoreRun puts volumes and databases back to an earlier state. It restores
 a claim in place, fills a new claim from a repository, recovers a
-CloudNativePG Cluster, or does all of these for a whole namespace.
+CloudNativePG Cluster, or does all of these for a whole namespace. Create one
+from a manifest or with `kubectl backup restore` (docs/cli.md).
 
 A namespace that is rebuilt, or a Cluster that is created again, comes back
 without a RestoreRun; automatic restores cover that case

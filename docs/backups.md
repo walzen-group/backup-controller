@@ -7,7 +7,8 @@ backup through the barman-cloud plugin; its WAL archive runs all the time,
 independent of the controller.
 
 A BackupRun is one backup. The scheduler creates one for each tick of a
-namespace's schedule, and a user can create one by hand.
+namespace's schedule, and a user can create one by hand, from a manifest or
+with `kubectl backup run` (docs/cli.md).
 
 ## Mark what to back up
 

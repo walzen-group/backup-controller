@@ -203,6 +203,21 @@ jobs:
             cat "$f" >> "crds-$VERSION.yaml"
           done
 
+      # The kubectl plugin is a static binary per platform. kubectl finds it
+      # as "kubectl backup" once it sits on the PATH named kubectl-backup.
+      - name: Build the kubectl-backup plugin
+        run: |
+          # shellcheck disable=SC2016  # the inner bash expands these
+          nix develop -c bash -c '
+            set -euo pipefail
+            for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+              os=${platform%/*} arch=${platform#*/}
+              CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+                -ldflags "-s -w -X main.version=$VERSION" \
+                -o "kubectl-backup-$VERSION-$os-$arch" ./cmd/kubectl-backup
+            done
+          '
+
       - name: Create the GitHub Release
         uses: softprops/action-gh-release@v3.0.3
         with:
@@ -220,7 +235,10 @@ jobs:
             deploy/ tree with the image already pinned to that digest.
             crds-${{ steps.version.outputs.version }}.yaml holds the CRDs,
             which version separately from the controller.
+            kubectl-backup-${{ steps.version.outputs.version }}-OS-ARCH is the
+            kubectl plugin; docs/cli.md says how to install it.
           files: |
             backup-controller-${{ steps.version.outputs.version }}.yaml
             backup-controller-${{ steps.version.outputs.version }}.tgz
             crds-${{ steps.version.outputs.version }}.yaml
+            kubectl-backup-${{ steps.version.outputs.version }}-*

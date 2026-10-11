@@ -102,7 +102,7 @@ jobs:
           nix develop -c bash -c '
             set -euo pipefail
             assets=$(setup-envtest use 1.37.0 -p path)
-            KUBEBUILDER_ASSETS="$assets" go test -tags envtest ./internal/api/...
+            KUBEBUILDER_ASSETS="$assets" go test -tags envtest ./internal/api/... ./internal/cli/...
           '
 
   chart:
