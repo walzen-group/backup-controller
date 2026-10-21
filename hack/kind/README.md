@@ -89,6 +89,8 @@ it; a change to logic alone never runs it.
 | .dockerignore | smoke |
 | cmd/backup-controller/ | smoke |
 | cmd/backup-controller/main.go:populatorQueue | TestAPopulatorRestoreWaitsForTheQueue |
+| cmd/kubectl-backup/ | none |
+| internal/cli/ | none |
 | deploy/ | smoke |
 | chart/ | smoke |
 | config/crd/ | smoke |
