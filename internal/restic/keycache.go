@@ -13,7 +13,7 @@ import (
 
 // keys holds the master key of every repository the controller has opened,
 // so each repository runs scrypt once for the life of the process. restic
-// v0.18.1 calibrates scrypt to up to 60 MiB and 500 ms per key
+// 0.19.1 calibrates scrypt to up to 60 MiB and 500 ms per key
 // (internal/repository/key.go:51-55), so ten opens at once would need about
 // 600 MiB.
 var keys = &keyCache{masters: map[string]key{}}

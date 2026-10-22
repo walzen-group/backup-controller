@@ -28,7 +28,7 @@ templated. Where this chart and `deploy/` disagree, `deploy/` is right.
 2. Install the release into that namespace.
 
    ```
-   helm install backup-controller ./chart -n backup-system --set restoreImage=quay.io/backube/volsync:0.16.0
+   helm install backup-controller ./chart -n backup-system --set restoreImage=quay.io/backube/volsync:0.17.0
    ```
 
    Expected result: `STATUS: deployed`.

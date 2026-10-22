@@ -24,7 +24,7 @@ namespace: backup-system
 
 # Image of the restore Jobs, passed as --restore-image. It has to be VolSync's
 # mover image, whose restic wrote the repositories, such as
-# quay.io/backube/volsync:0.16.0. The controller does not start without it.
+# quay.io/backube/volsync:0.17.0. The controller does not start without it.
 restoreImage: ""
 
 # Pods of the controller. One holds the Lease backup-controller and runs the

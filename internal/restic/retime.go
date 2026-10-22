@@ -19,7 +19,7 @@ import (
 const PausedTag = "paused"
 
 // lockCheckDelay and staleLockAge are the two timings restic's lock protocol
-// uses, taken from internal/restic/lock.go in restic 0.18.1. lockCheckDelay is
+// uses, taken from internal/restic/lock.go in restic 0.19.1. lockCheckDelay is
 // how long restic waits after it writes its lock before it checks again for
 // other locks. staleLockAge is the age at which restic calls a lock stale. A
 // running restic refreshes its lock every five minutes, so a lock older than

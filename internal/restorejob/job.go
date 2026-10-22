@@ -5,7 +5,7 @@
 // The Job runs restic from the image the controller gets in --restore-image,
 // which is VolSync's mover image, so the restic that restores is the one that
 // wrote the repository. It restores the way VolSync's mover does
-// (mover-restic/entry.sh in VolSync 0.16.0): the snapshot's root is the
+// (mover-restic/entry.sh in VolSync 0.17.0): the snapshot's root is the
 // content of the volume, and it goes into /data.
 package restorejob
 

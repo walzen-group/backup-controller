@@ -10,9 +10,9 @@ import (
 )
 
 // resticImage is the VolSync mover image, which holds the restic that
-// writes the repositories (restic 0.18.1 in VolSync 0.16.0). The tests read
+// writes the repositories (restic 0.19.1 in VolSync 0.17.0). The tests read
 // a repository with the same restic.
-const resticImage = "quay.io/backube/volsync:0.16.0"
+const resticImage = "quay.io/backube/volsync:0.17.0"
 
 // snapshot is one restic snapshot as restic snapshots --json prints it.
 type snapshot struct {

@@ -33,7 +33,7 @@ build() {
 
 # restore_image is the image of the controller's restore Jobs: VolSync's
 # mover image, as prod's infra unit passes it in --restore-image.
-restore_image=quay.io/backube/volsync:0.16.0
+restore_image=quay.io/backube/volsync:0.17.0
 
 # render prints the deploy/ manifests without the CRDs, with the release image
 # replaced by the image in $1, the Deployment's replicas set to $2 (2 when

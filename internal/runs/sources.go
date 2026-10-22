@@ -267,7 +267,8 @@ func ensureSource(ctx context.Context, c client.Client, reader client.Reader, cl
 				},
 				Repository: vr.Spec.Repository,
 				// A new value makes VolSync run restic unlock before the
-				// backup (volsync v0.16.0 mover/restic/mover.go:670). restic
+				// backup (volsync v0.17.0
+				// internal/controller/mover/restic/mover.go:632). restic
 				// then removes only locks it considers stale, such as the
 				// lock of a mover that was killed, so a stale lock never
 				// blocks the backups of a repository for good.
