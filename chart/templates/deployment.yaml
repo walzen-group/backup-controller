@@ -9,6 +9,14 @@ spec:
   # answer the webhook, so creating a CloudNativePG Cluster keeps working while
   # one pod is gone.
   replicas: {{ .Values.replicas }}
+  # A rollout stops one old pod before it starts the new pod. The
+  # anti-affinity below leaves no free node for an extra pod when each node
+  # runs a replica.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       {{- include "backup-controller.selectorLabels" . | nindent 6 }}

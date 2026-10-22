@@ -87,6 +87,21 @@ quiet partial backup. With the timeout alone, a hang ends the run Failed with
 reason TimedOut, the app is resumed, and the namespace's last-success metric
 stops moving, which fires the backup alert.
 
+## Stop an old controller pod before its replacement starts
+
+A rollout of the controller deletes one old pod first and starts the new pod
+on the node that pod freed. The Deployment sets maxSurge 0 and maxUnavailable
+1 for this. With two replicas or fewer, the Deployment default (25%
+surge, 25% unavailable) starts the new pod first and keeps every old pod until
+the new one is ready. Each replica needs a node of its own, so on a cluster
+where every schedulable node already runs a replica, the new pod stays Pending
+with `didn't match pod anti-affinity rules`. That rollout never finishes. The
+running pods keep their old arguments, and a change such as --pause has no
+effect on them. When an old pod stops first, its node is free on every
+cluster. During the swap one replica fewer answers the webhook, and with a
+single replica a CloudNativePG Cluster create fails until the new pod is
+ready.
+
 ## Test against the real stack
 
 Every feature has a scenario on a kind cluster that runs the real VolSync,

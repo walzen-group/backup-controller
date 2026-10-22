@@ -163,6 +163,13 @@ events. Lower the count or add a node. One replica also works: it acquires the
 Lease and runs everything, and the webhook is unanswered while that pod is
 gone.
 
+A rollout, for a new release or a change to the controller's arguments,
+deletes one old pod and then starts its replacement on the node that pod freed
+(docs/decisions.md, "Stop an old controller pod before its replacement
+starts"). With two replicas, the other pod answers the webhook during the
+swap, and it acquires the Lease when the deleted pod was the leader. With one
+replica, the webhook is unanswered until the new pod is ready.
+
 ## Timeouts
 
 | Run | Timeout, counted from admission |
