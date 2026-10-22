@@ -124,15 +124,18 @@ func getJSON(namespace, kind, name string, into any) error {
 //   - describe returns the state of the cluster for the failure message.
 //
 // waitFor calls check every two seconds. It logs each new state that check
-// reports, so the test log shows how the wait went. When the timeout passes
-// first, the test fails with the last state and what describe returns.
+// reports, and the time the wait used when the condition holds, so the test
+// log shows how the wait went and which step uses the time. When the timeout
+// passes first, the test fails with the last state and what describe returns.
 func waitFor(t *testing.T, what string, timeout time.Duration, check func() (bool, string), describe func() string) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
+	deadline := start.Add(timeout)
 	state := ""
 	for {
 		done, now := check()
 		if done {
+			t.Logf("%s after %s", what, time.Since(start).Round(time.Second))
 			return
 		}
 		if now != state {

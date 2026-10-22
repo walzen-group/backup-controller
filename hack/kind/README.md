@@ -30,10 +30,17 @@ the Deployment rolls to it.
 
 ## Run the scenarios
 
-All of them:
+Every scenario except the load scenario, 8 at a time:
 
 ```
 make e2e
+```
+
+The load scenario, TestSeventyNamespacesBackUpAtOneTick, on its own. It runs
+for about 15 minutes:
+
+```
+make e2e-load
 ```
 
 One of them:
@@ -48,9 +55,9 @@ namespace when it ends.
 
 ## Run the scenarios a change touches
 
-The whole suite runs for about 40 minutes and the load scenario for about
-15, so a change runs only the scenarios that exercise the code it changes,
-plus the scenarios it adds or edits.
+A change runs only the scenarios that exercise the code it changes, plus the
+scenarios it adds or edits. The load scenario runs here when a row in the
+table selects it.
 
 ```
 make e2e-affected
@@ -143,7 +150,7 @@ it; a change to logic alone never runs it.
 | cert-manager | v1.21.2 | the certificate of the controller's webhook |
 | RustFS | 1.0.0 | S3, namespace s3, buckets volsync and postgres |
 | CloudNativePG, barman-cloud plugin | 1.30.0, v0.15.0 | the databases and their archives |
-| VolSync | 0.16.0 | the backup movers, with restic 0.18.1 |
+| VolSync | 0.17.0 | the backup movers, with restic 0.19.1 |
 | Kueue | 0.19.5 | ClusterQueue backup, which admits 5 runs at once |
 | Flux | v2.9.5 | applies each test app from the in-cluster registry |
 | registry | 3.0.0 | holds the test apps as OCI artifacts |
