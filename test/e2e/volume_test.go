@@ -110,6 +110,21 @@ func (a *app) waitNote(what, want string) {
 	}, a.describe)
 }
 
+// deleteClaim deletes the claim data and the Deployment app, as a rebuild of
+// the namespace does, and waits up to three minutes until the claim is gone.
+// Flux creates both again at its next apply.
+//
+// It deletes the claim first. Flux can create the Deployment again before the
+// claim is gone, and the scheduler places no new pod that uses a claim in
+// deletion. So only the old pod uses the claim, and Kubernetes deletes the
+// claim once that pod is gone.
+func (a *app) deleteClaim() {
+	a.t.Helper()
+	kubectl(a.t, "", "-n", a.ns, "delete", "pvc", "data", "--wait=false")
+	kubectl(a.t, "", "-n", a.ns, "delete", "deployment", "app", "--wait=true", "--timeout=2m")
+	kubectl(a.t, "", "-n", a.ns, "wait", "--for=delete", "pvc/data", "--timeout=3m")
+}
+
 // firstLine returns the first line of a text, for a short state in a wait.
 func firstLine(text string) string {
 	line, _, _ := strings.Cut(strings.TrimSpace(text), "\n")
@@ -227,8 +242,7 @@ func TestThePopulatorFillsARecreatedClaim(t *testing.T) {
 	backedUp := a.backup("base", "source: data")
 	mustSucceed(t, "BackupRun", "base", backedUp.Status.Phase, backedUp.Status.Conditions, a.describe)
 
-	kubectl(t, "", "-n", a.ns, "delete", "deployment", "app", "--wait=true", "--timeout=2m")
-	kubectl(t, "", "-n", a.ns, "delete", "pvc", "data", "--wait=true", "--timeout=3m")
+	a.deleteClaim()
 	a.reconcile()
 	a.waitNote("the app to read the file from the filled claim", "before the rebuild")
 }
@@ -251,8 +265,7 @@ func TestAFailedPopulatorRestoreRunsAgainOnceItsJobIsDeleted(t *testing.T) {
 	forbidden := strings.Replace(volumeManifests(), "  cacheCapacity: 100Mi\n",
 		"  cacheCapacity: 100Mi\n  moverSecurityContext:\n    sysctls: [{name: kernel.msgmax, value: \"1024\"}]\n", 1)
 	a.publish(forbidden)
-	kubectl(t, "", "-n", a.ns, "delete", "deployment", "app", "--wait=true", "--timeout=2m")
-	kubectl(t, "", "-n", a.ns, "delete", "pvc", "data", "--wait=true", "--timeout=3m")
+	a.deleteClaim()
 	a.reconcile()
 	waitFor(t, "the VolumeRestore to report the failed restore", 8*time.Minute, func() (bool, string) {
 		var vr backupv1alpha1.VolumeRestore
@@ -303,8 +316,7 @@ func TestAPopulatorRestoreWaitsForTheQueue(t *testing.T) {
 	kubectl(t, "", "-n", controllerNamespace, "delete", "localqueue", "backups", "--wait=true")
 	t.Cleanup(func() { apply(t, queue) })
 
-	kubectl(t, "", "-n", a.ns, "delete", "deployment", "app", "--wait=true", "--timeout=2m")
-	kubectl(t, "", "-n", a.ns, "delete", "pvc", "data", "--wait=true", "--timeout=3m")
+	a.deleteClaim()
 	a.reconcile()
 	waitFor(t, "the VolumeRestore to report that the restore waits for the queue", 5*time.Minute, func() (bool, string) {
 		var vr backupv1alpha1.VolumeRestore

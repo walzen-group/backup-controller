@@ -192,6 +192,19 @@ func (a *app) backup(name, spec string) backupv1alpha1.BackupRun {
 func (a *app) backupWithin(name, spec string, wait time.Duration) backupv1alpha1.BackupRun {
 	a.t.Helper()
 	apply(a.t, fmt.Sprintf("apiVersion: backup.wlz.li/v1alpha1\nkind: BackupRun\nmetadata:\n  name: %s\n  namespace: %s\nspec:\n%s", name, a.ns, indent(spec, 2)))
+	return a.waitBackup(name, wait)
+}
+
+// waitBackup waits for a BackupRun in the app's namespace to end.
+//
+// Parameters:
+//   - name is the name of the BackupRun, which the test created before.
+//   - wait is how long the test waits for the run to end.
+//
+// It returns the run as it ended, Succeeded or Failed. The test fails when
+// the run does not end in time.
+func (a *app) waitBackup(name string, wait time.Duration) backupv1alpha1.BackupRun {
+	a.t.Helper()
 	var run backupv1alpha1.BackupRun
 	waitFor(a.t, "BackupRun "+name+" to end", wait, func() (bool, string) {
 		run = backupv1alpha1.BackupRun{}

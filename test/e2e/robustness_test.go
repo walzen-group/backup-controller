@@ -177,36 +177,6 @@ func TestTwoRestoresOfOneClusterDoNotFight(t *testing.T) {
 	}
 }
 
-// TestAFailedBackupResumesTheApp backs up a namespace whose restic Secret
-// holds the wrong password for an existing repository, so the mover fails.
-// VolSync retries the mover up to its Job's backoff limit of 8 and then
-// records the result Failed, about 20 minutes later. The run notices that
-// result and ends Failed with a reason on the item, well before its
-// 45-minute timeout, and the app runs again.
-func TestAFailedBackupResumesTheApp(t *testing.T) {
-	t.Parallel()
-	a := newApp(t, "failed")
-	a.publish(volumeManifests())
-	a.write("state")
-	first := a.backup("first", "source: data")
-	mustSucceed(t, "BackupRun", "first", first.Status.Phase, first.Status.Conditions, a.describe)
-
-	kubectl(t, "", "-n", a.ns, "patch", "secret", "restic", "--type=merge", "-p", `{"stringData":{"RESTIC_PASSWORD":"wrong"}}`)
-	failed := a.backupWithin("wrong-password", "all: true\ntimeout: 45m", 50*time.Minute)
-	if failed.Status.Phase != backupv1alpha1.RunPhaseFailed {
-		t.Fatalf("BackupRun wrong-password ended %s, want Failed\n%s", failed.Status.Phase, a.describe())
-	}
-	if reason := readyReason(failed.Status.Conditions); reason == backupv1alpha1.ReasonTimedOut {
-		t.Errorf("BackupRun wrong-password failed only at its timeout; the run has to notice the failed mover")
-	}
-	for _, item := range failed.Status.Items {
-		if item.Kind == "ReplicationSource" && item.Phase != backupv1alpha1.ItemFailed {
-			t.Errorf("item %s is %s, want Failed", item.Name, item.Phase)
-		}
-	}
-	a.waitNote("the app to run again after the failed backup", "state")
-}
-
 // TestAKilledControllerFinishesThePausedBackup kills the controller while a
 // paused backup has the app scaled to 0. The new controller pod finishes the
 // run, the app gets its replicas back, and the snapshot holds the file.

@@ -85,15 +85,19 @@ kueue() {
     --namespace kueue-system --create-namespace --wait --timeout 10m
 }
 
-# flux installs only the two controllers the tests use: source-controller
+# flux installs the three controllers the tests use: source-controller
 # reads the test apps from the registry, kustomize-controller applies them.
+# Both controllers send their events to notification-controller. Without it,
+# each event retries for about 40 seconds and blocks the reconcile.
 flux() {
   curl -fsSL "$FLUX_INSTALL" | k apply -f -
-  for d in helm-controller notification-controller image-reflector-controller image-automation-controller; do
+  for d in helm-controller image-reflector-controller image-automation-controller; do
     k -n flux-system scale deployment "$d" --replicas=0 2>/dev/null || true
   done
-  k -n flux-system rollout status deployment/source-controller --timeout=300s
-  k -n flux-system rollout status deployment/kustomize-controller --timeout=300s
+  k -n flux-system scale deployment notification-controller --replicas=1
+  for d in source-controller kustomize-controller notification-controller; do
+    k -n flux-system rollout status deployment/"$d" --timeout=300s
+  done
 }
 
 cluster() {

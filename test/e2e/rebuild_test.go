@@ -322,9 +322,9 @@ func TestARebuildWithTheClaimsFilledFirstComesBackToThePausedMoment(t *testing.T
 }
 
 // TestARebuildBringsAHibernatedDatabaseBackWithItsLastRows takes a base
-// backup, writes one more row, and hibernates Cluster db. A paused backup of
-// the namespace then skips the hibernated Cluster and tags the volume's
-// snapshot hibernated/db. After a rebuild the webhook recovers the Cluster
+// backup, writes one more row, and hibernates Cluster db through the
+// manifests Flux applies, as on prod. A paused backup of the namespace then
+// skips the hibernated Cluster and tags the volume's snapshot hibernated/db. After a rebuild the webhook recovers the Cluster
 // to the end of its archive, since no WAL came after the paused backup: the
 // database holds the row written after its last base backup.
 func TestARebuildBringsAHibernatedDatabaseBackWithItsLastRows(t *testing.T) {
@@ -340,7 +340,7 @@ func TestARebuildBringsAHibernatedDatabaseBackWithItsLastRows(t *testing.T) {
 	a.archived()
 	a.write("paused")
 
-	kubectl(t, "", "-n", a.ns, "annotate", "clusters.postgresql.cnpg.io", "db", "cnpg.io/hibernation=on")
+	a.publish(strings.Replace(rebuildManifests(), "  name: db\n  annotations:\n", "  name: db\n  annotations:\n    cnpg.io/hibernation: \"on\"\n", 1))
 	waitFor(t, "Cluster db to hibernate", 5*time.Minute, func() (bool, string) {
 		out, err := run(t.Context(), "", "-n", a.ns, "get", "pods", "-l", "cnpg.io/cluster=db", "-o", "name")
 		return err == nil && strings.TrimSpace(out) == "", strings.TrimSpace(out)
