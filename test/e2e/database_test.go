@@ -16,14 +16,22 @@ import (
 // pauseAnnotation marks a workload that a BackupRun with all: true pauses.
 const pauseAnnotation = "backup.wlz.li/pause-during-backup"
 
-// appManifests returns the objects Flux applies for a test app. They are:
+// appManifests returns the objects Flux applies for a test app.
+//
+// Parameters:
+//   - instances is the number of Postgres instances of Cluster db. With 2,
+//     the Cluster has a standby.
+//   - archiveTimeout is the archive_timeout of Postgres, such as "5min",
+//     which is the CloudNativePG default.
+//
+// It returns these objects:
 //   - the claim data, marked for backup, and the VolumeRestore data that
 //     names the restic repository of the claim;
 //   - the Deployment app, which mounts the claim and which a BackupRun with
 //     all: true pauses;
 //   - the Cluster db with the database app, marked for backup, which
 //     archives through the ObjectStore store.
-func appManifests() string {
+func appManifests(instances int, archiveTimeout string) string {
 	return fmt.Sprintf(`apiVersion: backup.wlz.li/v1alpha1
 kind: VolumeRestore
 metadata:
@@ -77,7 +85,7 @@ metadata:
   annotations:
     backup.wlz.li/enabled: "true"
 spec:
-  instances: 1
+  instances: %[5]d
   imageName: %[4]s
   storage:
     size: 512Mi
@@ -86,6 +94,7 @@ spec:
       shared_buffers: 32MB
       max_wal_size: 64MB
       min_wal_size: 32MB
+      archive_timeout: %[6]s
   bootstrap:
     initdb: {database: app, owner: app}
   plugins:
@@ -93,7 +102,7 @@ spec:
       isWALArchiver: true
       parameters:
         barmanObjectName: store
-`, storageClass, pauseAnnotation, appImage, postgresImage)
+`, storageClass, pauseAnnotation, appImage, postgresImage, instances, archiveTimeout)
 }
 
 // cluster is the part of a CloudNativePG Cluster the tests read.
@@ -247,7 +256,7 @@ func (a *app) restore(name, spec string) backupv1alpha1.RestoreRun {
 // healthy, and creates the table notes before it writes the rows.
 func (a *app) setUpDatabase(notes ...string) {
 	a.t.Helper()
-	a.publish(appManifests())
+	a.publish(appManifests(1, "5min"))
 	a.waitHealthy("Cluster db to come up")
 	a.sql("create table notes (id serial primary key, note text)")
 	for _, n := range notes {
@@ -306,6 +315,33 @@ func TestADeletedClusterComesBackWithItsData(t *testing.T) {
 	}
 	if got, want := a.rows(), []string{"first", "second"}; strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("rows after the recovery = %q, want %q", got, want)
+	}
+}
+
+// TestABackupOfAClusterWithAStandbyRestoresRightAway backs up Cluster db with
+// a primary and a standby, and deletes the Cluster as soon as the BackupRun
+// succeeds. No test step switches the WAL file, and archive_timeout is 1h, as
+// on prod. Flux creates the Cluster again, and the recovery from the new base
+// backup finishes with the row. A base backup from the standby fails here:
+// the WAL file that ends it is not archived, and every recovery attempt stops
+// with "WAL not found".
+func TestABackupOfAClusterWithAStandbyRestoresRightAway(t *testing.T) {
+	t.Parallel()
+	a := newApp(t, "db-standby")
+	a.publish(appManifests(2, "1h"))
+	a.waitHealthy("Cluster db with a standby to come up")
+	a.sql("create table notes (id serial primary key, note text)")
+	a.sql("insert into notes (note) values ('before the backup')")
+	before := a.waitHealthy("Cluster db")
+
+	run := a.backup("base", "database: db")
+	mustSucceed(t, "BackupRun", "base", run.Status.Phase, run.Status.Conditions, a.describe)
+	kubectl(t, "", "-n", a.ns, "delete", "clusters.postgresql.cnpg.io", "db", "--wait=true", "--timeout=5m")
+	if after := a.waitHealthy("Flux to create Cluster db again and the recovery to finish"); after == before {
+		t.Fatalf("Cluster db still has UID %s after the delete", before)
+	}
+	if got := a.rows(); strings.Join(got, "|") != "before the backup" {
+		t.Errorf("rows after the recovery = %q, want [before the backup]", got)
 	}
 }
 

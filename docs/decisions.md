@@ -43,6 +43,23 @@ then has to fall back to an older base backup, or to a clock time. With the
 pause held, the base backup that completes during the pause holds exactly the
 paused moment, and the snapshots name it in a base-backup tag.
 
+## Take every base backup on the primary
+
+The controller creates each CloudNativePG Backup with target: primary. A
+Backup without a target runs on a standby when the Cluster has one. On a
+standby, pg_backup_stop returns at once and switches no WAL file. The Backup
+then reports completed while the WAL file that ends it is still open on the
+primary.
+
+The primary archives that file when it fills or when archive_timeout passes,
+up to an hour later on prod. A Cluster deleted in that window recovers from the
+new base backup, fails on "WAL not found", and retries forever.
+
+On the primary, pg_backup_stop switches the WAL file and waits until the
+archive has it, so a completed Backup can be restored at once. The primary
+also reads the whole database for the backup. A backup needs the primary
+anyway, because only the primary archives WAL.
+
 ## Admit every run and populator restore before it does any work
 
 A run creates its Kueue Workload first and reads no repository, pauses no app

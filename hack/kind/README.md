@@ -123,6 +123,7 @@ it; a change to logic alone never runs it.
 | internal/runs/trigger.go | TestABackupPausesTheMarkedAppAndTagsTheSnapshot |
 | internal/runs/schedule.go | TestTenNamespacesShareOneQueue |
 | internal/runs/namespace_settings.go | TestAnInvalidTimeoutDuringAPauseGivesTheAppBack |
+| internal/runs/cnpg.go:ensureBackup | TestABackupOfAClusterWithAStandbyRestoresRightAway, TestARestoredDatabaseHoldsWhatWasArchived |
 | internal/runs/cnpg.go | TestARestoredDatabaseHoldsWhatWasArchived, TestARebuildBringsAHibernatedDatabaseBackWithItsLastRows |
 | internal/runs/restorerun.go | TestAClaimRestoresInPlace, TestARestoredDatabaseHoldsWhatWasArchived, TestTwoRestoresOfOneClusterDoNotFight, TestAKilledControllerFinishesTheDatabaseRestore |
 | internal/runs/restore_items.go | TestAClaimRestoresInPlace, TestASnapshotRestoresIntoANewClaim, TestADatabaseRestoreKeepsTheAppPausedUntilTheOldClusterIsGone |

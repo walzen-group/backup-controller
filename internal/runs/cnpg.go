@@ -105,12 +105,21 @@ func backupName(cluster string, uid types.UID) string {
 // It returns the Backup's name. A Backup of that name that already exists
 // counts as created, so a second call for the same run is safe. The Backup
 // carries the label app.kubernetes.io/managed-by: backup-controller.
+//
+// The Backup runs on the primary. barman 3.20.1 ends the base backup with
+// pg_backup_stop() and no argument (src/barman/postgres.py:1372-1377), so
+// Postgres waits until the WAL file that ends the backup is archived. On the
+// primary, pg_backup_stop also switches to a new WAL file, so the wait lasts
+// one upload. On a standby, pg_backup_stop returns at once, and the backup can
+// only be restored after the primary archives that WAL file, up to
+// archive_timeout later.
 func ensureBackup(ctx context.Context, c client.Client, namespace, cluster string, uid types.UID) (string, error) {
 	backup := &unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{
 			"method":              "plugin",
 			"pluginConfiguration": map[string]any{"name": bootstrap.PluginName},
 			"cluster":             map[string]any{"name": cluster},
+			"target":              "primary",
 		},
 	}}
 	backup.SetGroupVersionKind(BackupGVK)

@@ -16,7 +16,7 @@ import (
 // VolumeRestore and the Deployment of volumeManifests, whose claim names the
 // VolumeRestore in its dataSourceRef as on prod, and the Cluster db.
 func rebuildManifests() string {
-	cluster := appManifests()
+	cluster := appManifests(1, "5min")
 	return volumeManifests() + "---\n" + cluster[strings.Index(cluster, "apiVersion: postgresql.cnpg.io/v1"):]
 }
 

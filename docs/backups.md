@@ -140,7 +140,8 @@ writes to either.
    up, and scales each workload to 0.
 3. It waits until every pod of the paused workloads is gone.
 4. It starts the items. VolSync cuts a clone of each claim and backs up the
-   clone; CloudNativePG writes a base backup of each Cluster.
+   clone; CloudNativePG writes a base backup of each Cluster on its primary
+   (docs/decisions.md, "Take every base backup on the primary").
 5. Once every clone is cut and every database Backup completed or failed, the
    run records status.resumedAt, writes the status, and scales each workload
    back to its recorded count and resumes the Kustomizations.
