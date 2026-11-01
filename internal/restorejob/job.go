@@ -63,7 +63,9 @@ type Spec struct {
 // an exclusive lock on the repository, such as a retime's, to go away before
 // it gives up. The restic cache lives in an emptyDir. The Job tries 4 times
 // before it fails, so a short S3 outage does not fail the restore. The Job's
-// success or failure is its only result; no log is read.
+// success or failure is its only result; no log is read. RESTIC_PROGRESS_FPS
+// makes restic print a progress line every 10 seconds without a terminal, as
+// VolSync's mover-restic/entry.sh does, so people can follow a restore.
 func New(spec Spec) *batchv1.Job {
 	labels := map[string]string{Label: spec.Owner}
 	for k, v := range spec.Labels {
@@ -95,6 +97,7 @@ func New(spec Spec) *batchv1.Job {
 						Env: []corev1.EnvVar{
 							{Name: "RESTIC_CACHE_DIR", Value: "/cache"},
 							{Name: "HOME", Value: "/tmp"},
+							{Name: "RESTIC_PROGRESS_FPS", Value: "0.1"},
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "data", MountPath: "/data"},
