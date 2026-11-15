@@ -20,6 +20,9 @@ spec:
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
       type: string
+    - jsonPath: .status.repository
+      name: Repository
+      type: string
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -356,8 +359,9 @@ spec:
           status:
             description: |-
               VolumeRestoreStatus reports what is being populated from this object right
-              now. A VolumeRestore is a standing declaration that fills claims as they
-              appear, so a restore that has finished leaves no entry here.
+              now, and the repository the claim's backups go to. A VolumeRestore is a
+              standing declaration that fills claims as they appear, so a restore that has
+              finished leaves no entry in Claims.
             properties:
               claims:
                 description: |-
@@ -466,6 +470,12 @@ spec:
                   - type
                   type: object
                 type: array
+              repository:
+                description: |-
+                  Repository is RESTIC_REPOSITORY from the Secret in spec.repository, as
+                  the latest backup of the claim read it. It shows the endpoint, the
+                  bucket and the repository path, and no key or password.
+                type: string
             type: object
         type: object
     served: true

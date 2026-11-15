@@ -113,6 +113,7 @@ it; a change to logic alone never runs it.
 | internal/runs/backuprun.go:admit | TestARunWithoutALocalQueueWaitsForOne, TestTenNamespacesShareOneQueue |
 | internal/runs/backuprun.go:endIfEvicted | TestABackupPausesTheMarkedAppAndTagsTheSnapshot |
 | internal/runs/backuprun.go:release | TestABackupPausesTheMarkedAppAndTagsTheSnapshot |
+| internal/runs/backuprun.go:recordRepository | TestAVolumeRestoreShowsTheRepositoryOfItsBackups |
 | internal/runs/restorerun.go:Reconcile | TestTheControllerWithPauseFinishesStartedRunsAndStartsNoNewOne, TestARestoredDatabaseHoldsWhatWasArchived |
 | internal/runs/restorerun.go:admit | TestARestoredDatabaseHoldsWhatWasArchived |
 | internal/runs/restorerun.go:endIfEvicted | TestARestoredDatabaseHoldsWhatWasArchived |

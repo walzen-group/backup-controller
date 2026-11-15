@@ -656,9 +656,11 @@ func (r *BackupRunReconciler) collectItem(ctx context.Context, run *backupv1alph
 // the run's trigger. VolSync sets it only when a sync completes. A mover that
 // fails never completes the sync: VolSync tries it again and records the
 // result Failed in status.latestMoverStatus, which fails the item. Once the
-// sync completed, the item lists the repository and records the snapshot
-// the sync wrote (see restic.SyncedSnapshot). No snapshot in the sync means
-// the volume held no files, and the item succeeds with Empty set.
+// sync completed, the pass writes the repository URL into the VolumeRestore's
+// status.repository (see recordRepository). Then the item lists the
+// repository and records the snapshot the sync wrote (see
+// restic.SyncedSnapshot). No snapshot in the sync means the volume held no
+// files, and the item succeeds with Empty set.
 //
 // On a run that paused the app, the item waits until the app is resumed,
 // since a sync can end while a database backup still keeps the app paused.
@@ -702,8 +704,12 @@ func (r *BackupRunReconciler) collectVolume(ctx context.Context, run *backupv1al
 		return
 	}
 
-	secret, err := r.repositorySecret(ctx, run.Namespace, item.Name)
+	secret, vr, err := r.repositorySecret(ctx, run.Namespace, item.Name)
 	if err != nil {
+		item.Message = err.Error()
+		return
+	}
+	if err := r.recordRepository(ctx, vr, secret); err != nil {
 		item.Message = err.Error()
 		return
 	}
@@ -798,22 +804,48 @@ func (r *BackupRunReconciler) collectDatabase(ctx context.Context, run *backupv1
 //   - namespace is the claim's namespace.
 //   - claimName is the claim's name.
 //
-// It returns an error naming what is missing when the claim, its
-// VolumeRestore or the Secret can't be read.
-func (r *BackupRunReconciler) repositorySecret(ctx context.Context, namespace, claimName string) (*corev1.Secret, error) {
+// It returns the Secret and the VolumeRestore. It returns an error naming
+// what is missing when the claim, its VolumeRestore or the Secret can't be
+// read.
+func (r *BackupRunReconciler) repositorySecret(ctx context.Context, namespace, claimName string) (*corev1.Secret, *backupv1alpha1.VolumeRestore, error) {
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: claimName}, claim); err != nil {
-		return nil, fmt.Errorf("get claim %s: %w", claimName, err)
+		return nil, nil, fmt.Errorf("get claim %s: %w", claimName, err)
 	}
 	vr, err := volumeRestoreFor(ctx, r.Reader, claim)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	secret := &corev1.Secret{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: vr.Spec.Repository}, secret); err != nil {
-		return nil, fmt.Errorf("get Secret %s: %w", vr.Spec.Repository, err)
+		return nil, nil, fmt.Errorf("get Secret %s: %w", vr.Spec.Repository, err)
 	}
-	return secret, nil
+	return secret, vr, nil
+}
+
+// recordRepository writes the repository URL of a backup into the
+// VolumeRestore's status.repository, so an admin sees where a volume backs up
+// to without reading its Secret.
+//
+// Parameters:
+//   - vr is the claim's VolumeRestore, as repositorySecret read it.
+//   - secret is the repository Secret in vr's spec.repository.
+//
+// It returns an error when the status patch fails. The value is
+// RESTIC_REPOSITORY from the Secret. The function writes it only when it
+// differs from the value in the status, and it uses a merge patch, so the
+// populator's status.claims stays as it is.
+func (r *BackupRunReconciler) recordRepository(ctx context.Context, vr *backupv1alpha1.VolumeRestore, secret *corev1.Secret) error {
+	repository := string(secret.Data[restic.KeyRepository])
+	if vr.Status.Repository == repository {
+		return nil
+	}
+	patch := client.MergeFrom(vr.DeepCopy())
+	vr.Status.Repository = repository
+	if err := r.Status().Patch(ctx, vr, patch); err != nil {
+		return fmt.Errorf("write status.repository of VolumeRestore %s: %w", vr.Name, err)
+	}
+	return nil
 }
 
 // abort ends a run early as Failed.

@@ -180,6 +180,67 @@ func TestAClaimRestoresInPlace(t *testing.T) {
 	}
 }
 
+// TestAVolumeRestoreShowsTheRepositoryOfItsBackups checks the repository that
+// the VolumeRestore data reports, before and after the app moves to another
+// repository. The test backs up the app, points the Secret restic at a new
+// repository path, as a switch to another backup profile does, and backs up
+// again. After each backup, status.repository is the repository of that
+// backup. An in-place restore of the newest snapshot then reads the new
+// repository, which holds only the second file.
+func TestAVolumeRestoreShowsTheRepositoryOfItsBackups(t *testing.T) {
+	t.Parallel()
+	a := newApp(t, "repository")
+	a.publish(volumeManifests())
+
+	a.write("first")
+	first := a.backup("first", "source: data")
+	mustSucceed(t, "BackupRun", "first", first.Status.Phase, first.Status.Conditions, a.describe)
+	a.mustReportRepository("s3:" + s3Endpoint + "/volsync/" + a.ns + "/data")
+
+	moved := "s3:" + s3Endpoint + "/volsync/" + a.ns + "/moved"
+	apply(t, fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: restic
+  namespace: %[1]s
+stringData:
+  RESTIC_REPOSITORY: %[2]s
+  RESTIC_PASSWORD: e2e-restic-password
+  AWS_ACCESS_KEY_ID: %[3]s
+  AWS_SECRET_ACCESS_KEY: %[4]s
+`, a.ns, moved, accessKey, secretKey))
+	a.write("second")
+	second := a.backup("second", "source: data")
+	mustSucceed(t, "BackupRun", "second", second.Status.Phase, second.Status.Conditions, a.describe)
+	a.mustReportRepository(moved)
+
+	a.write("not backed up")
+	run := a.restore("newest", "claim: data\npauseDuringRestore:\n  - {kind: Deployment, name: app}")
+	mustSucceed(t, "RestoreRun", "newest", run.Status.Phase, run.Status.Conditions, a.describe)
+	a.waitNote("the app to read the file of the backup in the new repository", "second")
+}
+
+// mustReportRepository fails the test when the VolumeRestore data reports
+// another repository than the expected one.
+//
+// Parameters:
+//   - want is the repository URL that status.repository must have, the
+//     RESTIC_REPOSITORY of the latest backup.
+//
+// It reads the VolumeRestore once. The BackupRun writes the field before it
+// reports the volume as backed up, so the caller calls it after the run
+// succeeds and does not wait.
+func (a *app) mustReportRepository(want string) {
+	a.t.Helper()
+	var vr backupv1alpha1.VolumeRestore
+	if err := getJSON(a.ns, "volumerestore", "data", &vr); err != nil {
+		a.t.Fatalf("read VolumeRestore data: %v", err)
+	}
+	if vr.Status.Repository != want {
+		a.t.Fatalf("VolumeRestore data reports repository %q, want %q\n%s", vr.Status.Repository, want, a.describe())
+	}
+}
+
 // TestASnapshotRestoresIntoANewClaim restores the newest snapshot of the
 // app's repository into a new claim named copy. The new claim holds the
 // file, the app's own claim keeps what it holds now, and the new claim stays

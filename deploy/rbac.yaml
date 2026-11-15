@@ -46,7 +46,7 @@ rules:
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores"]
     verbs: ["get", "list", "watch", "create"]
-  # The conditions the controller reports on a VolumeRestore.
+  # The conditions and the repository the controller reports on a VolumeRestore.
   - apiGroups: ["backup.wlz.li"]
     resources: ["volumerestores/status"]
     verbs: ["patch", "update"]

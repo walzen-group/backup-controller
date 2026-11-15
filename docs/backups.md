@@ -186,7 +186,10 @@ it never reads a mover's log.
    first removes a stale restic lock, such as one a killed mover left.
 2. VolSync sets status.lastManualSync to the trigger, together with
    status.lastSyncTime and status.lastSyncDuration, when the sync completes.
-3. The run lists the repository's snapshots and selects the newest one whose
+3. The run copies RESTIC_REPOSITORY from the repository Secret into the
+   VolumeRestore's status.repository, so `kubectl get volumerestore` shows
+   where the volume backs up to.
+4. The run lists the repository's snapshots and selects the newest one whose
    time lies between lastSyncTime minus lastSyncDuration and lastSyncTime. A
    sync with no snapshot in that window backed up an empty volume, and the
    item succeeds with empty: true.

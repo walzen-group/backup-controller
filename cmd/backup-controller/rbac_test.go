@@ -42,7 +42,7 @@ var grants = []grant{
 	{"", "secrets", []string{"get", "create", "delete"}, "the repository Secret copied for the length of a restore"},
 	{"", "events", []string{"create", "patch"}, "the recorder the library hands to the callbacks"},
 	{"backup.wlz.li", "volumerestores", []string{"create"}, "a RestoreRun's point-in-time VolumeRestore"},
-	{"backup.wlz.li", "volumerestores/status", []string{"patch", "update"}, "the conditions reported on a VolumeRestore"},
+	{"backup.wlz.li", "volumerestores/status", []string{"patch", "update"}, "the conditions and the repository reported on a VolumeRestore"},
 	{"batch", "jobs", []string{"get", "create", "delete"}, "the restic Job that restores a snapshot into a claim"},
 
 	{"volsync.backube", "replicationsources", []string{"get", "list", "watch", "create", "update", "patch"}, "each enabled claim's source, which the controller writes and triggers"},

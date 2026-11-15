@@ -87,13 +87,20 @@ func (s VolumeRestoreSpec) MoverLabels() map[string]string {
 }
 
 // VolumeRestoreStatus reports what is being populated from this object right
-// now. A VolumeRestore is a standing declaration that fills claims as they
-// appear, so a restore that has finished leaves no entry here.
+// now, and the repository the claim's backups go to. A VolumeRestore is a
+// standing declaration that fills claims as they appear, so a restore that has
+// finished leaves no entry in Claims.
 type VolumeRestoreStatus struct {
 	// Conditions holds the object's kstatus-compatible state, so a Flux
 	// Kustomization with wait: true can wait for this object.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// Repository is RESTIC_REPOSITORY from the Secret in spec.repository, as
+	// the latest backup of the claim read it. It shows the endpoint, the
+	// bucket and the repository path, and no key or password.
+	// +optional
+	Repository string `json:"repository,omitempty"`
 
 	// Claims has one entry for each claim this object filled or fills: which
 	// snapshot, and how far the restore got.
@@ -156,6 +163,7 @@ const (
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=vrestore
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Repository",type=string,JSONPath=`.status.repository`
 
 // VolumeRestore declares that claims in this namespace are restored from a
 // restic repository. A claim names the VolumeRestore in its dataSourceRef,

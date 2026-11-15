@@ -116,6 +116,7 @@ Set exactly one of source, database and all.
 | --- | --- |
 | conditions | Ready: True with reason Restored, or False with Queued, Restoring, RestoreFailed, NoBackupInReach or ControllerPaused |
 | claims | per claim: name, UID, phase (Restoring, Restored, Failed), startedAt, and the snapshot it is filled from |
+| repository | RESTIC_REPOSITORY of the latest backup, such as `s3:<endpoint>/<bucket>/<name>`; each BackupRun writes it before it records the volume's snapshot, which on a run that paused the app is after the app is resumed, and `kubectl get volumerestore` shows it in the Repository column |
 
 ## Ready reasons
 

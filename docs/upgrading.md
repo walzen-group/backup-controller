@@ -1,9 +1,31 @@
 # Upgrading
 
-This doc covers the upgrade from v1.1.0 to v1.2.0, which runs two replicas,
-and the upgrade from v0.10.1 to v1.0.1, which keeps the three kinds and most of
+This doc covers the upgrade from v1.3.3 to v1.4.0, which adds a status field to
+VolumeRestore, the upgrade from v1.1.0 to v1.2.0, which runs two replicas, and
+the upgrade from v0.10.1 to v1.0.1, which keeps the three kinds and most of
 their fields, renames the pause fields, and sends all its restic work through
 one Kueue queue.
+
+## From v1.3.3 to v1.4.0
+
+v1.4.0 adds status.repository to VolumeRestore and a Repository column to
+`kubectl get volumerestore`. Each BackupRun writes the field from
+RESTIC_REPOSITORY in the repository Secret. The ClusterRole is unchanged.
+
+1. Follow "Pause the controller for an upgrade" in docs/operations.md: set
+   pause: true, apply, and wait until no run is active.
+2. Move backup_controller_version to v1.4.0 with pause still true, and apply.
+   The plan updates the VolumeRestore CRD and the Deployment's image.
+3. Set pause: false and apply.
+4. After the next scheduled run, check the column:
+
+   ```
+   kubectl get volumerestore -A
+   ```
+
+   Expected result: each VolumeRestore whose claim has backed up since the
+   upgrade shows its `s3:` repository URL. A VolumeRestore without a backup
+   since the upgrade shows an empty column until its next run.
 
 ## From v1.1.0 to v1.2.0
 
