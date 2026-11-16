@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	backupv1alpha1 "github.com/walzen-group/backup-controller/internal/api/v1alpha1"
@@ -63,6 +64,12 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 			item.Phase, item.Message = backupv1alpha1.ItemFailed, err.Error()
 			return wait{}, nil
 		}
+		// Kubernetes does not let anyone change the pod template of a Job, so
+		// a failed read stops the pass before the Job exists.
+		vr, err := r.sourceVolumeRestore(ctx, run, item)
+		if err != nil {
+			return wait{}, err
+		}
 		// The Job's name is recorded before the Job exists, so a pass that
 		// stops after the create still deletes it at the end. The item stays
 		// Pending until the create went through; a pass that finds the name
@@ -74,7 +81,6 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 				return wait{}, err
 			}
 		}
-		vr := r.sourceVolumeRestore(ctx, run, item)
 		job := restorejob.New(restorejob.Spec{
 			Namespace: run.Namespace, Name: item.Job, Image: r.RestoreImage, Claim: item.Name,
 			RepositorySecret: secret.Name, SnapshotID: item.SnapshotID,
@@ -176,27 +182,34 @@ func (r *RestoreRunReconciler) intoClaim(ctx context.Context, run *backupv1alpha
 //   - item is the volume item the Job restores.
 //
 // It returns nil when the run has no source claim, as for a restore from
-// spec.repository, or when the claim or its VolumeRestore can't be read.
+// spec.repository, or when the claim or its VolumeRestore does not exist. It
+// returns an error when a read fails for another reason.
 //
 // The source claim is the item's own claim for a restore in place, and
-// spec.claim for an into restore.
-func (r *RestoreRunReconciler) sourceVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) *backupv1alpha1.VolumeRestore {
+// spec.claim for an into restore. A failed read is an error because a Job
+// without the VolumeRestore's settings runs as a different user, or without
+// the download limit, and the Job cannot change after it is created.
+func (r *RestoreRunReconciler) sourceVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) (*backupv1alpha1.VolumeRestore, error) {
 	name := item.Name
 	if run.Spec.Into != "" {
 		name = run.Spec.Claim
 	}
 	if name == "" {
-		return nil
+		return nil, nil
 	}
 	claim := &corev1.PersistentVolumeClaim{}
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, claim); err != nil {
-		return nil
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get claim %s: %w", name, err)
 	}
 	vr, err := volumeRestoreFor(ctx, r.Reader, claim)
-	if err != nil {
-		return nil
+	var missing *missingVolumeRestoreError
+	if errors.As(err, &missing) {
+		return nil, nil
 	}
-	return vr
+	return vr, err
 }
 
 // moverSecurityContext returns the pod security context of one restore Job.
