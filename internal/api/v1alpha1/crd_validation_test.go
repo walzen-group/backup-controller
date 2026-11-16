@@ -221,6 +221,40 @@ func TestRunsNameExactlyOneScope(t *testing.T) {
 	}
 }
 
+// TestLimitDownloadIsZeroOrMore checks the minimum of limitDownloadKiBps on
+// RestoreRun and VolumeRestore. A negative limit would go to restic as
+// --limit-download, so the API server has to refuse it.
+//
+// Parameters:
+//   - t is the test handle that the go test runner gives.
+//
+// It has no return value. It reports an error when the API server refuses 0 or
+// 20480, or stores -1.
+//
+// 0 has to pass, because it lifts the limit of the VolumeRestore or the
+// controller for one run.
+func TestLimitDownloadIsZeroOrMore(t *testing.T) {
+	for _, tc := range []struct {
+		limit   int32
+		wantErr bool
+	}{{0, false}, {20480, false}, {-1, true}} {
+		t.Run(fmt.Sprintf("RestoreRun %d", tc.limit), func(t *testing.T) {
+			run := &RestoreRun{
+				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("limit-%d", tc.limit+1), Namespace: "default"},
+				Spec:       RestoreRunSpec{Claim: "notes-data", LimitDownloadKiBps: &tc.limit},
+			}
+			check(t, k8sClient.Create(context.Background(), run), tc.wantErr)
+		})
+		t.Run(fmt.Sprintf("VolumeRestore %d", tc.limit), func(t *testing.T) {
+			vr := &VolumeRestore{
+				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("limit-%d", tc.limit+1), Namespace: "default"},
+				Spec:       VolumeRestoreSpec{Repository: "notes-restic", LimitDownloadKiBps: &tc.limit},
+			}
+			check(t, k8sClient.Create(context.Background(), vr), tc.wantErr)
+		})
+	}
+}
+
 // check fails the test when the API server's answer to creating a run does not
 // match wantErr. A wanted error has to be an Invalid rejection.
 func check(t *testing.T, err error, wantErr bool) {

@@ -50,6 +50,9 @@ spec:
         - --namespace={{ .Values.namespace }}
         - --leader-elect
         - --restore-image={{ required "restoreImage is required: set it to VolSync's mover image" .Values.restoreImage }}
+        {{- if .Values.restoreLimitDownload }}
+        - --restore-limit-download={{ .Values.restoreLimitDownload }}
+        {{- end }}
         {{- if .Values.pause }}
         - --pause
         {{- end }}

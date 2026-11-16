@@ -27,6 +27,11 @@ namespace: backup-system
 # quay.io/backube/volsync:0.17.0. The controller does not start without it.
 restoreImage: ""
 
+# Download limit of each restore Job in KiB/s, passed as
+# --restore-limit-download. It applies to a restore whose RestoreRun and
+# VolumeRestore set no limitDownloadKiBps. 0 means no limit.
+restoreLimitDownload: 0
+
 # Pods of the controller. One holds the Lease backup-controller and runs the
 # controllers; every pod answers the webhook. Each pod needs a node of its own,
 # so a count above the node count leaves the rest Pending.

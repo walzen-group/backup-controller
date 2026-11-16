@@ -73,7 +73,7 @@ func TestBackupRunOptionalFields(t *testing.T) {
 func TestRestoreRunFromFlags(t *testing.T) {
 	run := parseRestore(t, "look-back", "-n", "immich",
 		"--claim", "immich-library", "--into", "immich-library-old", "--into-size", "10Gi",
-		"--as-of", "2026-10-11T04:00:00Z", "--previous", "1",
+		"--as-of", "2026-10-11T04:00:00Z", "--previous", "1", "--limit-download", "20480",
 		"--timeout", "30m", "--ttl", "86400")
 
 	s := run.Spec
@@ -92,6 +92,9 @@ func TestRestoreRunFromFlags(t *testing.T) {
 	if s.Previous == nil || *s.Previous != 1 {
 		t.Errorf("previous %v, want 1", s.Previous)
 	}
+	if s.LimitDownloadKiBps == nil || *s.LimitDownloadKiBps != 20480 {
+		t.Errorf("limitDownloadKiBps %v, want 20480", s.LimitDownloadKiBps)
+	}
 	if s.Timeout == nil || s.Timeout.Duration != 30*time.Minute {
 		t.Errorf("timeout %v, want 30m", s.Timeout)
 	}
@@ -107,8 +110,25 @@ func TestRestoreRunFromFlags(t *testing.T) {
 	if len(run.Spec.PauseDuringRestore) != 2 || run.Spec.PauseDuringRestore[0] != want[0] || run.Spec.PauseDuringRestore[1] != want[1] {
 		t.Errorf("pauseDuringRestore %v, want %v", run.Spec.PauseDuringRestore, want)
 	}
-	if run.Spec.Previous != nil || run.Spec.RestoreAsOf != nil || run.Spec.IntoSize != nil {
-		t.Errorf("previous %v, restoreAsOf %v, intoSize %v; want all nil when the flags are omitted", run.Spec.Previous, run.Spec.RestoreAsOf, run.Spec.IntoSize)
+	if run.Spec.Previous != nil || run.Spec.RestoreAsOf != nil || run.Spec.IntoSize != nil || run.Spec.LimitDownloadKiBps != nil {
+		t.Errorf("previous %v, restoreAsOf %v, intoSize %v, limitDownloadKiBps %v; want all nil when the flags are omitted",
+			run.Spec.Previous, run.Spec.RestoreAsOf, run.Spec.IntoSize, run.Spec.LimitDownloadKiBps)
+	}
+}
+
+// TestRestoreRunLimitDownloadZero checks that --limit-download 0 writes 0
+// into limitDownloadKiBps. A nil field would leave the limit of the
+// VolumeRestore or the controller in place, so the flag could not lift it.
+//
+// Parameters:
+//   - t is the test handle that the go test runner gives.
+//
+// It has no return value. It reports an error when the field is nil or has a
+// value other than 0.
+func TestRestoreRunLimitDownloadZero(t *testing.T) {
+	run := parseRestore(t, "fast", "--claim", "data", "--limit-download", "0")
+	if run.Spec.LimitDownloadKiBps == nil || *run.Spec.LimitDownloadKiBps != 0 {
+		t.Errorf("limitDownloadKiBps %v, want a pointer to 0", run.Spec.LimitDownloadKiBps)
 	}
 }
 

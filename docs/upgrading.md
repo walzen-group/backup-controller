@@ -1,10 +1,37 @@
 # Upgrading
 
-This doc covers the upgrade from v1.3.3 to v1.4.0, which adds a status field to
+This doc covers the upgrade from v1.4.0 to v1.5.0, which adds a download limit
+to restores, the upgrade from v1.3.3 to v1.4.0, which adds a status field to
 VolumeRestore, the upgrade from v1.1.0 to v1.2.0, which runs two replicas, and
 the upgrade from v0.10.1 to v1.0.1, which keeps the three kinds and most of
 their fields, renames the pause fields, and sends all its restic work through
 one Kueue queue.
+
+## From v1.4.0 to v1.5.0
+
+v1.5.0 adds spec.limitDownloadKiBps to RestoreRun and VolumeRestore, the
+controller flag --restore-limit-download and the chart value
+restoreLimitDownload (docs/restores.md, Volumes). The fields are optional,
+and without a limit the restore Jobs run as before. The ClusterRole is
+unchanged.
+
+Set limitDownloadKiBps in a VolumeRestore or a RestoreRun only after the
+upgrade. Until then, the API server removes the field from the object, since
+the old CRD does not have it.
+
+1. Follow "Pause the controller for an upgrade" in docs/operations.md: set
+   pause: true, apply, and wait until no run is active.
+2. Move backup_controller_version to v1.5.0 with pause still true, and apply.
+   The plan updates the RestoreRun and VolumeRestore CRDs and the
+   Deployment's image.
+3. Set pause: false and apply.
+4. Check that the CRD has the field:
+
+   ```
+   kubectl get crd volumerestores.backup.wlz.li -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.limitDownloadKiBps.type}'
+   ```
+
+   Expected result: `integer`.
 
 ## From v1.3.3 to v1.4.0
 

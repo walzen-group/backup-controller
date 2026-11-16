@@ -64,3 +64,31 @@ func TestKubeconfigFlagOnTheDefaultFlagSetDoesNotPanic(t *testing.T) {
 		t.Fatal("kubeconfigFlag returned nothing for the default FlagSet")
 	}
 }
+
+// TestRestoreJobsRefusesAWrongLimit checks that the controller stops at
+// startup for a --restore-limit-download below 0 or above the int32 of
+// limitDownloadKiBps. Otherwise the value would go to restic as a negative or
+// wrapped --limit-download in every restore Job.
+//
+// Parameters:
+//   - t is the test handle that the go test runner gives.
+//
+// It has no return value. It reports an error when restoreJobs accepts -1, 1<<31
+// or an empty image, or refuses 0 or 20480.
+func TestRestoreJobsRefusesAWrongLimit(t *testing.T) {
+	const image = "quay.io/backube/volsync:0.17.0"
+	for _, limit := range []int{-1, 1 << 31} {
+		if _, err := restoreJobs(image, limit); err == nil {
+			t.Errorf("restoreJobs accepted --restore-limit-download %d, want an error", limit)
+		}
+	}
+	if _, err := restoreJobs("", 0); err == nil {
+		t.Error("restoreJobs accepted an empty --restore-image, want an error")
+	}
+	for _, limit := range []int{0, 20480} {
+		got, err := restoreJobs(image, limit)
+		if err != nil || got.LimitDownloadKiBps != int32(limit) || got.Image != image {
+			t.Errorf("restoreJobs(%d) = %+v, %v; want the image and the limit %d", limit, got, err, limit)
+		}
+	}
+}

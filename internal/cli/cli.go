@@ -244,6 +244,7 @@ func restoreFlags(fs *pflag.FlagSet) builder {
 		intoSize   string
 		asOf       string
 		previous   int32
+		limit      int32
 		syncDB     bool
 		pause      []string
 		shared     common
@@ -256,6 +257,7 @@ func restoreFlags(fs *pflag.FlagSet) builder {
 	fs.StringVar(&intoSize, "into-size", "", "storage request of the claim --into creates, such as 10Gi; the source claim's size when omitted")
 	fs.StringVar(&asOf, "as-of", "", "moment to restore to, as an RFC 3339 time such as 2026-10-11T04:00:00Z; the newest backup when omitted")
 	fs.Int32Var(&previous, "previous", 0, "number of snapshots to step back from the one otherwise selected; one claim only")
+	fs.Int32Var(&limit, "limit-download", 0, "cap each restore Job's download rate in KiB/s, passed to restic as --limit-download; 0 lifts a default from the VolumeRestore or the controller")
 	fs.BoolVar(&syncDB, "sync-database-to-volume", false, "restore volumes and databases to one paused moment; needs --all")
 	fs.StringArrayVar(&pause, "pause", nil, "workload to stop before the restore, as deployment/NAME or statefulset/NAME; repeat for more")
 	shared.register(fs)
@@ -287,6 +289,10 @@ func restoreFlags(fs *pflag.FlagSet) builder {
 		if fs.Changed("previous") {
 			v := previous
 			run.Spec.Previous = &v
+		}
+		if fs.Changed("limit-download") {
+			v := limit
+			run.Spec.LimitDownloadKiBps = &v
 		}
 		for _, p := range pause {
 			ref, err := workloadRef(p)

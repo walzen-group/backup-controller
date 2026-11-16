@@ -61,6 +61,16 @@ type VolumeRestoreSpec struct {
 	// and of the restore Jobs of this repository's claims.
 	// +optional
 	MoverSecurityContext *corev1.PodSecurityContext `json:"moverSecurityContext,omitempty"`
+
+	// LimitDownloadKiBps is the maximum rate at which each restore Job of
+	// this repository's claims reads from the repository, in KiB/s. The
+	// controller gives it to restic as --limit-download. 0 removes the limit
+	// that the controller's --restore-limit-download sets. When omitted, the
+	// controller's limit applies. A RestoreRun's own limitDownloadKiBps has
+	// precedence over it. The backup mover ignores it.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	LimitDownloadKiBps *int32 `json:"limitDownloadKiBps,omitempty"`
 }
 
 // MoverPodLabelValue is one value in MoverPodLabels.

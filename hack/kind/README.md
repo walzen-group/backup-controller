@@ -127,13 +127,18 @@ it; a change to logic alone never runs it.
 | internal/runs/cnpg.go:ensureBackup | TestABackupOfAClusterWithAStandbyRestoresRightAway, TestARestoredDatabaseHoldsWhatWasArchived |
 | internal/runs/cnpg.go | TestARestoredDatabaseHoldsWhatWasArchived, TestARebuildBringsAHibernatedDatabaseBackWithItsLastRows |
 | internal/runs/restorerun.go | TestAClaimRestoresInPlace, TestARestoredDatabaseHoldsWhatWasArchived, TestTwoRestoresOfOneClusterDoNotFight, TestAKilledControllerFinishesTheDatabaseRestore |
+| internal/runs/restore_items.go:restoreVolume | TestAClaimRestoresInPlace, TestASnapshotRestoresIntoANewClaim, TestARestoreReadsNoFasterThanItsDownloadLimit |
+| internal/runs/restore_items.go:sourceVolumeRestore | TestAClaimRestoresInPlace, TestASnapshotRestoresIntoANewClaim, TestARestoreReadsNoFasterThanItsDownloadLimit |
+| internal/runs/restore_items.go:limitDownload | TestARestoreReadsNoFasterThanItsDownloadLimit |
 | internal/runs/restore_items.go | TestAClaimRestoresInPlace, TestASnapshotRestoresIntoANewClaim, TestADatabaseRestoreKeepsTheAppPausedUntilTheOldClusterIsGone |
 | internal/runs/restore_select.go | TestADatabaseRestoreToAMomentLandsOnTheBaseBackupBeforeIt, TestASyncedRestoreBringsTheFileAndTheRowsBackToThePausedMoment, TestASyncedRestoreOfAnIdleAppMatchesTheBackupThatPausedIt |
 | internal/runs/ | TestABackupPausesTheMarkedAppAndTagsTheSnapshot, TestAClaimRestoresInPlace |
 | internal/bootstrap/instance.go | TestADeletedClusterComesBackWithItsData, TestADatabaseRestoreKeepsTheAppPausedUntilTheOldClusterIsGone |
 | internal/bootstrap/ | TestTheWebhookRefusesASecondClusterOnOneArchive, TestTheWebhookRefusesAnEmptyDatabaseOverAnArchiveWithoutABackup, TestAnOptedOutClusterStartsEmptyOnlyOverAnEmptyArchive, TestADeletedClusterComesBackWithItsData, TestARebuiltNamespaceComesBackToThePausedMoment, TestAClusterDeletedAfterARebuildKeepsTheRowsWrittenSince, TestARebuildWithTheClaimsFilledFirstComesBackToThePausedMoment |
 | internal/synced/ | TestARebuiltNamespaceComesBackToThePausedMoment, TestARebuildComesBackToTheNewestBackupWhenARepositoryIsStale |
+| internal/populator/populator.go:start | TestThePopulatorFillsARecreatedClaim, TestARestoreReadsNoFasterThanItsDownloadLimit |
 | internal/populator/ | TestThePopulatorFillsARecreatedClaim, TestAFailedPopulatorRestoreRunsAgainOnceItsJobIsDeleted, TestAPopulatorRestoreWaitsForTheQueue |
+| internal/restorejob/job.go:New | TestAClaimRestoresInPlace, TestThePopulatorFillsARecreatedClaim, TestARestoreReadsNoFasterThanItsDownloadLimit |
 | internal/restorejob/ | TestAClaimRestoresInPlace, TestThePopulatorFillsARecreatedClaim |
 | internal/volsync/ | TestThePopulatorFillsARecreatedClaim |
 | internal/restic/ | TestABackupPausesTheMarkedAppAndTagsTheSnapshot, TestAClaimRestoresInPlace, TestThePopulatorFillsARecreatedClaim |

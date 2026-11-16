@@ -80,6 +80,16 @@ type BootstrapWebhook struct {
 	Port    int
 }
 
+// RestoreJobs says how the RestoreRun controller and the populator build their
+// restore Jobs. Image is the --restore-image flag, the image that contains
+// restic. LimitDownloadKiBps is the --restore-limit-download flag, the
+// download limit in KiB/s of a restore whose RestoreRun and VolumeRestore set
+// none, with 0 for no limit.
+type RestoreJobs struct {
+	Image              string
+	LimitDownloadKiBps int32
+}
+
 // startRunControllers starts the controller-runtime manager that reconciles
 // BackupRun and RestoreRun, runs the namespace scheduler, and serves the
 // bootstrap webhook when one is configured. It returns as soon as the manager
@@ -104,8 +114,8 @@ type BootstrapWebhook struct {
 //   - election is the --leader-elect flag and the controller's namespace.
 //   - paused is the --pause flag: the run controllers start no new run while
 //     it is set, and finish the runs that already started work.
-//   - restoreImage is the --restore-image flag, the image of the restore
-//     Jobs.
+//   - restores are the --restore-image and --restore-limit-download flags,
+//     which the RestoreRun controller gives its restore Jobs.
 //
 // It returns two channels. elected closes once this process may run
 // controllers: at once without election, and when it takes the Lease with it.
@@ -119,7 +129,7 @@ type BootstrapWebhook struct {
 // election it ends the process: a lost Lease stops the manager, and the
 // populator library in this process would go on filling claims beside the
 // new leader's.
-func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook, election Election, paused bool, restoreImage string) (elected, stopped <-chan struct{}, err error) {
+func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, hook BootstrapWebhook, election Election, paused bool, restores RestoreJobs) (elected, stopped <-chan struct{}, err error) {
 	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return nil, nil, fmt.Errorf("build client configuration: %w", err)
@@ -183,9 +193,9 @@ func startRunControllers(ctx context.Context, kubeconfig, metricsAddr string, ho
 	if err := backups.SetupWithManager(manager); err != nil {
 		return nil, nil, fmt.Errorf("register the BackupRun controller: %w", err)
 	}
-	restores := &runs.RestoreRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Prober: bootstrap.S3Prober{},
-		Leases: leases, RestoreImage: restoreImage, Paused: paused, Recorder: recorder}
-	if err := restores.SetupWithManager(manager); err != nil {
+	restoreRuns := &runs.RestoreRunReconciler{Client: manager.GetClient(), Reader: reader, Snapshots: restic.S3Lister{}, Prober: bootstrap.S3Prober{},
+		Leases: leases, RestoreImage: restores.Image, LimitDownloadKiBps: restores.LimitDownloadKiBps, Paused: paused, Recorder: recorder}
+	if err := restoreRuns.SetupWithManager(manager); err != nil {
 		return nil, nil, fmt.Errorf("register the RestoreRun controller: %w", err)
 	}
 	if err := (&runs.Scheduler{Client: manager.GetClient(), Reader: reader, Paused: paused, Recorder: recorder}).SetupWithManager(manager); err != nil {

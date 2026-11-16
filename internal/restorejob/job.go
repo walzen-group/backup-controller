@@ -10,6 +10,8 @@
 package restorejob
 
 import (
+	"strconv"
+
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +41,9 @@ type Spec struct {
 	// VolumeRestore's or the RestoreRun's moverSecurityContext. Nil runs
 	// restic as the image's user, which can set every file's owner.
 	SecurityContext *corev1.PodSecurityContext
+	// LimitDownloadKiBps is the maximum rate at which restic reads from the
+	// repository, in KiB/s. 0 means no limit.
+	LimitDownloadKiBps int32
 	// Owner is the value of Label on the Job and its pod.
 	Owner string
 	// OwnerReferences are set on the Job. A RestoreRun owns its Jobs, so a
@@ -59,7 +64,9 @@ type Spec struct {
 //
 // restic restores the snapshot into /data and, with --delete, removes every
 // file there that the snapshot does not hold, so the claim holds exactly the
-// snapshot afterwards. With --retry-lock, restic waits up to 5 minutes for
+// snapshot afterwards. With --limit-download, restic reads from the
+// repository at most at LimitDownloadKiBps. The Job gets the flag only for a
+// limit above 0. With --retry-lock, restic waits up to 5 minutes for
 // an exclusive lock on the repository, such as a retime's, to go away before
 // it gives up. The restic cache lives in an emptyDir. The Job tries 4 times
 // before it fails, so a short S3 outage does not fail the restore. The Job's
@@ -70,6 +77,16 @@ func New(spec Spec) *batchv1.Job {
 	labels := map[string]string{Label: spec.Owner}
 	for k, v := range spec.Labels {
 		labels[k] = v
+	}
+	args := []string{
+		"restore", spec.SnapshotID,
+		"--retry-lock", "5m",
+		"--target", "/data",
+		"--delete",
+		"--include-xattr", "user.*",
+	}
+	if spec.LimitDownloadKiBps > 0 {
+		args = append(args, "--limit-download", strconv.Itoa(int(spec.LimitDownloadKiBps)))
 	}
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Namespace: spec.Namespace, Name: spec.Name, Labels: labels, OwnerReferences: spec.OwnerReferences},
@@ -84,13 +101,7 @@ func New(spec Spec) *batchv1.Job {
 						Name:    "restic",
 						Image:   spec.Image,
 						Command: []string{"restic"},
-						Args: []string{
-							"restore", spec.SnapshotID,
-							"--retry-lock", "5m",
-							"--target", "/data",
-							"--delete",
-							"--include-xattr", "user.*",
-						},
+						Args:    args,
 						EnvFrom: []corev1.EnvFromSource{{
 							SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: spec.RepositorySecret}},
 						}},

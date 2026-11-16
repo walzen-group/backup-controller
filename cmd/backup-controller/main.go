@@ -61,6 +61,7 @@ func main() {
 		printVer    = flag.Bool("version", false, "print the version and exit")
 		pause       = flag.Bool("pause", false, "start paused, for an upgrade: new runs wait, runs that started work finish, the scheduler creates no run")
 		restoreImg  = flag.String("restore-image", "", "image of the restore Jobs: VolSync's mover image, which holds the restic that wrote the repositories")
+		restoreRate = flag.Int("restore-limit-download", 0, "download limit of each restore Job in KiB/s, for a RestoreRun and a VolumeRestore that set no limitDownloadKiBps; 0 means no limit")
 		leaderElect = flag.Bool("leader-elect", false, "take the Lease backup-controller in --namespace before running any controller, so several replicas can run")
 	)
 	klog.InitFlags(nil)
@@ -70,10 +71,9 @@ func main() {
 		fmt.Println(version)
 		return
 	}
-	// Every volume restore runs a Job with this image. Without it, each
-	// restore would fail only once it starts, so the process stops here.
-	if *restoreImg == "" {
-		klog.Errorf("--restore-image is required: pass VolSync's mover image, which holds the restic that wrote the repositories")
+	restores, err := restoreJobs(*restoreImg, *restoreRate)
+	if err != nil {
+		klog.Error(err)
 		os.Exit(2)
 	}
 
@@ -87,9 +87,12 @@ func main() {
 		Client:     operations.client,
 		Reader:     operations.client,
 		Namespace:  *namespace,
-		Image:      *restoreImg,
+		Image:      restores.Image,
 		Snapshots:  restic.S3Lister{},
 		Paused:     *pause,
+		// The populator's restores have no RestoreRun, so only the
+		// VolumeRestore and this flag give a limit.
+		LimitDownloadKiBps: restores.LimitDownloadKiBps,
 	})
 
 	// The populator library drives only the one kind it is given, so
@@ -101,7 +104,7 @@ func main() {
 	defer stopRuns()
 	hook := BootstrapWebhook{CertDir: *webhookCert, Port: *webhookPort}
 	election := Election{Enabled: *leaderElect, Namespace: *namespace}
-	elected, stopped, err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook, election, *pause, *restoreImg)
+	elected, stopped, err := startRunControllers(runs, kubeconfig(), *runsMetrics, hook, election, *pause, restores)
 	if err != nil {
 		klog.Errorf("failed to start the run controllers: %v", err)
 		os.Exit(1)

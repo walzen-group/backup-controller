@@ -9,6 +9,7 @@ pause it for an upgrade, and what to do when a run fails or hangs.
 | Flag | Default | Effect |
 | --- | --- | --- |
 | --restore-image | none, required | image of the restore Jobs; pass VolSync's mover image, whose restic wrote the repositories |
+| --restore-limit-download | 0 | download limit in KiB/s of each restore Job whose RestoreRun and VolumeRestore set no limitDownloadKiBps; 0 means no limit (docs/restores.md, Volumes) |
 | --pause | false | new runs wait, runs that started work finish, the scheduler creates no run, the populator starts no restore |
 | --leader-elect | false | the process runs its controllers only while it holds the Lease backup-controller in --namespace; deploy/ and the chart pass it |
 | --namespace | backup-system | where the populator's prime claims and restore Jobs live |
@@ -18,7 +19,8 @@ pause it for an upgrade, and what to do when a run fails or hangs.
 | --metrics-addr, --metrics-path | :8080, /metrics | listener of the populator library's metrics |
 
 The controller stops at startup when --restore-image is empty, since every
-volume restore would fail later. It needs a memory limit of 512Mi.
+volume restore would fail later. It also stops when --restore-limit-download
+is below 0. It needs a memory limit of 512Mi.
 
 ## Load
 
@@ -61,6 +63,13 @@ The ClusterQueue needs no pods quota. The runs' Workloads have no real pods,
 and the populator's restore Jobs start only once their Workload is admitted,
 so Kueue does not queue those Jobs a second time: the controller removes the
 Kueue queue label from them.
+
+A download limit applies to each restore Job, since restic cannot share one
+limit between processes. The download rate of all restores is at most the
+number of running restore Jobs times the limit. A RestoreRun with all starts
+the Jobs of all its claims at once, under one slot of the quota. Each
+populator restore uses a slot of its own, so the quota limits how many
+populator Jobs run at once.
 
 Inside the controller, opening a restic repository is the expensive step:
 restic derives each repository's key with scrypt, up to 60 MiB and 500 ms per

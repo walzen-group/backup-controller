@@ -322,6 +322,11 @@ func (in *RestoreRunSpec) DeepCopyInto(out *RestoreRunSpec) {
 		*out = new(corev1.PodSecurityContext)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.LimitDownloadKiBps != nil {
+		in, out := &in.LimitDownloadKiBps, &out.LimitDownloadKiBps
+		*out = new(int32)
+		**out = **in
+	}
 	if in.TTLSecondsAfterFinished != nil {
 		in, out := &in.TTLSecondsAfterFinished, &out.TTLSecondsAfterFinished
 		*out = new(int32)
@@ -495,6 +500,11 @@ func (in *VolumeRestoreSpec) DeepCopyInto(out *VolumeRestoreSpec) {
 		in, out := &in.MoverSecurityContext, &out.MoverSecurityContext
 		*out = new(corev1.PodSecurityContext)
 		(*in).DeepCopyInto(*out)
+	}
+	if in.LimitDownloadKiBps != nil {
+		in, out := &in.LimitDownloadKiBps, &out.LimitDownloadKiBps
+		*out = new(int32)
+		**out = **in
 	}
 }
 

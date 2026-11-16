@@ -120,7 +120,9 @@ claims at a time, and the slot goes back once the restore Job ends.
 
 The restore Job runs in the controller namespace with a copy of the repository
 Secret, and uses the image from --restore-image. The VolumeRestore's
-moverPodLabels go onto the Job, except Kueue's queue label.
+moverPodLabels go onto the Job, except Kueue's queue label. The Job reads at
+most at the VolumeRestore's limitDownloadKiBps, else at the controller's
+--restore-limit-download (docs/restores.md, Volumes).
 
 The VolumeRestore keeps one entry per claim in status.claims, with the
 snapshot ID and time, and the phase Restoring, Restored or Failed. The entry

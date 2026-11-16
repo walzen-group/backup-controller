@@ -56,6 +56,11 @@ type RestoreRunReconciler struct {
 	// repositories.
 	RestoreImage string
 
+	// LimitDownloadKiBps is the download limit of a restore Job in KiB/s,
+	// from --restore-limit-download, for a run and a VolumeRestore that set
+	// none. 0 means no limit.
+	LimitDownloadKiBps int32
+
 	// Paused is true when the controller runs with --pause: a run that has
 	// not started work waits, and a run that has goes on until it ends.
 	Paused bool

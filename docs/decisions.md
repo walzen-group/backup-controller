@@ -119,6 +119,22 @@ cluster. During the swap one replica fewer answers the webhook, and with a
 single replica a CloudNativePG Cluster create fails until the new pod is
 ready.
 
+## Limit the download rate of each restore Job
+
+A restore Job gives restic `--limit-download` from the RestoreRun, the
+VolumeRestore or the controller's --restore-limit-download. The repository
+Secret cannot contain the limit: restic reads its rate limits only from flags,
+and the Job reads the Secret only as environment variables. The controller
+flag is there for the populator, which restores without a RestoreRun. Without
+the flag, a limit for all claims needs a limitDownloadKiBps in every
+VolumeRestore of every app.
+
+The limit applies to each Job, because restic cannot share a limit between
+processes. A limit for a whole run would need the controller to split the
+limit between the run's Jobs, or to start the Jobs one after another. A split
+leaves the share of a small claim unused after its Job ends, and Jobs one after
+another make a restore with all as slow as all its claims together.
+
 ## Test against the real stack
 
 Every feature has a scenario on a kind cluster that runs the real VolSync,

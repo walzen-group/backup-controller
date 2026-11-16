@@ -1,6 +1,11 @@
 package main
 
-import "flag"
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"math"
+)
 
 // kubeconfigFlag returns a function that reads the --kubeconfig flag from fs.
 // It registers the flag only when fs doesn't already have one, and otherwise
@@ -22,4 +27,27 @@ func kubeconfigFlag(fs *flag.FlagSet) func() string {
 	}
 	value := fs.String(name, "", "path to a kubeconfig; empty means the ambient configuration")
 	return func() string { return *value }
+}
+
+// restoreJobs checks the restore Job flags and returns them as RestoreJobs.
+// main calls it before it starts anything, so a wrong flag stops the process
+// at once.
+//
+// Parameters:
+//   - image is the --restore-image flag. Every volume restore runs a Job
+//     with this image, so it must not be empty.
+//   - limit is the --restore-limit-download flag in KiB/s. It must be 0 or
+//     more and fit the int32 of limitDownloadKiBps.
+//
+// It returns the settings, or an error that gives the flag and the value it
+// expects. Without this check, an empty image fails each restore only once
+// it starts, and a negative limit goes to restic.
+func restoreJobs(image string, limit int) (RestoreJobs, error) {
+	if image == "" {
+		return RestoreJobs{}, errors.New("--restore-image is required: pass VolSync's mover image, which holds the restic that wrote the repositories")
+	}
+	if limit < 0 || limit > math.MaxInt32 {
+		return RestoreJobs{}, fmt.Errorf("--restore-limit-download is %d: pass a rate in KiB/s from 0 to %d, where 0 means no limit", limit, math.MaxInt32)
+	}
+	return RestoreJobs{Image: image, LimitDownloadKiBps: int32(limit)}, nil
 }

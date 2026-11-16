@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -70,6 +71,10 @@ type Config struct {
 	Namespace string
 	// Image is the image of the restore Jobs, from --restore-image.
 	Image string
+	// LimitDownloadKiBps is the download limit of a restore Job in KiB/s,
+	// from --restore-limit-download, for a VolumeRestore without a limit. 0
+	// means no limit.
+	LimitDownloadKiBps int32
 	// Snapshots lists the snapshots of a repository.
 	Snapshots restic.Lister
 	// Paused is the --pause flag. While it is set, Populate starts no
@@ -368,8 +373,8 @@ func (c *Callbacks) unreachable(ctx context.Context, vr *backupv1alpha1.VolumeRe
 // creates the restore Job.
 //
 // Parameters:
-//   - vr is the claim's VolumeRestore. It gives the repository Secret and
-//     gives the Job's security context.
+//   - vr is the claim's VolumeRestore. It gives the repository Secret, the
+//     Job's security context and the Job's download limit.
 //   - claim is the claim to fill. The Job and the Secret copy are named
 //     after its UID.
 //   - prime is the name of the prime claim, which the Job writes into.
@@ -389,7 +394,10 @@ func (c *Callbacks) start(ctx context.Context, vr *backupv1alpha1.VolumeRestore,
 		RepositorySecret: internalvolsync.SecretCopyName(claim.UID),
 		SnapshotID:       snapshotID,
 		SecurityContext:  vr.Spec.MoverSecurityContext,
-		Labels:           jobLabels(vr),
+		// The VolumeRestore's limit has precedence over the controller's,
+		// and a VolumeRestore with 0 lifts the controller's limit.
+		LimitDownloadKiBps: ptr.Deref(vr.Spec.LimitDownloadKiBps, c.config.LimitDownloadKiBps),
+		Labels:             jobLabels(vr),
 		// A label value cannot hold a slash, so the label holds the claim's
 		// namespace. The Job's name holds the claim's UID.
 		Owner: claim.Namespace,

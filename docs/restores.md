@@ -86,6 +86,22 @@ its Kubernetes condition, Complete or Failed; no log is read.
 A restore Job that is deleted before it finished fails its item, and the
 message says the claim may hold part of the snapshot.
 
+A restore Job reads from the repository at most at a download limit in
+KiB/s, which restic gets as `--limit-download`. The controller uses the first
+limit that is set, and 0 counts as set and means no limit:
+
+| Restore | Order |
+| --- | --- |
+| A RestoreRun with claim or all, in place or into a new claim | the run's spec.limitDownloadKiBps, the VolumeRestore of the source claim, the controller's --restore-limit-download |
+| A RestoreRun with repository | the run's spec.limitDownloadKiBps, the controller's --restore-limit-download |
+| The populator, for a new claim | the VolumeRestore's spec.limitDownloadKiBps, the controller's --restore-limit-download |
+
+The source claim is the claim itself for a restore in place, and spec.claim
+for an into restore. The controller sets the limit when it creates the Job.
+A change to the run or the VolumeRestore applies to the Jobs that start after
+it. The limit applies to each Job: a run with all restores its claims at the
+same time, so it reads up to the number of claims times the limit.
+
 ### Selecting the snapshot
 
 | Spec | Snapshot |
@@ -172,6 +188,16 @@ close to a chosen time a database can come back.
 | A restore Job failed | Failed, item message points at `kubectl logs job/NAME` | the claims restored so far, including a partial one |
 | The Cluster came back without the run's recovery | Failed | the old Cluster was deleted |
 | Timeout or eviction | Failed, TimedOut or Evicted | the app is resumed |
+
+A restore that runs slower than expected can have a download limit. The
+restic arguments of the restore Job show it:
+
+```sh
+kubectl get job NAME -o jsonpath='{.spec.template.spec.containers[0].args}'
+```
+
+Expected result: the arguments end with `--limit-download` and the limit in
+KiB/s when a limit applies, and without it when none applies.
 
 In every case the run resumes what it paused, deletes its restore Jobs, and
 gives its Leases and its Workload back before it ends. A restore Job that

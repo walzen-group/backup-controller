@@ -129,6 +129,16 @@ type RestoreRunSpec struct {
 	// +optional
 	MoverSecurityContext *corev1.PodSecurityContext `json:"moverSecurityContext,omitempty"`
 
+	// LimitDownloadKiBps is the maximum rate at which each restore Job of the
+	// run reads from the repository, in KiB/s. The controller gives it to
+	// restic as --limit-download. 0 removes the limit that the claim's
+	// VolumeRestore or the controller's --restore-limit-download sets. When
+	// omitted, the limit of the claim's VolumeRestore applies, and then the
+	// controller's. A database restore runs no restic Job and ignores it.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	LimitDownloadKiBps *int32 `json:"limitDownloadKiBps,omitempty"`
+
 	// TTLSecondsAfterFinished is how many seconds after the run finishes the
 	// controller deletes it. When omitted, the run is kept as the record of
 	// what was restored.

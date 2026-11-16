@@ -75,6 +75,7 @@ kubectl backup restore everything -n immich --all --sync-database-to-volume --pa
 | `--into-size 10Gi` | spec.intoSize | the source claim's size |
 | `--as-of TIME` | spec.restoreAsOf, an RFC 3339 time | the newest backup |
 | `--previous 1` | spec.previous | |
+| `--limit-download 20480` | spec.limitDownloadKiBps, the download limit of each restore Job in KiB/s; 0 lifts the limit of the VolumeRestore and of the controller | the limit of the VolumeRestore, else of the controller |
 | `--sync-database-to-volume` | spec.syncDatabaseToVolume | |
 | `--pause deploy/NAME` | one entry of spec.pauseDuringRestore; repeat the flag for more | the run waits for the workloads to stop |
 | `--timeout 30m` | spec.timeout | 4h |

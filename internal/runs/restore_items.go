@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -73,11 +74,14 @@ func (r *RestoreRunReconciler) restoreVolume(ctx context.Context, run *backupv1a
 				return wait{}, err
 			}
 		}
+		vr := r.sourceVolumeRestore(ctx, run, item)
 		job := restorejob.New(restorejob.Spec{
 			Namespace: run.Namespace, Name: item.Job, Image: r.RestoreImage, Claim: item.Name,
 			RepositorySecret: secret.Name, SnapshotID: item.SnapshotID,
-			SecurityContext: r.moverSecurityContext(ctx, run, item), Owner: run.Name,
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(run, restoreRunKind)},
+			SecurityContext:    moverSecurityContext(run, vr),
+			LimitDownloadKiBps: limitDownload(run, vr, r.LimitDownloadKiBps),
+			Owner:              run.Name,
+			OwnerReferences:    []metav1.OwnerReference{*metav1.NewControllerRef(run, restoreRunKind)},
 		})
 		if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
 			return wait{}, fmt.Errorf("create restore Job %s: %w", item.Job, err)
@@ -163,20 +167,20 @@ func (r *RestoreRunReconciler) intoClaim(ctx context.Context, run *backupv1alpha
 	return nil
 }
 
-// moverSecurityContext returns the pod security context of one restore Job.
+// sourceVolumeRestore returns the VolumeRestore of the claim that a volume
+// item restores from. The restore Job gets its security context and its
+// download limit from it when the run sets none.
 //
 // Parameters:
 //   - run is the RestoreRun.
 //   - item is the volume item the Job restores.
 //
-// It returns spec.moverSecurityContext when the run sets one. Otherwise it
-// returns the moverSecurityContext of the VolumeRestore of the source claim:
-// the item's own claim for a restore in place, and spec.claim for an into
-// restore. It returns nil when there is none.
-func (r *RestoreRunReconciler) moverSecurityContext(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) *corev1.PodSecurityContext {
-	if run.Spec.MoverSecurityContext != nil {
-		return run.Spec.MoverSecurityContext
-	}
+// It returns nil when the run has no source claim, as for a restore from
+// spec.repository, or when the claim or its VolumeRestore can't be read.
+//
+// The source claim is the item's own claim for a restore in place, and
+// spec.claim for an into restore.
+func (r *RestoreRunReconciler) sourceVolumeRestore(ctx context.Context, run *backupv1alpha1.RestoreRun, item *backupv1alpha1.RestoreItem) *backupv1alpha1.VolumeRestore {
 	name := item.Name
 	if run.Spec.Into != "" {
 		name = run.Spec.Claim
@@ -192,7 +196,44 @@ func (r *RestoreRunReconciler) moverSecurityContext(ctx context.Context, run *ba
 	if err != nil {
 		return nil
 	}
+	return vr
+}
+
+// moverSecurityContext returns the pod security context of one restore Job.
+//
+// Parameters:
+//   - run is the RestoreRun.
+//   - vr is the VolumeRestore of the source claim, or nil (see
+//     sourceVolumeRestore).
+//
+// It returns spec.moverSecurityContext when the run sets one, else the
+// moverSecurityContext of the VolumeRestore. It returns nil when neither
+// sets one.
+func moverSecurityContext(run *backupv1alpha1.RestoreRun, vr *backupv1alpha1.VolumeRestore) *corev1.PodSecurityContext {
+	if run.Spec.MoverSecurityContext != nil || vr == nil {
+		return run.Spec.MoverSecurityContext
+	}
 	return vr.Spec.MoverSecurityContext
+}
+
+// limitDownload returns the download limit of one restore Job in KiB/s, with
+// 0 for no limit.
+//
+// Parameters:
+//   - run is the RestoreRun.
+//   - vr is the VolumeRestore of the source claim, or nil (see
+//     sourceVolumeRestore).
+//   - fallback is the controller's --restore-limit-download, which applies
+//     when neither the run nor the VolumeRestore sets a limit.
+//
+// It returns the run's spec.limitDownloadKiBps when the run sets it, else the
+// VolumeRestore's, else the fallback. A limit of 0 counts as a limit, so a
+// run with 0 lifts the limit of its VolumeRestore and of the controller.
+func limitDownload(run *backupv1alpha1.RestoreRun, vr *backupv1alpha1.VolumeRestore, fallback int32) int32 {
+	if vr != nil {
+		fallback = ptr.Deref(vr.Spec.LimitDownloadKiBps, fallback)
+	}
+	return ptr.Deref(run.Spec.LimitDownloadKiBps, fallback)
 }
 
 // deleteJob deletes a restore Job and, in the background, its pods. A Job
