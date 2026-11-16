@@ -20,7 +20,7 @@ pause it for an upgrade, and what to do when a run fails or hangs.
 
 The controller stops at startup when --restore-image is empty, since every
 volume restore would fail later. It also stops when --restore-limit-download
-is below 0. It needs a memory limit of 512Mi.
+is below 0 or above 2147483647. It needs a memory limit of 512Mi.
 
 ## Load
 

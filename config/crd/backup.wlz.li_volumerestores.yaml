@@ -81,7 +81,7 @@ spec:
                   this repository's claims reads from the repository, in KiB/s. The
                   controller gives it to restic as --limit-download. 0 removes the limit
                   that the controller's --restore-limit-download sets. When omitted, the
-                  controller's limit applies. A RestoreRun's own limitDownloadKiBps takes
+                  controller's limit applies. A RestoreRun's own limitDownloadKiBps has
                   precedence over it. The backup mover ignores it.
                 format: int32
                 minimum: 0

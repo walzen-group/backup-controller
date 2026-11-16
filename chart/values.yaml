@@ -29,7 +29,9 @@ restoreImage: ""
 
 # Download limit of each restore Job in KiB/s, passed as
 # --restore-limit-download. It applies to a restore whose RestoreRun and
-# VolumeRestore set no limitDownloadKiBps. 0 means no limit.
+# VolumeRestore set no limitDownloadKiBps. 0 means no limit. The template
+# prints it as an integer, because Helm reads a YAML number as a float and
+# prints a large float as 1.048576e+06, which the flag refuses.
 restoreLimitDownload: 0
 
 # Pods of the controller. One holds the Lease backup-controller and runs the

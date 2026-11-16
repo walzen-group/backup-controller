@@ -112,7 +112,7 @@ Set exactly one of source, database and all.
 | cacheStorageClassName, cacheCapacity | the class and size of the backup mover's cache claim and clone |
 | moverPodLabels | labels on the populator's restore Jobs; Kueue's queue label is left off, since the controller admits the restore itself |
 | moverSecurityContext | the pod security context of the backup mover and the restore Jobs |
-| limitDownloadKiBps | the download limit of each restore Job of this claim in KiB/s; 0 lifts the limit of the controller; the backup mover ignores it |
+| limitDownloadKiBps | the download limit in KiB/s of each restore Job of the claims that use this repository; 0 lifts the limit of the controller; the backup mover ignores it |
 
 | Status field | Holds |
 | --- | --- |

@@ -1,11 +1,13 @@
 # Upgrading
 
-This doc covers the upgrade from v1.4.0 to v1.5.0, which adds a download limit
-to restores, the upgrade from v1.3.3 to v1.4.0, which adds a status field to
-VolumeRestore, the upgrade from v1.1.0 to v1.2.0, which runs two replicas, and
-the upgrade from v0.10.1 to v1.0.1, which keeps the three kinds and most of
-their fields, renames the pause fields, and sends all its restic work through
-one Kueue queue.
+This doc covers these upgrades:
+
+| Upgrade | Change |
+| --- | --- |
+| v1.4.0 to v1.5.0 | adds a download limit to restores |
+| v1.3.3 to v1.4.0 | adds a status field to VolumeRestore |
+| v1.1.0 to v1.2.0 | runs two replicas |
+| v0.10.1 to v1.0.1 | keeps the three kinds and most of their fields, renames the pause fields, and sends all restic work through one Kueue queue |
 
 ## From v1.4.0 to v1.5.0
 

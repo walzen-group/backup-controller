@@ -93,7 +93,7 @@ limit that is set, and 0 counts as set and means no limit:
 | Restore | Order |
 | --- | --- |
 | A RestoreRun with claim or all, in place or into a new claim | the run's spec.limitDownloadKiBps, the VolumeRestore of the source claim, the controller's --restore-limit-download |
-| A RestoreRun with repository | the run's spec.limitDownloadKiBps, the controller's --restore-limit-download |
+| A RestoreRun with repository and without claim | the run's spec.limitDownloadKiBps, the controller's --restore-limit-download |
 | The populator, for a new claim | the VolumeRestore's spec.limitDownloadKiBps, the controller's --restore-limit-download |
 
 The source claim is the claim itself for a restore in place, and spec.claim

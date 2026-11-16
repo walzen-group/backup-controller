@@ -144,6 +144,15 @@ jobs:
           # image. The render uses the one the kind test cluster runs.
           nix develop -c helm template backup-controller chart/ --set restoreImage=quay.io/backube/volsync:0.17.0 > .tmp/ci-chart-render.yaml
 
+      # Helm reads a number from a values file as a float, and prints a float
+      # of 1000000 or more as 1e+06. The controller refuses that value, so the
+      # limit has to render as a plain integer.
+      - name: helm template prints a large download limit as an integer
+        run: |
+          mkdir -p .tmp
+          printf 'restoreImage: quay.io/backube/volsync:0.17.0\nrestoreLimitDownload: 1048576\n' > .tmp/ci-limit-values.yaml
+          nix develop -c helm template backup-controller chart/ -f .tmp/ci-limit-values.yaml | grep -q -- '--restore-limit-download=1048576$'
+
       # Schema validation of both renders with no cluster available.
       # `kubectl apply --dry-run=client` cannot run here at all: kubectl v1.37
       # performs API discovery even for a client dry-run, so it needs a
